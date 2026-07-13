@@ -100,10 +100,34 @@ def cmd_task(args) -> int:
         print(f"{task} already has content (use --force to redraft)")
         return 1
     target = draft_task(cfg, args.description, agent_name=args.agent)
-    print(f"drafted {target}")
+    print(f"drafted {target}\n")
+    _print_task_summary(target.read_text(encoding="utf-8"))
     print("Review and edit it — the draft is a proposal, not a decision.")
     print("Open questions in it are yours to answer. Then: claudex run")
     return 0
+
+
+def _print_task_summary(task_md: str) -> None:
+    """Surface the mission in the terminal — the goal line decides what the
+    whole pipeline does, so the human must see it without opening the file."""
+    import re
+
+    def section(name: str) -> str:
+        m = re.search(rf"^# {name}\n+(.*?)(?=\n# |\Z)", task_md, re.S | re.M)
+        return m.group(1).strip() if m else ""
+
+    goal = " ".join(section("Goal").split())
+    print(f"GOAL: {goal}\n")
+    questions = [
+        q.strip("- ").strip()
+        for q in section("Open questions").splitlines()
+        if q.strip().startswith("-")
+    ]
+    if questions:
+        print(f"OPEN QUESTIONS ({len(questions)}) — answer these in the file:")
+        for q in questions:
+            print(f"  ? {q}")
+        print()
 
 
 def cmd_run(args) -> int:

@@ -42,6 +42,14 @@ decision open, put it in open_questions rather than silently resolving it.
 Acceptance criteria must be independently checkable statements; required
 tests must be tests that can fail.
 
+The goal must start with the deliverable type in brackets: "[REPORT]" if the
+task produces analysis/review output without changing product code,
+"[CHANGE]" if it modifies code or docs, "[MIXED]" if both. If the human's
+description is ambiguous between reporting and changing (e.g. "review and
+find what's wrong" — report the findings, or also fix them?), that ambiguity
+is a mandatory open question: pick the narrower reading for the draft and
+ask.
+
 This phase is read-only. Do not edit any files.
 """
 
