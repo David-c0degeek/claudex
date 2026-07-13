@@ -26,6 +26,26 @@ Rules of evidence:
 """
 
 
+def task_contract(description: str) -> str:
+    return f"""A human engineer gave this one-paragraph task description for this
+repository:
+
+---
+{description}
+---
+
+Draft the full task contract by investigating the repository directly. Ground
+every section in what the repository actually contains: name real files,
+real symbols, real behavior. Capture the human's intent faithfully — do not
+invent requirements they did not imply. Where the description leaves a real
+decision open, put it in open_questions rather than silently resolving it.
+Acceptance criteria must be independently checkable statements; required
+tests must be tests that can fail.
+
+This phase is read-only. Do not edit any files.
+"""
+
+
 def investigation(task_path: Path) -> str:
     return f"""{INDEPENDENCE}
 Read the task contract at: {task_path}

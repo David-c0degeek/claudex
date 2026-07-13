@@ -20,6 +20,23 @@ def _section(title: str, items: list[str]) -> str:
     return f"## {title}\n\n" + "\n".join(f"- {i}" for i in items) + "\n"
 
 
+def render_task_contract(c: dict) -> str:
+    return "\n".join(
+        [
+            f"# Goal\n\n{c.get('goal', '')}\n",
+            f"# Current behavior\n\n{c.get('current_behavior', '')}\n",
+            f"# Desired behavior\n\n{c.get('desired_behavior', '')}\n",
+            f"# Scope\n\n{c.get('scope', '')}\n",
+            _section("Explicit non-goals", c.get("non_goals", [])).replace("##", "#", 1),
+            _section("Constraints", c.get("constraints", [])).replace("##", "#", 1),
+            _section("Acceptance criteria", c.get("acceptance_criteria", [])).replace("##", "#", 1),
+            _section("Required tests", c.get("required_tests", [])).replace("##", "#", 1),
+            _section("Relevant files", c.get("relevant_files", [])).replace("##", "#", 1),
+            _section("Open questions", c.get("open_questions", [])).replace("##", "#", 1),
+        ]
+    )
+
+
 def render_analysis(agent: str, a: dict) -> str:
     ev = [
         f"`{e.get('file', '?')}` — {e.get('symbol', '')} — {e.get('claim', '')}".replace(" —  — ", " — ")

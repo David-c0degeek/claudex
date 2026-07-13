@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -41,24 +42,71 @@ class OrchestratorError(RuntimeError):
     pass
 
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def task_has_content(task_md: str) -> bool:
+    """True if the contract contains substantive text beyond the scaffold —
+    an unfilled template (headings + HTML comments only) must not reach the
+    agents: they would either report an empty contract or invent a task."""
+    stripped = _HTML_COMMENT_RE.sub("", task_md)
+    substantive = [
+        line.strip()
+        for line in stripped.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    return len(" ".join(substantive)) >= 20
+
+
+def build_agents(cfg: Config) -> dict:
+    return {
+        "claude": ClaudeAgent(
+            binary=resolve_claude_bin(cfg.claude_bin or None),
+            model=cfg.claude_model,
+            write_allowed_tools=cfg.claude_write_allowed_tools,
+            extra_args=list(cfg.claude_extra_args),
+        ),
+        "codex": CodexAgent(
+            binary=resolve_codex_bin(cfg.codex_bin or None),
+            model=cfg.codex_model,
+            extra_args=list(cfg.codex_extra_args),
+        ),
+    }
+
+
+def draft_task(cfg: Config, description: str, agent_name: str = "claude") -> Path:
+    """Agent-assisted task authoring: expand a one-paragraph human description
+    into a full contract, grounded in the repository. The human reviews and
+    edits the result before `claudex run` — this drafts, it does not decide."""
+    from .state import claudex_dir, task_file
+
+    agent = build_agents(cfg)[agent_name]
+    log_root = claudex_dir(cfg.repo)
+    print(f"[claudex] {agent_name}: drafting task contract (read-only) ...", flush=True)
+    result = agent.run(
+        prompts.task_contract(description),
+        cwd=cfg.repo,
+        run_dir=log_root,
+        label="task-draft",
+        read_only=True,
+        schema=schemas.TASK_CONTRACT_SCHEMA,
+        timeout=cfg.agent_timeout,
+    )
+    if not result.ok:
+        raise OrchestratorError(f"{agent_name}/task-draft: {result.error}")
+    contract = result.require_structured()
+    target = task_file(cfg.repo)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(artifacts.render_task_contract(contract), encoding="utf-8")
+    return target
+
+
 class Orchestrator:
     def __init__(self, cfg: Config, state: RunState):
         self.cfg = cfg
         self.state = state
         self.run_dir = run_dir_for(cfg.repo, state.run_id)
-        self.agents = {
-            "claude": ClaudeAgent(
-                binary=resolve_claude_bin(cfg.claude_bin or None),
-                model=cfg.claude_model,
-                write_allowed_tools=cfg.claude_write_allowed_tools,
-                extra_args=list(cfg.claude_extra_args),
-            ),
-            "codex": CodexAgent(
-                binary=resolve_codex_bin(cfg.codex_bin or None),
-                model=cfg.codex_model,
-                extra_args=list(cfg.codex_extra_args),
-            ),
-        }
+        self.agents = build_agents(cfg)
 
     # ------------------------------------------------------------- utilities
     def _save(self) -> None:
@@ -158,10 +206,14 @@ class Orchestrator:
         from .state import task_file
 
         task = task_file(self.cfg.repo)
-        if not task.exists() or len(task.read_text(encoding="utf-8").strip()) < 40:
+        if not task.exists():
             raise OrchestratorError(
-                f"task contract missing or trivial: {task} — run `claudex init` "
-                "and fill it in before `claudex run`"
+                f"task contract missing: {task} — run `claudex init` first"
+            )
+        if not task_has_content(task.read_text(encoding="utf-8")):
+            raise OrchestratorError(
+                f"task contract is an unfilled template: {task} — fill it in, "
+                'or draft it from a description with `claudex task "..."`'
             )
         if not gitops.is_git_repo(self.cfg.repo):
             raise OrchestratorError(f"{self.cfg.repo} is not a git repository")

@@ -65,7 +65,9 @@ logged-in `codex` CLI.
 ```powershell
 cd your-project
 claudex init                 # scaffolds .claudex/task.md + config, gitignores .claudex/
-# … fill in .claudex/task.md (the task contract) …
+# … fill in .claudex/task.md (the task contract) by hand, or draft it:
+claudex task "users report the export button hangs on files >10MB; fix it without changing the export format"
+# … review/edit the drafted contract — answer its open questions …
 claudex doctor               # verify git/claude/codex wiring
 claudex run                  # runs until gate 1
 # … read claude-analysis.md, codex-analysis.md, disagreement.md …
@@ -123,6 +125,11 @@ the same schemas.
 * **Same contract, no retelling.** Both agents read the identical
   `task.md` snapshot (copied into the run dir at start, so mid-run edits
   can't skew it). Reviewers receive artifact file paths, never summaries.
+* **The human owns the task definition.** `claudex run` refuses an unfilled
+  template — steering must come from you. `claudex task "..."` can draft the
+  contract from one paragraph (an agent expands it, grounded in the repo),
+  but the draft is a proposal: you review it, answer its open questions, and
+  edit it before any run starts.
 * **Independence before comparison.** Investigations run in parallel and
   blind, then a disagreement pass checks conflicting claims against the
   repository — the second opinion can't just validate the first framing.

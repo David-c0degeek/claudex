@@ -26,6 +26,21 @@ def _arr(items: dict) -> dict:
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
 
+TASK_CONTRACT_SCHEMA = _obj(
+    {
+        "goal": {"type": "string", "description": "What should be true when done"},
+        "current_behavior": _STR,
+        "desired_behavior": _STR,
+        "scope": _STR,
+        "non_goals": _arr(_STR),
+        "constraints": _arr(_STR),
+        "acceptance_criteria": _arr(_STR),
+        "required_tests": _arr(_STR),
+        "relevant_files": _arr(_STR),
+        "open_questions": _arr(_STR),
+    }
+)
+
 EVIDENCE_ITEM = _obj(
     {
         "file": _STR,

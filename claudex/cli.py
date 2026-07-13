@@ -22,7 +22,7 @@ from pathlib import Path
 from . import __version__, gitops
 from .agents import AgentError, resolve_claude_bin, resolve_codex_bin
 from .config import Config
-from .phases import Orchestrator, OrchestratorError
+from .phases import Orchestrator, OrchestratorError, draft_task, task_has_content
 from .state import (
     RunState,
     clear_current_run,
@@ -83,7 +83,26 @@ def cmd_init(args) -> int:
             print("added .claudex/ to .gitignore")
     else:
         print("WARNING: not a git repository — claudex requires git before `run`")
-    print("\nNext: fill in .claudex/task.md, then `claudex run`")
+    print("\nNext: fill in .claudex/task.md by hand, or draft it from a")
+    print('description with `claudex task "one paragraph of what you want"`,')
+    print("then `claudex run`")
+    return 0
+
+
+def cmd_task(args) -> int:
+    cfg = _cfg(args)
+    task = task_file(cfg.repo)
+    if (
+        task.exists()
+        and task_has_content(task.read_text(encoding="utf-8"))
+        and not args.force
+    ):
+        print(f"{task} already has content (use --force to redraft)")
+        return 1
+    target = draft_task(cfg, args.description, agent_name=args.agent)
+    print(f"drafted {target}")
+    print("Review and edit it — the draft is a proposal, not a decision.")
+    print("Open questions in it are yours to answer. Then: claudex run")
     return 0
 
 
@@ -248,6 +267,16 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.add_argument("--force", action="store_true", help="overwrite existing task.md")
     sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser(
+        "task", help="draft the task contract from a one-paragraph description"
+    )
+    common(sp)
+    sp.add_argument("description", help="one-paragraph task description")
+    sp.add_argument("--agent", choices=["claude", "codex"], default="claude",
+                    help="which agent drafts the contract (default: claude)")
+    sp.add_argument("--force", action="store_true", help="overwrite a filled task.md")
+    sp.set_defaults(func=cmd_task)
 
     sp = sub.add_parser("run", help="start or resume a run")
     common(sp)
