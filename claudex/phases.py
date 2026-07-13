@@ -25,6 +25,7 @@ import concurrent.futures
 import json
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -115,10 +116,13 @@ class Orchestrator:
         self.state = state
         self.run_dir = run_dir_for(cfg.repo, state.run_id)
         self.agents = build_agents(cfg)
+        self._save_lock = threading.Lock()
 
     # ------------------------------------------------------------- utilities
     def _save(self) -> None:
-        self.state.save(self.run_dir)
+        # Parallel investigation workers save from their own threads.
+        with self._save_lock:
+            self.state.save(self.run_dir)
 
     def _art(self, name: str) -> Path:
         return self.run_dir / name
@@ -253,8 +257,13 @@ class Orchestrator:
     def phase_investigate(self) -> None:
         prompt = prompts.investigation(self.task_snapshot)
 
-        def investigate(name: str):
-            return name, self._run_agent(
+        def investigate(name: str) -> None:
+            # A retried phase must not re-run (and re-pay for) an agent whose
+            # analysis already landed — save inside the worker, skip if done.
+            if self._art(f"{name}-analysis.json").exists():
+                self.say(f"{name}: analysis already present, skipping")
+                return
+            res = self._run_agent(
                 name,
                 prompt,
                 cwd=self.cfg.repo,
@@ -262,17 +271,23 @@ class Orchestrator:
                 schema=schemas.ANALYSIS_SCHEMA,
                 label=f"{name}-investigate",
             )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            results = dict(pool.map(investigate, ("claude", "codex")))
-
-        for name, res in results.items():
             analysis = res.require_structured()
             self.state.sessions[name] = res.session_id
             artifacts.save_json(self._art(f"{name}-analysis.json"), analysis)
             self._art(f"{name}-analysis.md").write_text(
                 artifacts.render_analysis(name, analysis), encoding="utf-8"
             )
+
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(investigate, n): n for n in ("claude", "codex")}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except (AgentError, gitops.GitError, OrchestratorError) as exc:
+                    errors.append(str(exc))
+        if errors:
+            raise OrchestratorError("; ".join(errors))
         self.state.advance(Phase.DISAGREEMENT)
 
     def phase_disagreement(self) -> None:

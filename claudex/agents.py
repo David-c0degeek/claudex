@@ -38,14 +38,14 @@ class AgentError(RuntimeError):
 
 
 # ------------------------------------------------------- usage-limit parsing
-_LIMIT_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "rate_limit",
-    "limit reached",
-    "too many requests",
-    '"status":429',
-    "status: 429",
+# Providers phrase limits many ways: "usage limit reached", "You've hit your
+# session limit", "rate limit", "5-hour limit reached", 429s.
+_LIMIT_RE = re.compile(
+    r"(?:usage|rate|session|daily|weekly|monthly|\d+-hour)[ _-]limit"
+    r"|limit\s+(?:reached|hit|exceeded)"
+    r"|too\s+many\s+requests"
+    r"|\b429\b",
+    re.IGNORECASE,
 )
 
 # Claude's print-mode limit message historically carries a unix epoch after a
@@ -58,11 +58,13 @@ _TRY_AGAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _DUR_PART_RE = re.compile(r"(\d+)\s*(h|m|s)", re.IGNORECASE)
-# Clock style: "resets at 3pm" / "resets 15:30" / "available at 9:00 am".
+# Clock style: "resets at 3pm" / "resets 15:30" / "available at 9:00 am",
+# optionally followed by an IANA zone: "resets 7pm (Europe/Amsterdam)".
 _CLOCK_RE = re.compile(
     r"(?:reset\w*|available)\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
     re.IGNORECASE,
 )
+_TZ_RE = re.compile(r"\(([A-Za-z]+(?:_[A-Za-z]+)*/[A-Za-z_+\-]+)\)")
 
 
 def classify_limit(text: str, now: float | None = None) -> tuple[bool, int | None]:
@@ -71,8 +73,7 @@ def classify_limit(text: str, now: float | None = None) -> tuple[bool, int | Non
     Providers usually say when the limit lifts; parse that instead of
     guessing. Returns None for the delay when the message names no time.
     """
-    low = text.lower()
-    if not any(marker in low for marker in _LIMIT_MARKERS):
+    if not _LIMIT_RE.search(text):
         return False, None
     now = now if now is not None else time.time()
 
@@ -101,16 +102,36 @@ def classify_limit(text: str, now: float | None = None) -> tuple[bool, int | Non
         elif meridiem == "am" and hour == 12:
             hour = 0
         if hour < 24 and minute < 60:
-            local = time.localtime(now)
-            target = time.mktime(
-                (local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0,
-                 0, 0, -1)
-            )
-            if target <= now:
-                target += 86400  # that clock time already passed → tomorrow
-            return True, int(target - now)
+            delay = _delay_until_clock(text, now, hour, minute)
+            if delay is not None:
+                return True, delay
 
     return True, None
+
+
+def _delay_until_clock(text: str, now: float, hour: int, minute: int) -> int | None:
+    """Seconds from `now` until the next occurrence of hour:minute. Honors an
+    IANA zone named in the message ("(Europe/Amsterdam)"); otherwise assumes
+    the machine's local zone."""
+    from datetime import datetime, timedelta
+
+    tzinfo = None
+    tz_match = _TZ_RE.search(text)
+    if tz_match:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tzinfo = ZoneInfo(tz_match.group(1))
+        except Exception:  # unknown zone name → fall back to local
+            tzinfo = None
+    try:
+        now_dt = datetime.fromtimestamp(now, tz=tzinfo).astimezone(tzinfo)
+        target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now_dt:
+            target += timedelta(days=1)  # that clock time already passed
+        return int(target.timestamp() - now)
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 @dataclass
