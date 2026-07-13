@@ -29,26 +29,47 @@ DEFINE TASK (.claudex/task.md — both agents get the identical contract)
     ├── CLAUDE INVESTIGATES ──┐   read-only, parallel, blind to each other,
     └── CODEX INVESTIGATES  ──┤   schema-validated analyses
                               ▼
-                   DISAGREEMENT ANALYSIS      reviewer checks conflicting claims
+                   DISAGREEMENT ANALYSIS      REVIEWER checks conflicting claims
                               ▼               against the repo itself
               ┌─ GATE 1: HUMAN SELECTS PLAN   (or --auto-plan)
               ▼
-                ADVERSARIAL PLAN REVIEW       non-author attacks the plan
+                ADVERSARIAL PLAN REVIEW       plan NON-AUTHOR attacks the plan
                               ▼
-                     PLAN FINALIZE            author addresses blocking
+                     PLAN FINALIZE            plan author addresses blocking
                               ▼               corrections (skipped on clean approve)
                   OWNER IMPLEMENTS            isolated worktree + branch, commits
                               ▼
-                   REVIEWER REVIEWS           reads exact diff at the commit,
+                  REVIEWER REVIEWS            reads exact diff at the commit,
                               ▼               read-only, severity-tagged findings
                   OWNER REMEDIATES            resumes its own session, commits
                               ▼               (loops, bounded by max_review_rounds)
-                 FRESH VERIFICATION           reviewer, NEW session, checks every
+                 FRESH VERIFICATION           REVIEWER, NEW session, checks every
                               ▼               acceptance criterion with evidence
               ┌─ GATE 2: HUMAN APPROVAL
               ▼
                         DONE                  `git merge claudex/<run-id>`
 ```
+
+### Roles and rotation
+
+OWNER and REVIEWER are *per-run roles*, not fixed models. They are bound
+once, when the run is created, and never change mid-run:
+
+| | run 1 | run 2 | run 3 | … |
+|---|---|---|---|---|
+| OWNER (implements, remediates) | claude | codex | claude | … |
+| REVIEWER (disagreement, diff review, fresh verification) | codex | claude | codex | … |
+
+With `--owner auto` (the default) the roles flip after every **completed**
+run, recorded in `.claudex/history.json` at final approval. Aborted or
+failed runs don't rotate — a crashed run shouldn't cost a model its turn.
+Force a side with `claudex run --owner codex`, or pin it permanently via
+`"owner"` in `.claudex/config.json`.
+
+One role floats *within* a run: the adversarial plan review is done by
+whichever agent did **not** author the selected plan. If codex's analysis
+wins gate 1 but claude owns implementation, claude attacks the plan, then
+implements the corrected version of it.
 
 ## Install
 
@@ -85,6 +106,28 @@ Useful flags on `run`: `--owner claude|codex|auto` (auto alternates per
 task, recorded in `.claudex/history.json`), `--auto-plan`,
 `--max-review-rounds N`, `--timeout SECONDS`, `--claude-model X`,
 `--codex-model Y`.
+
+### Picking models
+
+Per run: `claudex run --claude-model opus --codex-model gpt-5.6-sol`.
+Permanently: `"claude_model"` / `"codex_model"` in `.claudex/config.json`.
+Values are passed straight through (`claude --model`, `codex -m`), so
+anything the CLIs accept works — aliases like `fable`/`opus`/`sonnet` or
+full model names. Unset means each CLI's own configured default. Both
+agents keep their model for the entire run; there is deliberately no
+per-phase model mixing — a cheaper model reviewing a stronger model's plan
+inverts the adversarial pressure the pipeline depends on.
+
+### Usage limits
+
+When either provider reports a usage/rate limit, claudex does not fail the
+run: it parses the reset time out of the limit message (epoch, "try again
+in 3h27m", or "resets at 3pm" styles), reports when it will retry, sleeps,
+and continues. If the message names no time it waits `default_limit_wait`
+(30 min). Waits are capped at `max_limit_wait` (6 h) and at
+`max_limit_waits` retries per invocation; state is saved before each wait,
+so Ctrl+C during a wait loses nothing — `claudex run` resumes the phase.
+Disable with `"wait_on_limits": false` to fail fast instead.
 
 ## How permissions are enforced
 

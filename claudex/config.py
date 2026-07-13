@@ -27,6 +27,13 @@ class Config:
     max_review_rounds: int = 3
     max_verify_rounds: int = 2
     agent_timeout: int = 3600  # seconds per agent invocation
+    # Usage-limit handling: when a provider reports a usage/rate limit, wait
+    # until the reset time it names (or default_limit_wait when it names
+    # none) and retry, instead of failing the run.
+    wait_on_limits: bool = True
+    default_limit_wait: int = 1800  # seconds, when the message names no time
+    max_limit_wait: int = 6 * 3600  # cap a single wait
+    max_limit_waits: int = 12  # per agent invocation
     claude_write_allowed_tools: str = "Edit,Write,NotebookEdit,TodoWrite,Bash"
     claude_extra_args: list = field(default_factory=list)
     codex_extra_args: list = field(default_factory=list)
@@ -41,6 +48,10 @@ class Config:
         "max_review_rounds",
         "max_verify_rounds",
         "agent_timeout",
+        "wait_on_limits",
+        "default_limit_wait",
+        "max_limit_wait",
+        "max_limit_waits",
         "claude_write_allowed_tools",
         "claude_extra_args",
         "codex_extra_args",

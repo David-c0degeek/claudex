@@ -25,10 +25,18 @@ import concurrent.futures
 import json
 import re
 import shutil
+import time
 from pathlib import Path
 
 from . import artifacts, gitops, prompts, schemas
-from .agents import AgentError, ClaudeAgent, CodexAgent, resolve_claude_bin, resolve_codex_bin
+from .agents import (
+    AgentError,
+    ClaudeAgent,
+    CodexAgent,
+    classify_limit,
+    resolve_claude_bin,
+    resolve_codex_bin,
+)
 from .config import Config
 from .state import (
     Phase,
@@ -130,20 +138,37 @@ class Orchestrator:
             f"({'read-only' if kw.get('read_only', True) else 'WRITE'}, "
             f"cwd={kw.get('cwd')}) ..."
         )
-        result = agent.run(
-            prompt,
-            run_dir=self.run_dir,
-            label=label,
-            timeout=self.cfg.agent_timeout,
-            **kw,
-        )
-        self.say(
-            f"{agent_name}: {label} finished in {result.duration_s:.0f}s "
-            f"(ok={result.ok})"
-        )
-        if not result.ok:
-            raise AgentError(f"{agent_name}/{label}: {result.error}")
-        return result
+        waits = 0
+        while True:
+            result = agent.run(
+                prompt,
+                run_dir=self.run_dir,
+                label=label,
+                timeout=self.cfg.agent_timeout,
+                **kw,
+            )
+            self.say(
+                f"{agent_name}: {label} finished in {result.duration_s:.0f}s "
+                f"(ok={result.ok})"
+            )
+            if result.ok:
+                return result
+            is_limit, delay = classify_limit(f"{result.error}\n{result.text}")
+            if not (is_limit and self.cfg.wait_on_limits and waits < self.cfg.max_limit_waits):
+                raise AgentError(f"{agent_name}/{label}: {result.error}")
+            delay = min(
+                self.cfg.max_limit_wait,
+                max(60, delay if delay is not None else self.cfg.default_limit_wait),
+            )
+            resume_at = time.strftime("%H:%M:%S", time.localtime(time.time() + delay))
+            self.say(
+                f"{agent_name}: usage limit hit; waiting {delay // 60} min "
+                f"(retry ~{resume_at}, wait {waits + 1}/{self.cfg.max_limit_waits})"
+            )
+            self.state.log(f"{agent_name}/{label}: usage limit, waiting {delay}s")
+            self._save()  # durable: Ctrl+C here loses nothing, `claudex run` resumes
+            time.sleep(delay)
+            waits += 1
 
     # ----------------------------------------------------------------- driver
     def run_until_gate(self) -> None:

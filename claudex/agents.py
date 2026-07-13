@@ -24,6 +24,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,82 @@ from pathlib import Path
 
 class AgentError(RuntimeError):
     pass
+
+
+# ------------------------------------------------------- usage-limit parsing
+_LIMIT_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "limit reached",
+    "too many requests",
+    '"status":429',
+    "status: 429",
+)
+
+# Claude's print-mode limit message historically carries a unix epoch after a
+# pipe: "Claude AI usage limit reached|1699999999".
+_EPOCH_RE = re.compile(r"\|(\d{10,13})\b")
+# OpenAI-style: "Please try again in 3h27m" / "try again in 20s" /
+# "try again after 2 hours".
+_TRY_AGAIN_RE = re.compile(
+    r"try again (?:in|after)\s+((?:\d+\s*(?:h(?:ours?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?)\s*)+)",
+    re.IGNORECASE,
+)
+_DUR_PART_RE = re.compile(r"(\d+)\s*(h|m|s)", re.IGNORECASE)
+# Clock style: "resets at 3pm" / "resets 15:30" / "available at 9:00 am".
+_CLOCK_RE = re.compile(
+    r"(?:reset\w*|available)\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+    re.IGNORECASE,
+)
+
+
+def classify_limit(text: str, now: float | None = None) -> tuple[bool, int | None]:
+    """(is_usage_limit, seconds_until_reset_or_None).
+
+    Providers usually say when the limit lifts; parse that instead of
+    guessing. Returns None for the delay when the message names no time.
+    """
+    low = text.lower()
+    if not any(marker in low for marker in _LIMIT_MARKERS):
+        return False, None
+    now = now if now is not None else time.time()
+
+    m = _EPOCH_RE.search(text)
+    if m:
+        epoch = int(m.group(1))
+        if epoch > 1e12:  # milliseconds
+            epoch //= 1000
+        return True, max(0, int(epoch - now))
+
+    m = _TRY_AGAIN_RE.search(text)
+    if m:
+        seconds = 0
+        for value, unit in _DUR_PART_RE.findall(m.group(1)):
+            seconds += int(value) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+        if seconds:
+            return True, seconds
+
+    m = _CLOCK_RE.search(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        meridiem = (m.group(3) or "").lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        if hour < 24 and minute < 60:
+            local = time.localtime(now)
+            target = time.mktime(
+                (local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0,
+                 0, 0, -1)
+            )
+            if target <= now:
+                target += 86400  # that clock time already passed → tomorrow
+            return True, int(target - now)
+
+    return True, None
 
 
 @dataclass
