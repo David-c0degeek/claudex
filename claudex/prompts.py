@@ -25,6 +25,11 @@ Rules of evidence:
 - Do not edit, create, or delete any files. This phase is read-only.
 """
 
+ANSWERS_ARE_BINDING = """\
+In the task contract, lines marked "Answer:" under Open questions are the
+human's decisions. They are binding parts of the contract, not suggestions.
+"""
+
 
 def task_contract(description: str) -> str:
     return f"""A human engineer gave this one-paragraph task description for this
@@ -63,10 +68,30 @@ the relevant execution paths, evidence with file and symbol references, your
 assumptions, the risks, the minimal justified solution, the competing
 solutions you rejected and why, the tests required, and any open questions.
 
+{ANSWERS_ARE_BINDING}
 {EVIDENCE_RULES}"""
 
 
-def disagreement(task_path: Path, claude_analysis: Path, codex_analysis: Path) -> str:
+def review_investigation(task_path: Path) -> str:
+    return f"""{INDEPENDENCE}
+Read the task contract at: {task_path}
+
+This task's deliverable IS a review. Produce the complete review now — the
+actual review, not a plan for reviewing later. Cover every dimension and
+acceptance criterion the contract names, run the read-only checks it
+requires, and record each material finding (gaps, wrong implementations,
+incorrect assumptions, missing pieces) with severity and direct repository
+evidence. Put the full self-contained report in report_markdown; findings
+are its machine-readable index.
+
+{ANSWERS_ARE_BINDING}
+{EVIDENCE_RULES}"""
+
+
+def disagreement(
+    task_path: Path, claude_analysis: Path, codex_analysis: Path, mode: str = "change"
+) -> str:
+    basis = "the plan" if mode == "change" else "the base of the final report"
     return f"""Two engineers independently analyzed the same task. Your job is to compare
 their analyses and surface every material agreement and disagreement, checking
 disputed claims directly against the repository — trust neither analysis.
@@ -76,11 +101,42 @@ Claude's analysis (JSON): {claude_analysis}
 Codex's analysis (JSON): {codex_analysis}
 
 For each conflict, state both positions, then state what the repository
-itself shows. Recommend which analysis should become the plan, and why.
+itself shows. Recommend which analysis should become {basis}, and why.
 Recommend "claude" or "codex" based on evidence quality and solution
 minimality, not verbosity.
 
 {EVIDENCE_RULES}"""
+
+
+def consolidate_report(
+    task_path: Path,
+    base_author: str,
+    base_report: Path,
+    other_report: Path,
+    disagreement_path: Path,
+) -> str:
+    return f"""You are consolidating two independent reviews into the final report. You
+are in a dedicated git worktree; you may create and edit files here.
+
+Task contract: {task_path}
+Base review ({base_author}'s, human-selected): {base_report}
+Other review (JSON): {other_report}
+Disagreement analysis (JSON): {disagreement_path}
+
+Produce the final report:
+- Start from the base review. Fold in every finding from the other review
+  that survives the evidence; note material disagreements and how the
+  repository resolves them rather than silently dropping either side.
+- Where the disagreement analysis showed a claim to be wrong, correct it.
+- Honor the contract's decisions about where the report lives (Answer:
+  lines are binding); default to REVIEW.md at the repository root if the
+  contract does not say.
+- Re-run any read-only checks the contract requires and report their real
+  output.
+- Commit the report file(s) with `git add` and `git commit`. Do not push.
+  Do not modify any product code — this task delivers a report only.
+
+{ANSWERS_ARE_BINDING}"""
 
 
 def plan_review(task_path: Path, plan_path: Path) -> str:
@@ -186,6 +242,40 @@ Do not modify code.
 {EVIDENCE_RULES}"""
 
 
+def report_review(
+    task_path: Path,
+    diff_path: Path,
+    report_path: Path,
+    base_commit: str,
+) -> str:
+    return f"""Review a consolidated review report as an independent senior engineer. You
+did not write it. Do not assume any of its claims are accurate.
+
+Task contract: {task_path}
+Exact diff (base {base_commit[:12]} -> HEAD, the committed report): {diff_path}
+Consolidator's own summary (JSON): {report_path}
+
+You are inside the worktree at the commit, so you can read the report and
+run read-only checks against the repository it describes.
+
+Evaluate:
+- spot-check the report's material claims against the repository: are they
+  evidenced and correct?
+- does the report cover every dimension and acceptance criterion the
+  contract names?
+- were findings from either source review silently dropped?
+- did the change stay report-only (no product code touched)?
+
+Severity: "blocking" = the report asserts something false or misses a
+contract dimension; "major" = should fix now; "minor"/"nit" = record only.
+Verdict "approve" only with zero blocking and zero major findings.
+
+Do not modify anything.
+
+{ANSWERS_ARE_BINDING}
+{EVIDENCE_RULES}"""
+
+
 def remediate(review_path: Path, round_no: int) -> str:
     return f"""An independent review of your implementation found problems that must be
 fixed (remediation round {round_no}).
@@ -204,16 +294,16 @@ Re-run the tests, then commit the remediation with `git add` and
 
 def verify(
     task_path: Path,
-    plan_path: Path,
+    plan_path: Path | None,
     diff_path: Path,
     base_commit: str,
 ) -> str:
+    plan_line = f"Agreed plan: {plan_path}\n" if plan_path else ""
     return f"""You are the final verifier. You have no history with this change: treat
 every prior claim about it as unverified testimony.
 
 Task contract: {task_path}
-Agreed plan: {plan_path}
-Full diff (base {base_commit[:12]} -> HEAD): {diff_path}
+{plan_line}Full diff (base {base_commit[:12]} -> HEAD): {diff_path}
 
 You are inside the implementation worktree at the final commit.
 

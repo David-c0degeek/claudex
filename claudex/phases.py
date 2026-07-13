@@ -43,6 +43,7 @@ from .state import (
     Phase,
     RunState,
     append_history,
+    other_agent,
     run_dir_for,
 )
 
@@ -65,6 +66,17 @@ def task_has_content(task_md: str) -> bool:
         if line.strip() and not line.strip().startswith("#")
     ]
     return len(" ".join(substantive)) >= 20
+
+
+def detect_mode(task_md: str, configured: str = "auto") -> str:
+    """"report": the deliverable IS analysis — parallel reviews are the work,
+    no plan-about-a-plan layer. "change": the deliverable is a diff. Detected
+    from the goal's [REPORT]/[CHANGE]/[MIXED] prefix unless configured."""
+    if configured in ("report", "change"):
+        return configured
+    m = re.search(r"^#\s*Goal\s*\n+(.{0,120})", task_md, re.MULTILINE | re.DOTALL)
+    goal_head = m.group(1) if m else ""
+    return "report" if "[REPORT]" in goal_head.upper() else "change"
 
 
 def build_agents(cfg: Config) -> dict:
@@ -209,7 +221,8 @@ class Orchestrator:
     def _report_gate(self) -> None:
         phase = Phase(self.state.phase)
         if phase is Phase.AWAIT_PLAN_SELECTION:
-            self.say("GATE: plan selection required.")
+            what = "base report" if self.report_mode else "plan"
+            self.say(f"GATE: {what} selection required.")
             self.say(f"  Read: {self._art('claude-analysis.md')}")
             self.say(f"        {self._art('codex-analysis.md')}")
             self.say(f"        {self._art('disagreement.md')}")
@@ -239,11 +252,13 @@ class Orchestrator:
             raise OrchestratorError(
                 f"task contract missing: {task} — run `claudex init` first"
             )
-        if not task_has_content(task.read_text(encoding="utf-8")):
+        task_text = task.read_text(encoding="utf-8")
+        if not task_has_content(task_text):
             raise OrchestratorError(
                 f"task contract is an unfilled template: {task} — fill it in, "
                 'or draft it from a description with `claudex task "..."`'
             )
+        self.state.mode = detect_mode(task_text, self.cfg.mode)
         if not gitops.is_git_repo(self.cfg.repo):
             raise OrchestratorError(f"{self.cfg.repo} is not a git repository")
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -254,8 +269,19 @@ class Orchestrator:
         self.state.branch = f"claudex/{self.state.run_id}"
         self.state.advance(Phase.INVESTIGATE)
 
+    @property
+    def report_mode(self) -> bool:
+        return self.state.mode == "report"
+
     def phase_investigate(self) -> None:
-        prompt = prompts.investigation(self.task_snapshot)
+        if self.report_mode:
+            prompt = prompts.review_investigation(self.task_snapshot)
+            schema = schemas.REVIEW_REPORT_SCHEMA
+            render = artifacts.render_review_report
+        else:
+            prompt = prompts.investigation(self.task_snapshot)
+            schema = schemas.ANALYSIS_SCHEMA
+            render = artifacts.render_analysis
 
         def investigate(name: str) -> None:
             # A retried phase must not re-run (and re-pay for) an agent whose
@@ -268,14 +294,14 @@ class Orchestrator:
                 prompt,
                 cwd=self.cfg.repo,
                 read_only=True,
-                schema=schemas.ANALYSIS_SCHEMA,
+                schema=schema,
                 label=f"{name}-investigate",
             )
             analysis = res.require_structured()
             self.state.sessions[name] = res.session_id
             artifacts.save_json(self._art(f"{name}-analysis.json"), analysis)
             self._art(f"{name}-analysis.md").write_text(
-                artifacts.render_analysis(name, analysis), encoding="utf-8"
+                render(name, analysis), encoding="utf-8"
             )
 
         errors = []
@@ -297,6 +323,7 @@ class Orchestrator:
                 self.task_snapshot,
                 self._art("claude-analysis.json"),
                 self._art("codex-analysis.json"),
+                mode=self.state.mode,
             ),
             cwd=self.cfg.repo,
             read_only=True,
@@ -319,13 +346,18 @@ class Orchestrator:
             self.state.advance(Phase.AWAIT_PLAN_SELECTION)
 
     def select_plan(self, choice: str, notes: str = "") -> None:
-        """Gate 1 resolution — invoked by `claudex approve plan` or --auto-plan."""
+        """Gate 1 resolution — invoked by `claudex approve plan` or --auto-plan.
+        In report mode the choice is the base report and consolidation starts
+        directly; no plan-about-the-work layer exists to review."""
         analysis = json.loads(
             self._art(f"{choice}-analysis.json").read_text(encoding="utf-8")
         )
         self.state.selected_plan = choice
         self.state.plan_author = choice
         self.state.plan_selection_notes = notes
+        if self.report_mode:
+            self.state.advance(Phase.IMPLEMENT, f"base report: {choice}")
+            return
         self._art("selected-plan.md").write_text(
             artifacts.render_selected_plan(choice, analysis, notes), encoding="utf-8"
         )
@@ -390,9 +422,20 @@ class Orchestrator:
         self.state.worktree = str(wt)
         self._save()
 
+        if self.report_mode:
+            base = self.state.selected_plan
+            prompt = prompts.consolidate_report(
+                self.task_snapshot,
+                base,
+                self._art(f"{base}-analysis.json"),
+                self._art(f"{other_agent(base)}-analysis.json"),
+                self._art("disagreement.json"),
+            )
+        else:
+            prompt = prompts.implement(self.task_snapshot, self._art("agreed-plan.md"))
         res = self._run_agent(
             self.state.owner,
-            prompts.implement(self.task_snapshot, self._art("agreed-plan.md")),
+            prompt,
             cwd=wt,
             read_only=False,
             schema=schemas.IMPLEMENTATION_REPORT_SCHEMA,
@@ -432,15 +475,24 @@ class Orchestrator:
         report_stem = (
             "implementation-report" if round_no == 0 else f"remediation-report-{round_no}"
         )
-        res = self._run_agent(
-            self.state.reviewer,
-            prompts.code_review(
+        if self.report_mode:
+            prompt = prompts.report_review(
+                self.task_snapshot,
+                self._art(f"diff-round-{round_no}.patch"),
+                self._art(f"{report_stem}.json"),
+                self.state.base_commit,
+            )
+        else:
+            prompt = prompts.code_review(
                 self.task_snapshot,
                 self._art("agreed-plan.md"),
                 self._art(f"diff-round-{round_no}.patch"),
                 self._art(f"{report_stem}.json"),
                 self.state.base_commit,
-            ),
+            )
+        res = self._run_agent(
+            self.state.reviewer,
+            prompt,
             cwd=Path(self.state.worktree),
             read_only=True,
             schema=schemas.CODE_REVIEW_SCHEMA,
@@ -495,7 +547,7 @@ class Orchestrator:
             self.state.reviewer,
             prompts.verify(
                 self.task_snapshot,
-                self._art("agreed-plan.md"),
+                None if self.report_mode else self._art("agreed-plan.md"),
                 self._art(f"diff-round-{self.state.review_round}.patch"),
                 self.state.base_commit,
             ),

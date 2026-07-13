@@ -32,9 +32,21 @@ def render_task_contract(c: dict) -> str:
             _section("Acceptance criteria", c.get("acceptance_criteria", [])).replace("##", "#", 1),
             _section("Required tests", c.get("required_tests", [])).replace("##", "#", 1),
             _section("Relevant files", c.get("relevant_files", [])).replace("##", "#", 1),
-            _section("Open questions", c.get("open_questions", [])).replace("##", "#", 1),
+            _open_questions_section(c.get("open_questions", [])),
         ]
     )
+
+
+def _open_questions_section(questions: list[str]) -> str:
+    """Each question gets an Answer stub — the human fills it in; agents are
+    told Answer: lines are binding contract decisions."""
+    if not questions:
+        return "# Open questions\n\n_None._\n"
+    lines = []
+    for q in questions:
+        lines.append(f"- {q}")
+        lines.append("  - Answer: ")
+    return "# Open questions\n\n" + "\n".join(lines) + "\n"
 
 
 def render_analysis(agent: str, a: dict) -> str:
@@ -58,6 +70,23 @@ def render_analysis(agent: str, a: dict) -> str:
             _section("Rejected alternatives", rejected),
             _section("Tests required", a.get("tests_required", [])),
             _section("Open questions", a.get("open_questions", [])),
+        ]
+    )
+
+
+def render_review_report(agent: str, r: dict) -> str:
+    findings = [
+        f"**[{f.get('severity', '?')}]** {f.get('area', '?')} — "
+        f"{f.get('finding', '')} (evidence: {f.get('evidence', '')})"
+        for f in r.get("findings", [])
+    ]
+    return "\n".join(
+        [
+            f"# {agent.capitalize()} review\n",
+            f"## Summary\n\n{r.get('summary', '')}\n",
+            _section("Findings", findings),
+            _section("Open questions", r.get("open_questions", [])),
+            f"## Full report\n\n{r.get('report_markdown', '')}\n",
         ]
     )
 

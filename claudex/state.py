@@ -49,6 +49,9 @@ class RunState:
     run_id: str
     repo: str
     owner: str  # implementation owner: "claude" | "codex"
+    # "change": deliverable is a diff (plan -> attack -> implement).
+    # "report": deliverable IS analysis (parallel reviews -> consolidate).
+    mode: str = "change"
     phase: str = Phase.INIT.value
     created_at: str = ""
     base_commit: str = ""

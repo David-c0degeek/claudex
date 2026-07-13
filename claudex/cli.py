@@ -48,6 +48,7 @@ def _cfg(args) -> Config:
         k: getattr(args, k, None)
         for k in (
             "owner",
+            "mode",
             "auto_plan",
             "max_review_rounds",
             "agent_timeout",
@@ -165,7 +166,7 @@ def cmd_status(args) -> int:
     state = RunState.load(run_dir_for(cfg.repo, rid))
     rd = run_dir_for(cfg.repo, rid)
     print(f"run:      {rid}")
-    print(f"phase:    {state.phase}")
+    print(f"phase:    {state.phase}   mode: {state.mode}")
     print(f"owner:    {state.owner}   reviewer: {state.reviewer}")
     if state.plan_author:
         print(f"plan:     authored by {state.plan_author}")
@@ -306,6 +307,10 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.add_argument("--owner", choices=["claude", "codex", "auto"], default=None,
                     help="implementation owner (auto alternates per task)")
+    sp.add_argument("--mode", choices=["auto", "report", "change"], default=None,
+                    help="pipeline shape: report (deliverable is analysis) or "
+                         "change (deliverable is a diff); auto detects from the "
+                         "goal's [REPORT]/[CHANGE] prefix")
     sp.add_argument("--auto-plan", dest="auto_plan", action="store_true", default=None,
                     help="skip the human plan-selection gate")
     sp.add_argument("--max-review-rounds", dest="max_review_rounds", type=int, default=None)

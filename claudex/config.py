@@ -23,6 +23,7 @@ class Config:
     claude_model: str = ""
     codex_model: str = ""
     owner: str = "auto"  # claude | codex | auto (alternates per task)
+    mode: str = "auto"  # auto (detect from goal prefix) | report | change
     auto_plan: bool = False  # skip the human plan-selection gate
     max_review_rounds: int = 3
     max_verify_rounds: int = 2
@@ -44,6 +45,7 @@ class Config:
         "claude_model",
         "codex_model",
         "owner",
+        "mode",
         "auto_plan",
         "max_review_rounds",
         "max_verify_rounds",

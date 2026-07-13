@@ -68,6 +68,30 @@ ANALYSIS_SCHEMA = _obj(
     }
 )
 
+REVIEW_REPORT_SCHEMA = _obj(
+    {
+        "summary": _STR,
+        "report_markdown": {
+            "type": "string",
+            "description": "The complete review report, markdown, self-contained",
+        },
+        "findings": _arr(
+            _obj(
+                {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["blocking", "major", "minor", "info"],
+                    },
+                    "area": _STR,
+                    "finding": _STR,
+                    "evidence": _STR,
+                }
+            )
+        ),
+        "open_questions": _arr(_STR),
+    }
+)
+
 DISAGREEMENT_SCHEMA = _obj(
     {
         "agreements": _arr(_STR),

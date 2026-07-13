@@ -107,6 +107,43 @@ task, recorded in `.claudex/history.json`), `--auto-plan`,
 `--max-review-rounds N`, `--timeout SECONDS`, `--claude-model X`,
 `--codex-model Y`.
 
+### Report mode vs change mode
+
+Not every task's deliverable is a diff. When the deliverable IS analysis —
+"review this repo thoroughly and find what's wrong" — planning would be one
+meta-level too high (two agents writing plans about how to review, then one
+executing the plan). Report mode removes that layer:
+
+| | change mode | report mode |
+|---|---|---|
+| investigation | analysis of the problem | **the actual review, in full** |
+| gate 1 | pick the plan | pick the base report |
+| plan review / finalize | non-author attacks plan | *(skipped)* |
+| implement | owner writes code + tests | owner consolidates both reviews + disagreement resolutions into the report file, commits it |
+| review rounds | diff review | adversarial spot-check of the report's claims against the repo |
+| verification | acceptance criteria vs diff | same, against the committed report |
+
+Mode is detected from the goal's `[REPORT]`/`[CHANGE]`/`[MIXED]` prefix
+(`claudex task` drafts always carry one; `[MIXED]` runs as change), or
+forced with `claudex run --mode report|change`. `claudex status` shows the
+active mode.
+
+### Answering open questions
+
+Contracts drafted by `claudex task` render each open question with an
+`Answer:` stub:
+
+```markdown
+# Open questions
+
+- Where should the review report live — chat-only, or committed to the repo?
+  - Answer: committed, under .review/
+```
+
+Fill the stubs in before `claudex run`. Every phase prompt tells the agents
+that `Answer:` lines are binding contract decisions; a blank answer leaves
+the question genuinely open and agents must not silently resolve it.
+
 ### Picking models
 
 Per run: `claudex run --claude-model opus --codex-model gpt-5.6-sol`.
