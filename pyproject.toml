@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claudex"
-version = "0.1.0"
-description = "Deterministic co-engineering orchestrator for Claude Code and OpenAI Codex"
+version = "0.2.0"
+description = "Pair-programming orchestrator for Claude Code and OpenAI Codex"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -5,6 +5,10 @@ false``, every property listed in ``required``) because Codex enforces that
 server-side for ``--output-schema``. Claude Code's ``--json-schema`` accepts
 the same schemas, so both agents share one set of contracts and the
 coordinator never parses free-form prose.
+
+Strict mode forces agents to emit every field, so plan critique and
+checkpoint review get separate thin wrappers around one shared FINDING item
+instead of a merged schema full of noise fields.
 """
 
 from __future__ import annotations
@@ -41,107 +45,100 @@ TASK_CONTRACT_SCHEMA = _obj(
     }
 )
 
-EVIDENCE_ITEM = _obj(
+# One finding shape for every critique the pair produces, plan or code.
+# `file`/`line` are nullable: plan findings reference plan sections, not code.
+FINDING = _obj(
     {
-        "file": _STR,
-        "symbol": _STR,
-        "claim": _STR,
+        "severity": {
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"],
+        },
+        "file": {"type": ["string", "null"]},
+        "line": {"type": ["integer", "null"]},
+        "problem": _STR,
+        "evidence": _STR,
+        "suggested_fix": _STR,
     }
 )
 
-ANALYSIS_SCHEMA = _obj(
+_PLAN_STEP = _obj(
     {
-        "summary": _STR,
-        "execution_paths": _arr(_STR),
-        "evidence": _arr(EVIDENCE_ITEM),
-        "assumptions": _arr(_STR),
+        "title": _STR,
+        "description": {
+            "type": "string",
+            "description": "Concrete file-level work; independently implementable and committable",
+        },
+        "files": _arr(_STR),
+        "tests": _arr(_STR),
+    }
+)
+
+# The lead's plan proposal: the single artifact both agents converge on.
+PAIR_PLAN_SCHEMA = _obj(
+    {
+        "plan_markdown": {
+            "type": "string",
+            "description": "Complete plan, markdown, self-contained",
+        },
+        "steps": {
+            "type": "array",
+            "items": _PLAN_STEP,
+            "description": "Ordered implementation steps; each becomes one commit + checkpoint review",
+        },
         "risks": _arr(_STR),
-        "proposed_solution": {
-            "type": "string",
-            "description": "Minimal justified solution, markdown, concrete file-level steps",
-        },
-        "rejected_alternatives": _arr(
-            _obj({"alternative": _STR, "reason_rejected": _STR})
-        ),
-        "tests_required": _arr(_STR),
         "open_questions": _arr(_STR),
     }
 )
 
-REVIEW_REPORT_SCHEMA = _obj(
+PLAN_CRITIQUE_SCHEMA = _obj(
     {
-        "summary": _STR,
-        "report_markdown": {
-            "type": "string",
-            "description": "The complete review report, markdown, self-contained",
-        },
-        "findings": _arr(
-            _obj(
-                {
-                    "severity": {
-                        "type": "string",
-                        "enum": ["blocking", "major", "minor", "info"],
-                    },
-                    "area": _STR,
-                    "finding": _STR,
-                    "evidence": _STR,
-                }
-            )
-        ),
-        "open_questions": _arr(_STR),
-    }
-)
-
-DISAGREEMENT_SCHEMA = _obj(
-    {
-        "agreements": _arr(_STR),
-        "conflicts": _arr(
-            _obj(
-                {
-                    "topic": _STR,
-                    "claude_position": _STR,
-                    "codex_position": _STR,
-                    "repo_evidence": {
-                        "type": "string",
-                        "description": "What the repository itself shows, checked directly",
-                    },
-                    "recommendation": _STR,
-                }
-            )
-        ),
-        "unique_to_claude": _arr(_STR),
-        "unique_to_codex": _arr(_STR),
-        "recommended_plan": {"type": "string", "enum": ["claude", "codex"]},
-        "recommendation_rationale": _STR,
-    }
-)
-
-PLAN_REVIEW_SCHEMA = _obj(
-    {
-        "confirmed_claims": _arr(_STR),
-        "disputed_claims": _arr(
-            _obj({"claim": _STR, "why_disputed": _STR, "repo_evidence": _STR})
-        ),
+        "verdict": {"type": "string", "enum": ["AGREE", "REVISE"]},
+        "findings": _arr(FINDING),
         "missing_evidence": _arr(_STR),
-        "blocking_corrections": _arr(_STR),
-        "non_blocking_suggestions": _arr(_STR),
         "simpler_alternative": {
             "type": ["string", "null"],
             "description": "A simpler valid plan if one exists, else null",
         },
-        "verdict": {"type": "string", "enum": ["approve", "revise"]},
+        "notes": _STR,
     }
 )
 
-FINAL_PLAN_SCHEMA = _obj(
+# Plan revisions re-emit the FULL plan (markdown AND steps), never a delta —
+# otherwise state.steps drifts from plan_markdown across rounds.
+PLAN_REVISION_SCHEMA = _obj(
     {
-        "final_plan": {
+        "plan_markdown": {
             "type": "string",
-            "description": "Complete agreed plan, markdown, self-contained",
+            "description": "Complete REVISED plan, markdown, self-contained",
         },
-        "blocking_corrections_addressed": _arr(
-            _obj({"correction": _STR, "resolution": _STR})
+        "steps": {
+            "type": "array",
+            "items": _PLAN_STEP,
+            "description": "Full revised step list, not a delta",
+        },
+        "risks": _arr(_STR),
+        "open_questions": _arr(_STR),
+        "responses": _arr(
+            _obj(
+                {
+                    "finding": _STR,
+                    "action": {"type": "string", "enum": ["accepted", "rebutted"]},
+                    "rationale": {
+                        "type": "string",
+                        "description": "For rebuttals: direct repository evidence, or it does not count",
+                    },
+                }
+            )
         ),
+    }
+)
+
+CHECKPOINT_REVIEW_SCHEMA = _obj(
+    {
+        "verdict": {"type": "string", "enum": ["AGREE", "REVISE"]},
+        "findings": _arr(FINDING),
+        "tests_adequate": _BOOL,
+        "tests_critique": _STR,
     }
 )
 
@@ -154,29 +151,6 @@ IMPLEMENTATION_REPORT_SCHEMA = _obj(
         "test_output_summary": _STR,
         "deviations_from_plan": _arr(_STR),
         "notes": _STR,
-    }
-)
-
-CODE_REVIEW_SCHEMA = _obj(
-    {
-        "findings": _arr(
-            _obj(
-                {
-                    "severity": {
-                        "type": "string",
-                        "enum": ["blocking", "major", "minor", "nit"],
-                    },
-                    "file": _STR,
-                    "line": {"type": ["integer", "null"]},
-                    "problem": _STR,
-                    "evidence": _STR,
-                    "suggested_fix": _STR,
-                }
-            )
-        ),
-        "tests_adequate": _BOOL,
-        "tests_critique": _STR,
-        "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
     }
 )
 
@@ -201,3 +175,13 @@ VERIFICATION_SCHEMA = _obj(
         "notes": _STR,
     }
 )
+
+
+def is_converged(critique: dict) -> bool:
+    """The stop rule, defined once: AGREE with zero blocking/major findings."""
+    if critique.get("verdict") != "AGREE":
+        return False
+    return not any(
+        f.get("severity") in ("blocking", "major")
+        for f in critique.get("findings", [])
+    )

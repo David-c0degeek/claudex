@@ -22,11 +22,17 @@ class Config:
     codex_bin: str = ""
     claude_model: str = ""
     codex_model: str = ""
-    owner: str = "auto"  # claude | codex | auto (alternates per task)
+    lead: str = "claude"  # who holds the pen: claude | codex
     mode: str = "auto"  # auto (detect from goal prefix) | report | change
-    auto_plan: bool = False  # skip the human plan-selection gate
-    max_review_rounds: int = 3
-    max_verify_rounds: int = 2
+    # Hard round caps — the "this is good enough" stop rules. A cap hit
+    # never loops silently: the run gates on AWAIT_GUIDANCE for the human.
+    max_plan_rounds: int = 5  # plan critique/revise cycles
+    max_checkpoint_rounds: int = 3  # review/fix cycles per step
+    max_test_rounds: int = 2  # test-gate failures -> fix cycles
+    max_verify_rounds: int = 2  # verify failures -> fix cycles
+    # Mechanical test gate: run in the worktree after the last step; exit
+    # code decides, never agent testimony. Empty = skip the mechanical gate.
+    test_command: str = ""
     agent_timeout: int = 3600  # seconds per agent invocation
     # Usage-limit handling: when a provider reports a usage/rate limit, wait
     # until the reset time it names (or default_limit_wait when it names
@@ -44,11 +50,13 @@ class Config:
         "codex_bin",
         "claude_model",
         "codex_model",
-        "owner",
+        "lead",
         "mode",
-        "auto_plan",
-        "max_review_rounds",
+        "max_plan_rounds",
+        "max_checkpoint_rounds",
+        "max_test_rounds",
         "max_verify_rounds",
+        "test_command",
         "agent_timeout",
         "wait_on_limits",
         "default_limit_wait",

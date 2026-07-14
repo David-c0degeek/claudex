@@ -1,30 +1,41 @@
-"""The orchestrator: deterministic phase driver.
+"""The orchestrator: deterministic phase driver for pair programming.
 
-Pipeline (mirrors the co-engineering protocol):
+Pipeline (one plan, one implementation, two agents converging on both):
 
-    INIT
-      -> INVESTIGATE          both agents in parallel, read-only, blind to each other
-      -> DISAGREEMENT         reviewer compares analyses against the repo
-      -> AWAIT_PLAN_SELECTION human gate (or --auto-plan)
-      -> PLAN_REVIEW          non-author adversarially attacks the chosen plan
-      -> PLAN_FINALIZE        author addresses blocking corrections (skipped on clean approve)
-      -> IMPLEMENT            owner edits in an isolated worktree, commits
-      -> REVIEW               reviewer reads exact diff + commit, read-only
-      -> REMEDIATE            owner resumes its session, fixes, commits   (loops)
-      -> VERIFY               reviewer with FRESH context checks acceptance criteria
-      -> AWAIT_FINAL_APPROVAL human gate
-      -> DONE
+    INIT               report mode -> synthesize the single report step,
+                       skip the plan phases entirely
+      -> PLAN_DRAFT    lead drafts the plan, grounded in the repo, read-only
+      -> PLAN_CRITIQUE pair critiques it against the repo
+      -> PLAN_REVISE   lead accepts or rebuts each finding, re-emits the plan
+           (critique/revise loops until the pair AGREEs with zero
+            blocking/major findings, or the round cap gates the run)
+      -> IMPLEMENT_STEP lead implements exactly one plan step, commits
+      -> CHECKPOINT    pair reviews that step's exact diff
+      -> FIX           lead fixes blocking/major findings, commits  (loops)
+      -> TESTS         coordinator runs the configured test command itself
+      -> VERIFY        pair with FRESH context checks acceptance criteria
+      -> DONE          automatically on verify pass
+    AWAIT_GUIDANCE     any round cap hit -> the open dispute goes to the
+                       human; `claudex resolve` feeds the answer back
 
 The coordinator — not either model — owns phase transitions, edit
-permissions, artifact routing, and disagreement surfacing.
+permissions, artifact routing, round caps, and the mailbox transcript.
+
+Two drivers share every pair-turn method: headless `claudex run` calls them
+from run_until_gate(); the live `claudex pair` subcommands (interactive
+session as lead) call them directly. One code path, one cap check, one
+mailbox append. One round = one handler iteration, so the save-per-iteration
+persistence gives round-granular crash durability. Round counters only ever
+increase (artifact names embed them); human guidance re-arms a cap by
+raising its ceiling, never by resetting a counter.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -43,7 +54,6 @@ from .state import (
     Phase,
     RunState,
     append_history,
-    other_agent,
     run_dir_for,
 )
 
@@ -69,9 +79,10 @@ def task_has_content(task_md: str) -> bool:
 
 
 def detect_mode(task_md: str, configured: str = "auto") -> str:
-    """"report": the deliverable IS analysis — parallel reviews are the work,
-    no plan-about-a-plan layer. "change": the deliverable is a diff. Detected
-    from the goal's [REPORT]/[CHANGE]/[MIXED] prefix unless configured."""
+    """"report": the deliverable IS analysis — the report draft is the single
+    step and no plan-about-a-plan layer exists. "change": the deliverable is
+    a diff. Detected from the goal's [REPORT]/[CHANGE]/[MIXED] prefix unless
+    configured."""
     if configured in ("report", "change"):
         return configured
     m = re.search(r"^#\s*Goal\s*\n+(.{0,120})", task_md, re.MULTILINE | re.DOTALL)
@@ -122,6 +133,22 @@ def draft_task(cfg: Config, description: str, agent_name: str = "claude") -> Pat
     return target
 
 
+def validate_plan_shape(plan: dict) -> None:
+    """Live mode accepts a lead-authored plan file; check the minimal shape
+    before it enters the run (full schema enforcement only exists for
+    agent-emitted output)."""
+    if not isinstance(plan, dict):
+        raise OrchestratorError("plan file must contain a JSON object")
+    if not str(plan.get("plan_markdown", "")).strip():
+        raise OrchestratorError("plan.plan_markdown is missing or empty")
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise OrchestratorError("plan.steps must be a non-empty array")
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict) or not str(s.get("title", "")).strip():
+            raise OrchestratorError(f"plan.steps[{i}] needs at least a title")
+
+
 class Orchestrator:
     def __init__(self, cfg: Config, state: RunState):
         self.cfg = cfg
@@ -132,7 +159,6 @@ class Orchestrator:
 
     # ------------------------------------------------------------- utilities
     def _save(self) -> None:
-        # Parallel investigation workers save from their own threads.
         with self._save_lock:
             self.state.save(self.run_dir)
 
@@ -145,6 +171,32 @@ class Orchestrator:
     @property
     def task_snapshot(self) -> Path:
         return self._art("task.md")
+
+    @property
+    def report_mode(self) -> bool:
+        return self.state.mode == "report"
+
+    def _agreed_plan(self) -> Path | None:
+        p = self._art("agreed-plan.md")
+        return p if p.exists() else None
+
+    def _post(self, role: str, stage: str, status: str, body: str) -> None:
+        """Append one turn to the mailbox transcript. Coordinator-written:
+        the pair is sandboxed read-only during critiques, and its output
+        reaches us as schema-validated JSON anyway."""
+        self.state.mailbox_turn += 1
+        artifacts.mailbox_append(
+            self.run_dir, role, self.state.mailbox_turn, stage, status, body
+        )
+
+    def _take_guidance(self) -> str:
+        """Consume pending human guidance: inject once, then clear. In
+        headless runs the lead phase after `resolve` consumes it; in live
+        runs the next pair turn does (the interactive lead saw it at
+        `resolve` time)."""
+        notes = self.state.guidance_notes
+        self.state.guidance_notes = ""
+        return notes
 
     def _run_agent(self, agent_name: str, prompt: str, **kw):
         agent = self.agents[agent_name]
@@ -182,21 +234,27 @@ class Orchestrator:
                 f"(retry ~{resume_at}, wait {waits + 1}/{self.cfg.max_limit_waits})"
             )
             self.state.log(f"{agent_name}/{label}: usage limit, waiting {delay}s")
-            self._save()  # durable: Ctrl+C here loses nothing, `claudex run` resumes
+            self._save()  # durable: Ctrl+C here loses nothing, resume continues
             time.sleep(delay)
             waits += 1
+
+    def _remember_session(self, lineage: str, session_id: str) -> None:
+        """Resumed Claude runs return a NEW session id every time; a missed
+        update orphans the lineage. Always re-capture."""
+        if session_id:
+            self.state.sessions[lineage] = session_id
 
     # ----------------------------------------------------------------- driver
     def run_until_gate(self) -> None:
         handlers = {
             Phase.INIT: self.phase_init,
-            Phase.INVESTIGATE: self.phase_investigate,
-            Phase.DISAGREEMENT: self.phase_disagreement,
-            Phase.PLAN_REVIEW: self.phase_plan_review,
-            Phase.PLAN_FINALIZE: self.phase_plan_finalize,
-            Phase.IMPLEMENT: self.phase_implement,
-            Phase.REVIEW: self.phase_review,
-            Phase.REMEDIATE: self.phase_remediate,
+            Phase.PLAN_DRAFT: self.phase_plan_draft,
+            Phase.PLAN_CRITIQUE: self.phase_plan_critique,
+            Phase.PLAN_REVISE: self.phase_plan_revise,
+            Phase.IMPLEMENT_STEP: self.phase_implement_step,
+            Phase.CHECKPOINT: self.phase_checkpoint,
+            Phase.FIX: self.phase_fix,
+            Phase.TESTS: self.phase_tests,
             Phase.VERIFY: self.phase_verify,
         }
         while True:
@@ -219,20 +277,10 @@ class Orchestrator:
             self._save()
 
     def _report_gate(self) -> None:
-        phase = Phase(self.state.phase)
-        if phase is Phase.AWAIT_PLAN_SELECTION:
-            what = "base report" if self.report_mode else "plan"
-            self.say(f"GATE: {what} selection required.")
-            self.say(f"  Read: {self._art('claude-analysis.md')}")
-            self.say(f"        {self._art('codex-analysis.md')}")
-            self.say(f"        {self._art('disagreement.md')}")
-            self.say("  Then: claudex approve plan claude|codex [--notes '...']")
-        elif phase is Phase.AWAIT_FINAL_APPROVAL:
-            self.say("GATE: final human approval required.")
-            self.say(f"  Read: {self._art('verification.md')}")
-            self.say(f"        {self._art(f'diff-round-{self.state.review_round}.patch')}")
-            self.say(f"  Branch: {self.state.branch}  Worktree: {self.state.worktree}")
-            self.say("  Then: claudex approve final   (or claudex abort)")
+        self.say("GATE: the pair hit a round cap — human guidance required.")
+        self.say(f"  Why: {self.state.gate_reason}")
+        self.say(f"  Transcript: {artifacts.mailbox_path(self.run_dir)}")
+        self.say("  Then: claudex resolve --notes 'your decision'")
 
     def _report_terminal(self) -> None:
         phase = Phase(self.state.phase)
@@ -267,361 +315,596 @@ class Orchestrator:
         shutil.copyfile(task, self.task_snapshot)
         self.state.base_commit = gitops.head_commit(self.cfg.repo)
         self.state.branch = f"claudex/{self.state.run_id}"
-        self.state.advance(Phase.INVESTIGATE)
-
-    @property
-    def report_mode(self) -> bool:
-        return self.state.mode == "report"
-
-    def phase_investigate(self) -> None:
         if self.report_mode:
-            prompt = prompts.review_investigation(self.task_snapshot)
-            schema = schemas.REVIEW_REPORT_SCHEMA
-            render = artifacts.render_review_report
+            # The report IS the single step; no plan-about-the-work layer.
+            self.state.steps = [
+                {
+                    "title": "Draft and commit the report",
+                    "description": "Write the complete report the task contract "
+                    "requires and commit it.",
+                    "files": [],
+                    "tests": [],
+                }
+            ]
+            self._ensure_worktree()
+            self.state.advance(Phase.IMPLEMENT_STEP, "report mode: single step")
         else:
-            prompt = prompts.investigation(self.task_snapshot)
-            schema = schemas.ANALYSIS_SCHEMA
-            render = artifacts.render_analysis
+            self.state.advance(Phase.PLAN_DRAFT)
 
-        def investigate(name: str) -> None:
-            # A retried phase must not re-run (and re-pay for) an agent whose
-            # analysis already landed — save inside the worker, skip if done.
-            if self._art(f"{name}-analysis.json").exists():
-                self.say(f"{name}: analysis already present, skipping")
-                return
+    # -------------------------------------------------------- plan converge
+    # plan_round counts critique rounds consumed and doubles as the index of
+    # the current plan version: critique r reads plan-round-r and writes
+    # plan-critique-r; a revision writes plan-round-(r+1).
+    def _plan_path(self, round_no: int) -> Path:
+        return self._art(f"plan-round-{round_no}.json")
+
+    def _critique_path(self, round_no: int) -> Path:
+        return self._art(f"plan-critique-{round_no}.json")
+
+    def phase_plan_draft(self) -> None:
+        """Headless only: the lead agent drafts the initial plan. In live
+        mode the interactive lead drafts it and submits via `pair plan`."""
+        if self._plan_path(0).exists():
+            self.say("plan draft already present, skipping")
+        else:
             res = self._run_agent(
-                name,
-                prompt,
+                self.state.lead,
+                prompts.plan_draft(self.task_snapshot),
                 cwd=self.cfg.repo,
                 read_only=True,
-                schema=schema,
-                label=f"{name}-investigate",
+                schema=schemas.PAIR_PLAN_SCHEMA,
+                label="plan-draft",
             )
-            analysis = res.require_structured()
-            self.state.sessions[name] = res.session_id
-            artifacts.save_json(self._art(f"{name}-analysis.json"), analysis)
-            self._art(f"{name}-analysis.md").write_text(
-                render(name, analysis), encoding="utf-8"
+            plan = res.require_structured()
+            self._remember_session("lead_plan", res.session_id)
+            self._store_plan(plan, 0)
+        self.state.advance(Phase.PLAN_CRITIQUE)
+
+    def _store_plan(self, plan: dict, round_no: int) -> None:
+        artifacts.save_json(self._plan_path(round_no), plan)
+        self._art(f"plan-round-{round_no}.md").write_text(
+            artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
+        )
+        titles = "\n".join(
+            f"  {i + 1}. {s.get('title', '?')}" for i, s in enumerate(plan.get("steps", []))
+        )
+        self._post(
+            "LEAD",
+            "plan",
+            "PROPOSE" if round_no == 0 else "REVISE",
+            f"plan round {round_no}: {self._plan_path(round_no)}\n"
+            f"steps ({len(plan.get('steps', []))}):\n{titles}",
+        )
+
+    def submit_plan(self, plan: dict) -> None:
+        """Live mode: the interactive lead submits its (initial or revised)
+        plan for critique."""
+        validate_plan_shape(plan)
+        self._store_plan(plan, self.state.plan_round)
+        self.state.advance(Phase.PLAN_CRITIQUE, "live plan submitted")
+        self._save()
+
+    def phase_plan_critique(self) -> None:
+        self.pair_plan_turn()
+
+    def pair_plan_turn(self) -> dict:
+        """One critique round. Shared by both drivers."""
+        rnd = self.state.plan_round
+        cpath = self._critique_path(rnd)
+        if cpath.exists():
+            self.say(f"plan critique {rnd} already present, skipping")
+            critique = json.loads(cpath.read_text(encoding="utf-8"))
+        else:
+            guidance = self._take_guidance() if self.state.driver == "live" else ""
+            res = self._run_agent(
+                self.state.pair,
+                prompts.plan_critique(
+                    self.task_snapshot,
+                    self._plan_path(rnd),
+                    rnd,
+                    guidance=guidance,
+                ),
+                cwd=self.cfg.repo,
+                read_only=True,
+                schema=schemas.PLAN_CRITIQUE_SCHEMA,
+                # The pair keeps its critique context across rounds — it must
+                # remember what it already conceded or escalated.
+                resume=self.state.sessions.get("pair_plan", ""),
+                label=f"plan-critique-{rnd}",
             )
-
-        errors = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = {pool.submit(investigate, n): n for n in ("claude", "codex")}
-            for fut in concurrent.futures.as_completed(futures):
-                try:
-                    fut.result()
-                except (AgentError, gitops.GitError, OrchestratorError) as exc:
-                    errors.append(str(exc))
-        if errors:
-            raise OrchestratorError("; ".join(errors))
-        self.state.advance(Phase.DISAGREEMENT)
-
-    def phase_disagreement(self) -> None:
-        res = self._run_agent(
-            self.state.reviewer,
-            prompts.disagreement(
-                self.task_snapshot,
-                self._art("claude-analysis.json"),
-                self._art("codex-analysis.json"),
-                mode=self.state.mode,
-            ),
-            cwd=self.cfg.repo,
-            read_only=True,
-            schema=schemas.DISAGREEMENT_SCHEMA,
-            label="disagreement",
+            critique = res.require_structured()
+            self._remember_session("pair_plan", res.session_id)
+            artifacts.save_json(cpath, critique)
+            self._art(f"plan-critique-{rnd}.md").write_text(
+                artifacts.render_critique(self.state.pair, "Plan critique", rnd, critique),
+                encoding="utf-8",
+            )
+        self._post(
+            "PAIR",
+            "plan",
+            critique.get("verdict", "?"),
+            artifacts.findings_digest(critique.get("findings", [])),
         )
-        d = res.require_structured()
-        artifacts.save_json(self._art("disagreement.json"), d)
-        self._art("disagreement.md").write_text(
-            artifacts.render_disagreement(d), encoding="utf-8"
-        )
-        if self.cfg.auto_plan:
-            choice = d.get("recommended_plan", "")
-            if choice not in ("claude", "codex"):
-                raise OrchestratorError(
-                    f"--auto-plan set but recommendation invalid: {choice!r}"
+        if schemas.is_converged(critique):
+            self._lock_agreed_plan(rnd)
+            self.state.advance(Phase.IMPLEMENT_STEP, f"plan agreed at round {rnd}")
+        else:
+            self.state.plan_round = rnd + 1  # round consumed
+            cap = self.cfg.max_plan_rounds + self.state.plan_cap_extra
+            if self.state.plan_round >= cap:
+                self.state.gate(
+                    f"plan not converged after {self.state.plan_round} round(s); "
+                    f"open findings in {cpath.name}",
+                    Phase.PLAN_REVISE,
                 )
-            self.select_plan(choice, notes="auto-selected from disagreement analysis")
+            else:
+                self.state.advance(Phase.PLAN_REVISE)
+        self._save()
+        return critique
+
+    def _lock_agreed_plan(self, round_no: int) -> None:
+        plan = json.loads(self._plan_path(round_no).read_text(encoding="utf-8"))
+        steps = plan.get("steps", [])
+        if not steps:
+            raise OrchestratorError("agreed plan has no steps — nothing to implement")
+        self.state.steps = steps
+        shutil.copyfile(self._plan_path(round_no), self._art("agreed-plan.json"))
+        self._art("agreed-plan.md").write_text(
+            artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
+        )
+        self._ensure_worktree()
+
+    def phase_plan_revise(self) -> None:
+        """Headless only: the lead agent revises. In live mode the
+        interactive lead revises and re-submits via `pair plan`."""
+        rnd = self.state.plan_round  # the version this revision will become
+        if self._plan_path(rnd).exists():
+            self.say(f"plan revision {rnd} already present, skipping")
         else:
-            self.state.advance(Phase.AWAIT_PLAN_SELECTION)
-
-    def select_plan(self, choice: str, notes: str = "") -> None:
-        """Gate 1 resolution — invoked by `claudex approve plan` or --auto-plan.
-        In report mode the choice is the base report and consolidation starts
-        directly; no plan-about-the-work layer exists to review."""
-        analysis = json.loads(
-            self._art(f"{choice}-analysis.json").read_text(encoding="utf-8")
-        )
-        self.state.selected_plan = choice
-        self.state.plan_author = choice
-        self.state.plan_selection_notes = notes
-        if self.report_mode:
-            self.state.advance(Phase.IMPLEMENT, f"base report: {choice}")
-            return
-        self._art("selected-plan.md").write_text(
-            artifacts.render_selected_plan(choice, analysis, notes), encoding="utf-8"
-        )
-        self.state.advance(Phase.PLAN_REVIEW, f"plan author: {choice}")
-
-    def phase_plan_review(self) -> None:
-        reviewer = self.state.plan_reviewer
-        res = self._run_agent(
-            reviewer,
-            prompts.plan_review(self.task_snapshot, self._art("selected-plan.md")),
-            cwd=self.cfg.repo,
-            read_only=True,
-            schema=schemas.PLAN_REVIEW_SCHEMA,
-            label="plan-review",
-        )
-        review = res.require_structured()
-        artifacts.save_json(self._art("plan-review.json"), review)
-        self._art("plan-review.md").write_text(
-            artifacts.render_plan_review(reviewer, review), encoding="utf-8"
-        )
-        if review.get("verdict") == "approve" and not review.get("blocking_corrections"):
-            # Clean approve: the selected plan IS the agreed plan.
-            shutil.copyfile(self._art("selected-plan.md"), self._art("agreed-plan.md"))
-            self.state.advance(Phase.IMPLEMENT, "plan approved as-is")
-        else:
-            self.state.advance(Phase.PLAN_FINALIZE)
-
-    def phase_plan_finalize(self) -> None:
-        author = self.state.plan_author
-        res = self._run_agent(
-            author,
-            prompts.plan_finalize(
-                self.task_snapshot,
-                self._art("selected-plan.md"),
-                self._art("plan-review.json"),
-            ),
-            cwd=self.cfg.repo,
-            read_only=True,
-            schema=schemas.FINAL_PLAN_SCHEMA,
-            # Resume the author's investigation session so the final plan is
-            # written with full context of its own evidence.
-            resume=self.state.sessions.get(author, ""),
-            label="plan-finalize",
-        )
-        final = res.require_structured()
-        addressed = final.get("blocking_corrections_addressed", [])
-        plan_md = final.get("final_plan", "")
-        if addressed:
-            plan_md += "\n\n## Blocking corrections addressed\n\n" + "\n".join(
-                f"- **{a.get('correction', '?')}** — {a.get('resolution', '')}"
-                for a in addressed
+            guidance = self._take_guidance()
+            res = self._run_agent(
+                self.state.lead,
+                prompts.plan_revise(
+                    self.task_snapshot,
+                    self._critique_path(rnd - 1),
+                    rnd - 1,
+                    guidance=guidance,
+                ),
+                cwd=self.cfg.repo,
+                read_only=True,
+                schema=schemas.PLAN_REVISION_SCHEMA,
+                resume=self.state.sessions.get("lead_plan", ""),
+                label=f"plan-revise-{rnd}",
             )
-        self._art("agreed-plan.md").write_text(plan_md, encoding="utf-8")
-        self.state.advance(Phase.IMPLEMENT)
+            revision = res.require_structured()
+            self._remember_session("lead_plan", res.session_id)
+            self._store_plan(revision, rnd)
+        self.state.advance(Phase.PLAN_CRITIQUE)
 
-    def phase_implement(self) -> None:
+    # ------------------------------------------------------------- implement
+    def _ensure_worktree(self) -> None:
         wt = gitops.worktree_path_for(self.cfg.repo, self.state.run_id)
         if not wt.exists():
             gitops.add_worktree(
                 self.cfg.repo, self.state.branch, wt, self.state.base_commit
             )
         self.state.worktree = str(wt)
-        self._save()
+        if not self.state.last_reviewed_commit:
+            self.state.last_reviewed_commit = self.state.base_commit
 
-        if self.report_mode:
-            base = self.state.selected_plan
-            prompt = prompts.consolidate_report(
-                self.task_snapshot,
-                base,
-                self._art(f"{base}-analysis.json"),
-                self._art(f"{other_agent(base)}-analysis.json"),
-                self._art("disagreement.json"),
+    def _current_step(self) -> dict:
+        try:
+            return self.state.steps[self.state.step_index]
+        except IndexError:
+            raise OrchestratorError(
+                f"step index {self.state.step_index} out of range "
+                f"({len(self.state.steps)} steps)"
             )
+
+    def phase_implement_step(self) -> None:
+        """Headless only: the lead agent implements the current step. In
+        live mode the interactive lead codes and commits, then runs
+        `claudex pair checkpoint`."""
+        self._ensure_worktree()
+        wt = Path(self.state.worktree)
+        i = self.state.step_index
+        step = self._current_step()
+        prev_head = gitops.head_commit(wt)
+        if self.report_mode:
+            prompt = prompts.draft_report(self.task_snapshot)
         else:
-            prompt = prompts.implement(self.task_snapshot, self._art("agreed-plan.md"))
+            prompt = prompts.implement_step(
+                self.task_snapshot,
+                self._art("agreed-plan.md"),
+                i,
+                len(self.state.steps),
+                step,
+            )
         res = self._run_agent(
-            self.state.owner,
+            self.state.lead,
             prompt,
             cwd=wt,
             read_only=False,
             schema=schemas.IMPLEMENTATION_REPORT_SCHEMA,
-            label="implement",
+            # Fresh session at step 0 (plan context arrives by file path; a
+            # plan-lineage session would be pinned to the wrong cwd), then
+            # one continuous implementation lineage.
+            resume=self.state.sessions.get("lead_impl", "") if i > 0 else "",
+            label=f"implement-step-{i}",
         )
         report = res.require_structured()
-        self.state.impl_session = res.session_id
-        self._store_implementation(report, "implementation-report")
-
-        commits = gitops.commits_between(wt, self.state.base_commit)
-        if not commits:
+        self._remember_session("lead_impl", res.session_id)
+        self._store_implementation(report, f"step-{i}-report")
+        if gitops.head_commit(wt) == prev_head:
             raise OrchestratorError(
-                "implementation produced no commits — nothing to review"
+                f"step {i + 1} produced no commits — nothing to review"
             )
-        if gitops.has_uncommitted_changes(wt):
-            self.say("WARNING: worktree has uncommitted changes; review covers commits only.")
-        self._write_diff()
-        self.state.advance(Phase.REVIEW, f"{len(commits)} commit(s)")
+        commits = gitops.commits_between(wt, prev_head)
+        self._post(
+            "LEAD",
+            f"step {i + 1}/{len(self.state.steps)}",
+            "COMMIT",
+            f"{step.get('title', '')}\n"
+            + "\n".join(f"  {c['sha'][:12]} {c['message']}" for c in commits),
+        )
+        self.state.advance(Phase.CHECKPOINT)
 
     def _store_implementation(self, report: dict, stem: str) -> None:
         artifacts.save_json(self._art(f"{stem}.json"), report)
         self._art(f"{stem}.md").write_text(
-            artifacts.render_implementation_report(self.state.owner, report),
+            artifacts.render_implementation_report(self.state.lead, report),
             encoding="utf-8",
         )
 
-    def _write_diff(self) -> Path:
+    # ------------------------------------------------------------ checkpoint
+    def phase_checkpoint(self) -> None:
+        self.pair_checkpoint_turn()
+
+    def pair_checkpoint_turn(self, lead_notes: str = "") -> dict:
+        """One checkpoint-review round for the current step. Shared by both
+        drivers; live mode passes the interactive lead's notes."""
+        self._ensure_worktree()
         wt = Path(self.state.worktree)
-        diff_path = self._art(f"diff-round-{self.state.review_round}.patch")
-        diff_path.write_text(
-            gitops.diff_text(wt, self.state.base_commit), encoding="utf-8"
-        )
-        return diff_path
-
-    def phase_review(self) -> None:
-        round_no = self.state.review_round
-        report_stem = (
-            "implementation-report" if round_no == 0 else f"remediation-report-{round_no}"
-        )
-        if self.report_mode:
-            prompt = prompts.report_review(
-                self.task_snapshot,
-                self._art(f"diff-round-{round_no}.patch"),
-                self._art(f"{report_stem}.json"),
-                self.state.base_commit,
-            )
-        else:
-            prompt = prompts.code_review(
-                self.task_snapshot,
-                self._art("agreed-plan.md"),
-                self._art(f"diff-round-{round_no}.patch"),
-                self._art(f"{report_stem}.json"),
-                self.state.base_commit,
-            )
-        res = self._run_agent(
-            self.state.reviewer,
-            prompt,
-            cwd=Path(self.state.worktree),
-            read_only=True,
-            schema=schemas.CODE_REVIEW_SCHEMA,
-            label=f"review-round-{round_no}",
-        )
-        review = res.require_structured()
-        artifacts.save_json(self._art(f"review-round-{round_no}.json"), review)
-        self._art(f"review-round-{round_no}.md").write_text(
-            artifacts.render_code_review(self.state.reviewer, round_no, review),
-            encoding="utf-8",
-        )
-        if review.get("verdict") == "approve":
-            self.state.advance(Phase.VERIFY, f"approved at round {round_no}")
-        elif round_no + 1 >= self.cfg.max_review_rounds:
+        if gitops.has_uncommitted_changes(wt):
+            # A dirty tree means the reviewed diff is not what would ship.
             raise OrchestratorError(
-                f"review still requests changes after {round_no + 1} round(s) — "
-                f"human intervention required (see review-round-{round_no}.md)"
+                f"worktree has uncommitted changes ({wt}) — commit them first; "
+                "the pair reviews exact commits only"
             )
+        base = self.state.last_reviewed_commit
+        if gitops.head_commit(wt) == base:
+            raise OrchestratorError(
+                "no new commits since the last reviewed commit — nothing to review"
+            )
+        i = self.state.step_index
+        rnd = self.state.checkpoint_round
+        step = self._current_step()
+        if lead_notes:
+            self._post(
+                "LEAD", f"step {i + 1}/{len(self.state.steps)}", "COMMIT", lead_notes
+            )
+        diff_path = self._art(f"diff-step-{i}-r{rnd}.patch")
+        diff_path.write_text(gitops.diff_text(wt, base), encoding="utf-8")
+        review_path = self._art(f"checkpoint-{i}-r{rnd}.json")
+        if review_path.exists():
+            self.say(f"checkpoint {i} round {rnd} already present, skipping")
+            review = json.loads(review_path.read_text(encoding="utf-8"))
         else:
-            self.state.findings_file = str(self._art(f"review-round-{round_no}.json"))
-            self.state.advance(Phase.REMEDIATE)
+            guidance = self._take_guidance() if self.state.driver == "live" else ""
+            res = self._run_agent(
+                self.state.pair,
+                prompts.checkpoint_review(
+                    self.task_snapshot,
+                    None if self.report_mode else self._agreed_plan(),
+                    f"step {i + 1}/{len(self.state.steps)}: {step.get('title', '')}",
+                    diff_path,
+                    base,
+                    rnd,
+                    guidance=guidance,
+                ),
+                cwd=wt,
+                read_only=True,
+                schema=schemas.CHECKPOINT_REVIEW_SCHEMA,
+                # Review lineage lives in the worktree cwd and never mixes
+                # with the plan lineage (resume pins the original cwd).
+                resume=self.state.sessions.get("pair_review", ""),
+                label=f"checkpoint-{i}-r{rnd}",
+            )
+            review = res.require_structured()
+            self._remember_session("pair_review", res.session_id)
+            artifacts.save_json(review_path, review)
+            self._art(f"checkpoint-{i}-r{rnd}.md").write_text(
+                artifacts.render_critique(
+                    self.state.pair, f"Checkpoint step {i + 1}", rnd, review
+                ),
+                encoding="utf-8",
+            )
+        self._post(
+            "PAIR",
+            f"step {i + 1}/{len(self.state.steps)}",
+            review.get("verdict", "?"),
+            artifacts.findings_digest(review.get("findings", [])),
+        )
+        if schemas.is_converged(review):
+            self.state.last_reviewed_commit = gitops.head_commit(wt)
+            self.state.checkpoint_round = 0
+            self.state.checkpoint_cap_extra = 0
+            if self.state.step_index + 1 < len(self.state.steps):
+                self.state.step_index += 1
+                self.state.advance(Phase.IMPLEMENT_STEP, f"step {i + 1} agreed")
+            else:
+                self.state.advance(Phase.TESTS, "all steps agreed")
+        else:
+            self.state.checkpoint_round = rnd + 1  # round consumed
+            self.state.findings_file = str(review_path)
+            self.state.fix_return = Phase.CHECKPOINT.value
+            cap = self.cfg.max_checkpoint_rounds + self.state.checkpoint_cap_extra
+            if self.state.checkpoint_round >= cap:
+                self.state.gate(
+                    f"step {i + 1} not agreed after {self.state.checkpoint_round} "
+                    f"review round(s); open findings in {review_path.name}",
+                    Phase.FIX,
+                )
+            else:
+                self.state.advance(Phase.FIX)
+        self._save()
+        return review
 
-    def phase_remediate(self) -> None:
+    # ------------------------------------------------------------------- fix
+    def phase_fix(self) -> None:
+        """Headless only: the lead agent fixes the open findings. In live
+        mode the interactive lead fixes, commits, and re-runs the loop that
+        produced the findings."""
         wt = Path(self.state.worktree)
         prev_head = gitops.head_commit(wt)
-        findings_path = Path(
-            self.state.findings_file
-            or self._art(f"review-round-{self.state.review_round}.json")
-        )
-        self.state.review_round += 1
+        findings_path = Path(self.state.findings_file)
+        self.state.fix_round += 1
+        source = {
+            Phase.CHECKPOINT.value: "Your pair's checkpoint review",
+            Phase.TESTS.value: "The mechanical test gate",
+            Phase.VERIFY.value: "The fresh-context final verification",
+        }.get(self.state.fix_return, "A review")
+        guidance = self._take_guidance()
+        prompt = prompts.fix(findings_path, self.state.fix_round, source)
+        if guidance:
+            prompt += prompts.guidance_block(guidance)
         res = self._run_agent(
-            self.state.owner,
-            prompts.remediate(findings_path, self.state.review_round),
+            self.state.lead,
+            prompt,
             cwd=wt,
             read_only=False,
             schema=schemas.IMPLEMENTATION_REPORT_SCHEMA,
-            # Same engineer, same context: resume the implementation session.
-            resume=self.state.impl_session,
-            label=f"remediate-round-{self.state.review_round}",
+            resume=self.state.sessions.get("lead_impl", ""),
+            label=f"fix-{self.state.fix_round}",
         )
         report = res.require_structured()
-        if res.session_id:
-            self.state.impl_session = res.session_id
-        self._store_implementation(report, f"remediation-report-{self.state.review_round}")
+        self._remember_session("lead_impl", res.session_id)
+        self._store_implementation(report, f"fix-{self.state.fix_round}-report")
         if gitops.head_commit(wt) == prev_head:
-            self.say("WARNING: remediation made no new commit.")
-        self._write_diff()
-        self.state.advance(Phase.REVIEW)
-
-    def phase_verify(self) -> None:
-        res = self._run_agent(
-            self.state.reviewer,
-            prompts.verify(
-                self.task_snapshot,
-                None if self.report_mode else self._art("agreed-plan.md"),
-                self._art(f"diff-round-{self.state.review_round}.patch"),
-                self.state.base_commit,
-            ),
-            cwd=Path(self.state.worktree),
-            read_only=True,
-            schema=schemas.VERIFICATION_SCHEMA,
-            # Deliberately NO resume: the verifier must not inherit the
-            # review conversation, let alone the implementation one.
-            label=f"verify-{self.state.verify_round}",
+            self.say("WARNING: fix made no new commit.")
+        self._post(
+            "LEAD",
+            "fix",
+            "COMMIT",
+            f"fix round {self.state.fix_round} for {findings_path.name}",
         )
-        verdict = res.require_structured()
-        artifacts.save_json(self._art("verification.json"), verdict)
-        self._art("verification.md").write_text(
-            artifacts.render_verification(self.state.reviewer, verdict),
+        self.state.advance(Phase(self.state.fix_return or Phase.CHECKPOINT.value))
+
+    # ----------------------------------------------------------------- tests
+    def phase_tests(self) -> None:
+        self.run_test_gate()
+
+    def run_test_gate(self) -> bool:
+        """Mechanical gate: the coordinator runs the configured test command
+        itself — exit code decides, never agent testimony. Shared by both
+        drivers. Returns True if the gate passed (or is unconfigured)."""
+        if not self.cfg.test_command:
+            self.say("no test_command configured — skipping mechanical gate")
+            self.state.advance(Phase.VERIFY, "test gate skipped")
+            self._save()
+            return True
+        wt = Path(self.state.worktree)
+        rnd = self.state.test_round
+        self.say(f"test gate: `{self.cfg.test_command}` in {wt} ...")
+        proc = subprocess.run(
+            self.cfg.test_command,
+            shell=True,
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=self.cfg.agent_timeout,
+        )
+        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        out_path = self._art(f"tests-round-{rnd}.txt")
+        out_path.write_text(
+            f"$ {self.cfg.test_command}\nexit: {proc.returncode}\n\n{output}",
             encoding="utf-8",
         )
-        if verdict.get("verdict") == "pass":
-            self.state.advance(Phase.AWAIT_FINAL_APPROVAL)
-            return
-        self.state.verify_round += 1
-        if self.state.verify_round > self.cfg.max_verify_rounds:
-            raise OrchestratorError(
-                "verification still failing after "
-                f"{self.cfg.max_verify_rounds} remediation attempt(s) — "
-                "human intervention required (see verification.md)"
-            )
-        # Convert failed criteria into review findings and remediate.
+        passed = proc.returncode == 0
+        tail = "\n".join(output.strip().splitlines()[-15:])
+        self._post(
+            "COORD",
+            "tests",
+            "PASS" if passed else "FAIL",
+            f"`{self.cfg.test_command}` exit {proc.returncode}\n{tail}",
+        )
+        if passed:
+            self.state.advance(Phase.VERIFY, "test gate passed")
+            self._save()
+            return True
         findings = {
             "findings": [
                 {
                     "severity": "blocking",
-                    "file": "",
+                    "file": None,
+                    "line": None,
+                    "problem": f"test command failed (exit {proc.returncode}): "
+                    f"{self.cfg.test_command}",
+                    "evidence": f"see {out_path} (last lines):\n{tail}",
+                    "suggested_fix": "",
+                }
+            ],
+            "verdict": "REVISE",
+        }
+        findings_path = self._art(f"tests-findings-{rnd}.json")
+        artifacts.save_json(findings_path, findings)
+        self.state.test_round = rnd + 1  # attempt consumed
+        self.state.findings_file = str(findings_path)
+        self.state.fix_return = Phase.TESTS.value
+        cap = self.cfg.max_test_rounds + self.state.test_cap_extra
+        if self.state.test_round >= cap:
+            self.state.gate(
+                f"test command still failing after {self.state.test_round} "
+                f"attempt(s) — see {out_path.name}",
+                Phase.FIX,
+            )
+        else:
+            self.state.advance(Phase.FIX, "test gate failed")
+        self._save()
+        return False
+
+    # ---------------------------------------------------------------- verify
+    def phase_verify(self) -> None:
+        self.pair_verify_turn()
+
+    def pair_verify_turn(self) -> dict:
+        """Fresh-context verification. Shared by both drivers. On pass the
+        run is DONE — the stop condition is agreement + evidence, not a
+        human signature."""
+        wt = Path(self.state.worktree)
+        if gitops.has_uncommitted_changes(wt):
+            raise OrchestratorError(
+                f"worktree has uncommitted changes ({wt}) — commit them first"
+            )
+        rnd = self.state.verify_round
+        diff_path = self._art("diff-final.patch")
+        diff_path.write_text(
+            gitops.diff_text(wt, self.state.base_commit), encoding="utf-8"
+        )
+        gate_summary = ""
+        if self.cfg.test_command:
+            for r in range(self.state.test_round, -1, -1):
+                tp = self._art(f"tests-round-{r}.txt")
+                if tp.exists():
+                    first = tp.read_text(encoding="utf-8").splitlines()[:2]
+                    gate_summary = " · ".join(first)
+                    break
+        res = self._run_agent(
+            self.state.pair,
+            prompts.verify(
+                self.task_snapshot,
+                None if self.report_mode else self._agreed_plan(),
+                diff_path,
+                self.state.base_commit,
+                test_gate_summary=gate_summary,
+            ),
+            cwd=wt,
+            read_only=True,
+            schema=schemas.VERIFICATION_SCHEMA,
+            # Deliberately NO resume: the verifier must not inherit the
+            # review conversation, let alone the implementation one.
+            label=f"verify-{rnd}",
+        )
+        verdict = res.require_structured()
+        artifacts.save_json(self._art(f"verification-{rnd}.json"), verdict)
+        self._art("verification.md").write_text(
+            artifacts.render_verification(self.state.pair, verdict),
+            encoding="utf-8",
+        )
+        failed = [c for c in verdict.get("criteria", []) if not c.get("met")]
+        self._post(
+            "PAIR",
+            "verify",
+            verdict.get("verdict", "?").upper(),
+            "all acceptance criteria met"
+            if not failed
+            else "\n".join(f"unmet: {c.get('criterion', '?')}" for c in failed),
+        )
+        if verdict.get("verdict") == "pass":
+            self._finish()
+            self._save()
+            return verdict
+        findings = {
+            "findings": [
+                {
+                    "severity": "blocking",
+                    "file": None,
                     "line": None,
                     "problem": f"acceptance criterion not met: {c.get('criterion', '')}",
                     "evidence": c.get("evidence", ""),
                     "suggested_fix": "",
                 }
-                for c in verdict.get("criteria", [])
-                if not c.get("met")
+                for c in failed
             ],
-            "tests_adequate": verdict.get("tests_meaningful", False),
-            "tests_critique": verdict.get("notes", ""),
-            "verdict": "request_changes",
+            "verdict": "REVISE",
         }
-        findings_path = self._art(
-            f"verification-findings-{self.state.verify_round}.json"
-        )
+        findings_path = self._art(f"verification-findings-{rnd}.json")
         artifacts.save_json(findings_path, findings)
+        self.state.verify_round = rnd + 1  # attempt consumed
         self.state.findings_file = str(findings_path)
-        self.state.advance(Phase.REMEDIATE, "verification failed")
-
-    # ------------------------------------------------------------------ gates
-    def approve_final(self) -> None:
-        if Phase(self.state.phase) is not Phase.AWAIT_FINAL_APPROVAL:
-            raise OrchestratorError(
-                f"run is in phase {self.state.phase}, not awaiting final approval"
+        self.state.fix_return = Phase.VERIFY.value
+        cap = self.cfg.max_verify_rounds + self.state.verify_cap_extra
+        if self.state.verify_round >= cap:
+            self.state.gate(
+                f"verification still failing after {self.state.verify_round} "
+                "attempt(s) — see verification.md",
+                Phase.FIX,
             )
-        self.state.advance(Phase.DONE)
+        else:
+            self.state.advance(Phase.FIX, "verification failed")
+        self._save()
+        return verdict
+
+    def _finish(self) -> None:
+        self.state.advance(Phase.DONE, "verified")
+        self._post("COORD", "done", "DONE", f"merge with: git merge {self.state.branch}")
+        # Persist DONE before the history write: a failing append_history
+        # must not leave state.json behind the in-memory phase.
         self._save()
         append_history(
             self.cfg.repo,
             {
                 "run_id": self.state.run_id,
-                "owner": self.state.owner,
-                "reviewer": self.state.reviewer,
+                "lead": self.state.lead,
+                "pair": self.state.pair,
                 "branch": self.state.branch,
                 "base_commit": self.state.base_commit,
                 "completed_at": self.state.events[-1]["ts"],
             },
         )
-        self.say(f"Approved. Merge with:\n  git merge {self.state.branch}")
+        self.say(f"DONE (verified). Merge with:\n  git merge {self.state.branch}")
         self.say(
             f"Then clean up with: claudex clean   (removes worktree {self.state.worktree})"
         )
+
+    # ------------------------------------------------------------------ gates
+    def resolve_guidance(self, notes: str) -> None:
+        """AWAIT_GUIDANCE resolution: record the human's decision, re-arm the
+        cap that gated (by raising its ceiling — counters never reset), and
+        return control to the phase the gate interrupted."""
+        if Phase(self.state.phase) is not Phase.AWAIT_GUIDANCE:
+            raise OrchestratorError(
+                f"run is in phase {self.state.phase}, not awaiting guidance"
+            )
+        if not notes.strip():
+            raise OrchestratorError("guidance notes must not be empty")
+        self.state.guidance_notes = notes
+        self._post("HUMAN", "guidance", "GUIDANCE", notes)
+        ret = Phase(self.state.return_phase or Phase.PLAN_REVISE.value)
+        if ret is Phase.PLAN_REVISE:
+            self.state.plan_cap_extra += self.cfg.max_plan_rounds
+        elif self.state.fix_return == Phase.CHECKPOINT.value:
+            self.state.checkpoint_cap_extra += self.cfg.max_checkpoint_rounds
+        elif self.state.fix_return == Phase.TESTS.value:
+            self.state.test_cap_extra += self.cfg.max_test_rounds
+        elif self.state.fix_return == Phase.VERIFY.value:
+            self.state.verify_cap_extra += self.cfg.max_verify_rounds
+        self.state.gate_reason = ""
+        self.state.return_phase = ""
+        self.state.advance(ret, "guidance received")
+        self._save()
 
     def abort(self) -> None:
         self.state.advance(Phase.ABORTED)

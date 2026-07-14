@@ -1,240 +1,201 @@
 # claudex
 
-A deterministic co-engineering orchestrator for **Claude Code** and **OpenAI
-Codex**. An external coordinator — not either model — drives both agents
-through an explicit protocol: independent investigation, disagreement
-analysis, adversarial plan review, single-owner implementation in an isolated
-git worktree, commit-based review, remediation, and fresh-context
-verification.
+Pair-programming orchestrator for **Claude Code** and **OpenAI Codex**.
 
-Neither agent is ever "the boss" of the other. The coordinator owns:
+Two AI engineers work as **one team on one plan and one implementation**:
+the **LEAD** (you choose it at start) drafts the plan, implements, and
+fixes; the **PAIR** critiques the plan, reviews every step's commits, and
+verifies the result with fresh context. They converge by agreement — not by
+facing off and having a winner picked.
 
-* **who owns the current change** (one implementation owner per run, roles
-  alternate between runs),
-* **what the other agent reviews** (exact artifacts: the task contract, the
-  agreed plan, the literal diff — never a paraphrase),
-* **how disagreements are resolved** (surfaced explicitly, human selects the
-  plan unless `--auto-plan`),
-* **when either agent may edit** (only the owner, only in the worktree,
-  only during implement/remediate; every other phase is enforced read-only),
-* **what evidence is required before completion** (schema-validated findings,
-  commit-based diffs, a fresh-context verifier that treats all prior claims
-  as testimony).
+An external, deterministic coordinator (Python stdlib only) owns everything
+the models must not own: phase order, edit permissions, round caps,
+convergence detection, diff extraction, and the transcript. Neither model
+is ever "the boss" of the other.
 
-## Pipeline
+## The loop
 
 ```
-DEFINE TASK (.claudex/task.md — both agents get the identical contract)
-    │
-    ├── CLAUDE INVESTIGATES ──┐   read-only, parallel, blind to each other,
-    └── CODEX INVESTIGATES  ──┤   schema-validated analyses
-                              ▼
-                   DISAGREEMENT ANALYSIS      REVIEWER checks conflicting claims
-                              ▼               against the repo itself
-              ┌─ GATE 1: HUMAN SELECTS PLAN   (or --auto-plan)
-              ▼
-                ADVERSARIAL PLAN REVIEW       plan NON-AUTHOR attacks the plan
-                              ▼
-                     PLAN FINALIZE            plan author addresses blocking
-                              ▼               corrections (skipped on clean approve)
-                  OWNER IMPLEMENTS            isolated worktree + branch, commits
-                              ▼
-                  REVIEWER REVIEWS            reads exact diff at the commit,
-                              ▼               read-only, severity-tagged findings
-                  OWNER REMEDIATES            resumes its own session, commits
-                              ▼               (loops, bounded by max_review_rounds)
-                 FRESH VERIFICATION           REVIEWER, NEW session, checks every
-                              ▼               acceptance criterion with evidence
-              ┌─ GATE 2: HUMAN APPROVAL
-              ▼
-                        DONE                  `git merge claudex/<run-id>`
+INIT
+  → PLAN_DRAFT       lead drafts the plan, grounded in the repo (read-only)
+  → PLAN_CRITIQUE    pair critiques it against the repo
+  → PLAN_REVISE      lead accepts each finding or rebuts it with evidence
+        ↺ until the pair AGREEs (zero blocking/major findings) — or the
+          round cap gates the run to the human
+  → IMPLEMENT_STEP   lead implements exactly one plan step, commits
+  → CHECKPOINT       pair reviews that step's exact diff
+  → FIX              lead fixes blocking/major findings, commits (loops)
+        ↺ next step, until all steps are agreed
+  → TESTS            coordinator runs your test command itself — exit code
+                     decides, never agent testimony
+  → VERIFY           pair with FRESH context checks every acceptance
+                     criterion in the task contract
+  → DONE             automatically on verify pass
+AWAIT_GUIDANCE       any cap hit → the open dispute goes to you;
+                     `claudex resolve --notes "..."` feeds your decision
+                     back as binding guidance
 ```
 
-### Roles and rotation
+**Stop conditions** (the "good enough" metric — they can never loop
+forever):
+- convergence = pair verdict `AGREE` with zero blocking/major findings;
+- hard round caps: plan (5), checkpoint per step (3), test gate (2),
+  verify (2) — all configurable; a cap hit stops the run and surfaces the
+  open disagreement to you;
+- mechanical test gate: your configured command must exit 0;
+- final verification runs with a fresh session — no shared history with
+  the implementation.
 
-OWNER and REVIEWER are *per-run roles*, not fixed models. They are bound
-once, when the run is created, and never change mid-run:
+## Two ways to run it
 
-| | run 1 | run 2 | run 3 | … |
-|---|---|---|---|---|
-| OWNER (implements, remediates) | claude | codex | claude | … |
-| REVIEWER (disagreement, diff review, fresh verification) | codex | claude | codex | … |
+### Headless — `claudex run`
 
-With `--owner auto` (the default) the roles flip after every **completed**
-run, recorded in `.claudex/history.json` at final approval. Aborted or
-failed runs don't rotate — a crashed run shouldn't cost a model its turn.
-Force a side with `claudex run --owner codex`, or pin it permanently via
-`"owner"` in `.claudex/config.json`.
+The coordinator drives **both** agents as subprocesses through the whole
+loop. You come back for gates (if any) and the merge.
 
-One role floats *within* a run: the adversarial plan review is done by
-whichever agent did **not** author the selected plan. If codex's analysis
-wins gate 1 but claude owns implementation, claude attacks the plan, then
-implements the corrected version of it.
+```bash
+claudex init                       # scaffold .claudex/task.md + config
+claudex task "one paragraph..."    # optional: agent-drafted task contract
+claudex run --lead claude          # or --lead codex — the lead is YOUR call
+# ...
+claudex status                     # phase, step k/N, round budgets
+claudex resolve --notes "..."      # only if a cap gated the run
+git merge claudex/<run_id>         # DONE prints the exact command
+claudex clean
+```
+
+### Live — `claudex pair` (your session is the lead)
+
+You work inside an interactive Claude Code (or codex) session as the lead;
+claudex runs only the **pair's** turns, enforcing the same state machine,
+caps, and artifacts.
+
+```bash
+claudex init --with-skill          # installs .claude/skills/claudex-pair
+claudex pair start                 # you lead; --lead codex if you are codex
+claudex pair plan --file plan.json # pair critiques; revise until AGREE
+# implement step 1 in the printed worktree, commit, then:
+claudex pair checkpoint --notes "step 1: ..."
+# ...steps advance automatically on AGREE...
+claudex pair verify                # test gate + fresh verification → DONE
+```
+
+The installed skill (`.claude/skills/claudex-pair/SKILL.md`) teaches an
+interactive Claude session the full protocol; `codex-lead-prompt.md` is the
+mirror for codex-led sessions. Two things the skill insists on: run pair
+turns in the background (they invoke the other model and can take many
+minutes plus usage-limit waits), and remember the worktree is a **sibling
+directory** of your repo (grant access with `--add-dir` or work from a
+shell).
+
+## The mailbox
+
+Every turn — plans, critiques, commits, test results, guidance, DONE — is
+appended by the coordinator to `.claudex/runs/<run_id>/mailbox.md` in an
+append-only block format:
+
+```
+===== [LEAD] turn 3 | plan | STATUS: REVISE =====
+plan round 1: ...\plan-round-1.json
+steps (4):
+  1. ...
+----- end [LEAD] turn 3 -----
+
+===== [PAIR] turn 4 | plan | STATUS: AGREE =====
+no findings
+----- end [PAIR] turn 4 -----
+```
+
+`tail -f` it to watch the pairing live. It is the run's full transcript;
+every claim in it is backed by a JSON artifact in the same directory.
+
+## Roles
+
+| | LEAD (you pick at start) | PAIR (the other one) |
+|---|---|---|
+| plan | drafts, revises, rebuts with evidence | critiques against the repo |
+| code | implements one step per commit, fixes | reviews each step's exact diff |
+| finish | — | fresh-context verification |
+| write access | worktree only, implement/fix turns only | never |
+
+The lead is whoever you start the run with — `--lead claude|codex`
+(headless) or which session you lead from (live). No rotation, no
+winner-picking: ownership is resolved by initiation.
+
+## Enforcement, not prompt discipline
+
+| guarantee | mechanism |
+|---|---|
+| critiques/reviews can't edit | Claude `--permission-mode plan`; Codex `-s read-only` (OS sandbox) |
+| implementation isolated | dedicated git worktree (sibling dir) on a run branch |
+| reviews see exact code | coordinator extracts `git diff` itself; dirty worktrees refused |
+| structured findings | Claude `--json-schema`, Codex `--output-schema` (strict mode) |
+| convergence is checkable | `AGREE` + zero blocking/major, evaluated by the coordinator |
+| no infinite loops | round caps in state, checked before every turn |
+| crash safety | state.json written after every round; artifact-presence skip on retry |
+| no cross-process races | run-dir lockfile around every state-mutating command |
+| verification is independent | verify turn never resumes any session |
+| test results are real | coordinator runs `test_command` itself, exit code decides |
+
+Session continuity without contamination: each role keeps its own session
+lineage (`lead_plan`, `pair_plan` in the repo; `lead_impl`, `pair_review`
+in the worktree — resume pins the original cwd, so lineages never cross),
+and the verifier gets none of them.
+
+## Report mode
+
+Start the task contract's goal with `[REPORT]` (or `--mode report`) when
+the deliverable IS analysis: the report draft becomes the single step —
+lead writes and commits it in the worktree, the pair critiques it through
+the same checkpoint loop, fresh verification checks the contract. No
+plan-about-the-work layer.
+
+## Configuration
+
+`.claudex/config.json` (written by `claudex init`, overridable per-run by
+flags):
+
+```jsonc
+{
+  "lead": "claude",             // who holds the pen by default
+  "mode": "auto",               // auto | change | report
+  "max_plan_rounds": 5,
+  "max_checkpoint_rounds": 3,
+  "max_test_rounds": 2,
+  "max_verify_rounds": 2,
+  "test_command": "",           // mechanical gate, run by the coordinator
+  "agent_timeout": 3600,
+  "wait_on_limits": true,       // wait out provider usage limits and resume
+  "claude_model": "",           // pin models if you want reproducibility
+  "codex_model": ""
+}
+```
+
+Binary discovery: `CLAUDEX_CLAUDE_BIN` / `CLAUDEX_CODEX_BIN` env vars win;
+on Windows the Codex desktop-app binary is preferred over npm shims.
 
 ## Install
 
-```powershell
+```bash
 pip install -e .
-claudex --version
+claudex doctor        # checks git + both CLIs
 ```
 
-Requires Python ≥ 3.10 (stdlib only), git, a logged-in `claude` CLI, and a
-logged-in `codex` CLI.
-
-## Usage
-
-```powershell
-cd your-project
-claudex init                 # scaffolds .claudex/task.md + config, gitignores .claudex/
-# … fill in .claudex/task.md (the task contract) by hand, or draft it:
-claudex task "users report the export button hangs on files >10MB; fix it without changing the export format"
-# … review/edit the drafted contract — answer its open questions …
-claudex doctor               # verify git/claude/codex wiring
-claudex run                  # runs until gate 1
-# … read claude-analysis.md, codex-analysis.md, disagreement.md …
-claudex approve plan claude --notes "codex missed the cache invalidation path"
-# … pipeline continues: plan review → implement → review → verify → gate 2 …
-claudex approve final
-git merge claudex/<run-id>
-claudex clean                # removes the worktree
-```
-
-Other commands: `claudex status`, `claudex retry` (re-attempt a failed
-phase), `claudex abort`.
-
-Useful flags on `run`: `--owner claude|codex|auto` (auto alternates per
-task, recorded in `.claudex/history.json`), `--auto-plan`,
-`--max-review-rounds N`, `--timeout SECONDS`, `--claude-model X`,
-`--codex-model Y`.
-
-### Report mode vs change mode
-
-Not every task's deliverable is a diff. When the deliverable IS analysis —
-"review this repo thoroughly and find what's wrong" — planning would be one
-meta-level too high (two agents writing plans about how to review, then one
-executing the plan). Report mode removes that layer:
-
-| | change mode | report mode |
-|---|---|---|
-| investigation | analysis of the problem | **the actual review, in full** |
-| gate 1 | pick the plan | pick the base report |
-| plan review / finalize | non-author attacks plan | *(skipped)* |
-| implement | owner writes code + tests | owner consolidates both reviews + disagreement resolutions into the report file, commits it |
-| review rounds | diff review | adversarial spot-check of the report's claims against the repo |
-| verification | acceptance criteria vs diff | same, against the committed report |
-
-Mode is detected from the goal's `[REPORT]`/`[CHANGE]`/`[MIXED]` prefix
-(`claudex task` drafts always carry one; `[MIXED]` runs as change), or
-forced with `claudex run --mode report|change`. `claudex status` shows the
-active mode.
-
-### Answering open questions
-
-Contracts drafted by `claudex task` render each open question with an
-`Answer:` stub:
-
-```markdown
-# Open questions
-
-- Where should the review report live — chat-only, or committed to the repo?
-  - Answer: committed, under .review/
-```
-
-Fill the stubs in before `claudex run`. Every phase prompt tells the agents
-that `Answer:` lines are binding contract decisions; a blank answer leaves
-the question genuinely open and agents must not silently resolve it.
-
-### Picking models
-
-Per run: `claudex run --claude-model opus --codex-model gpt-5.6-sol`.
-Permanently: `"claude_model"` / `"codex_model"` in `.claudex/config.json`.
-Values are passed straight through (`claude --model`, `codex -m`), so
-anything the CLIs accept works — aliases like `fable`/`opus`/`sonnet` or
-full model names. Unset means each CLI's own configured default. Both
-agents keep their model for the entire run; there is deliberately no
-per-phase model mixing — a cheaper model reviewing a stronger model's plan
-inverts the adversarial pressure the pipeline depends on.
-
-### Usage limits
-
-When either provider reports a usage/rate limit, claudex does not fail the
-run: it parses the reset time out of the limit message (epoch, "try again
-in 3h27m", or "resets at 3pm" styles), reports when it will retry, sleeps,
-and continues. If the message names no time it waits `default_limit_wait`
-(30 min). Waits are capped at `max_limit_wait` (6 h) and at
-`max_limit_waits` retries per invocation; state is saved before each wait,
-so Ctrl+C during a wait loses nothing — `claudex run` resumes the phase.
-Disable with `"wait_on_limits": false` to fail fast instead.
-
-## How permissions are enforced
-
-| Phase | Agent | Claude flags | Codex flags |
-|---|---|---|---|
-| investigate / disagreement / plan review / finalize | both / reviewer / author | `--permission-mode plan` | `-s read-only` (OS sandbox) |
-| implement / remediate | owner only | `--permission-mode acceptEdits --allowedTools Edit,Write,NotebookEdit,TodoWrite,Bash` | `-s workspace-write` |
-| review / verify | reviewer | `--permission-mode plan` | `-s read-only` |
-
-Write phases run **only** in the run's dedicated worktree
-(`<repo>.claudex.<run-id>` next to your checkout, branch
-`claudex/<run-id>`), so the main checkout is never touched and two runs can
-never collide. Note that Claude's write phase allowlists `Bash` so the owner
-can run tests and `git commit` unattended — scope what that means for your
-machine before running on sensitive projects, and tighten
-`claude_write_allowed_tools` in `.claudex/config.json` if needed.
-
-## Structured findings, not prose
-
-Every phase result is schema-validated at the CLI layer (Claude
-`--json-schema`, Codex `--output-schema`), so the coordinator routes typed
-JSON: analyses, disagreement reports, plan reviews, severity-tagged code
-review findings, per-criterion verification verdicts. Human-readable `.md`
-renders sit next to each `.json` in `.claudex/runs/<run-id>/`, and every raw
-agent invocation (command, stdin, stdout, stderr) is logged under
-`.claudex/runs/<run-id>/logs/` for audit.
-
-Schemas use OpenAI strict mode (`additionalProperties: false`, all
-properties required) because Codex enforces that server-side; Claude accepts
-the same schemas.
+Requires Python 3.10+, git, `claude` CLI, `codex` CLI. No third-party
+Python dependencies.
 
 ## Design decisions
 
-* **External deterministic coordinator, no MCP cross-wiring.** Making either
-  model "the boss" of the other lets it distort the task before delegating,
-  selectively summarize dissent, and blur permission boundaries. Here the
-  state machine is plain Python; every transition and artifact is auditable.
-* **Same contract, no retelling.** Both agents read the identical
-  `task.md` snapshot (copied into the run dir at start, so mid-run edits
-  can't skew it). Reviewers receive artifact file paths, never summaries.
-* **The human owns the task definition.** `claudex run` refuses an unfilled
-  template — steering must come from you. `claudex task "..."` can draft the
-  contract from one paragraph (an agent expands it, grounded in the repo),
-  but the draft is a proposal: you review it, answer its open questions, and
-  edit it before any run starts.
-* **Independence before comparison.** Investigations run in parallel and
-  blind, then a disagreement pass checks conflicting claims against the
-  repository — the second opinion can't just validate the first framing.
-* **One owner per change set, alternating.** `--owner auto` flips
-  owner/reviewer roles between runs to prevent one model from becoming the
-  permanent planner and the other a rubber stamp.
-* **Review commits, not moving files.** The reviewer gets the base commit,
-  the implementation commits, the implementer's report, and the exact diff
-  the coordinator extracted itself.
-* **Fresh-context verification.** The verifier never resumes any session.
-  The owner's remediation, by contrast, deliberately *does* resume the
-  implementation session — same engineer, same context.
-* **Sessions are resumable, state is durable.** Every transition is
-  persisted to `state.json` before proceeding; `claudex run` resumes
-  mid-pipeline, `claudex retry` re-attempts a failed phase.
-
-## Machine notes (binary resolution)
-
-`claudex` resolves binaries in this order:
-
-1. `CLAUDEX_CLAUDE_BIN` / `CLAUDEX_CODEX_BIN` environment variables,
-2. `claude_bin` / `codex_bin` in `.claudex/config.json`,
-3. for Codex on Windows: the desktop app binary under
-   `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` (npm-distributed builds can
-   lag behind what your account's configured model requires),
-4. `PATH` (`.cmd`/`.bat`/`.ps1` shims are wrapped automatically).
-
-`claudex doctor` shows what resolved and its version.
+- **Pair, not face-off.** One plan, co-owned. The pair's AGREE means "I
+  co-own this plan and its implementation", not "you win".
+- **Lead by initiation.** Whoever you start with holds the pen. This
+  resolves ownership without rotation schemes or model-vs-model authority.
+- **Agreement with teeth.** AGREE is only accepted with zero blocking/major
+  findings; every disagreement loop has a cap; every cap hit becomes a
+  human decision, recorded as binding guidance in the transcript.
+- **The coordinator is code, not a model.** Phase transitions, caps,
+  diffs, test results, and convergence are computed deterministically.
+  Models argue; the state machine decides what happens next.
+- **Evidence beats testimony.** Rebuttals require file-level evidence;
+  the verifier treats all prior claims as unverified; the test gate is a
+  subprocess exit code.

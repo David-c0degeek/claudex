@@ -3,18 +3,21 @@
 Every prompt hands the agent the same immutable task contract (task.md) plus
 exact artifact file paths — never a paraphrase of what the other agent said.
 Structured output is enforced by schema at the CLI layer, so prompts describe
-intent, not formatting.
+intent, not formatting. Prompts stay thin (paths, not content) so long
+resumed lineages don't bloat.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-INDEPENDENCE = """\
-You are one of two independent senior engineers assigned to the same task.
-The other engineer is investigating in parallel; you cannot see their work
-and must not speculate about it. Your value comes from reaching your own
-evidence-backed conclusions.
+TEAM = """\
+You are one of two senior engineers pair programming on this task. One of
+you is the LEAD (holds the pen: drafts the plan, implements, fixes); the
+other is the PAIR (critiques the plan, reviews every checkpoint, verifies).
+You are one team converging on one plan and one implementation. Disagree
+openly when the evidence demands it, concede when it doesn't — the goal is
+the best shippable change, not winning the argument.
 """
 
 EVIDENCE_RULES = """\
@@ -28,6 +31,18 @@ Rules of evidence:
 ANSWERS_ARE_BINDING = """\
 In the task contract, lines marked "Answer:" under Open questions are the
 human's decisions. They are binding parts of the contract, not suggestions.
+"""
+
+
+def guidance_block(notes: str) -> str:
+    if not notes:
+        return ""
+    return f"""
+The human broke a deadlock between you two with this binding guidance:
+---
+{notes}
+---
+Treat it like an Answer: line in the contract.
 """
 
 
@@ -59,258 +74,208 @@ This phase is read-only. Do not edit any files.
 """
 
 
-def investigation(task_path: Path) -> str:
-    return f"""{INDEPENDENCE}
-Read the task contract at: {task_path}
+# ------------------------------------------------------------- plan converge
+def plan_draft(task_path: Path) -> str:
+    return f"""{TEAM}
+You are the LEAD. Read the task contract at: {task_path}
 
-Investigate this repository directly and produce a full engineering analysis:
-the relevant execution paths, evidence with file and symbol references, your
-assumptions, the risks, the minimal justified solution, the competing
-solutions you rejected and why, the tests required, and any open questions.
+Investigate this repository directly and draft the implementation plan your
+pair will critique. The plan must be grounded in what the repository
+actually contains and self-contained: someone who has read only the task
+contract and this plan can implement the change.
 
-{ANSWERS_ARE_BINDING}
-{EVIDENCE_RULES}"""
-
-
-def review_investigation(task_path: Path) -> str:
-    return f"""{INDEPENDENCE}
-Read the task contract at: {task_path}
-
-This task's deliverable IS a review. Produce the complete review now — the
-actual review, not a plan for reviewing later. Cover every dimension and
-acceptance criterion the contract names, run the read-only checks it
-requires, and record each material finding (gaps, wrong implementations,
-incorrect assumptions, missing pieces) with severity and direct repository
-evidence. Put the full self-contained report in report_markdown; findings
-are its machine-readable index.
+Break the work into ordered steps. Each step must be independently
+implementable and committable — it becomes exactly one commit, reviewed by
+your pair before the next step starts. Prefer few, coherent steps over many
+fragments. Name the files each step touches and the tests it adds or
+changes.
 
 {ANSWERS_ARE_BINDING}
 {EVIDENCE_RULES}"""
 
 
-def disagreement(
-    task_path: Path, claude_analysis: Path, codex_analysis: Path, mode: str = "change"
-) -> str:
-    basis = "the plan" if mode == "change" else "the base of the final report"
-    return f"""Two engineers independently analyzed the same task. Your job is to compare
-their analyses and surface every material agreement and disagreement, checking
-disputed claims directly against the repository — trust neither analysis.
+def plan_critique(task_path: Path, plan_path: Path, round_no: int, guidance: str = "") -> str:
+    return f"""{TEAM}
+You are the PAIR. Critique round {round_no} of your lead's plan.
 
 Task contract: {task_path}
-Claude's analysis (JSON): {claude_analysis}
-Codex's analysis (JSON): {codex_analysis}
+Lead's current plan (JSON: plan_markdown + steps): {plan_path}
+{guidance_block(guidance)}
+Verify every material claim against the repository — do not assume the plan
+is correct. Find: incorrect assumptions, missing affected paths, unnecessary
+scope, architectural inconsistencies, compatibility risks, insufficient
+tests, steps that are not independently committable, and simpler valid
+alternatives.
 
-For each conflict, state both positions, then state what the repository
-itself shows. Recommend which analysis should become {basis}, and why.
-Recommend "claude" or "codex" based on evidence quality and solution
-minimality, not verbosity.
+Severity: "blocking" = the plan is wrong or unsafe without this fix;
+"major" = should fix before implementation; "minor"/"nit" = record only.
+Verdict "AGREE" only if you have zero blocking and zero major findings —
+AGREE means you co-own this plan and will review its implementation.
+If the lead rebutted an earlier finding of yours with repository evidence,
+verify the rebuttal; concede when it holds, escalate severity when it
+doesn't.
 
+{ANSWERS_ARE_BINDING}
 {EVIDENCE_RULES}"""
 
 
-def consolidate_report(
-    task_path: Path,
-    base_author: str,
-    base_report: Path,
-    other_report: Path,
-    disagreement_path: Path,
-) -> str:
-    return f"""You are consolidating two independent reviews into the final report. You
-are in a dedicated git worktree; you may create and edit files here.
+def plan_revise(task_path: Path, critique_path: Path, round_no: int, guidance: str = "") -> str:
+    return f"""{TEAM}
+You are the LEAD. Your pair critiqued your plan (round {round_no}).
 
 Task contract: {task_path}
-Base review ({base_author}'s, human-selected): {base_report}
-Other review (JSON): {other_report}
-Disagreement analysis (JSON): {disagreement_path}
+Pair's critique (JSON): {critique_path}
+{guidance_block(guidance)}
+Revise the plan. For every blocking and major finding: either incorporate it
+(action "accepted"), or rebut it with direct repository evidence (action
+"rebutted" — a rebuttal without file-level evidence is not acceptable).
+Incorporate minor findings where they genuinely improve the plan; drop them
+otherwise. Do not silently drop any blocking/major finding.
 
-Produce the final report:
-- Start from the base review. Fold in every finding from the other review
-  that survives the evidence; note material disagreements and how the
-  repository resolves them rather than silently dropping either side.
-- Where the disagreement analysis showed a claim to be wrong, correct it.
-- Honor the contract's decisions about where the report lives (Answer:
-  lines are binding); default to REVIEW.md at the repository root if the
-  contract does not say.
-- Re-run any read-only checks the contract requires and report their real
-  output.
-- Commit the report file(s) with `git add` and `git commit`. Do not push.
-  Do not modify any product code — this task delivers a report only.
-
-{ANSWERS_ARE_BINDING}"""
-
-
-def plan_review(task_path: Path, plan_path: Path) -> str:
-    return f"""Review this proposal as an independent senior engineer.
-
-Do not assume its conclusions are correct.
-
-Task contract: {task_path}
-Proposed plan: {plan_path}
-
-Verify every material claim against the repository.
-
-Find:
-- incorrect assumptions;
-- missing affected paths;
-- unnecessary scope;
-- architectural inconsistencies;
-- compatibility risks;
-- insufficient tests;
-- simpler valid alternatives.
-
-Do not modify code.
-
-Classify each correction as blocking (the plan is wrong or unsafe without it)
-or non-blocking (improvement). Verdict "approve" only if there are zero
-blocking corrections.
-
-{EVIDENCE_RULES}"""
-
-
-def plan_finalize(task_path: Path, plan_path: Path, review_path: Path) -> str:
-    return f"""You authored the proposed plan. An independent reviewer has challenged it.
-
-Task contract: {task_path}
-Your plan: {plan_path}
-Adversarial review (JSON): {review_path}
-
-Produce the final agreed plan. You must address every blocking correction:
-either incorporate it, or rebut it with direct repository evidence (a rebuttal
-without file-level evidence is not acceptable). Incorporate non-blocking
-suggestions where they genuinely improve the plan; drop them otherwise.
-The final plan must be self-contained: someone who has read only the task
-contract and your final plan can implement the change.
+Re-emit the COMPLETE revised plan — full plan_markdown and the full ordered
+steps array, not a delta. Keep steps independently implementable and
+committable.
 
 This phase is read-only. Do not edit any files.
 
 {EVIDENCE_RULES}"""
 
 
-def implement(task_path: Path, plan_path: Path) -> str:
-    return f"""You are the implementation owner. You are working in a dedicated git
-worktree on a dedicated branch; you may edit files here.
+# ---------------------------------------------------------------- implement
+def implement_step(
+    task_path: Path, plan_path: Path, step_index: int, total: int, step: dict
+) -> str:
+    files = ", ".join(step.get("files", [])) or "(see plan)"
+    tests = "; ".join(step.get("tests", [])) or "(see plan)"
+    return f"""You are the LEAD, implementing the agreed plan step by step in a dedicated
+git worktree on a dedicated branch; you may edit files here.
 
 Task contract: {task_path}
 Agreed plan: {plan_path}
 
-Implement the agreed plan exactly. If reality forces a deviation, keep it
+Implement ONLY step {step_index + 1} of {total}: {step.get('title', '')}
+
+{step.get('description', '')}
+
+Files: {files}
+Tests: {tests}
+
+Do not start later steps — your pair reviews this step's commit before the
+next step begins. If reality forces a deviation from the plan, keep it
 minimal and record it in your report — do not silently expand scope.
 
 Requirements:
-- Write the tests the plan requires. Tests must be able to fail: assert on
+- Write the tests this step requires. Tests must be able to fail: assert on
   behavior, not on the absence of exceptions.
 - Run the test suite (or the closest relevant subset) and record the command
   and outcome truthfully. A failing suite must be reported as failing.
-- Commit your work with `git add` and `git commit` in one or more coherent
-  commits with descriptive messages. Do not push. Do not create branches.
+- Commit this step's work with `git add` and `git commit` with a descriptive
+  message. Do not push. Do not create branches.
 - Never use `git commit --no-verify`, force flags, or history rewrites.
 """
 
 
-def code_review(
-    task_path: Path,
-    plan_path: Path,
-    diff_path: Path,
-    report_path: Path,
-    base_commit: str,
-) -> str:
-    return f"""Review a completed implementation as an independent senior engineer. You
-did not write this code. Do not assume the implementer's report is accurate.
+def draft_report(task_path: Path) -> str:
+    return f"""You are the LEAD. This task's deliverable IS a report, not a code change.
+You are in a dedicated git worktree; you may create and edit files here.
 
 Task contract: {task_path}
-Agreed plan: {plan_path}
-Exact diff (base {base_commit[:12]} -> HEAD): {diff_path}
-Implementer's report (JSON): {report_path}
 
-You are inside the implementation worktree at the implementation commit, so
-you can read the final state of every file and run read-only checks.
+Investigate the repository and write the complete report now — the actual
+deliverable, not a plan for one. Cover every dimension and acceptance
+criterion the contract names, run the read-only checks it requires, and
+record each material finding with severity and direct repository evidence.
+Honor the contract's decisions about where the report lives (Answer: lines
+are binding); default to REVIEW.md at the repository root if the contract
+does not say.
+
+Commit the report file(s) with `git add` and `git commit`. Do not push. Do
+not modify any product code — this task delivers a report only. Your pair
+reviews the committed report next; expect to revise it.
+
+{ANSWERS_ARE_BINDING}"""
+
+
+# --------------------------------------------------------------- checkpoints
+def checkpoint_review(
+    task_path: Path,
+    plan_path: Path | None,
+    step_label: str,
+    diff_path: Path,
+    base: str,
+    round_no: int,
+    guidance: str = "",
+) -> str:
+    plan_line = f"Agreed plan: {plan_path}\n" if plan_path else ""
+    return f"""{TEAM}
+You are the PAIR. Checkpoint review, round {round_no}, for: {step_label}
+
+Task contract: {task_path}
+{plan_line}Exact diff under review ({base[:12]}..HEAD): {diff_path}
+{guidance_block(guidance)}
+You are inside the implementation worktree at the current commit, so you can
+read the final state of every file and run read-only checks. Review the
+diff, not the lead's account of it.
 
 Evaluate:
-- correctness against the task contract and agreed plan;
-- unintended scope expansion;
+- correctness against the task contract{' and agreed plan step' if plan_path else ''};
+- unintended scope expansion beyond this step;
 - whether the tests are meaningful (could they fail?) and sufficient;
 - error handling, boundary conditions, concurrency, and compatibility where
-  relevant;
-- whether the implementer's report matches the actual diff.
+  relevant.
 
-Severity: "blocking" = must fix before this change can proceed; "major" =
-should fix now; "minor"/"nit" = record only. Verdict "approve" only with zero
-blocking and zero major findings.
+Severity: "blocking" = must fix before the next step; "major" = fix now;
+"minor"/"nit" = record only. Verdict "AGREE" only with zero blocking and
+zero major findings — AGREE means this step ships as-is and you co-own it.
 
 Do not modify code.
-
-{EVIDENCE_RULES}"""
-
-
-def report_review(
-    task_path: Path,
-    diff_path: Path,
-    report_path: Path,
-    base_commit: str,
-) -> str:
-    return f"""Review a consolidated review report as an independent senior engineer. You
-did not write it. Do not assume any of its claims are accurate.
-
-Task contract: {task_path}
-Exact diff (base {base_commit[:12]} -> HEAD, the committed report): {diff_path}
-Consolidator's own summary (JSON): {report_path}
-
-You are inside the worktree at the commit, so you can read the report and
-run read-only checks against the repository it describes.
-
-Evaluate:
-- spot-check the report's material claims against the repository: are they
-  evidenced and correct?
-- does the report cover every dimension and acceptance criterion the
-  contract names?
-- were findings from either source review silently dropped?
-- did the change stay report-only (no product code touched)?
-
-Severity: "blocking" = the report asserts something false or misses a
-contract dimension; "major" = should fix now; "minor"/"nit" = record only.
-Verdict "approve" only with zero blocking and zero major findings.
-
-Do not modify anything.
 
 {ANSWERS_ARE_BINDING}
 {EVIDENCE_RULES}"""
 
 
-def remediate(review_path: Path, round_no: int) -> str:
-    return f"""An independent review of your implementation found problems that must be
-fixed (remediation round {round_no}).
+def fix(findings_path: Path, round_no: int, source: str) -> str:
+    return f"""You are the LEAD. {source} found problems that must be fixed
+(fix round {round_no}).
 
-Review findings (JSON): {review_path}
+Findings (JSON): {findings_path}
 
 Fix every "blocking" and "major" finding. If you believe a finding is wrong,
 do not argue — fix what is real and record your evidence-backed rebuttal for
 the rest in your report notes. Do not address minor/nit findings unless the
 fix is trivial and zero-risk. Do not expand scope.
 
-Re-run the tests, then commit the remediation with `git add` and
-`git commit`. Report truthfully.
+Re-run the tests, then commit the fix with `git add` and `git commit`.
+Report truthfully.
 """
 
 
+# -------------------------------------------------------------------- verify
 def verify(
     task_path: Path,
     plan_path: Path | None,
     diff_path: Path,
     base_commit: str,
+    test_gate_summary: str = "",
 ) -> str:
     plan_line = f"Agreed plan: {plan_path}\n" if plan_path else ""
+    tests_line = (
+        f"Mechanical test gate result (coordinator-run): {test_gate_summary}\n"
+        if test_gate_summary
+        else ""
+    )
     return f"""You are the final verifier. You have no history with this change: treat
 every prior claim about it as unverified testimony.
 
 Task contract: {task_path}
 {plan_line}Full diff (base {base_commit[:12]} -> HEAD): {diff_path}
-
+{tests_line}
 You are inside the implementation worktree at the final commit.
 
 Independently answer, with direct file or test evidence for each:
 - Does the implementation satisfy every acceptance criterion in the task
   contract? Check each one separately.
-- Did scope expand beyond the contract and agreed plan?
+- Did scope expand beyond the contract{' and agreed plan' if plan_path else ''}?
 - Are the tests meaningful rather than merely passing — do they assert real
   behavior and could they fail?
 - Are errors, cancellation, concurrency, persistence, and boundary conditions
@@ -323,4 +288,5 @@ Verdict "pass" only if every acceptance criterion is met with evidence.
 
 Do not modify code.
 
+{ANSWERS_ARE_BINDING}
 {EVIDENCE_RULES}"""

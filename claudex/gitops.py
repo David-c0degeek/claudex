@@ -1,9 +1,9 @@
 """Git plumbing: worktree isolation, commit capture, diff extraction.
 
-The implementation owner works in a dedicated worktree on a run-specific
-branch. Reviewers read the same worktree in read-only mode; the coordinator
-extracts diffs itself so the reviewer receives an exact, immutable artifact
-rather than "review what the other agent just did".
+The lead implements in a dedicated worktree on a run-specific branch. The
+pair reads the same worktree in read-only mode; the coordinator extracts
+diffs itself so the pair reviews an exact, immutable artifact rather than
+"review what the other agent just did".
 """
 
 from __future__ import annotations

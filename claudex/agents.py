@@ -3,10 +3,10 @@
 Design rules enforced here, not by prompt discipline:
 
 * ``read_only=True`` maps to `--permission-mode plan` (Claude) and
-  `-s read-only` (Codex, OS-level sandbox). Investigation, disagreement
-  analysis, plan review, code review, and verification can never edit.
-* ``read_only=False`` is only ever used by the phase driver for the single
-  implementation owner, inside its dedicated worktree.
+  `-s read-only` (Codex, OS-level sandbox). Plan drafting, critiques,
+  checkpoint reviews, and verification can never edit.
+* ``read_only=False`` is only ever used by the phase driver for the lead's
+  implement/fix turns, inside the run's dedicated worktree.
 * Structured output goes through `--json-schema` (Claude) and
   `--output-schema` + `-o` (Codex), so the coordinator parses validated JSON,
   never prose.
@@ -260,7 +260,7 @@ class ClaudeAgent:
     binary: str
     model: str = ""
     # Write-phase tool policy. acceptEdits auto-approves file edits; Bash is
-    # explicitly allowlisted so the owner can run tests and `git commit`
+    # explicitly allowlisted so the lead can run tests and `git commit`
     # unattended. Tighten via config if your project needs a narrower policy.
     write_allowed_tools: str = "Edit,Write,NotebookEdit,TodoWrite,Bash"
     extra_args: list[str] = field(default_factory=list)

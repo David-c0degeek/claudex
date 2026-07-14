@@ -1,10 +1,12 @@
-"""claudex — deterministic co-engineering orchestrator for Claude Code and OpenAI Codex.
+"""claudex — pair-programming orchestrator for Claude Code and OpenAI Codex.
 
-An external coordinator drives both agents through an explicit state machine:
-independent investigation, disagreement analysis, adversarial plan review,
-single-owner implementation in an isolated git worktree, commit-based review,
-remediation, and fresh-context verification. Neither model is ever "the boss"
-of the other; the coordinator owns phase transitions and edit permissions.
+An external coordinator makes the two agents work as one team: the LEAD
+(chosen by the human at start) drafts the plan, implements, and fixes; the
+PAIR critiques the plan, reviews every step's commits, and verifies with
+fresh context. Convergence is agreement (AGREE + zero blocking/major
+findings) under hard round caps — deadlocks gate to the human instead of
+looping. The coordinator owns phase transitions, edit permissions, and the
+mailbox transcript; neither model is ever "the boss" of the other.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

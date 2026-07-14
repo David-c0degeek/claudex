@@ -1,7 +1,10 @@
 """Render structured agent findings into human-readable markdown artifacts.
 
-The JSON files are the machine contract; these .md files are what the human
-reads at the two gates (plan selection, final approval).
+The JSON files are the machine contract; the .md files are what the human
+reads. mailbox.md is the append-only pairing transcript — every turn both
+sides take, in the codex-collab block format, written only by the
+coordinator (the pair is sandboxed read-only during critiques, and all its
+output flows through the coordinator as schema-validated JSON anyway).
 """
 
 from __future__ import annotations
@@ -20,6 +23,57 @@ def _section(title: str, items: list[str]) -> str:
     return f"## {title}\n\n" + "\n".join(f"- {i}" for i in items) + "\n"
 
 
+# ------------------------------------------------------------------- mailbox
+def mailbox_path(run_dir: Path) -> Path:
+    return run_dir / "mailbox.md"
+
+
+MAILBOX_HEADER = """\
+# mailbox — pairing transcript
+# protocol: append-only turn blocks, written by the coordinator.
+# [LEAD] holds the pen (plan, implement, fix); [PAIR] critiques and verifies.
+# turn: ===== [ROLE] turn <n> | <stage> | STATUS: <...> =====
+#       <body>
+#       ----- end [ROLE] turn <n> -----
+# convergence: PAIR posts AGREE with zero blocking/major findings.
+"""
+
+
+def mailbox_append(
+    run_dir: Path, role: str, turn: int, stage: str, status: str, body: str
+) -> None:
+    mb = mailbox_path(run_dir)
+    if not mb.exists():
+        mb.write_text(MAILBOX_HEADER, encoding="utf-8")
+    header = f"===== [{role}] turn {turn} |"
+    # Idempotent: turn numbers are unique, so a crash between the mailbox
+    # append and the state save must not duplicate the block on retry.
+    if header in mb.read_text(encoding="utf-8"):
+        return
+    block = (
+        f"\n{header} {stage} | STATUS: {status} =====\n"
+        f"{body.rstrip()}\n"
+        f"----- end [{role}] turn {turn} -----\n"
+    )
+    with mb.open("a", encoding="utf-8") as f:
+        f.write(block)
+
+
+def findings_digest(findings: list[dict]) -> str:
+    """Short per-finding lines for mailbox turn bodies."""
+    if not findings:
+        return "no findings"
+    lines = []
+    for f in findings:
+        loc = f.get("file") or ""
+        if loc and f.get("line"):
+            loc += f":{f['line']}"
+        loc = f" `{loc}`" if loc else ""
+        lines.append(f"[{f.get('severity', '?')}]{loc} {f.get('problem', '')}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------- task contract
 def render_task_contract(c: dict) -> str:
     return "\n".join(
         [
@@ -49,109 +103,39 @@ def _open_questions_section(questions: list[str]) -> str:
     return "# Open questions\n\n" + "\n".join(lines) + "\n"
 
 
-def render_analysis(agent: str, a: dict) -> str:
-    ev = [
-        f"`{e.get('file', '?')}` — {e.get('symbol', '')} — {e.get('claim', '')}".replace(" —  — ", " — ")
-        for e in a.get("evidence", [])
-    ]
-    rejected = [
-        f"**{r.get('alternative', '?')}** — {r.get('reason_rejected', '')}"
-        for r in a.get("rejected_alternatives", [])
-    ]
-    return "\n".join(
-        [
-            f"# {agent.capitalize()} analysis\n",
-            f"## Summary\n\n{a.get('summary', '')}\n",
-            _section("Execution paths", a.get("execution_paths", [])),
-            _section("Evidence", ev),
-            _section("Assumptions", a.get("assumptions", [])),
-            _section("Risks", a.get("risks", [])),
-            f"## Proposed solution\n\n{a.get('proposed_solution', '')}\n",
-            _section("Rejected alternatives", rejected),
-            _section("Tests required", a.get("tests_required", [])),
-            _section("Open questions", a.get("open_questions", [])),
-        ]
-    )
-
-
-def render_review_report(agent: str, r: dict) -> str:
-    findings = [
-        f"**[{f.get('severity', '?')}]** {f.get('area', '?')} — "
-        f"{f.get('finding', '')} (evidence: {f.get('evidence', '')})"
-        for f in r.get("findings", [])
-    ]
-    return "\n".join(
-        [
-            f"# {agent.capitalize()} review\n",
-            f"## Summary\n\n{r.get('summary', '')}\n",
-            _section("Findings", findings),
-            _section("Open questions", r.get("open_questions", [])),
-            f"## Full report\n\n{r.get('report_markdown', '')}\n",
-        ]
-    )
-
-
-def render_disagreement(d: dict) -> str:
-    conflicts = []
-    for c in d.get("conflicts", []):
-        conflicts.append(
-            f"### {c.get('topic', '?')}\n\n"
-            f"- **Claude:** {c.get('claude_position', '')}\n"
-            f"- **Codex:** {c.get('codex_position', '')}\n"
-            f"- **Repository shows:** {c.get('repo_evidence', '')}\n"
-            f"- **Recommendation:** {c.get('recommendation', '')}\n"
+# --------------------------------------------------------------------- plans
+def render_plan(lead: str, round_no: int, p: dict) -> str:
+    steps = []
+    for i, s in enumerate(p.get("steps", [])):
+        files = ", ".join(s.get("files", []))
+        tests = "; ".join(s.get("tests", []))
+        steps.append(
+            f"### Step {i + 1}: {s.get('title', '?')}\n\n"
+            f"{s.get('description', '')}\n\n"
+            f"- files: {files or '_unspecified_'}\n"
+            f"- tests: {tests or '_unspecified_'}\n"
         )
-    return "\n".join(
-        [
-            "# Disagreement analysis\n",
-            _section("Agreements", d.get("agreements", [])),
-            "## Conflicts\n",
-            "\n".join(conflicts) if conflicts else "_None._\n",
-            _section("Unique to Claude", d.get("unique_to_claude", [])),
-            _section("Unique to Codex", d.get("unique_to_codex", [])),
-            f"## Recommended plan: **{d.get('recommended_plan', '?')}**\n",
-            f"{d.get('recommendation_rationale', '')}\n",
-        ]
-    )
-
-
-def render_selected_plan(author: str, analysis: dict, notes: str) -> str:
     parts = [
-        f"# Proposed plan (author: {author})\n",
-        f"## Solution\n\n{analysis.get('proposed_solution', '')}\n",
-        _section("Tests required", analysis.get("tests_required", [])),
-        _section("Assumptions", analysis.get("assumptions", [])),
-        _section("Risks", analysis.get("risks", [])),
+        f"# Plan — round {round_no} (lead: {lead})\n",
+        f"{p.get('plan_markdown', '')}\n",
+        "## Steps\n",
+        "\n".join(steps) if steps else "_None._\n",
+        _section("Risks", p.get("risks", [])),
+        _section("Open questions", p.get("open_questions", [])),
     ]
-    if notes:
-        parts.append(f"## Selection notes (human)\n\n{notes}\n")
+    responses = [
+        f"**{r.get('action', '?')}**: {r.get('finding', '?')} — {r.get('rationale', '')}"
+        for r in p.get("responses", [])
+    ]
+    if responses:
+        parts.append(_section("Responses to pair critique", responses))
     return "\n".join(parts)
 
 
-def render_plan_review(reviewer: str, r: dict) -> str:
-    disputed = [
-        f"**{d.get('claim', '?')}** — {d.get('why_disputed', '')} "
-        f"(repo: {d.get('repo_evidence', '')})"
-        for d in r.get("disputed_claims", [])
-    ]
-    parts = [
-        f"# Adversarial plan review (reviewer: {reviewer})\n",
-        f"**Verdict: {r.get('verdict', '?')}**\n",
-        _section("Confirmed claims", r.get("confirmed_claims", [])),
-        _section("Disputed claims", disputed),
-        _section("Missing evidence", r.get("missing_evidence", [])),
-        _section("Blocking corrections", r.get("blocking_corrections", [])),
-        _section("Non-blocking suggestions", r.get("non_blocking_suggestions", [])),
-    ]
-    if r.get("simpler_alternative"):
-        parts.append(f"## Simpler alternative\n\n{r['simpler_alternative']}\n")
-    return "\n".join(parts)
-
-
-def render_code_review(reviewer: str, round_no: int, r: dict) -> str:
+def _findings_rows(findings: list[dict]) -> list[str]:
     rows = []
-    for f in r.get("findings", []):
-        loc = f.get("file", "?")
+    for f in findings:
+        loc = f.get("file") or "?"
         if f.get("line"):
             loc += f":{f['line']}"
         rows.append(
@@ -159,19 +143,56 @@ def render_code_review(reviewer: str, round_no: int, r: dict) -> str:
             f"  - evidence: {f.get('evidence', '')}\n"
             f"  - fix: {f.get('suggested_fix', '')}"
         )
+    return rows
+
+
+def render_critique(pair: str, stage: str, round_no: int, c: dict) -> str:
+    """Shared renderer for plan critiques and checkpoint reviews — the
+    fields differ per schema; absent ones are simply not rendered."""
+    rows = _findings_rows(c.get("findings", []))
+    parts = [
+        f"# {stage} — round {round_no} (pair: {pair})\n",
+        f"**Verdict: {c.get('verdict', '?')}**"
+        + (
+            f" · tests adequate: {c.get('tests_adequate')}"
+            if "tests_adequate" in c
+            else ""
+        )
+        + "\n",
+        "## Findings\n",
+        "\n".join(rows) if rows else "_None._\n",
+    ]
+    if c.get("missing_evidence"):
+        parts.append(_section("Missing evidence", c["missing_evidence"]))
+    if c.get("simpler_alternative"):
+        parts.append(f"## Simpler alternative\n\n{c['simpler_alternative']}\n")
+    if c.get("tests_critique"):
+        parts.append(f"## Tests critique\n\n{c['tests_critique']}\n")
+    if c.get("notes"):
+        parts.append(f"## Notes\n\n{c['notes']}\n")
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------ implementation
+def render_implementation_report(lead: str, r: dict) -> str:
+    commits = [
+        f"`{c.get('sha', '')[:12]}` {c.get('message', '')}" for c in r.get("commits", [])
+    ]
     return "\n".join(
         [
-            f"# Code review — round {round_no} (reviewer: {reviewer})\n",
-            f"**Verdict: {r.get('verdict', '?')}** · tests adequate: "
-            f"{r.get('tests_adequate', '?')}\n",
-            "## Findings\n",
-            "\n".join(rows) if rows else "_None._\n",
-            f"## Tests critique\n\n{r.get('tests_critique', '')}\n",
+            f"# Implementation report (lead: {lead})\n",
+            f"**Tests passed: {r.get('tests_passed', '?')}** · command: "
+            f"`{r.get('tests_command', '')}`\n",
+            _section("Commits", commits),
+            _section("Files changed", r.get("files_changed", [])),
+            _section("Deviations from plan", r.get("deviations_from_plan", [])),
+            f"## Test output summary\n\n{r.get('test_output_summary', '')}\n",
+            f"## Notes\n\n{r.get('notes', '')}\n",
         ]
     )
 
 
-def render_verification(verifier: str, v: dict) -> str:
+def render_verification(pair: str, v: dict) -> str:
     crit = [
         f"{'✅' if c.get('met') else '❌'} {c.get('criterion', '?')} — "
         f"{c.get('evidence', '')}"
@@ -179,7 +200,7 @@ def render_verification(verifier: str, v: dict) -> str:
     ]
     return "\n".join(
         [
-            f"# Final verification (verifier: {verifier}, fresh context)\n",
+            f"# Final verification (verifier: {pair}, fresh context)\n",
             f"**Verdict: {v.get('verdict', '?')}** · tests meaningful: "
             f"{v.get('tests_meaningful', '?')}\n",
             _section("Acceptance criteria", crit),
@@ -189,23 +210,5 @@ def render_verification(verifier: str, v: dict) -> str:
                 v.get("unsupported_claims", []),
             ),
             f"## Notes\n\n{v.get('notes', '')}\n",
-        ]
-    )
-
-
-def render_implementation_report(owner: str, r: dict) -> str:
-    commits = [
-        f"`{c.get('sha', '')[:12]}` {c.get('message', '')}" for c in r.get("commits", [])
-    ]
-    return "\n".join(
-        [
-            f"# Implementation report (owner: {owner})\n",
-            f"**Tests passed: {r.get('tests_passed', '?')}** · command: "
-            f"`{r.get('tests_command', '')}`\n",
-            _section("Commits", commits),
-            _section("Files changed", r.get("files_changed", [])),
-            _section("Deviations from plan", r.get("deviations_from_plan", [])),
-            f"## Test output summary\n\n{r.get('test_output_summary', '')}\n",
-            f"## Notes\n\n{r.get('notes', '')}\n",
         ]
     )
