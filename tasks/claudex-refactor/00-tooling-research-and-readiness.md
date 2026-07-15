@@ -77,8 +77,9 @@ facts and preserve the dirty starting workspace.
 - 2026-07-15 · slice 2 · 00.8 · baked provider/event/process/Git findings into
   §2, §4, the implementation boxes, documentation inventory, and readiness
   conclusion; installed nothing and required no manual action · plan structure,
-  sources, commands, and dirty-baseline preservation reviewed · checkpoint is
-  the subject-close commit containing this entry; push required before 01 starts.
+  sources, commands, and dirty-baseline preservation reviewed · checkpoint
+  `042a227` pushed; its cached whitespace check exposed Markdown hard-break/EOF
+  whitespace, corrected in the immediate follow-up checkpoint before 01.
 
 ### Captain Hindsight — closing review
 
@@ -86,9 +87,11 @@ facts and preserve the dirty starting workspace.
    preserved the user's dirty work before refactoring, and mapped every new
    concern to an existing production seam. The offline-first test decision and
    explicit unknown-cost rule should remain.
-2. **Fix before closing:** None. The stale editable package metadata is a known
-   release task, not a readiness blocker; it is recorded in `readiness.md` and
-   covered by 06.5.
+2. **Fix before closing:** The first documentation checkpoint reported trailing
+   Markdown hard-break spaces and extra EOF blank lines. They were removed in a
+   follow-up commit without rewriting pushed history. The stale editable package
+   metadata is a known release task, not a readiness blocker; it is recorded in
+   `readiness.md` and covered by 06.5.
 3. **Record:** D001–D003 capture the baseline, provider-boundary, and test-policy
    decisions. `readiness.md` records the provider versions and time-sensitive
    sources. No additional lesson is durable yet.

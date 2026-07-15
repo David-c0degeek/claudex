@@ -73,4 +73,3 @@ provider-specific data remains explicitly unknown.
 
 > One line per slice: date · slice number · boxes touched · outcome · verification
 > · checkpoint commit/push. Record documentation impact and learned lessons.
-

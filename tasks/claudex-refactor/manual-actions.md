@@ -5,4 +5,3 @@ human-owned implementation boxes; §8 acceptance remains outside the box tracker
 
 | Box ID | Owner | Action | Source subject | Status | Deferral rationale |
 |---|---|---|---|---|---|
-

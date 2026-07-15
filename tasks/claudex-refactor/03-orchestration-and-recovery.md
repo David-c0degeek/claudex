@@ -77,4 +77,3 @@ small predictable number of calls or stop with a precise durable reason.
 
 > One line per slice: date · slice number · boxes touched · outcome · verification
 > · checkpoint commit/push. Record documentation impact and learned lessons.
-

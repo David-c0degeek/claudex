@@ -1,7 +1,9 @@
 # Claudex Reliability and Observability Refactor
 
-Status: proposed implementation specification  
-Date: 2026-07-15  
+Status: proposed implementation specification
+
+Date: 2026-07-15
+
 Scope: Claudex orchestration, provider execution, recovery, safety, testing, and operator UX
 
 ## Executive verdict

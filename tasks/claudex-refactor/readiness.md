@@ -1,7 +1,9 @@
 # Claudex Refactor Readiness Record
 
-Date: 2026-07-15  
-Platform: Windows 11, PowerShell, Europe/Amsterdam  
+Date: 2026-07-15
+
+Platform: Windows 11, PowerShell, Europe/Amsterdam
+
 Execution branch: `reliability-observability-refactor`
 
 ## Repository and baseline
@@ -168,4 +170,3 @@ contracts are verified from installed help and primary docs, the new module
 boundaries are justified, and the plan's commands/gates now name deterministic
 offline tests. Provider schema uncertainty is contained by raw journaling,
 tolerant adapters, capability checks, and versioned fixtures.
-
