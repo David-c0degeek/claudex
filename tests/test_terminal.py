@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from claudex.cli import _active_orchestrator, cmd_status, open_watch_terminals
 from claudex.config import Config
@@ -216,7 +216,9 @@ class StatusGoldenTests(unittest.TestCase):
             self.assertEqual(legacy, state_path.read_text(encoding="utf-8"))
             current = repo / ".claudex" / "current"
             current.write_text(run_id, encoding="utf-8")
-            _active_orchestrator(Config(repo=repo))
+            with patch("claudex.cli.Orchestrator") as orchestrator:
+                _active_orchestrator(Config(repo=repo))
+            orchestrator.assert_called_once()
             self.assertTrue((run_dir / "state.v1.bak.json").exists())
 
 

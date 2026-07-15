@@ -42,4 +42,6 @@ capabilities. Redaction precedes persistence and retention prunes raw data only.
 
 Normalized journals and durable state are the sole terminal read model. Watcher
 windows do not host provider TUIs, scrape output, acquire run locks, or interpret
-pane closure as cancellation.
+pane closure as cancellation. Observer loads apply legacy config/state defaults
+in memory without persisting them; a control command performs the durable
+migration and retains its rollback backup.
