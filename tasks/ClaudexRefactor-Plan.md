@@ -148,6 +148,7 @@ Retired boxes remain visible as checked, struck-through `ABANDONED` entries.
 | D006 | 2026-07-15 | Resume identity; restart checkpoint | `resume` continues the same durable run. `restart` changes execution identity only after copying and hash-verifying the latest canonical checkpoint; discarding planning state requires `--fresh-plan`. | Identity replacement is not permission to discard accepted work, decisions, budgets, worktree identity, or safe sessions. Promote to recovery ADR in 06.4. | 03.4–03.6; `lifecycle.py`, `recovery.py` |
 | D007 | 2026-07-15 | Coordinator-owned safety boundary | Providers and mechanical tests use one streamed process-group/job lifecycle; rate limits return durable control by default; cancellation is lock-independent; tested/reviewed content includes untracked bytes; explicit provider binaries fail capability checks and automatic candidates are ranked semantically; redaction precedes persistence and retention removes raw streams only. | These boundaries prevent invisible waits, surviving descendants, reviewed/tested-tree skew, incompatible provider drift, and secret recovery artifacts without treating a Git worktree as an OS sandbox. Promote to process, provider, and security ADRs in 06.4. | 04.1–04.7; `processes.py`, `gitops.py`, `providers.py`, `security.py` |
 | D008 | 2026-07-15 | Paid smoke fails closed on native-cap gaps | The credential-explicit compatibility smoke performs capability checks before invocation and refuses without spending when either provider lacks a native spend cap; a coordinator total observed after a call is not equivalent enforcement. | The refactor exists partly to stop invisible token burn. A nominal live check is not worth an unbounded provider call, and current Codex truthfully reports monetary budgeting as coordinator-only. Promote to test/release policy in 06.4. | 05.6; `tests/test_live_smoke.py`, `README.md` |
+| D009 | 2026-07-16 | Terminal observers never own control state | Watch/status and spawned terminal windows are read-only projections over normalized journals and in-memory migrated state. Control commands alone persist migrations and rollback backups. Recovery export re-redacts text and excludes raw streams, exact backups, control files, and symlinks. | Visible output must not create a second coordinator, block control, mutate a legacy run, or leak outside the recovery boundary. Promoted to permanent architecture/decision docs. | 06.1–06.5; `terminal.py`, `state.py`, `config.py`, `recovery.py`, `docs/decisions.md` |
 
 ---
 
@@ -166,7 +167,7 @@ checkpoint. Owners are `agent`, `release-engineer`, `product-owner`,
 | [x] | 03 | `tasks/claudex-refactor/03-orchestration-and-recovery.md` | DONE | agent: 6 | n/a |
 | [x] | 04 | `tasks/claudex-refactor/04-process-git-and-provider-safety.md` | DONE | agent: 7 | n/a |
 | [x] | 05 | `tasks/claudex-refactor/05-integration-and-fault-testing.md` | DONE | agent: 6 | n/a |
-| [ ] | 06 | `tasks/claudex-refactor/06-terminal-ux-docs-and-release.md` | TODO | agent: 7 | n/a |
+| [x] | 06 | `tasks/claudex-refactor/06-terminal-ux-docs-and-release.md` | DONE | agent: 7 | n/a |
 
 ---
 
@@ -205,39 +206,39 @@ Violations are blockers, not review nits. Keep numbering stable.
 Run only when §5 is fully resolved. This is the engineering gate; §8 is the
 separate user/reviewer acceptance.
 
-- [ ] All §5 subjects are `DONE` or explicitly `ABANDONED` through §4
-- [ ] Subject 00 completed, or was explicitly waived/abandoned through §4
-- [ ] Build command from §2 passes with zero errors
-- [ ] Test command from §2 passes; any repo-enforced coverage gate passes
-- [ ] Runtime boxes have end-to-end observed-versus-expected evidence, not only a green unit command
-- [ ] Remaining §2 lint, smoke, and plan-specific gates pass or are explicitly `n/a`
-- [ ] §1 risks and rollback paths were rechecked against what actually shipped
-- [ ] All §6 principles hold
-- [ ] Every implementation subject contains concrete Integration analysis and no unjustified parallel implementation
-- [ ] Every new public surface is wired to a non-test caller or explicitly documented as library-only/unwired
-- [ ] Every non-abandoned subject has a Captain Hindsight verdict of `CLOSE`
-- [ ] Every checked box has a Progress-log entry and pushed checkpoint (or recorded no-remote exception)
-- [ ] Durable architecture decisions were promoted to the project's permanent decision/ADR record
-- [ ] Documentation-impact review was completed for every shipped box
-- [ ] The integration branch is pushed or covered by the no-remote exception; `git status --short` has no unexplained changes
-- [ ] If mode became `parallel`, there are no stale owners, unmerged branches, or unresolved handoffs
-- [ ] Shipped files outside `tasks/` contain no plan-only IDs, plan paths, or accidental slice terminology after false-positive triage
-- [ ] `git log 7ab861f..HEAD` commit messages contain no plan-only IDs, paths, or slice terminology after false-positive triage
-- [ ] Branch and PR metadata are plan-agnostic if used
-- [ ] `tasks/claudex-refactor/manual-actions.md` contains no unresolved human-owned action
-- [ ] Run the cleanup-audit teardown review, or waive it through §4; triage every finding into fix-now, a new plan, or won't-fix with reason
-- [ ] Reconcile `tasks/claudex-refactor/lessons.md` and migrate lasting lessons to `tasks/lessons.md`
-- [ ] The exact false-gate incident fixture does not gate when the explicit field is false and the question is absent
-- [ ] A slow fake provider produces watcher-visible text/tool events before it exits and without stdout/stderr deadlock
-- [ ] Rate limiting returns promptly into durable `RATE_LIMITED` state; no default path performs a long foreground sleep
-- [ ] Usage totals and reported cost reconcile from attempt events into status; missing fields stay visibly unknown
-- [ ] Budget exhaustion blocks the next invocation and resumes only through an explicit recorded override
-- [ ] Restart preserves a hash-equivalent canonical checkpoint unless `--fresh-plan` is explicit
-- [ ] Cancel/timeout terminate fake-provider descendants and retain unique partial attempt artifacts on Windows and supported CI platforms
-- [ ] Real temporary Git/worktree tests prove untracked-file handling and verified-tree identity
-- [ ] Watch/status golden tests cover running, paused, rate-limited, failed, cancelled, and completed states
-- [ ] Any live-provider smoke used for release was opt-in and bounded by native plus coordinator spend caps
-- [ ] Plan handed to reviewer for §8 sign-off
+- [x] All §5 subjects are `DONE` or explicitly `ABANDONED` through §4
+- [x] Subject 00 completed, or was explicitly waived/abandoned through §4
+- [x] Build command from §2 passes with zero errors
+- [x] Test command from §2 passes; any repo-enforced coverage gate passes
+- [x] Runtime boxes have end-to-end observed-versus-expected evidence, not only a green unit command
+- [x] Remaining §2 lint, smoke, and plan-specific gates pass or are explicitly `n/a`
+- [x] §1 risks and rollback paths were rechecked against what actually shipped
+- [x] All §6 principles hold
+- [x] Every implementation subject contains concrete Integration analysis and no unjustified parallel implementation
+- [x] Every new public surface is wired to a non-test caller or explicitly documented as library-only/unwired
+- [x] Every non-abandoned subject has a Captain Hindsight verdict of `CLOSE`
+- [x] Every checked box has a Progress-log entry and pushed checkpoint (or recorded no-remote exception)
+- [x] Durable architecture decisions were promoted to the project's permanent decision/ADR record
+- [x] Documentation-impact review was completed for every shipped box
+- [x] The integration branch is pushed or covered by the no-remote exception; `git status --short` has no unexplained changes
+- [x] If mode became `parallel`, there are no stale owners, unmerged branches, or unresolved handoffs
+- [x] Shipped files outside `tasks/` contain no plan-only IDs, plan paths, or accidental slice terminology after false-positive triage
+- [x] `git log 7ab861f..HEAD` commit messages contain no plan-only IDs, paths, or slice terminology after false-positive triage
+- [x] Branch and PR metadata are plan-agnostic if used
+- [x] `tasks/claudex-refactor/manual-actions.md` contains no unresolved human-owned action
+- [x] Run the cleanup-audit teardown review, or waive it through §4; triage every finding into fix-now, a new plan, or won't-fix with reason
+- [x] Reconcile `tasks/claudex-refactor/lessons.md` and migrate lasting lessons to `tasks/lessons.md`
+- [x] The exact false-gate incident fixture does not gate when the explicit field is false and the question is absent
+- [x] A slow fake provider produces watcher-visible text/tool events before it exits and without stdout/stderr deadlock
+- [x] Rate limiting returns promptly into durable `RATE_LIMITED` state; no default path performs a long foreground sleep
+- [x] Usage totals and reported cost reconcile from attempt events into status; missing fields stay visibly unknown
+- [x] Budget exhaustion blocks the next invocation and resumes only through an explicit recorded override
+- [x] Restart preserves a hash-equivalent canonical checkpoint unless `--fresh-plan` is explicit
+- [x] Cancel/timeout terminate fake-provider descendants and retain unique partial attempt artifacts on Windows and supported CI platforms
+- [x] Real temporary Git/worktree tests prove untracked-file handling and verified-tree identity
+- [x] Watch/status golden tests cover running, paused, rate-limited, failed, cancelled, and completed states
+- [x] Any live-provider smoke used for release was opt-in and bounded by native plus coordinator spend caps
+- [x] Plan handed to reviewer for §8 sign-off
 
 ---
 

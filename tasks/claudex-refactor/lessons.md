@@ -54,3 +54,7 @@
 - 2026-07-16 — Recovery export is a separate security boundary. Re-redact
   exported text, exclude exact legacy rollback backups and raw streams, and
   reject symlinks so a support bundle cannot escape the run directory.
+- 2026-07-16 — A focused state-loader regression must not accidentally
+  instantiate provider discovery. Local Claude/Codex installations can hide
+  that dependency; mock the unrelated constructor so clean CI proves the
+  intended boundary instead of workstation tooling.

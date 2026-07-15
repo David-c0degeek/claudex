@@ -32,6 +32,9 @@
 - Scenario-driven fake executables are the authoritative integration boundary:
   they make live streaming, rate limits, faults, budgets, restart, cancellation,
   and real worktree behavior reproducible without credentials or spend.
+- Focused migration/state tests must isolate unrelated provider discovery.
+  Workstation-installed CLIs can hide an accidental dependency that clean CI
+  correctly rejects.
 - A paid compatibility smoke is subordinate to enforceable native caps. Missing
   native spend enforcement is a safe preflight refusal, not permission to call
   a provider and inspect cost afterward.
