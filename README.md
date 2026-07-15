@@ -9,7 +9,7 @@ verifies the result with fresh context. They converge by agreement — not by
 facing off and having a winner picked.
 
 An external, deterministic coordinator (Python stdlib only) owns everything
-the models must not own: phase order, edit permissions, round caps,
+the models must not own: phase order, edit permissions, response budgets,
 convergence detection, diff extraction, and the transcript. Neither model
 is ever "the boss" of the other.
 
@@ -20,8 +20,10 @@ INIT
   → PLAN_DRAFT       lead drafts the plan, grounded in the repo (read-only)
   → PLAN_CRITIQUE    pair critiques it against the repo
   → PLAN_REVISE      lead accepts each finding or rebuts it with evidence
-        ↺ until the pair AGREEs (zero blocking/major findings) — or the
-          round cap gates the run to the human
+        ↺ until the pair AGREEs (zero blocking/major findings); each response
+          budget includes the lead's final revision and a fresh plan audit
+        content facts that fit an existing step become persistent
+        implementation checks instead of forcing another plan rewrite
   → IMPLEMENT_STEP   lead implements exactly one plan step, commits
   → CHECKPOINT       pair reviews that step's exact diff
   → FIX              lead fixes blocking/major findings, commits (loops)
@@ -31,17 +33,22 @@ INIT
   → VERIFY           pair with FRESH context checks every acceptance
                      criterion in the task contract
   → DONE             automatically on verify pass
-AWAIT_GUIDANCE       any cap hit → the open dispute goes to you;
-                     `claudex resolve --notes "..."` feeds your decision
-                     back as binding guidance
+AWAIT_GUIDANCE       actual choice → `claudex resolve --notes "..."`;
+                     exhausted quality budget → `claudex continue`
 ```
 
 **Stop conditions** (the "good enough" metric — they can never loop
 forever):
 - convergence = pair verdict `AGREE` with zero blocking/major findings;
-- hard round caps: plan (5), checkpoint per step (3), test gate (2),
-  verify (2) — all configurable; a cap hit stops the run and surfaces the
-  open disagreement to you;
+- plan findings are limited to architecture, scope, step safety, and
+  validation strategy; volatile facts/content details are carried forward as
+  implementation checks and reviewed against committed artifacts;
+- lead-response budgets: plan revisions (5), checkpoint fixes per step (3),
+  test fixes (2), verify fixes (2) — all configurable; every budget permits
+  the final lead response before a fresh review. Exhaustion is reported as a
+  quality-budget stop, not falsely labeled a disagreement;
+- a critique can request human guidance early only for a concrete unresolved
+  value choice or repeated evidence-backed disagreement;
 - mechanical test gate: your configured command must exit 0;
 - final verification runs with a fresh session — no shared history with
   the implementation.
@@ -58,8 +65,12 @@ claudex init                       # scaffold .claudex/task.md + config
 claudex task "one paragraph..."    # optional: agent-drafted task contract
 claudex run --lead claude          # or --lead codex — the lead is YOUR call
 # ...
-claudex status                     # phase, step k/N, round budgets
-claudex resolve --notes "..."      # only if a cap gated the run
+claudex status                     # phase, step k/N, response budgets
+claudex resolve --notes "..."      # answer a concrete decision gate
+claudex resolve --notes-file decision.md  # multiline/shell-safe alternative
+claudex continue                   # allow one response + fresh audit, no guidance
+claudex continue --responses 2     # larger extension only when explicitly chosen
+claudex restart                    # retire a legacy/stuck plan; preserve decisions
 git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
 ```
@@ -131,7 +142,10 @@ winner-picking: ownership is resolved by initiation.
 | reviews see exact code | coordinator extracts `git diff` itself; dirty worktrees refused |
 | structured findings | Claude `--json-schema`, Codex `--output-schema` (strict mode) |
 | convergence is checkable | `AGREE` + zero blocking/major, evaluated by the coordinator |
-| no infinite loops | round caps in state, checked before every turn |
+| planning stays planning | plan-level finding categories are schema-constrained; content obligations persist separately as implementation checks |
+| inconclusive reviews don't cause churn | tool/evidence failures retry the reviewer fresh without charging a lead response |
+| no infinite loops | explicit lead-response budgets plus a final fresh-context audit |
+| guidance stays binding | persistent guidance ledger included in every later agent turn |
 | crash safety | state.json written after every round; artifact-presence skip on retry |
 | no cross-process races | run-dir lockfile around every state-mutating command |
 | verification is independent | verify turn never resumes any session |
@@ -159,10 +173,10 @@ flags):
 {
   "lead": "claude",             // who holds the pen by default
   "mode": "auto",               // auto | change | report
-  "max_plan_rounds": 5,
-  "max_checkpoint_rounds": 3,
-  "max_test_rounds": 2,
-  "max_verify_rounds": 2,
+  "max_plan_rounds": 5,       // plan-revision budget
+  "max_checkpoint_rounds": 3, // fix budget per step
+  "max_test_rounds": 2,       // fixes after test failures
+  "max_verify_rounds": 2,     // fixes after verification failures
   "test_command": "",           // mechanical gate, run by the coordinator
   "agent_timeout": 3600,
   "wait_on_limits": true,       // wait out provider usage limits and resume
@@ -191,8 +205,9 @@ Python dependencies.
 - **Lead by initiation.** Whoever you start with holds the pen. This
   resolves ownership without rotation schemes or model-vs-model authority.
 - **Agreement with teeth.** AGREE is only accepted with zero blocking/major
-  findings; every disagreement loop has a cap; every cap hit becomes a
-  human decision, recorded as binding guidance in the transcript.
+  findings. Complete revision/fix cycles have explicit budgets. A real choice
+  becomes persistent human guidance; simple budget exhaustion can continue
+  without inventing a decision.
 - **The coordinator is code, not a model.** Phase transitions, caps,
   diffs, test results, and convergence are computed deterministically.
   Models argue; the state machine decides what happens next.

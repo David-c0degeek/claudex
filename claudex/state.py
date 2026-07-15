@@ -3,8 +3,8 @@
 Every phase transition is written to ``.claudex/runs/<run_id>/state.json``
 before the coordinator proceeds, so both drivers — headless ``claudex run``
 and a live interactive lead using ``claudex pair`` subcommands — can always
-resume from the last completed round. The one human gate (AWAIT_GUIDANCE)
-is just a phase the driver refuses to advance past on its own.
+resume from the last completed turn. AWAIT_GUIDANCE distinguishes concrete
+human decisions from resumable quality-budget stops.
 
 A run-dir lockfile serializes state-mutating commands across processes:
 the in-process ``threading.Lock`` cannot stop a live ``claudex pair`` call
@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,12 @@ AGENTS = ("claude", "codex")
 # no lineage ever crosses. VERIFY deliberately uses no lineage at all.
 SESSION_KEYS = ("lead_plan", "lead_impl", "pair_plan", "pair_review")
 
+_MAILBOX_GUIDANCE_RE = re.compile(
+    r"===== \[HUMAN\][^\r\n]*STATUS: GUIDANCE =====\r?\n"
+    r"(.*?)\r?\n----- end \[HUMAN\]",
+    re.DOTALL,
+)
+
 
 def other_agent(name: str) -> str:
     return "codex" if name == "claude" else "claude"
@@ -65,6 +72,9 @@ class RunState:
     # "live": an interactive session IS the lead; `claudex pair` subcommands
     # run only the pair agent's turns. The two drivers must not share a run.
     driver: str = "headless"
+    # v2 (Claudex 0.4+) separates compact planning from implementation
+    # checks. Legacy exhaustive-plan runs must restart while still planning.
+    plan_protocol_version: int = 2
     # "change": deliverable is a diff. "report": deliverable IS analysis;
     # the report draft is the single step and PLAN_* phases are skipped.
     mode: str = "change"
@@ -78,18 +88,24 @@ class RunState:
     # Agreed plan's ordered steps: [{title, description, files, tests}, ...]
     steps: list = field(default_factory=list)
     step_index: int = 0
-    # Round counters count rounds CONSUMED and only ever increase (artifact
-    # names embed them, so a reset would silently replay stale artifacts
-    # through the skip-if-present retry logic). checkpoint_round is the one
-    # exception: it resets per step, which is safe because checkpoint
-    # artifact names also embed the step index.
+    # Round counters identify critique/review artifacts and only ever
+    # increase (artifact names embed them, so a reset would silently replay
+    # stale artifacts through the skip-if-present retry logic).
     plan_round: int = 0
     checkpoint_round: int = 0
     fix_round: int = 0
     test_round: int = 0
     verify_round: int = 0
-    # Human guidance re-arms a cap by RAISING the ceiling instead of
-    # resetting the counter: cap = config max + extra.
+    # Budgets count lead responses, not reviewer findings. A configured cap
+    # of N therefore permits N complete critique -> revise/fix cycles and one
+    # final review of the Nth response. This prevents a cap from firing after
+    # a critique but before the lead is allowed to answer it.
+    plan_revisions: int = 0
+    checkpoint_fixes_used: int = 0
+    test_fixes_used: int = 0
+    verify_fixes_used: int = 0
+    # `continue` or guidance at a budget gate raises the response ceiling
+    # instead of resetting counters: budget = config max + extra.
     plan_cap_extra: int = 0
     checkpoint_cap_extra: int = 0
     test_cap_extra: int = 0
@@ -99,11 +115,21 @@ class RunState:
     last_reviewed_commit: str = ""
     # Mailbox turn counter (mailbox.md is the append-only transcript).
     mailbox_turn: int = 0
-    # AWAIT_GUIDANCE bookkeeping: why we gated, where resolve returns to,
-    # and the human's answer (injected into the next prompt).
+    # AWAIT_GUIDANCE bookkeeping. gate_kind distinguishes a real decision
+    # from a quality-budget stop, so the latter can be resumed without
+    # inventing binding guidance.
     gate_reason: str = ""
+    gate_kind: str = ""  # decision | budget
     return_phase: str = ""
+    # Deprecated one-shot field retained for loading v0.2 state files.
     guidance_notes: str = ""
+    # Human decisions remain binding for the rest of the run and are sent to
+    # both roles on every subsequent agent turn.
+    binding_guidance: list = field(default_factory=list)
+    # Content facts and edge cases discovered during plan review that fit an
+    # existing implementation step. They do not force plan rewrites; the
+    # coordinator carries them into implementation, checkpoints, and verify.
+    implementation_checks: list = field(default_factory=list)
     findings_file: str = ""  # findings the next FIX must address
     # Where FIX hands control back to: checkpoint | tests | verify —
     # fixes re-enter the loop that produced the findings.
@@ -129,9 +155,14 @@ class RunState:
         self.log(f"{self.phase} -> {new_phase.value}" + (f" ({note})" if note else ""))
         self.phase = new_phase.value
 
-    def gate(self, reason: str, return_phase: Phase) -> None:
-        """Cap hit: stop and surface the open dispute to the human."""
+    def gate(
+        self, reason: str, return_phase: Phase, *, kind: str = "decision"
+    ) -> None:
+        """Stop for either a real decision or an exhausted quality budget."""
+        if kind not in ("decision", "budget"):
+            raise ValueError(f"unknown gate kind: {kind}")
         self.gate_reason = reason
+        self.gate_kind = kind
         self.return_phase = return_phase.value
         self.advance(Phase.AWAIT_GUIDANCE, reason[:200])
 
@@ -170,6 +201,37 @@ class RunState:
         # Pre-pair state files called the lead "owner"; accept them.
         if "lead" not in data and "owner" in data:
             data["lead"] = data["owner"]
+        if "plan_protocol_version" not in data:
+            data["plan_protocol_version"] = 1
+        # Migrate one-shot v0.2 guidance into the persistent ledger.
+        guidance = str(data.get("guidance_notes", "")).strip()
+        binding = list(data.get("binding_guidance", []))
+        if guidance and guidance not in binding:
+            binding.append(guidance)
+        # v0.2 cleared guidance after one prompt. Recover the durable human
+        # record from the append-only mailbox when upgrading an in-flight run.
+        mailbox = run_dir / "mailbox.md"
+        if mailbox.exists():
+            for recorded in _MAILBOX_GUIDANCE_RE.findall(
+                mailbox.read_text(encoding="utf-8")
+            ):
+                recorded = recorded.strip()
+                if recorded and recorded not in binding:
+                    binding.append(recorded)
+        data["binding_guidance"] = binding
+        data["guidance_notes"] = ""
+        # Old state did not count completed plan revisions explicitly. Plan
+        # artifact indices are authoritative and survive crashes.
+        if "plan_revisions" not in data:
+            revisions = []
+            for path in run_dir.glob("plan-round-*.json"):
+                try:
+                    revisions.append(int(path.stem.rsplit("-", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+            data["plan_revisions"] = max(revisions, default=0)
+        if data.get("gate_reason") and not data.get("gate_kind"):
+            data["gate_kind"] = "budget"
         return RunState(**{k: v for k, v in data.items() if k in known})
 
 

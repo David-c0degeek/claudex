@@ -24,12 +24,13 @@ class Config:
     codex_model: str = ""
     lead: str = "claude"  # who holds the pen: claude | codex
     mode: str = "auto"  # auto (detect from goal prefix) | report | change
-    # Hard round caps — the "this is good enough" stop rules. A cap hit
-    # never loops silently: the run gates on AWAIT_GUIDANCE for the human.
-    max_plan_rounds: int = 5  # plan critique/revise cycles
-    max_checkpoint_rounds: int = 3  # review/fix cycles per step
-    max_test_rounds: int = 2  # test-gate failures -> fix cycles
-    max_verify_rounds: int = 2  # verify failures -> fix cycles
+    # Lead-response budgets. A value N permits N complete revise/fix cycles
+    # followed by a final fresh review of the Nth response. Exhaustion gates
+    # as a budget stop; it is not mislabeled as a model disagreement.
+    max_plan_rounds: int = 5  # lead plan revisions
+    max_checkpoint_rounds: int = 3  # lead fixes per step
+    max_test_rounds: int = 2  # fixes after mechanical test failures
+    max_verify_rounds: int = 2  # fixes after verification failures
     # Mechanical test gate: run in the worktree after the last step; exit
     # code decides, never agent testimony. Empty = skip the mechanical gate.
     test_command: str = ""

@@ -8,26 +8,27 @@ Pipeline (one plan, one implementation, two agents converging on both):
       -> PLAN_CRITIQUE pair critiques it against the repo
       -> PLAN_REVISE   lead accepts or rebuts each finding, re-emits the plan
            (critique/revise loops until the pair AGREEs with zero
-            blocking/major findings, or the round cap gates the run)
+            blocking/major findings; each configured revision budget ends
+            with a fresh-context audit of the lead's final response)
       -> IMPLEMENT_STEP lead implements exactly one plan step, commits
       -> CHECKPOINT    pair reviews that step's exact diff
       -> FIX           lead fixes blocking/major findings, commits  (loops)
       -> TESTS         coordinator runs the configured test command itself
       -> VERIFY        pair with FRESH context checks acceptance criteria
       -> DONE          automatically on verify pass
-    AWAIT_GUIDANCE     any round cap hit -> the open dispute goes to the
-                       human; `claudex resolve` feeds the answer back
+    AWAIT_GUIDANCE     a real decision needs `claudex resolve`; an exhausted
+                       quality budget can use `claudex continue`
 
 The coordinator — not either model — owns phase transitions, edit
-permissions, artifact routing, round caps, and the mailbox transcript.
+permissions, artifact routing, response budgets, and the mailbox transcript.
 
 Two drivers share every pair-turn method: headless `claudex run` calls them
 from run_until_gate(); the live `claudex pair` subcommands (interactive
 session as lead) call them directly. One code path, one cap check, one
-mailbox append. One round = one handler iteration, so the save-per-iteration
-persistence gives round-granular crash durability. Round counters only ever
-increase (artifact names embed them); human guidance re-arms a cap by
-raising its ceiling, never by resetting a counter.
+mailbox append. One review attempt = one handler iteration, so the
+save-per-iteration persistence gives attempt-granular crash durability.
+Artifact counters only increase; separate response counters enforce complete
+cycles. Budget extensions raise the ceiling rather than replaying artifacts.
 """
 
 from __future__ import annotations
@@ -149,6 +150,92 @@ def validate_plan_shape(plan: dict) -> None:
             raise OrchestratorError(f"plan.steps[{i}] needs at least a title")
 
 
+def validate_revision_responses(critique: dict, revision: dict) -> None:
+    """Mechanically require one response for every keyed blocking/major
+    finding. Older v0.2 critiques had no keys and remain loadable."""
+    findings = critique.get("findings", [])
+    required = {
+        str(f.get("key", "")).strip()
+        for f in findings
+        if f.get("severity") in ("blocking", "major")
+        and str(f.get("key", "")).strip()
+    }
+    if not required:
+        return
+    known = {
+        str(f.get("key", "")).strip()
+        for f in findings
+        if str(f.get("key", "")).strip()
+    }
+    response_keys = [
+        str(response.get("finding_key", "")).strip()
+        for response in revision.get("responses", [])
+    ]
+    duplicates = sorted({key for key in response_keys if response_keys.count(key) > 1})
+    missing = sorted(required - set(response_keys))
+    unknown = sorted({key for key in response_keys if key and key not in known})
+    problems = []
+    if missing:
+        problems.append(f"missing responses for: {', '.join(missing)}")
+    if duplicates:
+        problems.append(f"duplicate responses for: {', '.join(duplicates)}")
+    if unknown:
+        problems.append(f"responses use unknown keys: {', '.join(unknown)}")
+    if problems:
+        raise OrchestratorError("invalid plan revision: " + "; ".join(problems))
+
+
+def verification_findings(verdict: dict) -> list[dict]:
+    """Derive the coordinator's verification outcome from evidence fields,
+    rather than trusting a potentially contradictory pass/fail label."""
+    findings = [
+        {
+            "severity": "blocking",
+            "file": None,
+            "line": None,
+            "problem": f"acceptance criterion not met: {c.get('criterion', '')}",
+            "evidence": c.get("evidence", ""),
+            "suggested_fix": "",
+        }
+        for c in verdict.get("criteria", [])
+        if not c.get("met")
+    ]
+    if verdict.get("tests_meaningful") is False:
+        findings.append(
+            {
+                "severity": "blocking",
+                "file": None,
+                "line": None,
+                "problem": "verification found that the tests are not meaningful",
+                "evidence": verdict.get("notes", ""),
+                "suggested_fix": "add assertions that fail when behavior is wrong",
+            }
+        )
+    findings.extend(
+        {
+            "severity": "blocking",
+            "file": None,
+            "line": None,
+            "problem": f"scope expanded beyond the contract: {item}",
+            "evidence": item,
+            "suggested_fix": "remove or justify the scope expansion",
+        }
+        for item in verdict.get("scope_expansion", [])
+    )
+    findings.extend(
+        {
+            "severity": "major",
+            "file": None,
+            "line": None,
+            "problem": f"verification claim lacks repository evidence: {item}",
+            "evidence": item,
+            "suggested_fix": "supply repository/test evidence or correct the claim",
+        }
+        for item in verdict.get("unsupported_claims", [])
+    )
+    return findings
+
+
 class Orchestrator:
     def __init__(self, cfg: Config, state: RunState):
         self.cfg = cfg
@@ -180,6 +267,43 @@ class Orchestrator:
         p = self._art("agreed-plan.md")
         return p if p.exists() else None
 
+    def _implementation_checks_path(self) -> Path | None:
+        p = self._art("implementation-checks.json")
+        return p if p.exists() else None
+
+    def _merge_implementation_checks(self, critique: dict, plan_path: Path) -> None:
+        incoming = critique.get("implementation_checks", [])
+        if not incoming:
+            return
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        step_titles = {
+            str(step.get("title", "")).strip() for step in plan.get("steps", [])
+        }
+        merged = {
+            str(item.get("key", "")).strip(): item
+            for item in self.state.implementation_checks
+            if str(item.get("key", "")).strip()
+        }
+        for item in incoming:
+            key = str(item.get("key", "")).strip()
+            if not key:
+                raise OrchestratorError("implementation check key must not be empty")
+            target = item.get("target_step")
+            if target is not None and target not in step_titles:
+                raise OrchestratorError(
+                    f"implementation check {key!r} targets step {target}, but the "
+                    "plan has no step with that exact title"
+                )
+            if item.get("action") == "remove":
+                merged.pop(key, None)
+            else:
+                merged[key] = item
+        self.state.implementation_checks = list(merged.values())
+        artifacts.save_json(
+            self._art("implementation-checks.json"),
+            {"checks": self.state.implementation_checks},
+        )
+
     def _post(self, role: str, stage: str, status: str, body: str) -> None:
         """Append one turn to the mailbox transcript. Coordinator-written:
         the pair is sandboxed read-only during critiques, and its output
@@ -189,14 +313,13 @@ class Orchestrator:
             self.run_dir, role, self.state.mailbox_turn, stage, status, body
         )
 
-    def _take_guidance(self) -> str:
-        """Consume pending human guidance: inject once, then clear. In
-        headless runs the lead phase after `resolve` consumes it; in live
-        runs the next pair turn does (the interactive lead saw it at
-        `resolve` time)."""
-        notes = self.state.guidance_notes
-        self.state.guidance_notes = ""
-        return notes
+    def _binding_guidance(self) -> str:
+        """All human decisions remain visible to both roles for the run."""
+        return "\n\n".join(
+            f"Decision {i + 1}: {note}"
+            for i, note in enumerate(self.state.binding_guidance)
+            if str(note).strip()
+        )
 
     def _run_agent(self, agent_name: str, prompt: str, **kw):
         agent = self.agents[agent_name]
@@ -244,8 +367,62 @@ class Orchestrator:
         if session_id:
             self.state.sessions[lineage] = session_id
 
+    def _require_conclusive_review(
+        self,
+        review: dict,
+        *,
+        lineage: str,
+        label: str,
+        artifact_path: Path | None = None,
+    ) -> None:
+        if not schemas.is_inconclusive_review(review):
+            return
+        # A fresh retry should not inherit a session whose tool/evidence
+        # state made it unable to review. Quarantine legacy artifacts so
+        # artifact-presence retry logic does not replay them forever.
+        self.state.sessions[lineage] = ""
+        if artifact_path and artifact_path.exists():
+            target = artifact_path.with_name(
+                f"{artifact_path.stem}.inconclusive{artifact_path.suffix}"
+            )
+            n = 2
+            while target.exists():
+                target = artifact_path.with_name(
+                    f"{artifact_path.stem}.inconclusive-{n}{artifact_path.suffix}"
+                )
+                n += 1
+            artifact_path.replace(target)
+            rendered = artifact_path.with_suffix(".md")
+            if rendered.exists():
+                rendered.replace(target.with_suffix(".md"))
+        details = review.get("missing_evidence") or [
+            review.get("tests_critique") or review.get("notes") or "no actionable finding"
+        ]
+        raise OrchestratorError(
+            f"{label} was inconclusive and will not consume a lead response: "
+            + "; ".join(str(item) for item in details if item)
+        )
+
     # ----------------------------------------------------------------- driver
+    def _require_current_plan_protocol(self) -> None:
+        phase = Phase(self.state.phase)
+        planning = phase in {
+            Phase.PLAN_DRAFT,
+            Phase.PLAN_CRITIQUE,
+            Phase.PLAN_REVISE,
+        } or (
+            phase is Phase.AWAIT_GUIDANCE
+            and self.state.return_phase == Phase.PLAN_REVISE.value
+        )
+        if self.state.plan_protocol_version < 2 and planning:
+            raise OrchestratorError(
+                "this run uses the legacy exhaustive-plan protocol and cannot "
+                "converge under Claudex 0.4; run `claudex abort`, then start a "
+                "new run so content findings become implementation checks"
+            )
+
     def run_until_gate(self) -> None:
+        self._require_current_plan_protocol()
         handlers = {
             Phase.INIT: self.phase_init,
             Phase.PLAN_DRAFT: self.phase_plan_draft,
@@ -277,10 +454,19 @@ class Orchestrator:
             self._save()
 
     def _report_gate(self) -> None:
-        self.say("GATE: the pair hit a round cap — human guidance required.")
+        if self.state.gate_kind == "decision":
+            self.say("GATE: a concrete human decision is required.")
+        else:
+            self.say("GATE: the quality budget is exhausted; no model deadlock was inferred.")
         self.say(f"  Why: {self.state.gate_reason}")
         self.say(f"  Transcript: {artifacts.mailbox_path(self.run_dir)}")
-        self.say("  Then: claudex resolve --notes 'your decision'")
+        if self.state.gate_kind == "decision":
+            self.say(
+                "  Then: claudex resolve --notes 'your decision' "
+                "(or --notes-file PATH for multiline text)"
+            )
+        else:
+            self.say("  Then: claudex continue   (or resolve --notes if you want to steer)")
 
     def _report_terminal(self) -> None:
         phase = Phase(self.state.phase)
@@ -361,6 +547,7 @@ class Orchestrator:
         self.state.advance(Phase.PLAN_CRITIQUE)
 
     def _store_plan(self, plan: dict, round_no: int) -> None:
+        validate_plan_shape(plan)
         artifacts.save_json(self._plan_path(round_no), plan)
         self._art(f"plan-round-{round_no}.md").write_text(
             artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
@@ -380,7 +567,18 @@ class Orchestrator:
         """Live mode: the interactive lead submits its (initial or revised)
         plan for critique."""
         validate_plan_shape(plan)
+        if self.state.plan_round:
+            critique = json.loads(
+                self._critique_path(self.state.plan_round - 1).read_text(
+                    encoding="utf-8"
+                )
+            )
+            validate_revision_responses(critique, plan)
         self._store_plan(plan, self.state.plan_round)
+        if self.state.plan_round:
+            self.state.plan_revisions = max(
+                self.state.plan_revisions, self.state.plan_round
+            )
         self.state.advance(Phase.PLAN_CRITIQUE, "live plan submitted")
         self._save()
 
@@ -394,48 +592,78 @@ class Orchestrator:
         if cpath.exists():
             self.say(f"plan critique {rnd} already present, skipping")
             critique = json.loads(cpath.read_text(encoding="utf-8"))
+            self._require_conclusive_review(
+                critique,
+                lineage="pair_plan",
+                label=f"plan critique {rnd}",
+                artifact_path=cpath,
+            )
         else:
-            guidance = self._take_guidance() if self.state.driver == "live" else ""
+            budget = self.cfg.max_plan_rounds + self.state.plan_cap_extra
+            final_audit = self.state.plan_revisions >= budget
             res = self._run_agent(
                 self.state.pair,
                 prompts.plan_critique(
                     self.task_snapshot,
                     self._plan_path(rnd),
                     rnd,
-                    guidance=guidance,
+                    guidance=self._binding_guidance(),
+                    final_audit=final_audit,
                 ),
                 cwd=self.cfg.repo,
                 read_only=True,
                 schema=schemas.PLAN_CRITIQUE_SCHEMA,
-                # The pair keeps its critique context across rounds — it must
-                # remember what it already conceded or escalated.
-                resume=self.state.sessions.get("pair_plan", ""),
+                # Normal rounds retain concessions; the cap-boundary audit is
+                # deliberately fresh so accumulated context cannot hide a
+                # regression or an uncovered acceptance criterion.
+                resume="" if final_audit else self.state.sessions.get("pair_plan", ""),
                 label=f"plan-critique-{rnd}",
             )
             critique = res.require_structured()
+            self._require_conclusive_review(
+                critique, lineage="pair_plan", label=f"plan critique {rnd}"
+            )
             self._remember_session("pair_plan", res.session_id)
             artifacts.save_json(cpath, critique)
             self._art(f"plan-critique-{rnd}.md").write_text(
                 artifacts.render_critique(self.state.pair, "Plan critique", rnd, critique),
                 encoding="utf-8",
             )
+        self._merge_implementation_checks(critique, self._plan_path(rnd))
+        checks = critique.get("implementation_checks", [])
+        digest = artifacts.findings_digest(critique.get("findings", []))
+        if checks:
+            digest += "\nimplementation checks: " + ", ".join(
+                str(item.get("key", "?")) for item in checks
+            )
         self._post(
             "PAIR",
             "plan",
             critique.get("verdict", "?"),
-            artifacts.findings_digest(critique.get("findings", [])),
+            digest,
         )
-        if schemas.is_converged(critique):
+        if schemas.requires_human_decision(critique):
+            self.state.plan_round = rnd + 1  # round consumed
+            self.state.gate(
+                critique.get("decision_question")
+                or f"plan critique requests a decision; see {cpath.name}",
+                Phase.PLAN_REVISE,
+                kind="decision",
+            )
+        elif schemas.is_converged(critique):
             self._lock_agreed_plan(rnd)
             self.state.advance(Phase.IMPLEMENT_STEP, f"plan agreed at round {rnd}")
         else:
             self.state.plan_round = rnd + 1  # round consumed
-            cap = self.cfg.max_plan_rounds + self.state.plan_cap_extra
-            if self.state.plan_round >= cap:
+            budget = self.cfg.max_plan_rounds + self.state.plan_cap_extra
+            final_audit = self.state.plan_revisions >= budget
+            if final_audit:
                 self.state.gate(
-                    f"plan not converged after {self.state.plan_round} round(s); "
-                    f"open findings in {cpath.name}",
+                    f"plan still has actionable findings after "
+                    f"{self.state.plan_revisions} lead revision(s) and a fresh "
+                    f"final audit; see {cpath.name}",
                     Phase.PLAN_REVISE,
+                    kind="budget",
                 )
             else:
                 self.state.advance(Phase.PLAN_REVISE)
@@ -448,6 +676,20 @@ class Orchestrator:
         if not steps:
             raise OrchestratorError("agreed plan has no steps — nothing to implement")
         self.state.steps = steps
+        titles = {str(step.get("title", "")).strip() for step in steps}
+        checks_changed = False
+        for item in self.state.implementation_checks:
+            if item.get("target_step") and item["target_step"] not in titles:
+                # A revision renamed/merged the target step after the check
+                # was captured. Keeping it cross-cutting is safer than
+                # silently orphaning the obligation.
+                item["target_step"] = None
+                checks_changed = True
+        if checks_changed:
+            artifacts.save_json(
+                self._art("implementation-checks.json"),
+                {"checks": self.state.implementation_checks},
+            )
         shutil.copyfile(self._plan_path(round_no), self._art("agreed-plan.json"))
         self._art("agreed-plan.md").write_text(
             artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
@@ -460,15 +702,16 @@ class Orchestrator:
         rnd = self.state.plan_round  # the version this revision will become
         if self._plan_path(rnd).exists():
             self.say(f"plan revision {rnd} already present, skipping")
+            revision = json.loads(self._plan_path(rnd).read_text(encoding="utf-8"))
         else:
-            guidance = self._take_guidance()
             res = self._run_agent(
                 self.state.lead,
                 prompts.plan_revise(
                     self.task_snapshot,
+                    self._plan_path(rnd - 1),
                     self._critique_path(rnd - 1),
                     rnd - 1,
-                    guidance=guidance,
+                    guidance=self._binding_guidance(),
                 ),
                 cwd=self.cfg.repo,
                 read_only=True,
@@ -478,7 +721,13 @@ class Orchestrator:
             )
             revision = res.require_structured()
             self._remember_session("lead_plan", res.session_id)
+        critique = json.loads(
+            self._critique_path(rnd - 1).read_text(encoding="utf-8")
+        )
+        validate_revision_responses(critique, revision)
+        if not self._plan_path(rnd).exists():
             self._store_plan(revision, rnd)
+        self.state.plan_revisions = max(self.state.plan_revisions, rnd)
         self.state.advance(Phase.PLAN_CRITIQUE)
 
     # ------------------------------------------------------------- implement
@@ -516,10 +765,12 @@ class Orchestrator:
             prompt = prompts.implement_step(
                 self.task_snapshot,
                 self._art("agreed-plan.md"),
+                self._implementation_checks_path(),
                 i,
                 len(self.state.steps),
                 step,
             )
+        prompt += prompts.guidance_block(self._binding_guidance())
         res = self._run_agent(
             self.state.lead,
             prompt,
@@ -589,28 +840,46 @@ class Orchestrator:
         if review_path.exists():
             self.say(f"checkpoint {i} round {rnd} already present, skipping")
             review = json.loads(review_path.read_text(encoding="utf-8"))
+            self._require_conclusive_review(
+                review,
+                lineage="pair_review",
+                label=f"checkpoint {i} round {rnd}",
+                artifact_path=review_path,
+            )
         else:
-            guidance = self._take_guidance() if self.state.driver == "live" else ""
+            budget = self.cfg.max_checkpoint_rounds + self.state.checkpoint_cap_extra
+            final_audit = self.state.checkpoint_fixes_used >= budget
             res = self._run_agent(
                 self.state.pair,
                 prompts.checkpoint_review(
                     self.task_snapshot,
                     None if self.report_mode else self._agreed_plan(),
+                    self._implementation_checks_path(),
                     f"step {i + 1}/{len(self.state.steps)}: {step.get('title', '')}",
                     diff_path,
                     base,
                     rnd,
-                    guidance=guidance,
+                    guidance=self._binding_guidance(),
+                    final_audit=final_audit,
                 ),
                 cwd=wt,
                 read_only=True,
                 schema=schemas.CHECKPOINT_REVIEW_SCHEMA,
                 # Review lineage lives in the worktree cwd and never mixes
                 # with the plan lineage (resume pins the original cwd).
-                resume=self.state.sessions.get("pair_review", ""),
+                resume=(
+                    ""
+                    if final_audit
+                    else self.state.sessions.get("pair_review", "")
+                ),
                 label=f"checkpoint-{i}-r{rnd}",
             )
             review = res.require_structured()
+            self._require_conclusive_review(
+                review,
+                lineage="pair_review",
+                label=f"checkpoint {i} round {rnd}",
+            )
             self._remember_session("pair_review", res.session_id)
             artifacts.save_json(review_path, review)
             self._art(f"checkpoint-{i}-r{rnd}.md").write_text(
@@ -628,6 +897,7 @@ class Orchestrator:
         if schemas.is_converged(review):
             self.state.last_reviewed_commit = gitops.head_commit(wt)
             self.state.checkpoint_round = 0
+            self.state.checkpoint_fixes_used = 0
             self.state.checkpoint_cap_extra = 0
             if self.state.step_index + 1 < len(self.state.steps):
                 self.state.step_index += 1
@@ -638,12 +908,14 @@ class Orchestrator:
             self.state.checkpoint_round = rnd + 1  # round consumed
             self.state.findings_file = str(review_path)
             self.state.fix_return = Phase.CHECKPOINT.value
-            cap = self.cfg.max_checkpoint_rounds + self.state.checkpoint_cap_extra
-            if self.state.checkpoint_round >= cap:
+            budget = self.cfg.max_checkpoint_rounds + self.state.checkpoint_cap_extra
+            if self.state.checkpoint_fixes_used >= budget:
                 self.state.gate(
-                    f"step {i + 1} not agreed after {self.state.checkpoint_round} "
-                    f"review round(s); open findings in {review_path.name}",
+                    f"step {i + 1} still has findings after "
+                    f"{self.state.checkpoint_fixes_used} fix(es) and a final "
+                    f"fresh review; see {review_path.name}",
                     Phase.FIX,
+                    kind="budget",
                 )
             else:
                 self.state.advance(Phase.FIX)
@@ -664,10 +936,8 @@ class Orchestrator:
             Phase.TESTS.value: "The mechanical test gate",
             Phase.VERIFY.value: "The fresh-context final verification",
         }.get(self.state.fix_return, "A review")
-        guidance = self._take_guidance()
         prompt = prompts.fix(findings_path, self.state.fix_round, source)
-        if guidance:
-            prompt += prompts.guidance_block(guidance)
+        prompt += prompts.guidance_block(self._binding_guidance())
         res = self._run_agent(
             self.state.lead,
             prompt,
@@ -688,7 +958,19 @@ class Orchestrator:
             "COMMIT",
             f"fix round {self.state.fix_round} for {findings_path.name}",
         )
+        self.record_fix_completed()
         self.state.advance(Phase(self.state.fix_return or Phase.CHECKPOINT.value))
+
+    def record_fix_completed(self) -> None:
+        """Charge one completed lead response to the budget that requested
+        it. Live mode calls this after the human lead has committed a fix;
+        headless mode calls it after the fix agent succeeds."""
+        if self.state.fix_return == Phase.CHECKPOINT.value:
+            self.state.checkpoint_fixes_used += 1
+        elif self.state.fix_return == Phase.TESTS.value:
+            self.state.test_fixes_used += 1
+        elif self.state.fix_return == Phase.VERIFY.value:
+            self.state.verify_fixes_used += 1
 
     # ----------------------------------------------------------------- tests
     def phase_tests(self) -> None:
@@ -753,12 +1035,13 @@ class Orchestrator:
         self.state.test_round = rnd + 1  # attempt consumed
         self.state.findings_file = str(findings_path)
         self.state.fix_return = Phase.TESTS.value
-        cap = self.cfg.max_test_rounds + self.state.test_cap_extra
-        if self.state.test_round >= cap:
+        budget = self.cfg.max_test_rounds + self.state.test_cap_extra
+        if self.state.test_fixes_used >= budget:
             self.state.gate(
-                f"test command still failing after {self.state.test_round} "
-                f"attempt(s) — see {out_path.name}",
+                f"test command still fails after {self.state.test_fixes_used} "
+                f"fix(es) and a final test attempt — see {out_path.name}",
                 Phase.FIX,
+                kind="budget",
             )
         else:
             self.state.advance(Phase.FIX, "test gate failed")
@@ -796,9 +1079,11 @@ class Orchestrator:
             prompts.verify(
                 self.task_snapshot,
                 None if self.report_mode else self._agreed_plan(),
+                self._implementation_checks_path(),
                 diff_path,
                 self.state.base_commit,
                 test_gate_summary=gate_summary,
+                guidance=self._binding_guidance(),
             ),
             cwd=wt,
             read_only=True,
@@ -808,49 +1093,49 @@ class Orchestrator:
             label=f"verify-{rnd}",
         )
         verdict = res.require_structured()
+        findings_list = verification_findings(verdict)
+        if not verdict.get("criteria"):
+            raise OrchestratorError(
+                "final verification was inconclusive and will not consume a fix "
+                "budget: verifier returned no acceptance-criterion results"
+            )
+        if verdict.get("verdict") != "pass" and not findings_list:
+            raise OrchestratorError(
+                "final verification was inconclusive and will not consume a fix "
+                "budget: FAIL contained no actionable evidence"
+            )
         artifacts.save_json(self._art(f"verification-{rnd}.json"), verdict)
         self._art("verification.md").write_text(
             artifacts.render_verification(self.state.pair, verdict),
             encoding="utf-8",
         )
         failed = [c for c in verdict.get("criteria", []) if not c.get("met")]
+        effective_pass = verdict.get("verdict") == "pass" and not findings_list
         self._post(
             "PAIR",
             "verify",
-            verdict.get("verdict", "?").upper(),
+            "PASS" if effective_pass else "FAIL",
             "all acceptance criteria met"
             if not failed
             else "\n".join(f"unmet: {c.get('criterion', '?')}" for c in failed),
         )
-        if verdict.get("verdict") == "pass":
+        if effective_pass:
             self._finish()
             self._save()
             return verdict
-        findings = {
-            "findings": [
-                {
-                    "severity": "blocking",
-                    "file": None,
-                    "line": None,
-                    "problem": f"acceptance criterion not met: {c.get('criterion', '')}",
-                    "evidence": c.get("evidence", ""),
-                    "suggested_fix": "",
-                }
-                for c in failed
-            ],
-            "verdict": "REVISE",
-        }
+        findings = {"findings": findings_list, "verdict": "REVISE"}
         findings_path = self._art(f"verification-findings-{rnd}.json")
         artifacts.save_json(findings_path, findings)
         self.state.verify_round = rnd + 1  # attempt consumed
         self.state.findings_file = str(findings_path)
         self.state.fix_return = Phase.VERIFY.value
-        cap = self.cfg.max_verify_rounds + self.state.verify_cap_extra
-        if self.state.verify_round >= cap:
+        budget = self.cfg.max_verify_rounds + self.state.verify_cap_extra
+        if self.state.verify_fixes_used >= budget:
             self.state.gate(
-                f"verification still failing after {self.state.verify_round} "
-                "attempt(s) — see verification.md",
+                f"verification still fails after {self.state.verify_fixes_used} "
+                "fix(es) and a final fresh verification — see verification.md",
                 Phase.FIX,
+                kind="budget",
             )
         else:
             self.state.advance(Phase.FIX, "verification failed")
@@ -881,30 +1166,149 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ gates
     def resolve_guidance(self, notes: str) -> None:
-        """AWAIT_GUIDANCE resolution: record the human's decision, re-arm the
-        cap that gated (by raising its ceiling — counters never reset), and
-        return control to the phase the gate interrupted."""
+        """Record a persistent human decision and resume the interrupted
+        phase. A budget is expanded only when budget exhaustion caused the
+        gate; an early decision does not silently buy extra cycles."""
+        self._require_current_plan_protocol()
         if Phase(self.state.phase) is not Phase.AWAIT_GUIDANCE:
             raise OrchestratorError(
                 f"run is in phase {self.state.phase}, not awaiting guidance"
             )
         if not notes.strip():
             raise OrchestratorError("guidance notes must not be empty")
-        self.state.guidance_notes = notes
+        self.state.binding_guidance.append(notes.strip())
+        self.state.guidance_notes = ""
         self._post("HUMAN", "guidance", "GUIDANCE", notes)
         ret = Phase(self.state.return_phase or Phase.PLAN_REVISE.value)
-        if ret is Phase.PLAN_REVISE:
-            self.state.plan_cap_extra += self.cfg.max_plan_rounds
-        elif self.state.fix_return == Phase.CHECKPOINT.value:
-            self.state.checkpoint_cap_extra += self.cfg.max_checkpoint_rounds
-        elif self.state.fix_return == Phase.TESTS.value:
-            self.state.test_cap_extra += self.cfg.max_test_rounds
-        elif self.state.fix_return == Phase.VERIFY.value:
-            self.state.verify_cap_extra += self.cfg.max_verify_rounds
-        self.state.gate_reason = ""
-        self.state.return_phase = ""
+        if self.state.gate_kind == "budget" and self._budget_exhausted(ret):
+            self._extend_active_budget(ret)
+        elif (
+            ret is Phase.PLAN_REVISE
+            and self.state.plan_revisions
+            >= self.cfg.max_plan_rounds + self.state.plan_cap_extra
+        ):
+            # A real choice can surface during the final audit. Its answer
+            # must buy enough room for the corresponding revision and audit.
+            self._extend_active_budget(ret)
+        self._clear_gate()
         self.state.advance(ret, "guidance received")
         self._save()
+
+    def continue_after_budget(self, responses: int = 1) -> bool:
+        """Resume an exhausted quality budget without fabricating a human
+        design decision. Real decision gates still require resolve. Returns
+        whether the ceiling actually needed extension; migrated v0.2 gates
+        may merely need the final lead response they previously denied."""
+        self._require_current_plan_protocol()
+        if Phase(self.state.phase) is not Phase.AWAIT_GUIDANCE:
+            raise OrchestratorError(
+                f"run is in phase {self.state.phase}, not awaiting guidance"
+            )
+        if self.state.gate_kind != "budget":
+            raise OrchestratorError(
+                "this gate requires a decision; use `claudex resolve --notes ...` "
+                "or `claudex resolve --notes-file PATH`"
+            )
+        if responses < 1:
+            raise OrchestratorError("additional response budget must be at least 1")
+        ret = Phase(self.state.return_phase or Phase.PLAN_REVISE.value)
+        extended = self._budget_exhausted(ret)
+        if extended:
+            self._extend_active_budget(ret, responses)
+        action = (
+            f"quality budget extended by {responses} response(s)"
+            if extended
+            else "incomplete cycle resumed"
+        )
+        self._post("HUMAN", "guidance", "CONTINUE", action)
+        self._clear_gate()
+        self.state.advance(ret, action)
+        self._save()
+        return extended
+
+    def resume_interrupted_continue(self) -> bool:
+        """Recognize a continuation whose transition was saved before the
+        headless driver was interrupted. This makes the command idempotent.
+        It also narrows the old v0.3 five-response extension when none of
+        those responses has started yet."""
+        if self.state.driver != "headless" or not self.state.events:
+            return False
+        phase = Phase(self.state.phase)
+        last = self.state.events[-1].get("message", "")
+        prefix = f"await_guidance -> {phase.value} ("
+        normalized_plan = (
+            phase is Phase.PLAN_REVISE
+            and last
+            == f"normalized unused legacy plan budget to {self.state.plan_revisions + 1}"
+        )
+        continued = last.startswith(prefix) and (
+            "quality budget extended" in last or "incomplete cycle resumed" in last
+        )
+        if not (continued or normalized_plan):
+            return False
+        if phase is Phase.PLAN_REVISE:
+            # No response artifact means the extension has not been used.
+            # Legacy `continue` added cfg.max_plan_rounds at once; preserve
+            # only enough ceiling for the pending response + fresh audit.
+            if not self._plan_path(self.state.plan_round).exists():
+                desired_limit = self.state.plan_revisions + 1
+                current_limit = self.cfg.max_plan_rounds + self.state.plan_cap_extra
+                if current_limit > desired_limit and last.endswith(
+                    "(quality budget extended)"
+                ):
+                    self.state.plan_cap_extra = max(
+                        0, desired_limit - self.cfg.max_plan_rounds
+                    )
+                    self.state.log(
+                        f"normalized unused legacy plan budget to {desired_limit}"
+                    )
+                    self._save()
+            return True
+        # Other interrupted return phases are safe to resume, but there is
+        # no artifact-independent way to infer whether a human/live fix was
+        # already made, so their counters are left unchanged.
+        return phase is Phase.FIX
+
+    def _budget_exhausted(self, return_phase: Phase) -> bool:
+        if return_phase is Phase.PLAN_REVISE:
+            return self.state.plan_revisions >= (
+                self.cfg.max_plan_rounds + self.state.plan_cap_extra
+            )
+        if self.state.fix_return == Phase.CHECKPOINT.value:
+            used, limit = (
+                self.state.checkpoint_fixes_used,
+                self.cfg.max_checkpoint_rounds + self.state.checkpoint_cap_extra,
+            )
+        elif self.state.fix_return == Phase.TESTS.value:
+            used, limit = (
+                self.state.test_fixes_used,
+                self.cfg.max_test_rounds + self.state.test_cap_extra,
+            )
+        elif self.state.fix_return == Phase.VERIFY.value:
+            used, limit = (
+                self.state.verify_fixes_used,
+                self.cfg.max_verify_rounds + self.state.verify_cap_extra,
+            )
+        else:
+            # Unknown legacy gate: extending is safer than replaying the
+            # same gate without giving either role another response.
+            return True
+        return used >= limit
+
+    def _extend_active_budget(self, return_phase: Phase, responses: int = 1) -> None:
+        if return_phase is Phase.PLAN_REVISE:
+            self.state.plan_cap_extra += responses
+        elif self.state.fix_return == Phase.CHECKPOINT.value:
+            self.state.checkpoint_cap_extra += responses
+        elif self.state.fix_return == Phase.TESTS.value:
+            self.state.test_cap_extra += responses
+        elif self.state.fix_return == Phase.VERIFY.value:
+            self.state.verify_cap_extra += responses
+
+    def _clear_gate(self) -> None:
+        self.state.gate_reason = ""
+        self.state.gate_kind = ""
+        self.state.return_phase = ""
 
     def abort(self) -> None:
         self.state.advance(Phase.ABORTED)

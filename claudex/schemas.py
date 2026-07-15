@@ -61,6 +61,55 @@ FINDING = _obj(
     }
 )
 
+PLAN_FINDING = _obj(
+    {
+        "key": {
+            "type": "string",
+            "description": "Stable lowercase-hyphen identifier; reuse it when the same issue recurs",
+        },
+        "kind": {
+            "type": "string",
+            "enum": ["new", "repeated", "regression", "decision"],
+        },
+        "category": {
+            "type": "string",
+            "enum": [
+                "architecture",
+                "scope",
+                "sequencing",
+                "safety",
+                "validation",
+                "decision",
+            ],
+            "description": "The plan-level concern; content facts belong in implementation_checks",
+        },
+        **FINDING["properties"],
+    }
+)
+
+IMPLEMENTATION_CHECK = _obj(
+    {
+        "key": {
+            "type": "string",
+            "description": "Stable lowercase-hyphen identifier",
+        },
+        "description": {
+            "type": "string",
+            "description": "Concrete fact, edge case, or content requirement to verify while implementing",
+        },
+        "evidence": _STR,
+        "action": {
+            "type": "string",
+            "enum": ["add", "remove"],
+            "description": "Add/update this obligation, or retract it with evidence",
+        },
+        "target_step": {
+            "type": ["string", "null"],
+            "description": "Exact plan step title, or null when cross-cutting",
+        },
+    }
+)
+
 _PLAN_STEP = _obj(
     {
         "title": _STR,
@@ -78,7 +127,7 @@ PAIR_PLAN_SCHEMA = _obj(
     {
         "plan_markdown": {
             "type": "string",
-            "description": "Complete plan, markdown, self-contained",
+            "description": "Architecture, decisions, delivery contract, and rationale; do not duplicate structured steps, risks, or open questions",
         },
         "steps": {
             "type": "array",
@@ -93,7 +142,20 @@ PAIR_PLAN_SCHEMA = _obj(
 PLAN_CRITIQUE_SCHEMA = _obj(
     {
         "verdict": {"type": "string", "enum": ["AGREE", "REVISE"]},
-        "findings": _arr(FINDING),
+        "findings": _arr(PLAN_FINDING),
+        "implementation_checks": {
+            "type": "array",
+            "items": IMPLEMENTATION_CHECK,
+            "description": "Non-plan-blocking obligations carried into implementation and verification",
+        },
+        "requires_human_decision": {
+            "type": "boolean",
+            "description": "True only for an unresolved value choice or repeated evidence-backed disagreement",
+        },
+        "decision_question": {
+            "type": ["string", "null"],
+            "description": "The concrete question for the human, else null",
+        },
         "missing_evidence": _arr(_STR),
         "simpler_alternative": {
             "type": ["string", "null"],
@@ -109,7 +171,7 @@ PLAN_REVISION_SCHEMA = _obj(
     {
         "plan_markdown": {
             "type": "string",
-            "description": "Complete REVISED plan, markdown, self-contained",
+            "description": "Complete revised architecture and decisions without duplicating the structured steps, risks, or open questions",
         },
         "steps": {
             "type": "array",
@@ -121,6 +183,7 @@ PLAN_REVISION_SCHEMA = _obj(
         "responses": _arr(
             _obj(
                 {
+                    "finding_key": _STR,
                     "finding": _STR,
                     "action": {"type": "string", "enum": ["accepted", "rebutted"]},
                     "rationale": {
@@ -178,10 +241,44 @@ VERIFICATION_SCHEMA = _obj(
 
 
 def is_converged(critique: dict) -> bool:
-    """The stop rule, defined once: AGREE with zero blocking/major findings."""
+    """The stop rule: an internally supported AGREE with no actionable
+    findings. Evidence or test-assessment gaps are not convergence."""
     if critique.get("verdict") != "AGREE":
         return False
-    return not any(
+    if critique.get("missing_evidence"):
+        return False
+    if critique.get("tests_adequate") is False:
+        return False
+    return not has_actionable_findings(critique)
+
+
+def has_actionable_findings(review: dict) -> bool:
+    return any(
         f.get("severity") in ("blocking", "major")
+        for f in review.get("findings", [])
+    )
+
+
+def is_inconclusive_review(review: dict) -> bool:
+    """True when the reviewer refused agreement but supplied no defect the
+    lead can act on, or admitted it lacked the evidence needed to review.
+    Such a turn must retry the reviewer, not rewrite/fix the artifact."""
+    if requires_human_decision(review) or has_actionable_findings(review):
+        return False
+    return bool(
+        review.get("verdict") != "AGREE"
+        or review.get("missing_evidence")
+        or review.get("tests_adequate") is False
+    )
+
+
+def requires_human_decision(critique: dict) -> bool:
+    """A model may request guidance only for an actual choice or durable
+    evidence-backed disagreement, never merely because work remains."""
+    if critique.get("requires_human_decision"):
+        return True
+    return any(
+        f.get("kind") == "decision"
+        and f.get("severity") in ("blocking", "major")
         for f in critique.get("findings", [])
     )

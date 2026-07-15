@@ -69,7 +69,12 @@ def findings_digest(findings: list[dict]) -> str:
         if loc and f.get("line"):
             loc += f":{f['line']}"
         loc = f" `{loc}`" if loc else ""
-        lines.append(f"[{f.get('severity', '?')}]{loc} {f.get('problem', '')}")
+        key = f" {f.get('key')}" if f.get("key") else ""
+        kind = f"/{f.get('kind')}" if f.get("kind") else ""
+        category = f"/{f.get('category')}" if f.get("category") else ""
+        lines.append(
+            f"[{f.get('severity', '?')}{kind}{category}{key}]{loc} {f.get('problem', '')}"
+        )
     return "\n".join(lines)
 
 
@@ -123,10 +128,17 @@ def render_plan(lead: str, round_no: int, p: dict) -> str:
         _section("Risks", p.get("risks", [])),
         _section("Open questions", p.get("open_questions", [])),
     ]
-    responses = [
-        f"**{r.get('action', '?')}**: {r.get('finding', '?')} — {r.get('rationale', '')}"
-        for r in p.get("responses", [])
-    ]
+    responses = []
+    for response in p.get("responses", []):
+        key = (
+            f" `{response.get('finding_key')}`"
+            if response.get("finding_key")
+            else ""
+        )
+        responses.append(
+            f"**{response.get('action', '?')}**{key}: "
+            f"{response.get('finding', '?')} — {response.get('rationale', '')}"
+        )
     if responses:
         parts.append(_section("Responses to pair critique", responses))
     return "\n".join(parts)
@@ -138,8 +150,11 @@ def _findings_rows(findings: list[dict]) -> list[str]:
         loc = f.get("file") or "?"
         if f.get("line"):
             loc += f":{f['line']}"
+        key = f" · `{f.get('key')}`" if f.get("key") else ""
+        kind = f"/{f.get('kind')}" if f.get("kind") else ""
+        category = f"/{f.get('category')}" if f.get("category") else ""
         rows.append(
-            f"- **[{f.get('severity', '?')}]** `{loc}` — {f.get('problem', '')}\n"
+            f"- **[{f.get('severity', '?')}{kind}{category}]**{key} `{loc}` — {f.get('problem', '')}\n"
             f"  - evidence: {f.get('evidence', '')}\n"
             f"  - fix: {f.get('suggested_fix', '')}"
         )
@@ -164,8 +179,25 @@ def render_critique(pair: str, stage: str, round_no: int, c: dict) -> str:
     ]
     if c.get("missing_evidence"):
         parts.append(_section("Missing evidence", c["missing_evidence"]))
+    if c.get("implementation_checks"):
+        checks = [
+            f"**{item.get('action', 'add')}** `{item.get('key', '?')}`"
+            + (
+                f" (step: {item.get('target_step')})"
+                if item.get("target_step")
+                else " (cross-cutting)"
+            )
+            + f": {item.get('description', '')} — {item.get('evidence', '')}"
+            for item in c["implementation_checks"]
+        ]
+        parts.append(_section("Implementation checks captured", checks))
     if c.get("simpler_alternative"):
         parts.append(f"## Simpler alternative\n\n{c['simpler_alternative']}\n")
+    if c.get("requires_human_decision"):
+        parts.append(
+            "## Human decision required\n\n"
+            f"{c.get('decision_question') or 'Unspecified decision.'}\n"
+        )
     if c.get("tests_critique"):
         parts.append(f"## Tests critique\n\n{c['tests_critique']}\n")
     if c.get("notes"):

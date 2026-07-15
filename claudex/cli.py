@@ -8,7 +8,10 @@
     claudex pair plan --file f      submit your plan for pair critique
     claudex pair checkpoint         request pair review of your commits
     claudex pair verify             test gate + fresh-context verification
-    claudex resolve --notes "..."   answer an AWAIT_GUIDANCE gate
+    claudex resolve --notes "..."   answer a concrete decision gate
+    claudex resolve --notes-file p   answer from a file (safe for multiline text)
+    claudex continue                extend an exhausted quality budget
+    claudex restart                 retire a planning run under the current protocol
     claudex status                  show run state and artifacts
     claudex retry                   re-attempt the phase that failed
     claudex abort                   abort the active run
@@ -185,6 +188,19 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
     return state, True
 
 
+def _replacement_state(cfg: Config, old: RunState) -> RunState:
+    state = RunState(
+        run_id=new_run_id(),
+        repo=str(cfg.repo),
+        lead=old.lead,
+        driver="headless",
+        mode=old.mode,
+        binding_guidance=list(old.binding_guidance),
+    )
+    state.log(f"restarted from {old.run_id} under plan protocol v2")
+    return state
+
+
 def cmd_run(args) -> int:
     cfg = _cfg(args)
     state, is_new = _load_or_new_run(cfg, "headless", getattr(args, "lead", None))
@@ -289,7 +305,13 @@ def _next_live_hint(orch: Orchestrator) -> None:
         print("all steps agreed — next: claudex pair verify")
     elif phase is Phase.AWAIT_GUIDANCE:
         print(f"GATE: {s.gate_reason}")
-        print("bring this to the human, then: claudex resolve --notes '...'")
+        if s.gate_kind == "decision":
+            print(
+                "bring this to the human, then: claudex resolve --notes '...' "
+                "(or --notes-file PATH)"
+            )
+        else:
+            print("quality budget exhausted: claudex continue")
     elif phase is Phase.DONE:
         print(f"DONE — merge with: git merge {s.branch}")
 
@@ -314,6 +336,11 @@ def cmd_pair_plan(args) -> int:
         print(f"\npair verdict: {critique.get('verdict', '?')}")
         for f in critique.get("findings", []):
             print(f"  [{f.get('severity', '?')}] {f.get('problem', '')}")
+        for item in critique.get("implementation_checks", []):
+            print(
+                f"  [implementation:{item.get('action', 'add')}] "
+                f"{item.get('key', '?')}: {item.get('description', '')}"
+            )
         _next_live_hint(orch)
         return 0
 
@@ -332,6 +359,8 @@ def cmd_pair_checkpoint(args) -> int:
         )
 
     def go() -> int:
+        if phase is Phase.FIX:
+            orch.record_fix_completed()
         review = orch.pair_checkpoint_turn(lead_notes=args.notes or "")
         print(f"\npair verdict: {review.get('verdict', '?')}")
         for f in review.get("findings", []):
@@ -358,6 +387,7 @@ def cmd_pair_verify(args) -> int:
     def go() -> int:
         if Phase(orch.state.phase) is Phase.FIX:
             # Fixes for test/verify findings re-enter their gate.
+            orch.record_fix_completed()
             orch.state.advance(Phase(orch.state.fix_return))
         if Phase(orch.state.phase) is Phase.TESTS:
             if not orch.run_test_gate():
@@ -377,9 +407,10 @@ def cmd_pair_verify(args) -> int:
 def cmd_resolve(args) -> int:
     cfg = _cfg(args)
     orch = _active_orchestrator(cfg)
+    notes = _read_guidance_notes(args)
 
     def go() -> int:
-        orch.resolve_guidance(args.notes)
+        orch.resolve_guidance(notes)
         print(f"guidance recorded; run returns to {orch.state.phase}")
         if orch.state.driver == "live":
             _next_live_hint(orch)
@@ -388,6 +419,93 @@ def cmd_resolve(args) -> int:
         return 0
 
     return _locked(cfg, orch, go)
+
+
+def _read_guidance_notes(args) -> str:
+    """Read a decision without forcing multiline text through shell quotes.
+
+    ``--notes-file -`` accepts redirected stdin; an interactive terminal is
+    intentionally not prompted because its EOF keystroke is easy to miss on
+    Windows and recreates the apparent "command will not close" failure.
+    """
+    if args.notes is not None:
+        return args.notes
+    source = args.notes_file
+    if source == "-":
+        if sys.stdin.isatty():
+            raise OrchestratorError(
+                "--notes-file - requires redirected stdin; use --notes-file PATH "
+                "for multiline guidance"
+            )
+        return sys.stdin.read()
+    try:
+        return Path(source).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OrchestratorError(f"could not read guidance file {source}: {exc}") from exc
+
+
+def cmd_continue(args) -> int:
+    cfg = _cfg(args)
+    orch = _active_orchestrator(cfg)
+
+    def go() -> int:
+        if Phase(orch.state.phase) is not Phase.AWAIT_GUIDANCE:
+            if not orch.resume_interrupted_continue():
+                raise OrchestratorError(
+                    f"run is in phase {orch.state.phase}, not awaiting guidance; "
+                    "use `claudex run` to resume it"
+                )
+            print(f"interrupted continuation resumed at {orch.state.phase}")
+            orch.run_until_gate()
+            return 0 if orch.state.phase != Phase.FAILED.value else 1
+        extended = orch.continue_after_budget(args.responses)
+        action = (
+            f"quality budget extended by {args.responses} response(s)"
+            if extended
+            else "incomplete cycle resumed"
+        )
+        print(f"{action}; run returns to {orch.state.phase}")
+        if orch.state.driver == "live":
+            _next_live_hint(orch)
+        else:
+            orch.run_until_gate()
+        return 0
+
+    return _locked(cfg, orch, go)
+
+
+def cmd_restart(args) -> int:
+    """Retire a planning-stage headless run and immediately start a clean
+    run under the current protocol while preserving binding guidance."""
+    cfg = _cfg(args)
+    old = _active_orchestrator(cfg)
+    phase = Phase(old.state.phase)
+    planning = phase in {
+        Phase.PLAN_DRAFT,
+        Phase.PLAN_CRITIQUE,
+        Phase.PLAN_REVISE,
+        Phase.AWAIT_GUIDANCE,
+        Phase.FAILED,
+    }
+    if old.state.driver != "headless" or not planning or old.state.worktree:
+        raise OrchestratorError(
+            "restart is only safe for a headless planning run with no worktree; "
+            "use abort/clean explicitly for implementation-stage runs"
+        )
+    acquire_run_lock(old.run_dir)
+    try:
+        old.abort()
+        state = _replacement_state(cfg, old.state)
+        set_current_run(cfg.repo, state.run_id)
+        state.save(run_dir_for(cfg.repo, state.run_id))
+    finally:
+        release_run_lock(old.run_dir)
+    print(
+        f"retired {old.state.run_id}; restarting as {state.run_id} with "
+        f"{len(state.binding_guidance)} preserved decision(s)"
+    )
+    orch = Orchestrator(cfg, state)
+    return _locked(cfg, orch, lambda: _run_headless(orch))
 
 
 # ---------------------------------------------------------------- inspection
@@ -402,20 +520,51 @@ def cmd_status(args) -> int:
     print(f"run:      {rid}   ({state.driver})")
     print(f"phase:    {state.phase}   mode: {state.mode}")
     print(f"lead:     {state.lead}   pair: {state.pair}")
+    protocol = (
+        "compact-plan v2+"
+        if state.plan_protocol_version >= 2
+        else "legacy exhaustive-plan v1 (restart required while planning)"
+    )
+    print(f"protocol: {protocol}")
     if state.steps:
         print(f"step:     {min(state.step_index + 1, len(state.steps))}/{len(state.steps)}")
+    if state.implementation_checks:
+        print(f"checks:   {len(state.implementation_checks)} implementation obligation(s)")
+    plan_files = []
+    for path in rd.glob("plan-round-*.json"):
+        try:
+            plan_files.append((int(path.stem.rsplit("-", 1)[1]), path))
+        except (IndexError, ValueError):
+            continue
+    if plan_files:
+        plan_no, plan_path = max(plan_files, key=lambda item: item[0])
+        print(
+            f"plan size: {plan_path.stat().st_size / 1024:.1f} KiB "
+            f"(round {plan_no}, diagnostic only)"
+        )
     print(
-        f"rounds:   plan {state.plan_round}/{cfg.max_plan_rounds + state.plan_cap_extra}"
-        f" · checkpoint {state.checkpoint_round}/{cfg.max_checkpoint_rounds + state.checkpoint_cap_extra}"
-        f" · tests {state.test_round}/{cfg.max_test_rounds + state.test_cap_extra}"
-        f" · verify {state.verify_round}/{cfg.max_verify_rounds + state.verify_cap_extra}"
+        f"attempts: plan critiques {state.plan_round}"
+        f" · checkpoint reviews {state.checkpoint_round}"
+        f" · tests {state.test_round}"
+        f" · verify {state.verify_round}"
+    )
+    print(
+        f"responses: plan revisions {state.plan_revisions}/"
+        f"{cfg.max_plan_rounds + state.plan_cap_extra}"
+        f" · checkpoint fixes {state.checkpoint_fixes_used}/"
+        f"{cfg.max_checkpoint_rounds + state.checkpoint_cap_extra}"
+        f" · test fixes {state.test_fixes_used}/"
+        f"{cfg.max_test_rounds + state.test_cap_extra}"
+        f" · verify fixes {state.verify_fixes_used}/"
+        f"{cfg.max_verify_rounds + state.verify_cap_extra}"
     )
     if state.branch:
         print(f"branch:   {state.branch}")
     if state.worktree:
         print(f"worktree: {state.worktree}")
     if state.gate_reason:
-        print(f"gate:     {state.gate_reason}")
+        kind = state.gate_kind or "unknown"
+        print(f"gate:     [{kind}] {state.gate_reason}")
     if state.error:
         print(f"error:    {state.error}")
     print(f"run dir:  {rd}")
@@ -597,10 +746,37 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.set_defaults(func=cmd_pair_verify)
 
-    sp = sub.add_parser("resolve", help="answer an AWAIT_GUIDANCE gate")
+    sp = sub.add_parser("resolve", help="answer a concrete human-decision gate")
     common(sp)
-    sp.add_argument("--notes", required=True, help="your decision — becomes binding guidance")
+    guidance = sp.add_mutually_exclusive_group(required=True)
+    guidance.add_argument(
+        "--notes", help="your decision — becomes persistent binding guidance"
+    )
+    guidance.add_argument(
+        "--notes-file",
+        metavar="PATH",
+        help="read the decision from a UTF-8 file; use - for redirected stdin",
+    )
     sp.set_defaults(func=cmd_resolve)
+
+    sp = sub.add_parser(
+        "continue", help="allow another response and fresh audit without adding guidance"
+    )
+    common(sp)
+    sp.add_argument(
+        "--responses",
+        type=int,
+        default=1,
+        help="additional responses before the next fresh audit (default: 1)",
+    )
+    sp.set_defaults(func=cmd_continue)
+
+    sp = sub.add_parser(
+        "restart",
+        help="retire a planning run and restart compactly, preserving guidance",
+    )
+    common(sp)
+    sp.set_defaults(func=cmd_restart)
 
     sp = sub.add_parser("status", help="show run state and artifacts")
     common(sp)
