@@ -51,6 +51,7 @@ from .agents import (
     resolve_codex_bin,
 )
 from .config import Config
+from .events import AgentEvent
 from .state import (
     Phase,
     RunState,
@@ -243,6 +244,7 @@ class Orchestrator:
         self.run_dir = run_dir_for(cfg.repo, state.run_id)
         self.agents = build_agents(cfg)
         self._save_lock = threading.Lock()
+        self._live_text_attempts: set[str] = set()
 
     # ------------------------------------------------------------- utilities
     def _save(self) -> None:
@@ -336,6 +338,7 @@ class Orchestrator:
                 run_dir=self.run_dir,
                 label=label,
                 timeout=self.cfg.agent_timeout,
+                event_handler=self._on_agent_event,
                 **kw,
             )
             self.say(
@@ -360,6 +363,28 @@ class Orchestrator:
             self._save()  # durable: Ctrl+C here loses nothing, resume continues
             time.sleep(delay)
             waits += 1
+
+    def _on_agent_event(self, event: AgentEvent) -> None:
+        """High-signal live console view; the JSONL journal remains canonical."""
+        if event.kind == "text_delta":
+            self._live_text_attempts.add(event.attempt_id)
+            print(event.summary, end="", flush=True)
+            return
+        if event.kind == "message":
+            if event.attempt_id not in self._live_text_attempts and event.summary:
+                self.say(f"{event.agent}: {event.summary}")
+            return
+        if event.kind in ("tool_started", "tool_finished", "tool_progress"):
+            status = event.tool_status or event.kind.removeprefix("tool_")
+            self.say(f"{event.agent}: tool {event.tool_name or '?'} [{status}]")
+            return
+        if event.kind in ("warning", "stderr", "rate_limited"):
+            self.say(f"{event.agent}: {event.kind}: {event.summary}")
+            return
+        if event.kind in ("provider_completed", "failed", "completed"):
+            if event.attempt_id in self._live_text_attempts:
+                print(flush=True)
+                self._live_text_attempts.discard(event.attempt_id)
 
     def _remember_session(self, lineage: str, session_id: str) -> None:
         """Resumed Claude runs return a NEW session id every time; a missed

@@ -58,7 +58,9 @@ forever):
 ### Headless — `claudex run`
 
 The coordinator drives **both** agents as subprocesses through the whole
-loop. You come back for gates (if any) and the merge.
+loop. Provider text, tool activity, warnings, and lifecycle events are printed
+while each turn is running; you no longer wait for a buffered turn to discover
+whether the provider is active. You come back for gates (if any) and the merge.
 
 ```bash
 claudex init                       # scaffold .claudex/task.md + config
@@ -99,11 +101,30 @@ minutes plus usage-limit waits), and remember the worktree is a **sibling
 directory** of your repo (grant access with `--add-dir` or work from a
 shell).
 
-## The mailbox
+## Live events, attempt logs, and the mailbox
 
-Every turn — plans, critiques, commits, test results, guidance, DONE — is
-appended by the coordinator to `.claudex/runs/<run_id>/mailbox.md` in an
-append-only block format:
+Every provider invocation gets an immutable attempt directory:
+
+```
+.claudex/runs/<run_id>/attempts/<attempt_id>/
+  command.json
+  stdout.jsonl
+  stderr.log
+  events.jsonl
+  result.json
+  summary.json
+```
+
+`stdout.jsonl` and `stderr.log` retain the provider streams. `events.jsonl` is
+the provider-neutral, append-only live journal used by the coordinator's console
+view and status projection. It contains phase/attempt identity, ordered event
+kinds, elapsed time, tool lifecycle, and provider-reported usage/cost when
+available. Unknown provider events remain in the raw stream and are surfaced
+without breaking final result parsing.
+
+Every completed coordinator turn—plans, critiques, commits, test results,
+guidance, DONE—is also summarized by the coordinator in
+`.claudex/runs/<run_id>/mailbox.md` using an append-only block format:
 
 ```
 ===== [LEAD] turn 3 | plan | STATUS: REVISE =====
@@ -117,8 +138,9 @@ no findings
 ----- end [PAIR] turn 4 -----
 ```
 
-`tail -f` it to watch the pairing live. It is the run's full transcript;
-every claim in it is backed by a JSON artifact in the same directory.
+The mailbox is a concise turn ledger, not the live provider transcript. The
+initiating terminal and attempt event journal show in-flight work; every mailbox
+claim is backed by a typed JSON artifact in the run directory.
 
 ## Roles
 
@@ -141,6 +163,8 @@ winner-picking: ownership is resolved by initiation.
 | implementation isolated | dedicated git worktree (sibling dir) on a run branch |
 | reviews see exact code | coordinator extracts `git diff` itself; dirty worktrees refused |
 | structured findings | Claude `--json-schema`, Codex `--output-schema` (strict mode) |
+| provider work is visible | streamed Claude/Codex JSONL normalized into an append-only per-attempt event journal |
+| retries preserve evidence | every invocation has a unique immutable attempt directory |
 | convergence is checkable | `AGREE` + zero blocking/major, evaluated by the coordinator |
 | planning stays planning | plan-level finding categories are schema-constrained; content obligations persist separately as implementation checks |
 | inconclusive reviews don't cause churn | tool/evidence failures retry the reviewer fresh without charging a lead response |

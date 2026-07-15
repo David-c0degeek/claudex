@@ -156,7 +156,7 @@ checkpoint. Owners are `agent`, `release-engineer`, `product-owner`,
 | Done | # | File | Status | Owner summary | Human actions mirrored? |
 |---|---|---|---|---|---|
 | [x] | 00 | `tasks/claudex-refactor/00-tooling-research-and-readiness.md` | DONE | agent: 8 | n/a |
-| [ ] | 01 | `tasks/claudex-refactor/01-streaming-and-observability.md` | TODO | agent: 6 | n/a |
+| [x] | 01 | `tasks/claudex-refactor/01-streaming-and-observability.md` | DONE | agent: 6 | n/a |
 | [ ] | 02 | `tasks/claudex-refactor/02-usage-and-budget-controls.md` | TODO | agent: 6 | n/a |
 | [ ] | 03 | `tasks/claudex-refactor/03-orchestration-and-recovery.md` | TODO | agent: 6 | n/a |
 | [ ] | 04 | `tasks/claudex-refactor/04-process-git-and-provider-safety.md` | TODO | agent: 7 | n/a |

@@ -34,27 +34,27 @@ preserving typed final results and existing coordinator ownership.
 
 ## Boxes
 
-- [ ] **01.1** (agent) Define a versioned `AgentEvent`/attempt contract with
+- [x] **01.1** (agent) Define a versioned `AgentEvent`/attempt contract with
       run/attempt/agent/phase identity, monotonic ordering, timing, event kind,
       safe display summary, raw-event reference, tool fields, usage fields, and
       explicit unknowns; add serialization/forward-compatibility tests.
-- [ ] **01.2** (agent) Refactor the current `communicate()` execution path into
+- [x] **01.2** (agent) Refactor the current `communicate()` execution path into
       concurrent incremental stdout/stderr readers that cannot deadlock, emit
       promptly, preserve partial data on every exit path, and write unique
       immutable raw attempt artifacts; prove it with a timed fake subprocess.
-- [ ] **01.3** (agent) Implement and fixture-test the Codex JSONL adapter for
+- [x] **01.3** (agent) Implement and fixture-test the Codex JSONL adapter for
       text/reasoning, tool lifecycle, usage, completion, error, unknown, and
       malformed events while preserving the current final result/schema
       contract.
-- [ ] **01.4** (agent) Implement and fixture-test the Claude streamed-JSON
+- [x] **01.4** (agent) Implement and fixture-test the Claude streamed-JSON
       adapter for partial messages, tool lifecycle, usage/cost, completion,
       rate-limit/error, unknown, and malformed events while preserving the
       current final result/schema contract.
-- [ ] **01.5** (agent) Add an append-only normalized event journal plus a bounded
+- [x] **01.5** (agent) Add an append-only normalized event journal plus a bounded
       live reader/subscription and status projection; integrate phase summaries
       and mailbox output as consumers, with redaction hooks and deterministic
       replay tests rather than a second source of truth.
-- [ ] **01.6** (agent) Exercise a slow fake Claude and Codex run end to end:
+- [x] **01.6** (agent) Exercise a slow fake Claude and Codex run end to end:
       demonstrate that text/tool events are readable before completion, both
       pipes drain under load, sequence/replay is stable, partial artifacts
       survive failure, and final typed results match the old public contract;
@@ -66,10 +66,45 @@ preserving typed final results and existing coordinator ownership.
 > Use the plan's embedded Captain Hindsight prompt. Record Keep, Fix before
 > closing, Record, Risk, and Verdict. `DO NOT CLOSE` leaves this subject open.
 
-- [ ] Captain Hindsight review recorded
-- [ ] Verdict is `CLOSE`
+- [x] Captain Hindsight review recorded
+- [x] Verdict is `CLOSE`
 
 ## Progress log
 
 > One line per slice: date · slice number · boxes touched · outcome · verification
 > · checkpoint commit/push. Record documentation impact and learned lessons.
+
+- 2026-07-15 · slice 1 · 01.1–01.4 · added versioned `AgentEvent`, ordered JSONL
+  journal/replay, immutable unique attempt paths, concurrent stdin/stdout/stderr
+  process handling, streamed Claude/Codex decoders, and typed terminal-result
+  parsing; split process, limit, event, and provider-adapter responsibilities
+  into focused modules after diff review exposed `agents.py` growth · verified
+  adapter/parser/command tests and complete legacy suite · checkpoint is the
+  subject-close commit containing this log; push required before 02.
+- 2026-07-15 · slice 2 · 01.5–01.6 · wired a high-signal live coordinator
+  consumer, derived attempt status projection, raw/normalized/final attempt
+  artifacts, README event/mailbox corrections, and deterministic slow/noisy
+  subprocess behavior tests · observed provider event callback before the fake
+  process was released, drained >1 MB on each pipe without deadlock, retained
+  partial/unique evidence, and passed 36 tests plus compileall/diff-check · docs:
+  `README.md` updated in the same checkpoint.
+
+### Captain Hindsight — closing review
+
+1. **Keep:** Provider-specific JSON stays at the adapter edge, the coordinator
+   consumes one versioned event/result contract, raw lines are written before
+   decoding, and console/status are consumers of the append-only journal. The
+   slow-process synchronization proves visibility before exit rather than merely
+   asserting a final log file.
+2. **Fix before closing:** The first implementation made `agents.py` a large
+   mixed-responsibility file. Before closure, limit parsing, process lifecycle,
+   provider-event decoding, and journal contracts were extracted into
+   `limits.py`, `processes.py`, `provider_events.py`, and `events.py`. No open
+   subject-01 fix remains.
+3. **Record:** Added the concurrent-stdin lesson to `lessons.md`. D002 remains
+   the durable provider-boundary decision for promotion in 06.4.
+4. **Risk:** Real provider schemas can add or reorder events. Unknown/malformed
+   lines are retained and non-fatal, final typed parsing is independent, and
+   subject 05 adds broader versioned fixtures. Job-object-grade cancellation,
+   redaction, and retention intentionally remain tracked by subject 04.
+5. **Verdict:** CLOSE.
