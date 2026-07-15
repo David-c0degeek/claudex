@@ -26,6 +26,7 @@ class InvocationPolicy:
     max_turns: int
     timeout_seconds: int
     disable_nested_agents: bool
+    capability: str = "repo_read"
 
 
 def normalize_usage(raw: dict | None) -> dict[str, int]:
@@ -240,6 +241,15 @@ def profile_for_phase(phase_label: str) -> str:
     return "planning"
 
 
+def capability_for_phase(phase_label: str) -> str:
+    lowered = phase_label.lower()
+    if any(token in lowered for token in ("implement", "fix", "report-draft")):
+        return "workspace_write"
+    if any(token in lowered for token in ("critique", "review", "checkpoint", "verify", "revise")):
+        return "evidence_read"
+    return "repo_read"
+
+
 def invocation_policy(cfg, state, phase_label: str, agent_name: str = "") -> InvocationPolicy:
     profile = profile_for_phase(phase_label)
     requested_effort = str(_policy_value(cfg, state, f"{profile}_effort"))
@@ -279,6 +289,7 @@ def invocation_policy(cfg, state, phase_label: str, agent_name: str = "") -> Inv
         disable_nested_agents=bool(
             _policy_value(cfg, state, "disable_nested_agents")
         ),
+        capability=capability_for_phase(phase_label),
     )
 
 
@@ -302,6 +313,7 @@ def standalone_policy(cfg, profile: str, agent_name: str) -> InvocationPolicy:
         max_turns=cfg.max_invocation_turns,
         timeout_seconds=cfg.agent_timeout,
         disable_nested_agents=cfg.disable_nested_agents,
+        capability="repo_read",
     )
 
 

@@ -22,3 +22,17 @@
   paths while covering every canonical counter, ledger, budget, worktree/base
   field, and safe session. Verify the copy before retiring the predecessor;
   make destructive planning reset a separate explicit option.
+- 2026-07-15 — Cancellation is reliable only when the process owner creates a
+  group/job before work begins and the operator writes a durable request without
+  waiting on the coordinator lock. The same streamed primitive must own provider
+  and mechanical-test descendants, partial logs, timeout, and terminal reason.
+- 2026-07-15 — Git cleanliness and tested-content identity are different facts.
+  Include untracked files in cleanliness and hash HEAD/tree/status/patch plus
+  untracked bytes so a passing test cannot silently validate content that will
+  not be integrated.
+- 2026-07-15 — Executable discovery is a protocol negotiation, not a path
+  lookup. Explicit binaries fail closed; automatic candidates are capability
+  probed and ranked by semantic version, never by installation timestamp.
+- 2026-07-15 — Redact at every persistence boundary, then prune only raw
+  streams. Compact events/results/summaries, lifecycle state, decisions, and
+  exact content identities must survive retention and pruning faults.

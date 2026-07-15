@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import os
 import sys
 import time
 from importlib import resources
@@ -32,9 +32,11 @@ from pathlib import Path
 
 from . import __version__, gitops
 from . import budgets, recovery
-from .agents import AgentError, resolve_claude_bin, resolve_codex_bin
+from .agents import AgentError
 from .config import Config
 from .lifecycle import Lifecycle
+from .processes import terminate_process_tree
+from .providers import ProviderError, resolve_provider
 from .phases import (
     Orchestrator,
     OrchestratorError,
@@ -278,12 +280,63 @@ def cmd_run(args) -> int:
     else:
         print(f"resuming run {state.run_id} (phase: {state.phase})")
     orch = Orchestrator(cfg, state)
-    return _locked(cfg, orch, lambda: _run_headless(orch))
+    return _drive_headless(cfg, orch)
 
 
 def _run_headless(orch: Orchestrator) -> int:
     orch.run_until_gate()
+    lifecycle = Lifecycle(orch.state.lifecycle)
+    if lifecycle is Lifecycle.CANCELLED:
+        return 130
+    if lifecycle is Lifecycle.RATE_LIMITED:
+        return 75
     return 0 if orch.state.phase != "failed" else 1
+
+
+def _wait_until_rate_reset(
+    run_dir: Path,
+    reset_at: float,
+    *,
+    clock=time.time,
+    sleeper=time.sleep,
+) -> bool:
+    """Wait without holding run.lock. False means cancellation was requested."""
+    while clock() < reset_at:
+        if (run_dir / "cancel.requested").exists():
+            return False
+        sleeper(min(0.25, max(0.0, reset_at - clock())))
+    return not (run_dir / "cancel.requested").exists()
+
+
+def _drive_headless(cfg: Config, orch: Orchestrator) -> int:
+    """Run one durable slice; optional rate waiting occurs outside run.lock."""
+    while True:
+        result = _locked(cfg, orch, lambda: _run_headless(orch))
+        if (
+            Lifecycle(orch.state.lifecycle) is not Lifecycle.RATE_LIMITED
+            or not cfg.wait_on_limits
+        ):
+            return result
+        reset_at = orch.state.rate_limit_reset_at
+        print(
+            "[claudex] autonomous rate-limit wait enabled; run lock released "
+            f"until approximately {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_at))}"
+        )
+        completed_wait = _wait_until_rate_reset(orch.run_dir, reset_at)
+
+        def resume_after_wait() -> int:
+            orch.state = RunState.load(orch.run_dir)
+            if not completed_wait or (orch.run_dir / "cancel.requested").exists():
+                orch.run_until_gate()
+                return _run_headless(orch)
+            if Lifecycle(orch.state.lifecycle) is Lifecycle.RATE_LIMITED:
+                orch.state.resume_rate_limit("configured autonomous wait completed")
+                orch.state.save(orch.run_dir)
+            return _run_headless(orch)
+
+        result = _locked(cfg, orch, resume_after_wait)
+        if Lifecycle(orch.state.lifecycle) is not Lifecycle.RATE_LIMITED:
+            return result
 
 
 # ------------------------------------------------------------------ live mode
@@ -579,11 +632,7 @@ def cmd_resume(args) -> int:
             orch.state.save(orch.run_dir)
             print(f"retryable failure resumed at {orch.state.phase}")
         elif lifecycle is Lifecycle.RATE_LIMITED:
-            orch.state.transition_lifecycle(
-                Lifecycle.RUNNING,
-                "operator resumed rate-limited run",
-                "claudex resume",
-            )
+            orch.state.resume_rate_limit("operator resumed rate-limited run")
             orch.state.save(orch.run_dir)
             print(f"rate-limited run resumed at {orch.state.phase}")
         elif lifecycle is Lifecycle.RUNNING:
@@ -664,7 +713,7 @@ def cmd_restart(args) -> int:
         + f" with {len(state.binding_guidance)} preserved decision(s)"
     )
     orch = Orchestrator(cfg, state)
-    return _locked(cfg, orch, lambda: _run_headless(orch))
+    return _drive_headless(cfg, orch)
 
 
 # ---------------------------------------------------------------- inspection
@@ -800,6 +849,14 @@ def cmd_status(args) -> int:
     if state.gate_reason:
         kind = state.gate_kind or "unknown"
         print(f"gate:     [{kind}] {state.gate_reason}")
+    if Lifecycle(state.lifecycle) is Lifecycle.RATE_LIMITED:
+        reset = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(state.rate_limit_reset_at)
+        )
+        print(
+            f"limit:    {state.rate_limit_agent}/{state.rate_limit_label} · "
+            f"reset approximately {reset} · next: claudex resume"
+        )
     if state.lifecycle_history:
         transition = state.lifecycle_history[-1]
         print(
@@ -862,6 +919,64 @@ def cmd_abort(args) -> int:
     return _locked(cfg, orch, go)
 
 
+def cmd_cancel(args) -> int:
+    """Request cancellation without waiting for the active run lock."""
+    cfg = _cfg(args)
+    rid = get_current_run(cfg.repo)
+    if not rid:
+        print("no active run")
+        return 0
+    run_dir = run_dir_for(cfg.repo, rid)
+    state = RunState.load(run_dir)
+    if state.is_terminal() or Lifecycle(state.lifecycle) is Lifecycle.CANCELLED:
+        print(f"run {rid} is already terminal ({state.lifecycle})")
+        return 0
+    request = run_dir / "cancel.requested"
+    if not request.exists():
+        tmp = request.with_suffix(".requested.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "requested_at": time.time(),
+                    "pid": os.getpid(),
+                    "reason": args.reason,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(request)
+    if state.active_attempt_id:
+        attempt = run_dir / "attempts" / state.active_attempt_id
+        (attempt / "cancel.requested").touch(exist_ok=True)
+        control = attempt / "control.json"
+        if control.exists():
+            try:
+                value = json.loads(control.read_text(encoding="utf-8"))
+                pid = int(value.get("pid", 0) or 0)
+                if pid > 0:
+                    terminate_process_tree(pid, str(value.get("job_name", "")))
+            except (OSError, ValueError, json.JSONDecodeError):
+                # The running coordinator also polls the durable request.
+                pass
+        print(
+            f"cancellation requested for run {rid}, attempt {state.active_attempt_id}; "
+            "partial artifacts are retained"
+        )
+        return 0
+
+    acquire_run_lock(run_dir)
+    try:
+        state = RunState.load(run_dir)
+        if Lifecycle(state.lifecycle) is not Lifecycle.CANCELLED:
+            state.cancel(args.reason)
+            state.save(run_dir)
+    finally:
+        release_run_lock(run_dir)
+    print(f"cancelled idle run {rid}; partial artifacts are retained")
+    return 0
+
+
 def cmd_clean(args) -> int:
     cfg = _cfg(args)
     orch = _active_orchestrator(cfg)
@@ -889,16 +1004,13 @@ def cmd_doctor(args) -> int:
             print(f"  {name}: FAIL — {exc}")
             ok = False
 
-    def version_of(binary: str) -> str:
-        from .agents import _wrap_script  # noqa: PLC0415
-
-        out = subprocess.run(
-            [*_wrap_script(binary), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=60,
+    def provider_report(name: str, configured: str) -> str:
+        info = resolve_provider(name, configured or None)
+        caps = ", ".join(
+            f"{key}={'yes' if value else ('coordinator-only' if key == 'budget' else 'no')}"
+            for key, value in info.capabilities.items()
         )
-        return f"{out.stdout.strip() or out.stderr.strip()}  [{binary}]"
+        return f"{info.version} [{info.path}; {info.source}] · {caps}"
 
     print("claudex doctor:")
     check("git", lambda: gitops.git(cfg.repo, "--version", check=True) or "ok")
@@ -908,8 +1020,8 @@ def cmd_doctor(args) -> int:
             RuntimeError(f"{cfg.repo} is not a git repository")
         ),
     )
-    check("claude", lambda: version_of(resolve_claude_bin(cfg.claude_bin or None)))
-    check("codex", lambda: version_of(resolve_codex_bin(cfg.codex_bin or None)))
+    check("claude", lambda: provider_report("claude", cfg.claude_bin))
+    check("codex", lambda: provider_report("codex", cfg.codex_bin))
     check("task.md", lambda: str(task_file(cfg.repo)) if task_file(cfg.repo).exists() else "missing (run `claudex init`)")
     print("note: doctor checks wiring only; model/account issues surface on first run")
     return 0 if ok else 1
@@ -1101,6 +1213,13 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.set_defaults(func=cmd_abort)
 
+    sp = sub.add_parser(
+        "cancel", help="idempotently cancel an active provider/test process tree"
+    )
+    common(sp)
+    sp.add_argument("--reason", default="operator cancelled run")
+    sp.set_defaults(func=cmd_cancel)
+
     sp = sub.add_parser("clean", help="remove the finished run's worktree")
     common(sp)
     sp.set_defaults(func=cmd_clean)
@@ -1120,6 +1239,7 @@ def main(argv: list[str] | None = None) -> int:
         OrchestratorError,
         AgentError,
         gitops.GitError,
+        ProviderError,
         RunLockError,
         ValueError,
         json.JSONDecodeError,

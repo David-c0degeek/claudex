@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .security import redact_text, redact_value
+
 
 EVENT_SCHEMA_VERSION = 1
 TERMINAL_EVENT_KINDS = {"completed", "failed", "cancelled", "rate_limited"}
@@ -129,6 +131,7 @@ class EventEmitter:
         self.handler = handler
         self._sequence = 0
         self._lock = threading.Lock()
+        self.write_errors: list[str] = []
 
     def emit(
         self,
@@ -156,19 +159,25 @@ class EventEmitter:
                 timestamp=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 elapsed_s=round(time.monotonic() - self.started_monotonic, 6),
                 kind=kind,
-                summary=summary,
+                summary=redact_text(summary),
                 provider_type=provider_type,
                 raw_ref=raw_ref,
-                usage=dict(usage or {}),
+                usage=redact_value(dict(usage or {})),
                 cost=cost,
                 currency=currency,
                 tool_name=tool_name,
                 tool_status=tool_status,
-                metadata=dict(metadata or {}),
+                metadata=redact_value(dict(metadata or {})),
             )
             # Keep file order equal to sequence order even when stdout and
             # stderr reader threads emit concurrently.
-            self.journal.append(event)
+            try:
+                self.journal.append(event)
+            except OSError as exc:
+                # A broken raw event sink must not strand a provider process
+                # with unread pipes. Compact result/summary persistence still
+                # determines whether the attempt can be recovered.
+                self.write_errors.append(str(exc))
         if self.handler:
             try:
                 self.handler(event)

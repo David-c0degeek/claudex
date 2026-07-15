@@ -146,6 +146,7 @@ Retired boxes remain visible as checked, struck-through `ABANDONED` entries.
 | D004 | 2026-07-15 | Terminal-only authoritative accounting | Charge each attempt idempotently from its provider terminal result; streamed cumulative usage is display-only. Preserve non-USD amounts separately, never convert or estimate missing cost, and require explicit acknowledgement/override before continuing when a reported currency cannot be reconciled with the USD run cap. | Intermediate usage semantics differ by provider and may be cumulative; local price inference would create false precision and double counting. Promote to the budgeting ADR in 06.4. | 02.1–02.6; `claudex/budgets.py` |
 | D005 | 2026-07-15 | Explicit gates and bounded fresh planning | A human gate requires explicit true plus a non-empty question; finding labels never infer intent. Planning reviewers/revisions are fresh and consume immutable size-capped manifests; revisions are hash-guarded canonical section replacements. | This removes the exact incident false gate and prevents resumed conversation/history growth from multiplying context or corrupting an accepted baseline. Promote to orchestration/evidence ADRs in 06.4. | 03.1–03.3; `schemas.py`, `evidence.py`, `planops.py` |
 | D006 | 2026-07-15 | Resume identity; restart checkpoint | `resume` continues the same durable run. `restart` changes execution identity only after copying and hash-verifying the latest canonical checkpoint; discarding planning state requires `--fresh-plan`. | Identity replacement is not permission to discard accepted work, decisions, budgets, worktree identity, or safe sessions. Promote to recovery ADR in 06.4. | 03.4–03.6; `lifecycle.py`, `recovery.py` |
+| D007 | 2026-07-15 | Coordinator-owned safety boundary | Providers and mechanical tests use one streamed process-group/job lifecycle; rate limits return durable control by default; cancellation is lock-independent; tested/reviewed content includes untracked bytes; explicit provider binaries fail capability checks and automatic candidates are ranked semantically; redaction precedes persistence and retention removes raw streams only. | These boundaries prevent invisible waits, surviving descendants, reviewed/tested-tree skew, incompatible provider drift, and secret recovery artifacts without treating a Git worktree as an OS sandbox. Promote to process, provider, and security ADRs in 06.4. | 04.1–04.7; `processes.py`, `gitops.py`, `providers.py`, `security.py` |
 
 ---
 
@@ -162,7 +163,7 @@ checkpoint. Owners are `agent`, `release-engineer`, `product-owner`,
 | [x] | 01 | `tasks/claudex-refactor/01-streaming-and-observability.md` | DONE | agent: 6 | n/a |
 | [x] | 02 | `tasks/claudex-refactor/02-usage-and-budget-controls.md` | DONE | agent: 6 | n/a |
 | [x] | 03 | `tasks/claudex-refactor/03-orchestration-and-recovery.md` | DONE | agent: 6 | n/a |
-| [ ] | 04 | `tasks/claudex-refactor/04-process-git-and-provider-safety.md` | TODO | agent: 7 | n/a |
+| [x] | 04 | `tasks/claudex-refactor/04-process-git-and-provider-safety.md` | DONE | agent: 7 | n/a |
 | [ ] | 05 | `tasks/claudex-refactor/05-integration-and-fault-testing.md` | TODO | agent: 6 | n/a |
 | [ ] | 06 | `tasks/claudex-refactor/06-terminal-ux-docs-and-release.md` | TODO | agent: 7 | n/a |
 

@@ -61,14 +61,20 @@ class Config:
     max_evidence_bytes: int = 256 * 1024
     max_evidence_file_bytes: int = 96 * 1024
     max_evidence_requests: int = 8
+    raw_retention_days: int = 14
+    raw_retention_bytes: int = 100 * 1024 * 1024
     # Usage-limit handling: when a provider reports a usage/rate limit, wait
     # until the reset time it names (or default_limit_wait when it names
     # none) and retry, instead of failing the run.
-    wait_on_limits: bool = True
+    wait_on_limits: bool = False  # opt-in autonomous wait outside the run lock
     default_limit_wait: int = 1800  # seconds, when the message names no time
     max_limit_wait: int = 6 * 3600  # cap a single wait
     max_limit_waits: int = 12  # per agent invocation
-    claude_write_allowed_tools: str = "Edit,Write,NotebookEdit,TodoWrite,Bash"
+    claude_write_allowed_tools: str = (
+        "Read,Glob,Grep,Edit,Write,NotebookEdit,TodoWrite,"
+        "Bash(git status:*),Bash(git diff:*),Bash(git add:*),"
+        "Bash(git commit:*),Bash(git log:*),Bash(git rev-parse:*)"
+    )
     claude_extra_args: list = field(default_factory=list)
     codex_extra_args: list = field(default_factory=list)
 
@@ -109,6 +115,8 @@ class Config:
         "max_evidence_bytes",
         "max_evidence_file_bytes",
         "max_evidence_requests",
+        "raw_retention_days",
+        "raw_retention_bytes",
         "wait_on_limits",
         "default_limit_wait",
         "max_limit_wait",
@@ -176,6 +184,8 @@ class Config:
             "max_evidence_bytes": self.max_evidence_bytes,
             "max_evidence_file_bytes": self.max_evidence_file_bytes,
             "max_evidence_requests": self.max_evidence_requests,
+            "raw_retention_days": self.raw_retention_days,
+            "raw_retention_bytes": self.raw_retention_bytes,
         }
         for name, value in non_negative_integers.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -190,7 +200,7 @@ class Config:
             or self.max_run_cost_usd < 0
         ):
             raise ValueError("max_run_cost_usd must be a non-negative number")
-        for name in ("disable_nested_agents", "allow_expensive_profiles"):
+        for name in ("disable_nested_agents", "allow_expensive_profiles", "wait_on_limits"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be true or false")
         for name in ("claude_extra_args", "codex_extra_args"):
@@ -209,6 +219,19 @@ class Config:
         for name in model_fields:
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a model name string")
+        if not isinstance(self.claude_write_allowed_tools, str):
+            raise ValueError("claude_write_allowed_tools must be a tool-list string")
+        unsafe_tools = {
+            item.strip().lower()
+            for item in self.claude_write_allowed_tools.split(",")
+        }
+        denied = {"bash", "agent", "task", "websearch", "webfetch"}
+        present = sorted(unsafe_tools & denied)
+        if present:
+            raise ValueError(
+                "claude_write_allowed_tools grants broad or nested/network tools: "
+                + ", ".join(present)
+            )
         allowed_efforts = {"low", "medium", "high", "xhigh", "max"}
         efforts = {
             "planning_effort": self.planning_effort,

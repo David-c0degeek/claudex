@@ -312,7 +312,12 @@ class ProviderCommandPolicyTests(unittest.TestCase):
 
             cmd = captured["cmd"]
             self.assertIn('model_reasoning_effort="high"', cmd)
-            self.assertEqual("multi_agent", cmd[cmd.index("--disable") + 1])
+            disabled = [
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "--disable"
+            ]
+            self.assertIn("multi_agent", disabled)
 
     def test_nested_agent_opt_in_omits_provider_blocks(self) -> None:
         policy = budgets.InvocationPolicy(
@@ -336,7 +341,14 @@ class ProviderCommandPolicyTests(unittest.TestCase):
                     label="review",
                     policy=policy,
                 )
-            self.assertNotIn("--disable", captured["cmd"])
+            cmd = captured["cmd"]
+            disabled = [
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "--disable"
+            ]
+            self.assertNotIn("multi_agent", disabled)
+            self.assertIn("browser_use", disabled)
 
 
 class AdmissionAndResumeTests(unittest.TestCase):

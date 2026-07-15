@@ -24,8 +24,9 @@ from enum import Enum
 from pathlib import Path
 
 from .lifecycle import Lifecycle, transition_allowed
+from .security import redact_value
 
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 5
 
 
 class Phase(str, Enum):
@@ -148,6 +149,10 @@ class RunState:
     last_attempt_usage: dict = field(default_factory=dict)
     last_attempt_tool_calls: int = 0
     accounted_attempt_ids: list = field(default_factory=list)
+    rate_limit_reset_at: float = 0.0
+    rate_limit_delay_s: int = 0
+    rate_limit_agent: str = ""
+    rate_limit_label: str = ""
     # Last commit the pair has AGREEd to; checkpoint diffs are
     # last_reviewed_commit..HEAD.
     last_reviewed_commit: str = ""
@@ -285,6 +290,41 @@ class RunState:
         )
         self.advance(Phase.FAILED, error[:200])
 
+    def cancel(self, reason: str = "operator cancelled run") -> None:
+        if Lifecycle(self.lifecycle) is Lifecycle.CANCELLED:
+            return
+        self.advance(Phase.ABORTED, reason[:200])
+        self.transition_lifecycle(
+            Lifecycle.CANCELLED,
+            reason,
+            "inspect retained partial artifacts or start a new run",
+        )
+        self.active_attempt_id = ""
+
+    def rate_limit(
+        self, reason: str, *, agent: str, label: str, delay_s: int
+    ) -> None:
+        self.rate_limit_delay_s = max(0, delay_s)
+        self.rate_limit_reset_at = time.time() + self.rate_limit_delay_s
+        self.rate_limit_agent = agent
+        self.rate_limit_label = label
+        self.transition_lifecycle(
+            Lifecycle.RATE_LIMITED,
+            reason,
+            "claudex resume (override reset) or rerun after reset",
+        )
+
+    def resume_rate_limit(self, reason: str) -> None:
+        self.transition_lifecycle(
+            Lifecycle.RUNNING,
+            reason,
+            "claudex resume",
+        )
+        self.rate_limit_reset_at = 0.0
+        self.rate_limit_delay_s = 0
+        self.rate_limit_agent = ""
+        self.rate_limit_label = ""
+
     def retry(self) -> None:
         """Rewind FAILED back to the phase that failed, for a re-attempt."""
         if Phase(self.phase) is not Phase.FAILED or not self.failed_phase:
@@ -315,7 +355,7 @@ class RunState:
         run_dir.mkdir(parents=True, exist_ok=True)
         tmp = run_dir / "state.json.tmp"
         tmp.write_text(
-            json.dumps(dataclasses.asdict(self), indent=2), encoding="utf-8"
+            json.dumps(redact_value(dataclasses.asdict(self)), indent=2), encoding="utf-8"
         )
         tmp.replace(run_dir / "state.json")
 

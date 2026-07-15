@@ -35,33 +35,33 @@ based, and executable/artifact handling fails closed with useful diagnostics.
 
 ## Boxes
 
-- [ ] **04.1** (agent) Start every provider/test command in a controllable
+- [x] **04.1** (agent) Start every provider/test command in a controllable
       process group or Windows job-object equivalent; implement idempotent
       `claudex cancel` and timeout escalation that terminate descendants, retain
       partial events, persist the terminal reason, and release locks safely;
       prove it with a fake executable that spawns a long-lived child.
-- [ ] **04.2** (agent) Convert provider rate limits into unique immutable attempt
+- [x] **04.2** (agent) Convert provider rate limits into unique immutable attempt
       records and durable `RATE_LIMITED` state with reset metadata and resume
       instructions, then return control promptly by default. Keep autonomous
       waiting opt-in, cancellable, lock-safe, and tested without real sleeping.
-- [ ] **04.3** (agent) Remove untracked-file blindness from every cleanliness,
+- [x] **04.3** (agent) Remove untracked-file blindness from every cleanliness,
       convergence, checkpoint, test, and integration gate; record the exact
       worktree/tree/patch tested and prove through real temporary Git repositories
       that the proposed integration includes exactly that content.
-- [ ] **04.4** (agent) Replace broad provider write permissions with a verified
+- [x] **04.4** (agent) Replace broad provider write permissions with a verified
       capability policy per phase, narrowly restrict Claude shell/tool access,
       preserve Codex sandbox boundaries, disclose that a worktree is not an OS
       sandbox, and add command-construction/policy-denial tests for both adapters.
-- [ ] **04.5** (agent) Route mechanical test execution through the shared streamed
+- [x] **04.5** (agent) Route mechanical test execution through the shared streamed
       lifecycle so progress, timeout, cancel, descendant cleanup, partial logs,
       and durable failure state behave like provider attempts; demonstrate a
       hung and a noisy test command end to end.
-- [ ] **04.6** (agent) Resolve provider executables by explicit configuration
+- [x] **04.6** (agent) Resolve provider executables by explicit configuration
       followed by deterministic semantic version/capability selection—not file
       mtime—and extend `claudex doctor` to report path, version, stream/schema,
       budget, sandbox, session, and nested-agent compatibility with actionable
       failure messages.
-- [ ] **04.7** (agent) Implement redaction before display/persistence plus
+- [x] **04.7** (agent) Implement redaction before display/persistence plus
       configurable age/byte retention that prunes raw attempt data without
       deleting compact summaries, decisions, or recovery state; fault-test
       malformed logs, disk/write failures, retries, pruning, and redaction, and
@@ -73,10 +73,44 @@ based, and executable/artifact handling fails closed with useful diagnostics.
 > Use the plan's embedded Captain Hindsight prompt. Record Keep, Fix before
 > closing, Record, Risk, and Verdict. `DO NOT CLOSE` leaves this subject open.
 
-- [ ] Captain Hindsight review recorded
-- [ ] Verdict is `CLOSE`
+- [x] Captain Hindsight review recorded
+- [x] Verdict is `CLOSE`
 
 ## Progress log
 
 > One line per slice: date · slice number · boxes touched · outcome · verification
 > · checkpoint commit/push. Record documentation impact and learned lessons.
+
+- 2026-07-15 · slice 1 · 04.1–04.7 · added process groups/named Windows jobs,
+  lock-independent idempotent cancel, durable prompt-returning rate limits,
+  exact tracked/untracked tree identities, phase capability policies, streamed
+  mechanical tests, semantic capability-based provider resolution/doctor, and
+  redaction plus raw-only retention. README/config/operator behavior and lessons
+  updated. · `python -m compileall -q claudex tests`; 92 unittest cases pass,
+  including real Windows descendant cancel/timeout, >1 MiB noisy and hung test
+  gates, temp Git repos, fake provider probes, and storage faults; live `doctor`
+  selected Claude 2.1.210 and Codex 0.144.4 with the required capability matrix.
+  · checkpoint commit/push recorded after closing review.
+
+### Captain Hindsight — closing review
+
+1. **Keep:** One streamed subprocess owner now handles both providers and tests;
+   lifecycle state—not foreground sleeps—owns rate/cancel recovery; Git identity
+   and permission/capability checks live at their existing seams rather than in
+   parallel coordinators.
+2. **Fix before closing:** Review found two cancellation races: an external
+   `claudex cancel` could terminate a job before the stream loop classified the
+   durable marker, and idle cancellation unnecessarily constructed/probed both
+   providers. `processes.py` now classifies a post-exit marker as cancellation,
+   while `cli.py` updates idle state directly under the run lock. Review also
+   caught Windows `cmd.exe` argv quoting drift; mechanical commands now retain
+   native cmd syntax through a command-line string and the quoted Python gate is
+   exercised in `test_orchestration.py`.
+3. **Record:** Added durable lessons for process ownership/cancel, exact Git
+   content identity, provider negotiation, and raw-only retention/redaction;
+   D007 records the safety-boundary decision for promotion in 06.4.
+4. **Risk:** Named Windows jobs and taskkill fallback are exercised on the
+   release host. Non-Windows process-group fallback remains deterministic code
+   with platform-conditional behavior to be exercised by the Subject 05 CI
+   matrix. A worktree remains explicitly documented as non-sandbox isolation.
+5. **Verdict:** CLOSE.

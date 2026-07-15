@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from claudex import planops, prompts, schemas
+from claudex import gitops, planops, prompts, schemas
 from claudex.cli import _read_guidance_notes, _replacement_state, build_parser
 from claudex.config import Config
 from claudex.phases import (
@@ -87,6 +87,12 @@ class OrchestrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.repo = Path(self.temp.name)
+        gitops.git(self.repo, "init")
+        gitops.git(self.repo, "config", "user.email", "tests@example.invalid")
+        gitops.git(self.repo, "config", "user.name", "Claudex Tests")
+        (self.repo / ".gitignore").write_text(".claudex/\n", encoding="utf-8")
+        gitops.git(self.repo, "add", ".gitignore")
+        gitops.git(self.repo, "commit", "-m", "fixture")
         self.cfg = Config(repo=self.repo, max_plan_rounds=1)
         self.state = RunState(
             run_id="run",

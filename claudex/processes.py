@@ -15,9 +15,18 @@ from pathlib import Path
 from typing import Callable
 
 from .events import AgentEvent, EventEmitter, EventJournal
+from .security import redact_text, redact_value
 
 
 class ProcessExecutionError(RuntimeError):
+    pass
+
+
+class ProcessTimeoutError(ProcessExecutionError):
+    pass
+
+
+class ProcessCancelledError(ProcessExecutionError):
     pass
 
 
@@ -68,27 +77,105 @@ class ExecResult:
 LineDecoder = Callable[[str, int, EventEmitter], None]
 
 
+def shell_argv(command: str) -> list[str] | str:
+    """Use an explicit platform shell without Python's implicit shell mode."""
+    if os.name == "nt":
+        # Passing cmd.exe as an argv list makes Python apply C-runtime quote
+        # escaping that cmd does not understand. A command-line string keeps
+        # cmd's native quoting and existing Windows test_command semantics.
+        return f"cmd.exe /d /s /c {command}"
+    return ["/bin/sh", "-lc", command]
+
+
+def decode_text_line(line: str, line_no: int, emitter: EventEmitter) -> None:
+    summary = line.replace("\r", "").rstrip("\n")
+    if summary:
+        emitter.emit(
+            "message",
+            summary[:1000] + ("…" if len(summary) > 1000 else ""),
+            provider_type="process_output",
+            raw_ref=f"stdout.jsonl:{line_no}",
+        )
+
+
 def atomic_json(path: Path, value: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(redact_value(value), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     tmp.replace(path)
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _open_windows_job(name: str):
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        handle = ctypes.windll.kernel32.CreateJobObjectW(None, name)
+        return handle or None
+    except Exception:
+        return None
+
+
+def _assign_windows_job(handle, proc: subprocess.Popen) -> bool:
+    if not handle:
+        return False
+    try:
+        import ctypes
+
+        return bool(
+            ctypes.windll.kernel32.AssignProcessToJobObject(handle, proc._handle)
+        )
+    except Exception:
+        return False
+
+
+def _close_windows_handle(handle) -> None:
+    if handle and os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def terminate_process_tree(pid: int, job_name: str = "") -> None:
+    """Idempotently terminate one process tree, preferring its named job."""
     if os.name == "nt":
+        if job_name:
+            try:
+                import ctypes
+
+                handle = ctypes.windll.kernel32.OpenJobObjectW(0x1F001F, False, job_name)
+                if handle:
+                    ctypes.windll.kernel32.TerminateJobObject(handle, 1)
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return
+            except Exception:
+                pass
         subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
             capture_output=True,
         )
     else:
         try:
-            os.killpg(proc.pid, 9)
+            os.killpg(pid, 9)
         except (ProcessLookupError, PermissionError):
-            proc.kill()
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _kill_tree(proc: subprocess.Popen, job_name: str = "") -> None:
+    terminate_process_tree(proc.pid, job_name)
 
 
 def stream_process(
-    cmd: list[str],
+    cmd: list[str] | str,
     *,
     cwd: Path,
     stdin_text: str,
@@ -122,7 +209,12 @@ def stream_process(
         started_monotonic=started,
         handler=event_handler,
     )
-    emitter.emit("started", f"{agent}: {phase}", metadata={"cwd": str(cwd)})
+    try:
+        emitter.emit("started", f"{agent}: {phase}", metadata={"cwd": str(cwd)})
+    except OSError as exc:
+        raise ProcessExecutionError(
+            f"{phase}: could not persist the attempt journal: {exc}"
+        ) from exc
     popen_options: dict = {}
     if os.name == "nt":
         popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -155,6 +247,17 @@ def stream_process(
         )
         raise ProcessExecutionError(f"{phase}: could not start process: {exc}") from exc
 
+    job_name = f"Local\\Claudex-{attempt.attempt_id}" if os.name == "nt" else ""
+    job_handle = _open_windows_job(job_name)
+    if job_handle and not _assign_windows_job(job_handle, proc):
+        _close_windows_handle(job_handle)
+        job_handle = None
+        job_name = ""
+    atomic_json(
+        attempt.root / "control.json",
+        {"pid": proc.pid, "job_name": job_name, "started_at": time.time()},
+    )
+
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     reader_errors: list[str] = []
@@ -164,7 +267,7 @@ def stream_process(
             with path.open("w", encoding="utf-8", newline="\n") as log:
                 for line_no, line in enumerate(iter(pipe.readline, ""), start=1):
                     target.append(line)
-                    log.write(line)
+                    log.write(redact_text(line))
                     log.flush()
                     raw_ref = f"{path.name}:{line_no}"
                     if stream_name == "stdout" and decode_stdout:
@@ -230,14 +333,36 @@ def stream_process(
         thread.start()
     writer.start()
     timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_tree(proc)
+    cancelled = False
+    deadline = time.monotonic() + timeout
+    cancel_paths = (
+        attempt.root / "cancel.requested",
+        attempt.root.parent.parent / "cancel.requested",
+    )
+    while proc.poll() is None:
+        if any(path.exists() for path in cancel_paths):
+            cancelled = True
+            _kill_tree(proc, job_name)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            _kill_tree(proc, job_name)
+            break
+        try:
+            proc.wait(timeout=min(0.2, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+    # `claudex cancel` may terminate the job immediately after writing the
+    # marker, before this loop gets another poll. The durable request still
+    # owns the terminal classification.
+    if not timed_out and any(path.exists() for path in cancel_paths):
+        cancelled = True
+    if proc.poll() is None:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            _kill_tree(proc, job_name)
             proc.kill()
             proc.wait()
     writer.join(timeout=5)
@@ -248,6 +373,38 @@ def stream_process(
     stderr = "".join(stderr_parts)
     if reader_errors:
         emitter.emit("warning", "; ".join(reader_errors), provider_type="pipe_error")
+    if cancelled:
+        emitter.emit(
+            "cancelled",
+            "cancel requested; process tree terminated",
+            provider_type="cancelled",
+            metadata={"exit_code": proc.returncode},
+        )
+        atomic_json(
+            attempt.summary,
+            {
+                "attempt_id": attempt.attempt_id,
+                "agent": agent,
+                "phase": phase,
+                "ok": False,
+                "exit_code": proc.returncode,
+                "duration_s": duration,
+                "terminal_reason": "cancelled",
+            },
+        )
+        atomic_json(
+            attempt.root / "control.json",
+            {
+                "pid": proc.pid,
+                "job_name": job_name,
+                "terminal_reason": "cancelled",
+                "finished_at": time.time(),
+            },
+        )
+        _close_windows_handle(job_handle)
+        raise ProcessCancelledError(
+            f"{phase}: cancelled (attempt: {attempt.root})"
+        )
     if timed_out:
         emitter.emit(
             "failed",
@@ -265,9 +422,20 @@ def stream_process(
                 "exit_code": proc.returncode,
                 "duration_s": duration,
                 "error": f"timed out after {timeout}s",
+                "terminal_reason": "timeout",
             },
         )
-        raise ProcessExecutionError(
+        atomic_json(
+            attempt.root / "control.json",
+            {
+                "pid": proc.pid,
+                "job_name": job_name,
+                "terminal_reason": "timeout",
+                "finished_at": time.time(),
+            },
+        )
+        _close_windows_handle(job_handle)
+        raise ProcessTimeoutError(
             f"{phase}: timed out after {timeout}s (attempt: {attempt.root})"
         )
     emitter.emit(
@@ -276,7 +444,7 @@ def stream_process(
         provider_type="process_exited",
         metadata={"exit_code": proc.returncode},
     )
-    return ExecResult(
+    result = ExecResult(
         returncode=proc.returncode,
         stdout=stdout,
         stderr=stderr,
@@ -284,3 +452,15 @@ def stream_process(
         attempt=attempt,
         emitter=emitter,
     )
+    atomic_json(
+        attempt.root / "control.json",
+        {
+            "pid": proc.pid,
+            "job_name": job_name,
+            "terminal_reason": "exited",
+            "exit_code": proc.returncode,
+            "finished_at": time.time(),
+        },
+    )
+    _close_windows_handle(job_handle)
+    return result

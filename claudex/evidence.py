@@ -7,6 +7,8 @@ import json
 import shutil
 from pathlib import Path
 
+from .security import redact_value, scrub_file
+
 
 class EvidenceError(ValueError):
     pass
@@ -55,17 +57,17 @@ def build_plan_review_packet(
 
     decisions = packet_root / "decision-ledger.json"
     decisions.write_text(
-        json.dumps({"binding_guidance": state.binding_guidance}, indent=2),
+        json.dumps(redact_value({"binding_guidance": state.binding_guidance}), indent=2),
         encoding="utf-8",
     )
     findings = packet_root / "finding-ledger.json"
     findings.write_text(
-        json.dumps(
+        json.dumps(redact_value(
             {
                 "accepted": state.accepted_findings,
                 "unresolved": state.unresolved_findings,
             },
-            indent=2,
+        ), indent=2,
         ),
         encoding="utf-8",
     )
@@ -110,6 +112,7 @@ def build_plan_review_packet(
         target = packet_root / "repo" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+        scrub_file(target)
         sources.append((f"repo:{relative}", target, False))
 
     entries: list[dict] = []

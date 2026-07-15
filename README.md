@@ -78,6 +78,7 @@ claudex resume                     # continue this exact durable run/checkpoint
 claudex resume --add-invocations 2 # expand an exhausted run envelope explicitly
 claudex restart                    # new execution ID, hash-equivalent checkpoint
 claudex restart --fresh-plan       # explicitly discard planning state only
+claudex cancel                     # kill the active provider/test process tree
 git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
 ```
@@ -102,7 +103,7 @@ The installed skill (`.claude/skills/claudex-pair/SKILL.md`) teaches an
 interactive Claude session the full protocol; `codex-lead-prompt.md` is the
 mirror for codex-led sessions. Two things the skill insists on: run pair
 turns in the background (they invoke the other model and can take many
-minutes plus usage-limit waits), and remember the worktree is a **sibling
+minutes), and remember the worktree is a **sibling
 directory** of your repo (grant access with `--add-dir` or work from a
 shell).
 
@@ -120,7 +121,9 @@ Every provider invocation gets an immutable attempt directory:
   summary.json
 ```
 
-`stdout.jsonl` and `stderr.log` retain the provider streams. `events.jsonl` is
+`stdout.jsonl` and `stderr.log` retain redacted provider streams subject to the
+configured raw age/byte limits. `events.jsonl`, `result.json`, and `summary.json`
+are compact recovery evidence and are not removed by raw retention. `events.jsonl` is
 the provider-neutral, append-only live journal used by the coordinator's console
 view and status projection. It contains phase/attempt identity, ordered event
 kinds, elapsed time, tool lifecycle, and provider-reported usage/cost when
@@ -164,9 +167,9 @@ winner-picking: ownership is resolved by initiation.
 
 | guarantee | mechanism |
 |---|---|
-| critiques/reviews can't edit | Claude `--permission-mode plan`; Codex `-s read-only` (OS sandbox) |
-| implementation isolated | dedicated git worktree (sibling dir) on a run branch |
-| reviews see exact code | coordinator extracts `git diff` itself; dirty worktrees refused |
+| critiques/reviews can't edit | Claude plan mode with only Read/Glob/Grep; Codex `-s read-only` |
+| implementation isolated | dedicated git worktree (sibling dir) on a run branch plus provider permission boundaries |
+| reviews see exact code | coordinator extracts `git diff`; tracked and untracked dirty content is refused and exact tree identities are recorded |
 | structured findings | Claude `--json-schema`, Codex `--output-schema` (strict mode) |
 | provider work is visible | streamed Claude/Codex JSONL normalized into an append-only per-attempt event journal |
 | retries preserve evidence | every invocation has a unique immutable attempt directory |
@@ -176,12 +179,17 @@ winner-picking: ownership is resolved by initiation.
 | review context stays bounded | fresh plan reviewers receive hashed size-capped manifests, canonical plan/decision/finding ledgers, and selected repo files—never a critique glob |
 | no infinite loops | explicit lead-response budgets plus a final fresh-context audit |
 | economic admission | durable run caps are checked before every provider call; Claude also receives its native USD/turn caps |
-| conservative provider policy | phase-specific effort; Claude Agent/Task and Codex multi-agent features disabled unless explicitly enabled |
+| conservative provider policy | phase capabilities; narrow Claude tools, Codex sandbox/network controls, and provider sub-agents disabled by default |
 | guidance stays binding | persistent guidance ledger included in every later agent turn |
 | crash safety | state.json written after every round; artifact-presence skip on retry |
 | no cross-process races | run-dir lockfile around every state-mutating command |
 | verification is independent | verify turn never resumes any session |
-| test results are real | coordinator runs `test_command` itself, exit code decides |
+| test results are real | coordinator streams `test_command` through the same timeout/cancel lifecycle; exit code and unchanged exact tree decide |
+
+A Git worktree is an isolation boundary for commits, not an OS security sandbox.
+Claude tool restrictions and the Codex sandbox reduce provider capabilities, but
+they do not make an untrusted repository safe to execute. Review the repository
+and the configured mechanical test command before running Claudex.
 
 Session continuity without contamination: planning/revision reviewers and the
 final verifier are fresh and consume coordinator-built evidence. Only
@@ -204,6 +212,14 @@ hash-equivalence check of the copied canonical checkpoint—including decisions,
 findings, checks, budgets, worktree/base identity, and safe sessions. State
 migrations and restart retain an original-state backup; only `--fresh-plan`
 deliberately removes planning artifacts.
+
+Provider rate limits create an immutable failed attempt and durable
+`rate_limited` lifecycle with an approximate reset time, then return to the
+shell (exit 75) by default. Run `claudex resume` when ready. Set
+`wait_on_limits` only when autonomous waiting is intentional; Claudex releases
+the run lock while waiting and `claudex cancel` remains effective. Cancellation
+is idempotent, terminates the complete active process tree, keeps partial
+evidence, and exits a driving command with 130.
 
 ## Report mode
 
@@ -248,7 +264,9 @@ flags):
   "max_evidence_requests": 8,
   "disable_nested_agents": true,
   "allow_expensive_profiles": false,
-  "wait_on_limits": true,       // wait out provider usage limits and resume
+  "wait_on_limits": false,      // opt in to lock-free autonomous limit waits
+  "raw_retention_days": 14,     // raw stdout/stderr/last-message only
+  "raw_retention_bytes": 104857600,
   "claude_model": "",           // pin models if you want reproducibility
   "codex_model": ""
 }
@@ -276,8 +294,11 @@ Each provider can select a model per `planning`, `implementation`, and
 provider's global model. The run-start summary prints every effective
 model/effort profile and marks maximum-effort opt-ins prominently.
 
-Binary discovery: `CLAUDEX_CLAUDE_BIN` / `CLAUDEX_CODEX_BIN` env vars win;
-on Windows the Codex desktop-app binary is preferred over npm shims.
+Binary discovery: `CLAUDEX_CLAUDE_BIN` / `CLAUDEX_CODEX_BIN` env vars win and
+fail closed if that explicit binary lacks required capabilities. Otherwise
+Claudex probes PATH and installed desktop candidates, selects the highest
+compatible semantic version deterministically, and reports its stream, schema,
+budget, sandbox, session, and nested-agent matrix in `claudex doctor`.
 
 ## Install
 

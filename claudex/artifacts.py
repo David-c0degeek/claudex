@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .security import redact_text, redact_value
+
 
 def save_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(redact_value(data), indent=2), encoding="utf-8")
 
 
 def _section(title: str, items: list[str]) -> str:
@@ -52,7 +54,7 @@ def mailbox_append(
         return
     block = (
         f"\n{header} {stage} | STATUS: {status} =====\n"
-        f"{body.rstrip()}\n"
+        f"{redact_text(body).rstrip()}\n"
         f"----- end [{role}] turn {turn} -----\n"
     )
     with mb.open("a", encoding="utf-8") as f:

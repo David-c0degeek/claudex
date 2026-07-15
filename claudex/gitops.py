@@ -8,6 +8,8 @@ diffs itself so the pair reviews an exact, immutable artifact rather than
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -82,8 +84,56 @@ def diff_stat(worktree: Path, base: str) -> str:
 
 
 def has_uncommitted_changes(worktree: Path) -> bool:
-    # -uno: untracked files (build caches, __pycache__) are not review-relevant
-    return bool(git(worktree, "status", "--porcelain", "-uno"))
+    return bool(status_porcelain(worktree))
+
+
+def status_porcelain(worktree: Path) -> str:
+    """Return all tracked and untracked changes; ignored files stay ignored."""
+    return git(
+        worktree,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+
+
+def tree_id(worktree: Path, rev: str = "HEAD") -> str:
+    return git(worktree, "rev-parse", f"{rev}^{{tree}}")
+
+
+def worktree_identity(worktree: Path) -> dict[str, object]:
+    """Hash the exact visible worktree, including untracked file bytes."""
+    head = head_commit(worktree)
+    status = status_porcelain(worktree)
+    patch = git(worktree, "diff", "--binary", "HEAD")
+    staged = git(worktree, "diff", "--binary", "--cached", "HEAD")
+    untracked = git(
+        worktree, "ls-files", "--others", "--exclude-standard", "-z"
+    ).split("\0")
+    untracked_files: list[dict[str, object]] = []
+    for relative in sorted(item for item in untracked if item):
+        path = worktree / relative
+        if not path.is_file():
+            continue
+        content = path.read_bytes()
+        untracked_files.append(
+            {
+                "path": relative.replace("\\", "/"),
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    payload = {
+        "head": head,
+        "head_tree": tree_id(worktree),
+        "status": status,
+        "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+        "staged_patch_sha256": hashlib.sha256(staged.encode("utf-8")).hexdigest(),
+        "untracked": untracked_files,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["content_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return payload
 
 
 def ensure_gitignore_entry(repo: Path, entry: str) -> bool:

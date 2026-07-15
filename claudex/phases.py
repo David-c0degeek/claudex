@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -44,6 +43,7 @@ from pathlib import Path
 from . import artifacts, budgets, evidence, gitops, planops, prompts, schemas
 from .agents import (
     AgentError,
+    AgentCancelled,
     ClaudeAgent,
     CodexAgent,
     classify_limit,
@@ -53,6 +53,16 @@ from .agents import (
 from .config import Config
 from .events import AgentEvent
 from .lifecycle import Lifecycle
+from .processes import (
+    AttemptPaths,
+    ProcessCancelledError,
+    ProcessTimeoutError,
+    atomic_json,
+    decode_text_line,
+    shell_argv,
+    stream_process,
+)
+from .security import prune_raw_attempts, redact_text, write_redacted_text
 from .state import (
     Phase,
     RunState,
@@ -69,7 +79,26 @@ class BudgetPause(OrchestratorError):
     """Control-flow signal: state is already durably paused, not failed."""
 
 
+class RateLimitPause(OrchestratorError):
+    """Control-flow signal: reset metadata is already durably persisted."""
+
+
+class RunCancelled(OrchestratorError):
+    """Control-flow signal: cancellation is terminal, not a retryable error."""
+
+
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _read_attempt_output(attempt: AttemptPaths) -> str:
+    parts: list[str] = []
+    for path in (attempt.stdout, attempt.stderr):
+        try:
+            if path.exists():
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            parts.append(f"[could not read {path.name}: {exc}]")
+    return "\n".join(parts)
 
 
 def task_has_content(task_md: str) -> bool:
@@ -137,7 +166,7 @@ def draft_task(cfg: Config, description: str, agent_name: str = "claude") -> Pat
     contract = result.require_structured()
     target = task_file(cfg.repo)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(artifacts.render_task_contract(contract), encoding="utf-8")
+    write_redacted_text(target, artifacts.render_task_contract(contract))
     return target
 
 
@@ -337,7 +366,6 @@ class Orchestrator:
             f"({'read-only' if kw.get('read_only', True) else 'WRITE'}, "
             f"cwd={kw.get('cwd')}) ..."
         )
-        waits = 0
         while True:
             violations = budgets.budget_violations(self.cfg, self.state)
             if violations:
@@ -368,10 +396,17 @@ class Orchestrator:
                     event_handler=self._on_agent_event,
                     **kw,
                 )
+            except AgentCancelled as exc:
+                budgets.record_unreported_attempt(self.state)
+                self.state.cancel(str(exc))
+                self._save()
+                raise RunCancelled(str(exc)) from exc
             except AgentError:
                 budgets.record_unreported_attempt(self.state)
                 self._save()
                 raise
+            finally:
+                self._prune_raw_attempts()
             budgets.record_result(self.state, result)
             self._save()
             self.say(
@@ -381,21 +416,40 @@ class Orchestrator:
             if result.ok:
                 return result
             is_limit, delay = classify_limit(f"{result.error}\n{result.text}")
-            if not (is_limit and self.cfg.wait_on_limits and waits < self.cfg.max_limit_waits):
+            if not is_limit:
                 raise AgentError(f"{agent_name}/{label}: {result.error}")
             delay = min(
                 self.cfg.max_limit_wait,
-                max(60, delay if delay is not None else self.cfg.default_limit_wait),
+                max(0, delay if delay is not None else self.cfg.default_limit_wait),
             )
-            resume_at = time.strftime("%H:%M:%S", time.localtime(time.time() + delay))
-            self.say(
-                f"{agent_name}: usage limit hit; waiting {delay // 60} min "
-                f"(retry ~{resume_at}, wait {waits + 1}/{self.cfg.max_limit_waits})"
+            reason = (
+                f"{agent_name}/{label} rate limited; reset in approximately {delay}s"
             )
-            self.state.log(f"{agent_name}/{label}: usage limit, waiting {delay}s")
-            self._save()  # durable: Ctrl+C here loses nothing, resume continues
-            time.sleep(delay)
-            waits += 1
+            self.state.rate_limit(
+                reason, agent=agent_name, label=label, delay_s=delay
+            )
+            self._save()
+            raise RateLimitPause(reason)
+
+    def _prune_raw_attempts(self) -> None:
+        try:
+            report = prune_raw_attempts(
+                self.cfg.repo / ".claudex",
+                max_age_days=self.cfg.raw_retention_days,
+                max_bytes=self.cfg.raw_retention_bytes,
+            )
+        except OSError as exc:
+            report = {"errors": [str(exc)]}
+        errors = report.get("errors") or []
+        if errors:
+            self.state.log(
+                f"raw retention warning: {len(errors)} filesystem error(s); "
+                "compact recovery artifacts retained"
+            )
+            try:
+                self._save()
+            except OSError:
+                pass
 
     def _on_agent_event(self, event: AgentEvent) -> None:
         """High-signal live console view; the JSONL journal remains canonical."""
@@ -528,6 +582,22 @@ class Orchestrator:
         }
         while True:
             phase = Phase(self.state.phase)
+            lifecycle = Lifecycle(self.state.lifecycle)
+            if (self.run_dir / "cancel.requested").exists() and lifecycle not in (
+                Lifecycle.CANCELLED,
+                Lifecycle.COMPLETED,
+                Lifecycle.FAILED_TERMINAL,
+            ):
+                self.state.cancel("operator cancellation request observed")
+                self._save()
+                self._report_terminal()
+                return
+            if lifecycle is Lifecycle.RATE_LIMITED:
+                self._report_rate_limit()
+                return
+            if lifecycle is Lifecycle.CANCELLED:
+                self._report_terminal()
+                return
             if self.state.is_terminal():
                 self._report_terminal()
                 return
@@ -539,6 +609,12 @@ class Orchestrator:
                 handler()
             except BudgetPause:
                 self._report_gate()
+                return
+            except RateLimitPause:
+                self._report_rate_limit()
+                return
+            except RunCancelled:
+                self._report_terminal()
                 return
             except (AgentError, gitops.GitError, OrchestratorError) as exc:
                 self.state.fail(str(exc))
@@ -567,6 +643,17 @@ class Orchestrator:
             )
         else:
             self.say("  Then: claudex continue   (or resolve --notes if you want to steer)")
+
+    def _report_rate_limit(self) -> None:
+        reset = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(self.state.rate_limit_reset_at)
+        )
+        self.say("RATE_LIMITED: provider returned control to Claudex.")
+        self.say(
+            f"  Attempt: {self.state.rate_limit_agent}/{self.state.rate_limit_label}"
+        )
+        self.say(f"  Reset: approximately {reset}")
+        self.say("  Then: claudex resume after reset (or explicitly override earlier)")
 
     def _report_terminal(self) -> None:
         phase = Phase(self.state.phase)
@@ -662,8 +749,9 @@ class Orchestrator:
         artifacts.save_json(self._plan_path(round_no), plan)
         self.state.canonical_plan_round = round_no
         self.state.canonical_plan_sha256 = planops.plan_digest(plan)
-        self._art(f"plan-round-{round_no}.md").write_text(
-            artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
+        write_redacted_text(
+            self._art(f"plan-round-{round_no}.md"),
+            artifacts.render_plan(self.state.lead, round_no, plan),
         )
         titles = "\n".join(
             f"  {i + 1}. {s.get('title', '?')}" for i, s in enumerate(plan.get("steps", []))
@@ -743,9 +831,9 @@ class Orchestrator:
                 critique, lineage="pair_plan", label=f"plan critique {rnd}"
             )
             artifacts.save_json(cpath, critique)
-            self._art(f"plan-critique-{rnd}.md").write_text(
+            write_redacted_text(
+                self._art(f"plan-critique-{rnd}.md"),
                 artifacts.render_critique(self.state.pair, "Plan critique", rnd, critique),
-                encoding="utf-8",
             )
         self._merge_implementation_checks(critique, self._plan_path(rnd))
         self.state.unresolved_findings = [
@@ -821,8 +909,9 @@ class Orchestrator:
                 {"checks": self.state.implementation_checks},
             )
         shutil.copyfile(self._plan_path(round_no), self._art("agreed-plan.json"))
-        self._art("agreed-plan.md").write_text(
-            artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
+        write_redacted_text(
+            self._art("agreed-plan.md"),
+            artifacts.render_plan(self.state.lead, round_no, plan),
         )
         self._ensure_worktree()
 
@@ -977,9 +1066,9 @@ class Orchestrator:
 
     def _store_implementation(self, report: dict, stem: str) -> None:
         artifacts.save_json(self._art(f"{stem}.json"), report)
-        self._art(f"{stem}.md").write_text(
+        write_redacted_text(
+            self._art(f"{stem}.md"),
             artifacts.render_implementation_report(self.state.lead, report),
-            encoding="utf-8",
         )
 
     # ------------------------------------------------------------ checkpoint
@@ -1010,7 +1099,15 @@ class Orchestrator:
                 "LEAD", f"step {i + 1}/{len(self.state.steps)}", "COMMIT", lead_notes
             )
         diff_path = self._art(f"diff-step-{i}-r{rnd}.patch")
-        diff_path.write_text(gitops.diff_text(wt, base), encoding="utf-8")
+        write_redacted_text(diff_path, gitops.diff_text(wt, base))
+        artifacts.save_json(
+            self._art(f"diff-step-{i}-r{rnd}-identity.json"),
+            {
+                "base_commit": base,
+                "reviewed_commit": gitops.head_commit(wt),
+                "worktree": gitops.worktree_identity(wt),
+            },
+        )
         review_path = self._art(f"checkpoint-{i}-r{rnd}.json")
         if review_path.exists():
             self.say(f"checkpoint {i} round {rnd} already present, skipping")
@@ -1057,11 +1154,11 @@ class Orchestrator:
             )
             self._remember_session("pair_review", res.session_id)
             artifacts.save_json(review_path, review)
-            self._art(f"checkpoint-{i}-r{rnd}.md").write_text(
+            write_redacted_text(
+                self._art(f"checkpoint-{i}-r{rnd}.md"),
                 artifacts.render_critique(
                     self.state.pair, f"Checkpoint step {i + 1}", rnd, review
                 ),
-                encoding="utf-8",
             )
         self._post(
             "PAIR",
@@ -1162,30 +1259,104 @@ class Orchestrator:
             return True
         wt = Path(self.state.worktree)
         rnd = self.state.test_round
+        before = gitops.worktree_identity(wt)
+        if before["status"]:
+            raise OrchestratorError(
+                f"worktree is dirty before tests ({wt}); tracked and untracked "
+                "content must be committed or removed"
+            )
         self.say(f"test gate: `{self.cfg.test_command}` in {wt} ...")
-        proc = subprocess.run(
-            self.cfg.test_command,
-            shell=True,
-            cwd=str(wt),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=self.cfg.agent_timeout,
+        attempt = AttemptPaths.create(self.run_dir, f"tests-{rnd}")
+        returncode = 0
+        terminal_reason = "exited"
+        try:
+            execution = stream_process(
+                shell_argv(self.cfg.test_command),
+                cwd=wt,
+                stdin_text="",
+                timeout=self.cfg.agent_timeout,
+                attempt=attempt,
+                agent="coordinator-test",
+                phase=f"tests-{rnd}",
+                decode_stdout=decode_text_line,
+                event_handler=self._on_agent_event,
+            )
+            returncode = execution.returncode
+            output = execution.stdout + (
+                "\n" + execution.stderr if execution.stderr else ""
+            )
+        except ProcessTimeoutError:
+            returncode = 124
+            terminal_reason = "timeout"
+            output = _read_attempt_output(attempt)
+        except ProcessCancelledError as exc:
+            self.state.active_attempt_id = ""
+            self.state.last_attempt_id = attempt.attempt_id
+            self.state.cancel(str(exc))
+            self._save()
+            self._prune_raw_attempts()
+            raise RunCancelled(str(exc)) from exc
+        finally:
+            self.state.active_attempt_id = ""
+            self.state.last_attempt_id = attempt.attempt_id
+        output = redact_text(output)
+        after = gitops.worktree_identity(wt)
+        tree_changed = before["content_sha256"] != after["content_sha256"]
+        identity_path = self._art(f"tests-round-{rnd}-identity.json")
+        atomic_json(
+            identity_path,
+            {
+                "command": self.cfg.test_command,
+                "attempt_id": attempt.attempt_id,
+                "before": before,
+                "after": after,
+                "exact_tree_preserved": not tree_changed,
+                "returncode": returncode,
+                "terminal_reason": terminal_reason,
+            },
         )
-        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         out_path = self._art(f"tests-round-{rnd}.txt")
         out_path.write_text(
-            f"$ {self.cfg.test_command}\nexit: {proc.returncode}\n\n{output}",
+            f"$ {self.cfg.test_command}\nexit: {returncode}\n"
+            f"tree: {before['head_tree']}\nidentity: {before['content_sha256']}\n\n{output}",
             encoding="utf-8",
         )
-        passed = proc.returncode == 0
+        passed = returncode == 0 and not tree_changed
         tail = "\n".join(output.strip().splitlines()[-15:])
+        if tree_changed:
+            tail = (
+                "test command changed tracked or untracked worktree content; "
+                f"see {identity_path.name}\n" + tail
+            )
+        atomic_json(
+            attempt.result,
+            {
+                "attempt_id": attempt.attempt_id,
+                "ok": passed,
+                "exit_code": returncode,
+                "terminal_reason": terminal_reason,
+                "tree_changed": tree_changed,
+                "tree_identity": before["content_sha256"],
+            },
+        )
+        atomic_json(
+            attempt.summary,
+            {
+                "attempt_id": attempt.attempt_id,
+                "agent": "coordinator-test",
+                "phase": f"tests-{rnd}",
+                "ok": passed,
+                "exit_code": returncode,
+                "terminal_reason": terminal_reason,
+                "tree_changed": tree_changed,
+            },
+        )
+        self._prune_raw_attempts()
         self._post(
             "COORD",
             "tests",
             "PASS" if passed else "FAIL",
-            f"`{self.cfg.test_command}` exit {proc.returncode}\n{tail}",
+            f"`{self.cfg.test_command}` exit {returncode}\n{tail}",
         )
         if passed:
             self.state.advance(Phase.VERIFY, "test gate passed")
@@ -1197,8 +1368,12 @@ class Orchestrator:
                     "severity": "blocking",
                     "file": None,
                     "line": None,
-                    "problem": f"test command failed (exit {proc.returncode}): "
-                    f"{self.cfg.test_command}",
+                    "problem": (
+                        "test command changed the exact tested tree"
+                        if tree_changed
+                        else f"test command failed (exit {returncode}): "
+                        f"{self.cfg.test_command}"
+                    ),
                     "evidence": f"see {out_path} (last lines):\n{tail}",
                     "suggested_fix": "",
                 }
@@ -1238,8 +1413,14 @@ class Orchestrator:
             )
         rnd = self.state.verify_round
         diff_path = self._art("diff-final.patch")
-        diff_path.write_text(
-            gitops.diff_text(wt, self.state.base_commit), encoding="utf-8"
+        write_redacted_text(diff_path, gitops.diff_text(wt, self.state.base_commit))
+        artifacts.save_json(
+            self._art("diff-final-identity.json"),
+            {
+                "base_commit": self.state.base_commit,
+                "verified_commit": gitops.head_commit(wt),
+                "worktree": gitops.worktree_identity(wt),
+            },
         )
         gate_summary = ""
         if self.cfg.test_command:
@@ -1280,9 +1461,9 @@ class Orchestrator:
                 "budget: FAIL contained no actionable evidence"
             )
         artifacts.save_json(self._art(f"verification-{rnd}.json"), verdict)
-        self._art("verification.md").write_text(
+        write_redacted_text(
+            self._art("verification.md"),
             artifacts.render_verification(self.state.pair, verdict),
-            encoding="utf-8",
         )
         failed = [c for c in verdict.get("criteria", []) if not c.get("met")]
         effective_pass = verdict.get("verdict") == "pass" and not findings_list
@@ -1574,12 +1755,7 @@ class Orchestrator:
         self.state.return_phase = ""
 
     def abort(self) -> None:
-        self.state.advance(Phase.ABORTED)
-        self.state.transition_lifecycle(
-            Lifecycle.CANCELLED,
-            "operator aborted run",
-            "start a new run or inspect retained artifacts",
-        )
+        self.state.cancel("operator aborted run")
         self._save()
 
     def clean(self) -> None:

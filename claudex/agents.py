@@ -7,11 +7,8 @@ and Codex command/result contracts and binary resolution.
 
 from __future__ import annotations
 
-import glob
 import json
 import os
-import shutil
-import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -23,14 +20,34 @@ from .processes import (
     AttemptPaths,
     ExecResult,
     ProcessExecutionError,
+    ProcessCancelledError,
+    ProcessTimeoutError,
     atomic_json,
     stream_process,
 )
 from .provider_events import decode_claude_event, decode_codex_event
+from .providers import ProviderError, resolve_provider
+from .security import scrub_file
 
 
 class AgentError(RuntimeError):
     pass
+
+
+class AgentCancelled(AgentError):
+    pass
+
+
+class AgentTimeout(AgentError):
+    pass
+
+
+def _translate_process_error(exc: ProcessExecutionError) -> AgentError:
+    if isinstance(exc, ProcessCancelledError):
+        return AgentCancelled(str(exc))
+    if isinstance(exc, ProcessTimeoutError):
+        return AgentTimeout(str(exc))
+    return AgentError(str(exc))
 
 
 @dataclass
@@ -99,8 +116,10 @@ def _finalize_attempt(execution: ExecResult, result: AgentResult) -> AgentResult
     result.events_path = str(execution.attempt.events)
     result.stdout_path = str(execution.attempt.stdout)
     result.stderr_path = str(execution.attempt.stderr)
+    scrub_file(execution.attempt.last_message)
+    limited, _ = classify_limit(f"{result.error}\n{result.text}")
     execution.emitter.emit(
-        "completed" if result.ok else "failed",
+        "completed" if result.ok else ("rate_limited" if limited else "failed"),
         "provider result accepted" if result.ok else _truncate(result.error),
         provider_type="agent_result",
         usage=result.usage,
@@ -142,40 +161,24 @@ def _finalize_attempt(execution: ExecResult, result: AgentResult) -> AgentResult
 
 
 def resolve_claude_bin(configured: str | None = None) -> str:
-    for candidate in (os.environ.get("CLAUDEX_CLAUDE_BIN"), configured):
-        if candidate:
-            return candidate
-    found = shutil.which("claude")
-    if not found:
-        raise AgentError("claude CLI not found on PATH (set CLAUDEX_CLAUDE_BIN)")
-    return found
+    try:
+        return resolve_provider("claude", configured).path
+    except ProviderError as exc:
+        raise AgentError(str(exc)) from exc
 
 
 def resolve_codex_bin(configured: str | None = None) -> str:
-    for candidate in (os.environ.get("CLAUDEX_CODEX_BIN"), configured):
-        if candidate:
-            return candidate
-    # Kept for compatibility until subject 04 replaces mtime selection with
-    # semantic capability/version resolution.
-    if _windows():
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        if localappdata:
-            candidates = glob.glob(
-                os.path.join(localappdata, "OpenAI", "Codex", "bin", "*", "codex.exe")
-            )
-            if candidates:
-                return max(candidates, key=os.path.getmtime)
-    found = shutil.which("codex")
-    if not found:
-        raise AgentError("codex CLI not found on PATH (set CLAUDEX_CODEX_BIN)")
-    return found
+    try:
+        return resolve_provider("codex", configured).path
+    except ProviderError as exc:
+        raise AgentError(str(exc)) from exc
 
 
 @dataclass
 class ClaudeAgent:
     binary: str
     model: str = ""
-    write_allowed_tools: str = "Edit,Write,NotebookEdit,TodoWrite,Bash"
+    write_allowed_tools: str = "Read,Glob,Grep,Edit,Write"
     extra_args: list[str] = field(default_factory=list)
     name: str = "claude"
 
@@ -202,15 +205,6 @@ class ClaudeAgent:
             "--verbose",
             "--include-partial-messages",
         ]
-        if read_only:
-            cmd += ["--permission-mode", "plan"]
-        else:
-            cmd += [
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                self.write_allowed_tools,
-            ]
         if schema is not None:
             cmd += ["--json-schema", json.dumps(schema)]
         if resume:
@@ -219,6 +213,22 @@ class ClaudeAgent:
         if model:
             cmd += ["--model", model]
         cmd += self.extra_args
+        capability = policy.capability if policy else (
+            "repo_read" if read_only else "workspace_write"
+        )
+        if read_only or capability != "workspace_write":
+            cmd += [
+                "--permission-mode", "plan",
+                "--tools", "Read,Glob,Grep",
+                "--disallowedTools", "Bash,Agent,Task,WebSearch,WebFetch",
+            ]
+        else:
+            cmd += [
+                "--permission-mode", "acceptEdits",
+                "--tools", self.write_allowed_tools,
+                "--allowedTools", self.write_allowed_tools,
+                "--disallowedTools", "Agent,Task,WebSearch,WebFetch",
+            ]
         if policy is not None:
             cmd += ["--effort", policy.effort]
             if policy.max_budget_usd is not None:
@@ -239,7 +249,7 @@ class ClaudeAgent:
                 event_handler=event_handler,
             )
         except ProcessExecutionError as exc:
-            raise AgentError(str(exc)) from exc
+            raise _translate_process_error(exc) from exc
         result = self._parse(
             execution.returncode,
             execution.stdout,
@@ -348,7 +358,10 @@ class CodexAgent:
         attempt = AttemptPaths.create(run_dir, label)
         cmd = _wrap_script(self.binary)
         cmd += ["exec"]
-        sandbox = "read-only" if read_only else "workspace-write"
+        capability = policy.capability if policy else (
+            "repo_read" if read_only else "workspace_write"
+        )
+        sandbox = "workspace-write" if capability == "workspace_write" else "read-only"
         if resume:
             cmd += ["resume", resume, "-", "--json", "--skip-git-repo-check"]
             cmd += ["-c", f'sandbox_mode="{sandbox}"']
@@ -372,6 +385,14 @@ class CodexAgent:
         if model:
             cmd += ["-m", model]
         cmd += self.extra_args
+        # Append safety after user extras so a permissive extra cannot win.
+        cmd += ["-c", "sandbox_workspace_write.network_access=false"]
+        for feature in ("apps", "browser_use", "browser_use_external", "in_app_browser"):
+            cmd += ["--disable", feature]
+        if resume:
+            cmd += ["-c", f'sandbox_mode="{sandbox}"']
+        else:
+            cmd += ["-s", sandbox]
         if policy is not None:
             cmd += ["-c", f'model_reasoning_effort="{policy.effort}"']
             if policy.disable_nested_agents:
@@ -389,7 +410,7 @@ class CodexAgent:
                 event_handler=event_handler,
             )
         except ProcessExecutionError as exc:
-            raise AgentError(str(exc)) from exc
+            raise _translate_process_error(exc) from exc
         result = self._parse(
             execution.returncode,
             execution.stdout,
