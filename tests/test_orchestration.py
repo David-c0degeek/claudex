@@ -442,7 +442,7 @@ class OrchestrationTests(unittest.TestCase):
         self.state.gate_kind = "budget"
         self.state.return_phase = Phase.PLAN_REVISE.value
 
-        with self.assertRaisesRegex(OrchestratorError, "claudex abort"):
+        with self.assertRaisesRegex(OrchestratorError, "claudex cancel"):
             self.orch.continue_after_budget()
 
     def test_resolve_accepts_multiline_guidance_from_file_or_stdin(self) -> None:
@@ -572,7 +572,7 @@ class StateMigrationTests(unittest.TestCase):
                 ["Keep the simple design.", "Also preserve compatibility."],
                 state.binding_guidance,
             )
-            self.assertEqual("", state.guidance_notes)
+            self.assertFalse(hasattr(state, "guidance_notes"))
             self.assertEqual(3, state.plan_revisions)
             self.assertEqual(1, state.plan_protocol_version)
 

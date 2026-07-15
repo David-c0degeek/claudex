@@ -1,0 +1,9 @@
+{
+  "completed": "git merge claudex/run",
+  "cancelled": "inspect retained artifacts; start a new run when ready",
+  "failed_retryable": "claudex retry",
+  "failed_terminal": "export/inspect artifacts; start a new run",
+  "rate_limited": "claudex resume after the reported reset",
+  "paused_budget": "claudex resume --add-invocations N [other additions]",
+  "paused_decision": "claudex resolve --notes ..."
+}

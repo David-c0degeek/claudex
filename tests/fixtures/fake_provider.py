@@ -118,6 +118,11 @@ def _emit(provider: str, call: dict) -> int:
     return int(call.get("exit_code", 0 if not error else 1))
 
 
+def _emit_raw(values: list) -> None:
+    for value in values:
+        print(value if isinstance(value, str) else json.dumps(value), flush=True)
+
+
 def main() -> int:
     provider = _provider()
     args = sys.argv[1:]
@@ -167,10 +172,10 @@ def main() -> int:
         )
         if call.get("child_pid_file"):
             Path(call["child_pid_file"]).write_text(str(child.pid), encoding="utf-8")
+    _emit_raw(call.get("pre_events", []))
     _synchronize(call)
     return _emit(provider, call)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

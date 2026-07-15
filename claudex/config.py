@@ -13,11 +13,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_NAME = "config.json"
+CONFIG_SCHEMA_VERSION = 2
+LEGACY_BROAD_CLAUDE_TOOLS = "Edit,Write,NotebookEdit,TodoWrite,Bash"
 
 
 @dataclass
 class Config:
     repo: Path
+    config_schema_version: int = CONFIG_SCHEMA_VERSION
     claude_bin: str = ""
     codex_bin: str = ""
     claude_model: str = ""
@@ -63,13 +66,11 @@ class Config:
     max_evidence_requests: int = 8
     raw_retention_days: int = 14
     raw_retention_bytes: int = 100 * 1024 * 1024
-    # Usage-limit handling: when a provider reports a usage/rate limit, wait
-    # until the reset time it names (or default_limit_wait when it names
-    # none) and retry, instead of failing the run.
+    # Usage limits persist a reset and return control. Autonomous waiting is
+    # explicit and occurs outside the run lock.
     wait_on_limits: bool = False  # opt-in autonomous wait outside the run lock
     default_limit_wait: int = 1800  # seconds, when the message names no time
     max_limit_wait: int = 6 * 3600  # cap a single wait
-    max_limit_waits: int = 12  # per agent invocation
     claude_write_allowed_tools: str = (
         "Read,Glob,Grep,Edit,Write,NotebookEdit,TodoWrite,"
         "Bash(git status:*),Bash(git diff:*),Bash(git add:*),"
@@ -79,6 +80,7 @@ class Config:
     codex_extra_args: list = field(default_factory=list)
 
     _PERSISTED = (
+        "config_schema_version",
         "claude_bin",
         "codex_bin",
         "claude_model",
@@ -120,7 +122,6 @@ class Config:
         "wait_on_limits",
         "default_limit_wait",
         "max_limit_wait",
-        "max_limit_waits",
         "claude_write_allowed_tools",
         "claude_extra_args",
         "codex_extra_args",
@@ -134,25 +135,61 @@ class Config:
         self.validate()
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         data = {k: getattr(self, k) for k in self._PERSISTED}
-        self.config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(self.config_path)
 
     @classmethod
     def load(cls, repo: Path, overrides: dict | None = None) -> "Config":
         cfg = cls(repo=repo.resolve())
         path = cfg.config_path
+        stored_version = CONFIG_SCHEMA_VERSION
         if path.exists():
-            stored = json.loads(path.read_text(encoding="utf-8"))
+            original = path.read_text(encoding="utf-8")
+            stored = json.loads(original)
+            raw_version = stored.get("config_schema_version", 1)
+            if (
+                not isinstance(raw_version, int)
+                or isinstance(raw_version, bool)
+                or raw_version < 1
+            ):
+                raise ValueError("config_schema_version must be a positive integer")
+            stored_version = raw_version
+            if stored_version > CONFIG_SCHEMA_VERSION:
+                raise ValueError(
+                    f"config schema {stored_version} is newer than supported "
+                    f"schema {CONFIG_SCHEMA_VERSION}; upgrade Claudex"
+                )
             for k in cls._PERSISTED:
                 if k in stored:
+                    if (
+                        k == "claude_write_allowed_tools"
+                        and stored[k] == LEGACY_BROAD_CLAUDE_TOOLS
+                    ):
+                        # Migrate only the exact historical default. A custom
+                        # broad Bash grant remains an explicit validation error.
+                        continue
                     setattr(cfg, k, stored[k])
+            cfg.config_schema_version = CONFIG_SCHEMA_VERSION
         known = {f.name for f in dataclasses.fields(cls)}
         for k, v in (overrides or {}).items():
             if v is not None and k in known:
                 setattr(cfg, k, v)
         cfg.validate()
+        if path.exists() and stored_version < CONFIG_SCHEMA_VERSION:
+            backup = path.with_name(f"config.v{stored_version}.bak.json")
+            if not backup.exists():
+                backup_tmp = backup.with_suffix(backup.suffix + ".tmp")
+                backup_tmp.write_text(original, encoding="utf-8")
+                backup_tmp.replace(backup)
+            cfg.save()
         return cfg
 
     def validate(self) -> None:
+        if self.config_schema_version != CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                f"config_schema_version must be {CONFIG_SCHEMA_VERSION}"
+            )
         positive_integers = {
             "agent_timeout": self.agent_timeout,
             "max_invocation_turns": self.max_invocation_turns,
@@ -173,7 +210,6 @@ class Config:
             "max_checkpoint_rounds": self.max_checkpoint_rounds,
             "max_test_rounds": self.max_test_rounds,
             "max_verify_rounds": self.max_verify_rounds,
-            "max_limit_waits": self.max_limit_waits,
             "max_run_invocations": self.max_run_invocations,
             "max_invocation_output_tokens": self.max_invocation_output_tokens,
             "max_invocation_tool_calls": self.max_invocation_tool_calls,

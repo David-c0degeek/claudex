@@ -563,7 +563,7 @@ class Orchestrator:
         if self.state.plan_protocol_version < 2 and planning:
             raise OrchestratorError(
                 "this run uses the legacy exhaustive-plan protocol and cannot "
-                "converge under Claudex 0.4; run `claudex abort`, then start a "
+                "converge under Claudex 0.5; run `claudex cancel`, then start a "
                 "new run so content findings become implementation checks"
             )
 
@@ -662,7 +662,7 @@ class Orchestrator:
         elif phase is Phase.FAILED:
             self.say(f"FAILED: {self.state.error}")
         else:
-            self.say("Run aborted.")
+            self.say("Run cancelled.")
         used = budgets.budget_usage(self.state)
         self.say(
             "Usage: "
@@ -1563,7 +1563,6 @@ class Orchestrator:
             raise OrchestratorError("guidance notes must not be empty")
         self._reconcile_gate_lifecycle()
         self.state.binding_guidance.append(notes.strip())
-        self.state.guidance_notes = ""
         self._post("HUMAN", "guidance", "GUIDANCE", notes)
         ret = Phase(self.state.return_phase or Phase.PLAN_REVISE.value)
         if self.state.gate_kind == "budget" and self._budget_exhausted(ret):
@@ -1759,8 +1758,9 @@ class Orchestrator:
         self.state.gate_kind = ""
         self.state.return_phase = ""
 
-    def abort(self) -> None:
-        self.state.cancel("operator aborted run")
+    def retire(self) -> None:
+        """Retire a predecessor after its replacement checkpoint is verified."""
+        self.state.cancel("replacement run created")
         self._save()
 
     def clean(self) -> None:

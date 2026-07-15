@@ -153,7 +153,7 @@ class RestartAndMigrationTests(unittest.TestCase):
                 state = old
                 run_dir = old_dir
 
-                def abort(self):
+                def retire(self):
                     self.state.advance(Phase.ABORTED)
                     self.state.transition_lifecycle(
                         Lifecycle.CANCELLED, "restart", "inspect artifacts"

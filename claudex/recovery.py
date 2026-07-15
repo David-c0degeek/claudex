@@ -8,9 +8,11 @@ import hashlib
 import json
 import shutil
 import time
+import zipfile
 from pathlib import Path
 
 from .lifecycle import Lifecycle
+from .security import redact_text
 from .state import Phase, RunState
 
 
@@ -191,3 +193,57 @@ def checkpoint_digest(state: RunState, run_dir: Path) -> str:
     payload["files"] = files
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def export_run(run_dir: Path, output: Path) -> Path:
+    """Export compact recovery evidence without raw provider streams."""
+    if not (run_dir / "state.json").exists():
+        raise ValueError(f"run state not found: {run_dir}")
+    excluded_names = {
+        "stdout.jsonl",
+        "stderr.log",
+        "last-message.txt",
+        "run.lock",
+        "cancel.requested",
+    }
+    files = [
+        path
+        for path in run_dir.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name not in excluded_names
+        and not (path.name.startswith("state.v") and path.name.endswith(".bak.json"))
+        and not path.name.endswith(".tmp")
+    ]
+    contents: dict[Path, bytes] = {}
+    entries = []
+    for path in sorted(files):
+        # All run artifacts are text. Redact again at the export boundary so
+        # imported legacy artifacts cannot bypass current persistence rules.
+        content = redact_text(
+            path.read_text(encoding="utf-8", errors="replace")
+        ).encode("utf-8")
+        contents[path] = content
+        entries.append(
+            {
+                "path": path.relative_to(run_dir).as_posix(),
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "raw_attempt_streams_included": False,
+        "entries": entries,
+    }
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("export-manifest.json", json.dumps(manifest, indent=2))
+        for path in sorted(files):
+            archive.writestr(path.relative_to(run_dir).as_posix(), contents[path])
+    tmp.replace(output)
+    return output

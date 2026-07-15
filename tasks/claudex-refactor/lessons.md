@@ -44,3 +44,13 @@
   preflight must happen before invocation and a missing provider-native spend
   cap is a successful safe refusal, not permission to rely on an after-the-fact
   coordinator total.
+- 2026-07-16 — An observer is not read-only merely because it skips the run
+  lock. If its shared state loader performs migrations, a watcher can still
+  rewrite state. Inspection paths need an explicit non-persisting load mode;
+  control paths remain responsible for durable migration.
+- 2026-07-16 — Windows can deny an atomic state replace during a brief watcher
+  read. Keep the replace atomic and retry the sharing violation for a small,
+  bounded interval instead of making observers acquire the coordinator lock.
+- 2026-07-16 — Recovery export is a separate security boundary. Re-redact
+  exported text, exclude exact legacy rollback backups and raw streams, and
+  reject symlinks so a support bundle cannot escape the run directory.

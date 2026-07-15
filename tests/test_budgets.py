@@ -435,6 +435,13 @@ class AdmissionAndResumeTests(unittest.TestCase):
         self.assertIn("wall_seconds exhausted", state.gate_reason)
         agent.run.assert_not_called()
 
+    def test_terminal_run_elapsed_time_is_frozen(self) -> None:
+        state = state_for(
+            self.root, started_epoch_s=100.0, finished_epoch_s=112.5
+        )
+        with patch("claudex.budgets.time.time", return_value=999.0):
+            self.assertEqual(12.5, budgets.run_wall_seconds(state))
+
     def test_per_invocation_tool_limit_is_checked_when_observable(self) -> None:
         cfg = Config(repo=self.root, max_invocation_tool_calls=2)
         state = state_for(self.root, last_attempt_tool_calls=3)

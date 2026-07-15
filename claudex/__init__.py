@@ -11,4 +11,4 @@ permissions, and the mailbox transcript; neither model is ever "the boss" of
 the other.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

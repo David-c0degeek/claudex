@@ -54,10 +54,9 @@ Claudex carries content-level discoveries forward as implementation checks.
 ```
 claudex pair plan --file <your-plan.json>
 ```
-IMPORTANT: pair turns invoke the other model and can take many minutes
-(plus usage-limit waits). Run the command in the background and poll
-`claudex status`, or raise your shell timeout — do not let a foreground
-timeout kill the turn.
+IMPORTANT: pair turns invoke the other model and can take many minutes. Run the
+command in the background and use `claudex watch --agent <pair>` or
+`claudex status`; provider rate limits return control instead of sleeping.
 
 Read the verdict. On REVISE: address every blocking/major finding — accept
 it, or rebut it with file-level repository evidence in your revised plan's
@@ -108,5 +107,8 @@ run is DONE — tell the human to `git merge <branch>` and `claudex clean`.
   `claudex retry` re-attempts a retryable failed phase. `claudex restart`
   creates a replacement identity only after copying a hash-equivalent
   checkpoint; `--fresh-plan` is the explicit destructive planning reset.
+- Rate limit: wait for the reset shown by `claudex status`, then `resume`.
+  Cancellation is always `claudex cancel`; closing a watcher window is not
+  cancellation.
 - `mailbox.md` is the concise coordinator turn ledger. Provider text/tools
   live in each immutable attempt event journal.

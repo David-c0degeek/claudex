@@ -187,7 +187,8 @@ def budget_usage(state) -> dict[str, int | float]:
 
 def run_wall_seconds(state) -> float:
     if state.started_epoch_s:
-        return max(0.0, time.time() - state.started_epoch_s)
+        end = state.finished_epoch_s or time.time()
+        return max(0.0, end - state.started_epoch_s)
     # Conservative migration for old states that have no wall-clock anchor.
     return max(0.0, state.provider_duration_s)
 

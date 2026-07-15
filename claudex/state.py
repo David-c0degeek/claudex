@@ -26,7 +26,7 @@ from pathlib import Path
 from .lifecycle import Lifecycle, transition_allowed
 from .security import redact_value
 
-STATE_SCHEMA_VERSION = 5
+STATE_SCHEMA_VERSION = 6
 
 
 class Phase(str, Enum):
@@ -88,6 +88,7 @@ class RunState:
     phase: str = Phase.INIT.value
     created_at: str = ""
     started_epoch_s: float = 0.0
+    finished_epoch_s: float = 0.0
     lifecycle: str = Lifecycle.RUNNING.value
     lifecycle_history: list = field(default_factory=list)
     base_commit: str = ""
@@ -164,8 +165,6 @@ class RunState:
     gate_reason: str = ""
     gate_kind: str = ""  # decision | budget
     return_phase: str = ""
-    # Deprecated one-shot field retained for loading v0.2 state files.
-    guidance_notes: str = ""
     # Human decisions remain binding for the rest of the run and are sent to
     # both roles on every subsequent agent turn.
     binding_guidance: list = field(default_factory=list)
@@ -225,6 +224,15 @@ class RunState:
                 f"illegal lifecycle transition {previous.value} -> {target.value}"
             )
         self.lifecycle = target.value
+        if target in {
+            Lifecycle.CANCELLED,
+            Lifecycle.FAILED_RETRYABLE,
+            Lifecycle.FAILED_TERMINAL,
+            Lifecycle.COMPLETED,
+        }:
+            self.finished_epoch_s = time.time()
+        elif target is Lifecycle.RUNNING:
+            self.finished_epoch_s = 0.0
         self._append_lifecycle(
             previous.value,
             target,
@@ -357,10 +365,22 @@ class RunState:
         tmp.write_text(
             json.dumps(redact_value(dataclasses.asdict(self)), indent=2), encoding="utf-8"
         )
-        tmp.replace(run_dir / "state.json")
+        target = run_dir / "state.json"
+        for attempt in range(100):
+            try:
+                tmp.replace(target)
+                break
+            except PermissionError:
+                # Windows denies replace while a status/watch reader has the
+                # old file open. Readers are brief; bounded retry preserves
+                # atomicity without making observers state owners.
+                if os.name != "nt" or attempt == 99:
+                    raise
+                time.sleep(0.01)
 
     @staticmethod
-    def load(run_dir: Path) -> "RunState":
+    def load(run_dir: Path, *, persist_migration: bool = True) -> "RunState":
+        """Load current or legacy state, optionally without observer-side writes."""
         state_path = run_dir / "state.json"
         original = state_path.read_text(encoding="utf-8")
         data = json.loads(original)
@@ -402,7 +422,7 @@ class RunState:
                 if recorded and recorded not in binding:
                     binding.append(recorded)
         data["binding_guidance"] = binding
-        data["guidance_notes"] = ""
+        data.pop("guidance_notes", None)
         # Old state did not count completed plan revisions explicitly. Plan
         # artifact indices are authoritative and survive crashes.
         if "plan_revisions" not in data:
@@ -445,13 +465,13 @@ class RunState:
                 f"migrated from run state schema {version}",
                 "claudex resume",
             )
-        if version < STATE_SCHEMA_VERSION:
+        if persist_migration and version < STATE_SCHEMA_VERSION:
             backup = run_dir / f"state.v{version}.bak.json"
             if not backup.exists():
                 backup_tmp = backup.with_suffix(backup.suffix + ".tmp")
                 backup_tmp.write_text(original, encoding="utf-8")
                 backup_tmp.replace(backup)
-        if version < STATE_SCHEMA_VERSION or synthesized_history:
+        if persist_migration and (version < STATE_SCHEMA_VERSION or synthesized_history):
             state.save(run_dir)
         return state
 

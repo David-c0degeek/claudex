@@ -15,7 +15,7 @@
     claudex restart [--fresh-plan] replace execution identity without losing state
     claudex status                  show run state and artifacts
     claudex retry                   re-attempt the phase that failed
-    claudex abort                   abort the active run
+    claudex cancel                  cancel the active process tree or idle run
     claudex clean                   remove the run's worktree
     claudex doctor                  check git/claude/codex wiring
 """
@@ -25,6 +25,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import shutil
+import subprocess
 import sys
 import time
 from importlib import resources
@@ -37,6 +40,7 @@ from .config import Config
 from .lifecycle import Lifecycle
 from .processes import terminate_process_tree
 from .providers import ProviderError, resolve_provider
+from .terminal import next_action, terminal_reason, watch_run
 from .phases import (
     Orchestrator,
     OrchestratorError,
@@ -113,7 +117,7 @@ def _active_orchestrator(cfg: Config) -> Orchestrator:
     rid = get_current_run(cfg.repo)
     if not rid:
         raise OrchestratorError("no active run — start one with `claudex run` or `claudex pair start`")
-    state = RunState.load(run_dir_for(cfg.repo, rid))
+    state = RunState.load(run_dir_for(cfg.repo, rid), persist_migration=False)
     return Orchestrator(cfg, state)
 
 
@@ -268,7 +272,7 @@ def cmd_run(args) -> int:
     if not is_new and state.driver == "live":
         print(
             f"run {state.run_id} is a live run (your session is the lead) — "
-            "drive it with `claudex pair ...`, or `claudex abort` it first"
+            "drive it with `claudex pair ...`, or `claudex cancel` it first"
         )
         return 1
     if is_new:
@@ -279,6 +283,8 @@ def cmd_run(args) -> int:
         _print_economic_summary(cfg, state)
     else:
         print(f"resuming run {state.run_id} (phase: {state.phase})")
+    if getattr(args, "open_terminals", False):
+        open_watch_terminals(cfg.repo, state.run_id)
     orch = Orchestrator(cfg, state)
     return _drive_headless(cfg, orch)
 
@@ -309,7 +315,7 @@ def _wait_until_rate_reset(
 
 
 def _drive_headless(cfg: Config, orch: Orchestrator) -> int:
-    """Run one durable slice; optional rate waiting occurs outside run.lock."""
+    """Run one durable pass; optional rate waiting occurs outside run.lock."""
     while True:
         result = _locked(cfg, orch, lambda: _run_headless(orch))
         if (
@@ -364,7 +370,7 @@ def cmd_pair_start(args) -> int:
     if rid:
         prev = RunState.load(run_dir_for(cfg.repo, rid))
         if not prev.is_terminal():
-            print(f"run {rid} is still {prev.phase} — finish or `claudex abort` it first")
+            print(f"run {rid} is still {prev.phase} — finish or `claudex cancel` it first")
             return 1
     # In live mode YOU are the lead; --lead names which agent you are so the
     # remaining one becomes the pair.
@@ -672,7 +678,7 @@ def cmd_restart(args) -> int:
         raise OrchestratorError(f"cannot restart terminal lifecycle {lifecycle.value}")
     if args.fresh_plan and old.state.worktree:
         raise OrchestratorError(
-            "--fresh-plan would discard an implementation checkpoint; abort/clean "
+            "--fresh-plan would discard an implementation checkpoint; cancel/clean "
             "or restart without --fresh-plan"
         )
     acquire_run_lock(old.run_dir)
@@ -700,7 +706,7 @@ def cmd_restart(args) -> int:
                     f"restart checkpoint mismatch: {before} != {after}; old run retained"
                 )
         state.save(new_dir)
-        old.abort()
+        old.retire()
         if state.lifecycle == Lifecycle.FAILED_RETRYABLE.value:
             state.retry()
             state.save(new_dir)
@@ -719,7 +725,7 @@ def cmd_restart(args) -> int:
 # ---------------------------------------------------------------- inspection
 def cmd_status(args) -> int:
     cfg = _cfg(args)
-    rid = get_current_run(cfg.repo)
+    rid = getattr(args, "run_id", None) or get_current_run(cfg.repo)
     if not rid:
         print("no active run")
         return 0
@@ -728,6 +734,7 @@ def cmd_status(args) -> int:
     print(f"run:      {rid}   ({state.driver})")
     print(f"phase:    {state.phase}   mode: {state.mode}")
     print(f"lifecycle:{state.lifecycle}")
+    print(f"elapsed:  {budgets.run_wall_seconds(state):.1f}s")
     print(f"lead:     {state.lead}   pair: {state.pair}")
     protocol = (
         "compact-plan v2+"
@@ -780,7 +787,9 @@ def cmd_status(args) -> int:
         f"calls {used['invocations']}/{limits['invocations']} "
         f"(remaining {remaining['invocations']})"
         f" · input {used['input_tokens']}/{limits['input_tokens']} reported"
+        f" (remaining {remaining['input_tokens']})"
         f" · output {used['output_tokens']}/{limits['output_tokens']} reported"
+        f" (remaining {remaining['output_tokens']})"
     )
     usage = state.provider_usage
     print(
@@ -806,9 +815,11 @@ def cmd_status(args) -> int:
     print(
         "activity: "
         f"tools {used['tool_calls']}/{limits['tool_calls']} where observable"
-        f" ({state.unknown_tool_attempts} attempt(s) unknown)"
+        f" (remaining {remaining['tool_calls']}; "
+        f"{state.unknown_tool_attempts} attempt(s) unknown)"
         f" · provider time {used['provider_seconds']:.1f}s"
         f" · run wall time {used['wall_seconds']:.1f}/{limits['wall_seconds']}s"
+        f" (remaining {remaining['wall_seconds']:.1f}s)"
     )
     invocation_output_limit = state.run_policy.get(
         "max_invocation_output_tokens", cfg.max_invocation_output_tokens
@@ -865,6 +876,10 @@ def cmd_status(args) -> int:
         )
     if state.error:
         print(f"error:    {state.error}")
+    reason = terminal_reason(state)
+    if reason and reason != state.error:
+        print(f"reason:   {reason}")
+    print(f"next:     {next_action(state)}")
     print(f"run dir:  {rd}")
     mb = rd / "mailbox.md"
     if mb.exists():
@@ -884,6 +899,84 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _watcher_argv(repo: Path, run_id: str, agent: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "claudex",
+        "watch",
+        run_id,
+        "--agent",
+        agent,
+        "--repo",
+        str(repo),
+    ]
+
+
+def open_watch_terminals(
+    repo: Path,
+    run_id: str,
+    *,
+    platform_name: str | None = None,
+    which=shutil.which,
+    popen=subprocess.Popen,
+) -> bool:
+    """Open two Windows Terminal views. Watchers never own run state."""
+    platform_name = os.name if platform_name is None else platform_name
+    watcher_commands = [
+        _watcher_argv(repo, run_id, "claude"),
+        _watcher_argv(repo, run_id, "codex"),
+    ]
+    terminal = which("wt.exe") if platform_name == "nt" else None
+    if not terminal:
+        print("Windows Terminal is unavailable; open these watcher commands:")
+        for command in watcher_commands:
+            print("  " + (subprocess.list2cmdline(command) if platform_name == "nt" else shlex.join(command)))
+        return False
+    try:
+        for agent, command in zip(("Claude", "Codex"), watcher_commands):
+            popen(
+                [
+                    terminal,
+                    "-w",
+                    "new",
+                    "new-tab",
+                    "--title",
+                    f"Claudex · {agent} · {run_id}",
+                    *command,
+                ],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+        print(
+            "opened Claude and Codex watcher windows; closing a watcher does "
+            "not cancel or mutate the run"
+        )
+        return True
+    except OSError as exc:
+        print(f"could not open Windows Terminal ({exc}); use these watcher commands:")
+        for command in watcher_commands:
+            print("  " + subprocess.list2cmdline(command))
+        return False
+
+
+def cmd_watch(args) -> int:
+    cfg = _cfg(args)
+    rid = args.run_id or get_current_run(cfg.repo)
+    if not rid:
+        raise OrchestratorError("no run to watch; pass RUN_ID or start a run")
+    try:
+        return watch_run(
+            run_dir_for(cfg.repo, rid),
+            agent=args.agent,
+            follow=args.follow,
+            raw=args.raw,
+            color=args.color,
+        )
+    except KeyboardInterrupt:
+        return 130
+
+
 def cmd_retry(args) -> int:
     cfg = _cfg(args)
     orch = _active_orchestrator(cfg)
@@ -900,20 +993,6 @@ def cmd_retry(args) -> int:
             _next_live_hint(orch)
             return 0
         orch.run_until_gate()
-        return 0
-
-    return _locked(cfg, orch, go)
-
-
-def cmd_abort(args) -> int:
-    cfg = _cfg(args)
-    orch = _active_orchestrator(cfg)
-
-    def go() -> int:
-        orch.abort()
-        print(
-            f"aborted run {orch.state.run_id} (worktree kept; `claudex clean` to remove)"
-        )
         return 0
 
     return _locked(cfg, orch, go)
@@ -981,7 +1060,7 @@ def cmd_clean(args) -> int:
     cfg = _cfg(args)
     orch = _active_orchestrator(cfg)
     if not orch.state.is_terminal():
-        print(f"run {orch.state.run_id} is still {orch.state.phase}; abort it first")
+        print(f"run {orch.state.run_id} is still {orch.state.phase}; cancel it first")
         return 1
 
     def go() -> int:
@@ -990,6 +1069,17 @@ def cmd_clean(args) -> int:
         return 0
 
     return _locked(cfg, orch, go)
+
+
+def cmd_export(args) -> int:
+    cfg = _cfg(args)
+    rid = args.run_id or get_current_run(cfg.repo)
+    if not rid:
+        raise OrchestratorError("no run to export; pass RUN_ID or start a run")
+    output = recovery.export_run(run_dir_for(cfg.repo, rid), Path(args.output))
+    print(f"exported compact recovery bundle: {output}")
+    print("raw stdout/stderr/last-message streams were intentionally excluded")
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -1119,6 +1209,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("run", help="start or resume a headless pair run")
     common(sp)
     run_flags(sp)
+    sp.add_argument(
+        "--open-terminals",
+        action="store_true",
+        help="open separate Windows Terminal watcher windows for Claude and Codex",
+    )
     sp.set_defaults(func=cmd_run)
 
     pair = sub.add_parser("pair", help="live pairing: your session is the lead")
@@ -1203,15 +1298,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="show run state and artifacts")
     common(sp)
+    sp.add_argument("run_id", nargs="?", help="run to inspect (default: current)")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("watch", help="replay and tail normalized run events")
+    common(sp)
+    sp.add_argument("run_id", nargs="?", help="run to watch (default: current)")
+    sp.add_argument("--agent", choices=["claude", "codex", "all"], default="all")
+    follow = sp.add_mutually_exclusive_group()
+    follow.add_argument("--follow", dest="follow", action="store_true", default=True)
+    follow.add_argument("--no-follow", dest="follow", action="store_false")
+    format_group = sp.add_mutually_exclusive_group()
+    format_group.add_argument("--raw", action="store_true", help="emit stable JSONL")
+    format_group.add_argument(
+        "--readable", dest="raw", action="store_false", help="emit labeled text"
+    )
+    sp.set_defaults(raw=False)
+    sp.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    sp.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("retry", help="re-attempt the failed phase")
     common(sp)
     sp.set_defaults(func=cmd_retry)
-
-    sp = sub.add_parser("abort", help="abort the active run")
-    common(sp)
-    sp.set_defaults(func=cmd_abort)
 
     sp = sub.add_parser(
         "cancel", help="idempotently cancel an active provider/test process tree"
@@ -1223,6 +1331,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("clean", help="remove the finished run's worktree")
     common(sp)
     sp.set_defaults(func=cmd_clean)
+
+    sp = sub.add_parser("export", help="export a compact redacted recovery bundle")
+    common(sp)
+    sp.add_argument("run_id", nargs="?", help="run to export (default: current)")
+    sp.add_argument("--output", required=True, help="destination .zip path")
+    sp.set_defaults(func=cmd_export)
 
     sp = sub.add_parser("doctor", help="check git/claude/codex wiring")
     common(sp)

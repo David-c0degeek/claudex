@@ -84,3 +84,14 @@ the full acceptance flow before versioned release.
 
 > One line per slice: date · slice number · boxes touched · outcome · verification
 > · checkpoint commit/push. Record documentation impact and learned lessons.
+
+- 2026-07-16 · 1 · 06.1–06.7 · Implemented replay/tail watchers, rich status,
+  optional dual Windows Terminal views, migration/export/release surfaces,
+  documentation/ADRs, and slow dual-watcher acceptance. Hindsight caught and
+  fixed O(N²) journal replay, observer-triggered state migration, Windows atomic
+  replace sharing failures, terminal elapsed-time drift, missing watcher state/
+  rate exit, and unsafe export inclusion. Full Windows gate: compileall plus 125
+  tests in 67.963s, OK with one default live-smoke skip; diff-check/version
+  passed. Documentation: README, prompt/skill templates, architecture,
+  decisions, changelog. Lessons recorded. Implementation checkpoint awaits
+  pushed CI before boxes close.

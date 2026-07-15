@@ -29,7 +29,7 @@ Protocol:
    deliverable content inside the plan. Content-level review discoveries are
    persisted by Claudex as implementation checks.
 3. `claudex pair plan --file <plan.json>` — long-running (invokes Claude);
-   use a generous timeout. On REVISE: accept each blocking/major finding or
+   use `claudex watch --agent claude` for a visible view. On REVISE: accept each blocking/major finding or
    rebut it with file-level repository evidence in `responses`; re-emit the
    FULL plan; submit again until AGREE. Every response copies the critique's
    stable key into `finding_key`; do not duplicate structured steps, risks,
@@ -48,3 +48,5 @@ use `claudex continue`; at a decision gate use `claudex resolve`; at a run
 economic pause use `claudex resume --add-...`. Plain `claudex resume`
 continues the same durable identity. `mailbox.md` is the concise turn ledger;
 immutable attempt event journals hold live provider text and tools.
+Rate limits return control with a reset time; `claudex resume` retries later.
+Use `claudex cancel` to stop work. Closing a watcher never cancels the run.

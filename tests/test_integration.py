@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -244,6 +245,10 @@ class BlackBoxCoordinatorTests(unittest.TestCase):
         status = self._cli("status")
         self.assertIn("lifecycle:completed", status.stdout)
         self.assertIn("provider: calls 7/10", status.stdout)
+        export_path = self.repo / ".claudex" / "acceptance-export.zip"
+        exported = self._cli("export", run_id, "--output", str(export_path))
+        self.assertEqual(0, exported.returncode, exported.stdout + exported.stderr)
+        self.assertTrue(export_path.exists())
 
     def test_explicit_human_gate_accepts_guidance_and_resumes_same_run(self) -> None:
         self.scenario_path.write_text(
@@ -339,6 +344,75 @@ class BlackBoxCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("tracked or untracked changes before run start", result.stdout)
         self.assertFalse(self.call_log.exists())
+
+    def test_slow_acceptance_exposes_live_events_to_both_watchers(self) -> None:
+        scenario = _scenario()
+        ready = self.repo / ".claudex" / "provider.ready"
+        release = self.repo / ".claudex" / "provider.release"
+        scenario["calls"][0].update(
+            {
+                "pre_events": [
+                    {
+                        "type": "stream_event",
+                        "event": {
+                            "type": "content_block_delta",
+                            "delta": {
+                                "type": "text_delta",
+                                "text": "visible-before-provider-exit",
+                            },
+                        },
+                    }
+                ],
+                "ready_file": str(ready),
+                "release_file": str(release),
+            }
+        )
+        self.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [sys.executable, "-m", "claudex", "run", "--repo", str(self.repo)],
+            cwd=PROJECT_ROOT,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "fake provider did not reach ready event")
+        run_id = get_current_run(self.repo)
+        early = self._cli(
+            "watch", run_id, "--agent", "claude", "--no-follow", "--color", "never"
+        )
+        self.assertEqual(0, early.returncode, early.stderr)
+        self.assertIn("visible-before-provider-exit", early.stdout)
+        self.assertIsNone(process.poll(), "provider exited before live observation")
+        release.touch()
+        stdout, stderr = process.communicate(timeout=60)
+        self.assertEqual(0, process.returncode, stdout + stderr)
+        claude_view = self._cli(
+            "watch", run_id, "--agent", "claude", "--no-follow", "--color", "never"
+        )
+        codex_view = self._cli(
+            "watch", run_id, "--agent", "codex", "--no-follow", "--color", "never"
+        )
+        self.assertIn("[CLAUDE]", claude_view.stdout)
+        self.assertIn("[CODEX]", codex_view.stdout)
+        state = RunState.load(run_dir_for(self.repo, run_id))
+        self.assertEqual(Lifecycle.COMPLETED.value, state.lifecycle)
+        self.assertEqual(7, state.provider_invocations)
+        self.assertEqual(7 * 11, state.provider_usage["input_tokens"])
+        self.assertEqual(7 * 7, state.provider_usage["output_tokens"])
+        self.assertLess(time.monotonic() - started, 60)
+        identity = json.loads(
+            (run_dir_for(self.repo, run_id) / "diff-final-identity.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(identity["verified_commit"], identity["worktree"]["head"])
 
 
 class RealGitWorktreeTests(unittest.TestCase):

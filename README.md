@@ -68,8 +68,10 @@ whether the provider is active. You come back for gates (if any) and the merge.
 claudex init                       # scaffold .claudex/task.md + config
 claudex task "one paragraph..."    # optional: agent-drafted task contract
 claudex run --lead claude          # or --lead codex — the lead is YOUR call
+claudex run --open-terminals       # optional Claude + Codex watcher windows
 # ...
-claudex status                     # phase, live attempt, usage, remaining caps
+claudex watch --agent all          # replay + tail normalized provider activity
+claudex status [RUN_ID]            # lifecycle, usage, reason, exact next action
 claudex resolve --notes "..."      # answer a concrete decision gate
 claudex resolve --notes-file decision.md  # multiline/shell-safe alternative
 claudex continue                   # allow one response + fresh audit, no guidance
@@ -79,6 +81,7 @@ claudex resume --add-invocations 2 # expand an exhausted run envelope explicitly
 claudex restart                    # new execution ID, hash-equivalent checkpoint
 claudex restart --fresh-plan       # explicitly discard planning state only
 claudex cancel                     # kill the active provider/test process tree
+claudex export --output run.zip    # compact redacted recovery bundle
 git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
 ```
@@ -149,6 +152,17 @@ no findings
 The mailbox is a concise turn ledger, not the live provider transcript. The
 initiating terminal and attempt event journal show in-flight work; every mailbox
 claim is backed by a typed JSON artifact in the run directory.
+
+`claudex watch [RUN_ID] --agent claude|codex|all` replays those normalized
+events and follows new attempts. `--no-follow` is snapshot-friendly; `--raw`
+emits stable redacted JSONL; `--color never` is suitable for logs. A final
+`[CLAUDEX][STATE]` record explains the lifecycle, reason, and next action.
+Watcher exit codes are 0 for normal/paused/completed views, 75 for a rate-limit
+stop, 1 for failure, and 130 for cancellation or Ctrl+C. Watch and status reads
+never migrate or otherwise rewrite run state. On Windows,
+`run --open-terminals` opens two Windows Terminal views. The panes are readers:
+closing one never cancels or changes the run. On unsupported/headless systems,
+Claudex prints the two equivalent watcher commands.
 
 ## Roles
 
@@ -236,6 +250,7 @@ flags):
 
 ```jsonc
 {
+  "config_schema_version": 2,
   "lead": "claude",             // who holds the pen by default
   "mode": "auto",               // auto | change | report
   "max_plan_rounds": 1,       // one revision + one conditional fresh audit
@@ -299,6 +314,33 @@ fail closed if that explicit binary lacks required capabilities. Otherwise
 Claudex probes PATH and installed desktop candidates, selects the highest
 compatible semantic version deterministically, and reports its stream, schema,
 budget, sandbox, session, and nested-agent matrix in `claudex doctor`.
+
+Config files use schema 2. Loading schema 1 retains `config.v1.bak.json` and
+migrates only the exact historical broad Claude-tool default; a custom broad
+shell grant stops for review. Run state uses schema 6 and keeps
+`state.vN.bak.json` on migration. Future schemas fail closed. Before manual
+rollback or support work, `claudex export [RUN_ID] --output run.zip` captures
+state, decisions, manifests, events, results, and summaries while excluding raw
+stdout/stderr/last-message streams, rollback backups, control files, and
+symlinks. Text is redacted again at the export boundary.
+
+## Operator recovery
+
+- `rate_limited` (exit 75): check the reset in `status`, then `resume`; no
+  default command sleeps in the foreground.
+- `paused_budget`: add only the named capacity with `resume --add-...`.
+- decision gate: answer the exact question with `resolve`; use `continue` only
+  for a quality-response budget.
+- retryable failure: inspect the immutable attempt summary, then `retry`.
+- active or idle cancellation: `cancel`; partial evidence and the worktree stay.
+- replacement identity: `restart`; use `--fresh-plan` only to discard planning
+  state before implementation exists.
+- migration uncertainty: preserve the generated `.bak.json` and export the run
+  before changing files manually.
+
+The architecture and durable rationale are documented in
+[`docs/architecture.md`](docs/architecture.md) and
+[`docs/decisions.md`](docs/decisions.md).
 
 ## Install
 
