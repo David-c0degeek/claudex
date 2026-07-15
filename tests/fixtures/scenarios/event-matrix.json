@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "description": "Reusable scenario vocabulary for adapter and fault tests.",
+  "calls": [
+    {
+      "name": "partial-tools-usage",
+      "provider": "claude",
+      "raw_events": [
+        {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}}},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "id": "tool-1"}]}},
+        "{malformed",
+        {"type": "future.unknown", "value": 1}
+      ],
+      "stderr": ["interleaved diagnostic"],
+      "response": {"ok": true},
+      "usage": {"input_tokens": 10, "output_tokens": 5},
+      "cost_usd": 0.001
+    },
+    {
+      "name": "rate-limit",
+      "provider": "codex",
+      "error": "usage limit reached; retry after 2 seconds",
+      "exit_code": 1
+    },
+    {
+      "name": "hang-with-descendant",
+      "provider": "claude",
+      "spawn_descendant": true,
+      "hang": true
+    }
+  ]
+}

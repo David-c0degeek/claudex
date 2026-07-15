@@ -693,6 +693,11 @@ class Orchestrator:
         self.state.mode = detect_mode(task_text, self.cfg.mode)
         if not gitops.is_git_repo(self.cfg.repo):
             raise OrchestratorError(f"{self.cfg.repo} is not a git repository")
+        if gitops.has_uncommitted_changes(self.cfg.repo):
+            raise OrchestratorError(
+                "repository has tracked or untracked changes before run start; "
+                "commit, ignore, or remove them so the base snapshot is exact"
+            )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         # Immutable snapshot: both agents get the exact same contract, and a
         # later edit of .claudex/task.md cannot skew a run in flight.

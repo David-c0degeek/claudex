@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -98,6 +99,8 @@ def _wrap_script(binary: str) -> list[str]:
         return ["cmd.exe", "/c", binary]
     if _windows() and lowered.endswith(".ps1"):
         return ["powershell.exe", "-NoProfile", "-File", binary]
+    if lowered.endswith(".py"):
+        return [sys.executable, binary]
     return [binary]
 
 

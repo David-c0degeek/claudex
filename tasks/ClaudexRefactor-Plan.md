@@ -147,6 +147,7 @@ Retired boxes remain visible as checked, struck-through `ABANDONED` entries.
 | D005 | 2026-07-15 | Explicit gates and bounded fresh planning | A human gate requires explicit true plus a non-empty question; finding labels never infer intent. Planning reviewers/revisions are fresh and consume immutable size-capped manifests; revisions are hash-guarded canonical section replacements. | This removes the exact incident false gate and prevents resumed conversation/history growth from multiplying context or corrupting an accepted baseline. Promote to orchestration/evidence ADRs in 06.4. | 03.1–03.3; `schemas.py`, `evidence.py`, `planops.py` |
 | D006 | 2026-07-15 | Resume identity; restart checkpoint | `resume` continues the same durable run. `restart` changes execution identity only after copying and hash-verifying the latest canonical checkpoint; discarding planning state requires `--fresh-plan`. | Identity replacement is not permission to discard accepted work, decisions, budgets, worktree identity, or safe sessions. Promote to recovery ADR in 06.4. | 03.4–03.6; `lifecycle.py`, `recovery.py` |
 | D007 | 2026-07-15 | Coordinator-owned safety boundary | Providers and mechanical tests use one streamed process-group/job lifecycle; rate limits return durable control by default; cancellation is lock-independent; tested/reviewed content includes untracked bytes; explicit provider binaries fail capability checks and automatic candidates are ranked semantically; redaction precedes persistence and retention removes raw streams only. | These boundaries prevent invisible waits, surviving descendants, reviewed/tested-tree skew, incompatible provider drift, and secret recovery artifacts without treating a Git worktree as an OS sandbox. Promote to process, provider, and security ADRs in 06.4. | 04.1–04.7; `processes.py`, `gitops.py`, `providers.py`, `security.py` |
+| D008 | 2026-07-15 | Paid smoke fails closed on native-cap gaps | The credential-explicit compatibility smoke performs capability checks before invocation and refuses without spending when either provider lacks a native spend cap; a coordinator total observed after a call is not equivalent enforcement. | The refactor exists partly to stop invisible token burn. A nominal live check is not worth an unbounded provider call, and current Codex truthfully reports monetary budgeting as coordinator-only. Promote to test/release policy in 06.4. | 05.6; `tests/test_live_smoke.py`, `README.md` |
 
 ---
 
@@ -164,7 +165,7 @@ checkpoint. Owners are `agent`, `release-engineer`, `product-owner`,
 | [x] | 02 | `tasks/claudex-refactor/02-usage-and-budget-controls.md` | DONE | agent: 6 | n/a |
 | [x] | 03 | `tasks/claudex-refactor/03-orchestration-and-recovery.md` | DONE | agent: 6 | n/a |
 | [x] | 04 | `tasks/claudex-refactor/04-process-git-and-provider-safety.md` | DONE | agent: 7 | n/a |
-| [ ] | 05 | `tasks/claudex-refactor/05-integration-and-fault-testing.md` | TODO | agent: 6 | n/a |
+| [x] | 05 | `tasks/claudex-refactor/05-integration-and-fault-testing.md` | DONE | agent: 6 | n/a |
 | [ ] | 06 | `tasks/claudex-refactor/06-terminal-ux-docs-and-release.md` | TODO | agent: 7 | n/a |
 
 ---

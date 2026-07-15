@@ -83,6 +83,8 @@ def shell_argv(command: str) -> list[str] | str:
         # Passing cmd.exe as an argv list makes Python apply C-runtime quote
         # escaping that cmd does not understand. A command-line string keeps
         # cmd's native quoting and existing Windows test_command semantics.
+        if command.lstrip().startswith('"'):
+            return f'cmd.exe /d /s /c "{command}"'
         return f"cmd.exe /d /s /c {command}"
     return ["/bin/sh", "-lc", command]
 

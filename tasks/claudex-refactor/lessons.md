@@ -36,3 +36,11 @@
 - 2026-07-15 — Redact at every persistence boundary, then prune only raw
   streams. Compact events/results/summaries, lifecycle state, decisions, and
   exact content identities must survive retention and pruning faults.
+- 2026-07-15 — A reusable subprocess fake should model the provider boundary,
+  not duplicate coordinator decisions. Versioned call scenarios, prompt/call
+  logs, filesystem commit actions, and ready/release files let the same fixture
+  exercise adapters, the public CLI, faults, and golden views deterministically.
+- 2026-07-15 — A paid smoke is subordinate to enforceable safety. Capability
+  preflight must happen before invocation and a missing provider-native spend
+  cap is a successful safe refusal, not permission to rely on an after-the-fact
+  coordinator total.

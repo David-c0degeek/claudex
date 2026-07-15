@@ -310,6 +310,18 @@ claudex doctor        # checks git + both CLIs
 Requires Python 3.10+, git, `claude` CLI, `codex` CLI. No third-party
 Python dependencies.
 
+The paid compatibility smoke is deliberately excluded from normal tests. It
+runs capability preflight before any invocation and refuses safely while either
+provider lacks a native spend cap (current Codex reports
+`budget=coordinator-only`). If both providers can enforce the contract, it also
+disables nested/tool work and applies a $0.10 / 120-second coordinator envelope:
+
+```powershell
+$env:CLAUDEX_RUN_LIVE_SMOKE="1"
+$env:CLAUDEX_LIVE_SMOKE_ACK="I_ACCEPT_CAPPED_PROVIDER_COSTS"
+python -m unittest tests.test_live_smoke -v
+```
+
 ## Design decisions
 
 - **Pair, not face-off.** One plan, co-owned. The pair's AGREE means "I

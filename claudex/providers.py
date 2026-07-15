@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -42,6 +43,8 @@ def _wrap(binary: str) -> list[str]:
         return ["cmd.exe", "/d", "/s", "/c", binary]
     if os.name == "nt" and lowered.endswith(".ps1"):
         return ["powershell.exe", "-NoProfile", "-File", binary]
+    if lowered.endswith(".py"):
+        return [sys.executable, binary]
     return [binary]
 
 
@@ -198,4 +201,3 @@ def resolve_provider(
         reverse=True,
     )
     return compatible[0]
-
