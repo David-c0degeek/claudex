@@ -11,7 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from claudex.cli import cmd_status, open_watch_terminals
+from claudex.cli import _active_orchestrator, cmd_status, open_watch_terminals
+from claudex.config import Config
 from claudex.events import AgentEvent, EventJournal
 from claudex.lifecycle import Lifecycle
 from claudex.state import Phase, RunState
@@ -195,6 +196,28 @@ class StatusGoldenTests(unittest.TestCase):
         state.error = "token=super-secret-value"
         rendered = render_state(state, raw=True)
         self.assertNotIn("super-secret-value", rendered)
+
+    def test_status_is_read_only_but_control_load_retains_migration_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            run_id = "legacy"
+            run_dir = repo / ".claudex" / "runs" / run_id
+            run_dir.mkdir(parents=True)
+            legacy = json.dumps(
+                {"run_id": run_id, "repo": str(repo), "lead": "claude"}
+            )
+            state_path = run_dir / "state.json"
+            state_path.write_text(legacy, encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    0, cmd_status(SimpleNamespace(repo=str(repo), run_id=run_id))
+                )
+            self.assertEqual(legacy, state_path.read_text(encoding="utf-8"))
+            current = repo / ".claudex" / "current"
+            current.write_text(run_id, encoding="utf-8")
+            _active_orchestrator(Config(repo=repo))
+            self.assertTrue((run_dir / "state.v1.bak.json").exists())
 
 
 class TerminalLauncherTests(unittest.TestCase):

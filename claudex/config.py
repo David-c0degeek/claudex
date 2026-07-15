@@ -140,7 +140,13 @@ class Config:
         tmp.replace(self.config_path)
 
     @classmethod
-    def load(cls, repo: Path, overrides: dict | None = None) -> "Config":
+    def load(
+        cls,
+        repo: Path,
+        overrides: dict | None = None,
+        *,
+        persist_migration: bool = True,
+    ) -> "Config":
         cfg = cls(repo=repo.resolve())
         path = cfg.config_path
         stored_version = CONFIG_SCHEMA_VERSION
@@ -176,7 +182,11 @@ class Config:
             if v is not None and k in known:
                 setattr(cfg, k, v)
         cfg.validate()
-        if path.exists() and stored_version < CONFIG_SCHEMA_VERSION:
+        if (
+            persist_migration
+            and path.exists()
+            and stored_version < CONFIG_SCHEMA_VERSION
+        ):
             backup = path.with_name(f"config.v{stored_version}.bak.json")
             if not backup.exists():
                 backup_tmp = backup.with_suffix(backup.suffix + ".tmp")

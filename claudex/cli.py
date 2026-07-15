@@ -72,7 +72,7 @@ def _template(name: str) -> str:
     )
 
 
-def _cfg(args) -> Config:
+def _cfg(args, *, persist_migration: bool = True) -> Config:
     overrides = {
         k: getattr(args, k, None)
         for k in (
@@ -110,14 +110,16 @@ def _cfg(args) -> Config:
             "max_evidence_requests",
         )
     }
-    return Config.load(Path(args.repo), overrides)
+    return Config.load(
+        Path(args.repo), overrides, persist_migration=persist_migration
+    )
 
 
 def _active_orchestrator(cfg: Config) -> Orchestrator:
     rid = get_current_run(cfg.repo)
     if not rid:
         raise OrchestratorError("no active run — start one with `claudex run` or `claudex pair start`")
-    state = RunState.load(run_dir_for(cfg.repo, rid), persist_migration=False)
+    state = RunState.load(run_dir_for(cfg.repo, rid))
     return Orchestrator(cfg, state)
 
 
@@ -724,12 +726,12 @@ def cmd_restart(args) -> int:
 
 # ---------------------------------------------------------------- inspection
 def cmd_status(args) -> int:
-    cfg = _cfg(args)
+    cfg = _cfg(args, persist_migration=False)
     rid = getattr(args, "run_id", None) or get_current_run(cfg.repo)
     if not rid:
         print("no active run")
         return 0
-    state = RunState.load(run_dir_for(cfg.repo, rid))
+    state = RunState.load(run_dir_for(cfg.repo, rid), persist_migration=False)
     rd = run_dir_for(cfg.repo, rid)
     print(f"run:      {rid}   ({state.driver})")
     print(f"phase:    {state.phase}   mode: {state.mode}")
@@ -961,7 +963,7 @@ def open_watch_terminals(
 
 
 def cmd_watch(args) -> int:
-    cfg = _cfg(args)
+    cfg = _cfg(args, persist_migration=False)
     rid = args.run_id or get_current_run(cfg.repo)
     if not rid:
         raise OrchestratorError("no run to watch; pass RUN_ID or start a run")

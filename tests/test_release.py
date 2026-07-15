@@ -52,6 +52,22 @@ class ConfigMigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "newer than supported"):
                 Config.load(repo)
 
+    def test_read_only_config_load_applies_defaults_without_writing_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            path = repo / ".claudex" / "config.json"
+            path.parent.mkdir()
+            original = json.dumps(
+                {"claude_write_allowed_tools": LEGACY_BROAD_CLAUDE_TOOLS}
+            )
+            path.write_text(original, encoding="utf-8")
+            cfg = Config.load(repo, persist_migration=False)
+            self.assertNotEqual(
+                LEGACY_BROAD_CLAUDE_TOOLS, cfg.claude_write_allowed_tools
+            )
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertFalse(path.with_name("config.v1.bak.json").exists())
+
 
 class RecoveryExportTests(unittest.TestCase):
     def test_migrated_state_keeps_backup_and_export_excludes_raw_streams(self) -> None:
