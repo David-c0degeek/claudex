@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from claudex import prompts, schemas
+from claudex import planops, prompts, schemas
 from claudex.cli import _read_guidance_notes, _replacement_state, build_parser
 from claudex.config import Config
 from claudex.phases import (
@@ -39,6 +39,7 @@ def plan() -> dict:
 
 def revision() -> dict:
     value = plan()
+    value["base_plan_sha256"] = planops.plan_digest(plan())
     value["responses"] = [
         {
             "finding_key": "missing-test",
@@ -131,6 +132,58 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual("", captured["resume"])
         self.assertIn("FINAL PLAN AUDIT", captured["prompt"])
 
+    def test_default_planning_protocol_is_bounded_to_four_fresh_calls(self) -> None:
+        self.state.phase = Phase.PLAN_DRAFT.value
+        self.orch._plan_path(0).unlink()
+        agreed = critique()
+        agreed["verdict"] = "AGREE"
+        agreed["findings"] = []
+        payloads = [plan(), critique(), revision(), agreed]
+        calls: list[dict] = []
+
+        def agent(name, prompt, **kwargs):
+            calls.append({"name": name, "prompt": prompt, **kwargs})
+            return result(payloads.pop(0), f"session-{len(calls)}")
+
+        self.orch._run_agent = agent
+        self.orch._ensure_worktree = Mock()
+
+        self.orch.phase_plan_draft()
+        self.orch.phase_plan_critique()
+        self.orch.phase_plan_revise()
+        self.orch.phase_plan_critique()
+
+        self.assertEqual(4, len(calls))
+        self.assertEqual(Phase.IMPLEMENT_STEP.value, self.state.phase)
+        review_calls = [call for call in calls if "plan-critique" in call["label"]]
+        self.assertEqual(["", ""], [call["resume"] for call in review_calls])
+        self.assertTrue(all(call["cwd"] == self.orch.run_dir for call in review_calls))
+        self.assertIn("FINAL PLAN AUDIT", review_calls[-1]["prompt"])
+        manifests = sorted(self.orch.run_dir.glob("evidence-plan-review-*.json"))
+        self.assertEqual(2, len(manifests))
+
+    def test_malformed_plan_delta_retains_last_canonical_plan(self) -> None:
+        self.state.phase = Phase.PLAN_REVISE.value
+        self.state.plan_round = 1
+        baseline = plan()
+        self.orch._plan_path(0).write_text(json.dumps(baseline), encoding="utf-8")
+        self.orch._critique_path(0).write_text(
+            json.dumps(critique()), encoding="utf-8"
+        )
+        malformed = revision()
+        malformed["base_plan_sha256"] = "wrong-baseline"
+        self.orch._run_agent = Mock(return_value=result(malformed))
+
+        with self.assertRaisesRegex(OrchestratorError, "canonical round 0 is unchanged"):
+            self.orch.phase_plan_revise()
+
+        self.assertFalse(self.orch._plan_path(1).exists())
+        self.assertTrue(self.orch._art("plan-revision-1.rejected.json").exists())
+        self.assertEqual(
+            baseline,
+            json.loads(self.orch._plan_path(0).read_text(encoding="utf-8")),
+        )
+
     def test_actual_decision_gates_without_consuming_revision_budget(self) -> None:
         self.cfg.max_plan_rounds = 5
         self.orch._run_agent = Mock(return_value=result(critique(decision=True)))
@@ -157,6 +210,35 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual("", self.state.sessions["pair_plan"])
         self.assertFalse(self.orch._critique_path(0).exists())
 
+    def test_missing_evidence_gets_one_bounded_fresh_packet_expansion(self) -> None:
+        source = self.repo / "needed.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        missing = critique()
+        missing["findings"] = []
+        missing["missing_evidence"] = ["needed.py"]
+        self.orch._run_agent = Mock(return_value=result(missing))
+
+        with self.assertRaisesRegex(OrchestratorError, "bounded retry packet"):
+            self.orch.pair_plan_turn()
+
+        self.assertEqual(["needed.py"], self.state.evidence_requests)
+        self.assertEqual(1, self.state.evidence_expansions)
+
+        agreed = critique()
+        agreed["verdict"] = "AGREE"
+        agreed["findings"] = []
+        self.orch._run_agent = Mock(return_value=result(agreed))
+        self.orch._ensure_worktree = Mock()
+        self.orch.pair_plan_turn()
+
+        manifests = sorted(self.orch.run_dir.glob("evidence-plan-review-*.json"))
+        self.assertEqual(2, len(manifests))
+        expanded = json.loads(manifests[-1].read_text(encoding="utf-8"))
+        self.assertIn(
+            "repo:needed.py",
+            {entry["purpose"] for entry in expanded["entries"]},
+        )
+
     def test_decision_flag_takes_precedence_over_inconsistent_agree(self) -> None:
         inconsistent = critique(decision=True)
         inconsistent["verdict"] = "AGREE"
@@ -166,6 +248,37 @@ class OrchestrationTests(unittest.TestCase):
 
         self.assertEqual(Phase.AWAIT_GUIDANCE.value, self.state.phase)
         self.assertEqual("decision", self.state.gate_kind)
+
+    def test_incident_decision_findings_do_not_override_explicit_false(self) -> None:
+        incident = critique()
+        incident["findings"] = [
+            {
+                **incident["findings"][0],
+                "key": f"incident-{index}",
+                "kind": "decision",
+                "category": "decision",
+                "severity": severity,
+            }
+            for index, severity in enumerate(("blocking", "major", "major"), 1)
+        ]
+        incident["requires_human_decision"] = False
+        incident["decision_question"] = None
+        self.orch._run_agent = Mock(return_value=result(incident))
+
+        self.orch.pair_plan_turn()
+
+        self.assertEqual(Phase.PLAN_REVISE.value, self.state.phase)
+        self.assertEqual("", self.state.gate_kind)
+
+    def test_inconsistent_decision_contract_is_a_protocol_failure(self) -> None:
+        for requested, question in ((True, None), (False, "Choose A or B.")):
+            invalid = critique()
+            invalid["requires_human_decision"] = requested
+            invalid["decision_question"] = question
+            self.orch._run_agent = Mock(return_value=result(invalid))
+
+            with self.assertRaisesRegex(OrchestratorError, "protocol violation"):
+                self.orch.pair_plan_turn()
 
     def test_guidance_is_persistent_and_reaches_both_roles(self) -> None:
         self.state.binding_guidance = ["Use option A."]
@@ -305,7 +418,7 @@ class OrchestrationTests(unittest.TestCase):
         args = build_parser().parse_args(["continue", "--repo", str(self.repo)])
         self.assertEqual("continue", args.command)
 
-    def test_restart_state_preserves_guidance_but_resets_plan_churn(self) -> None:
+    def test_restart_state_preserves_guidance_and_plan_checkpoint(self) -> None:
         self.state.binding_guidance = ["Keep the Preview disposition."]
         self.state.plan_round = 11
         self.state.plan_revisions = 11
@@ -314,8 +427,8 @@ class OrchestrationTests(unittest.TestCase):
 
         self.assertEqual(["Keep the Preview disposition."], replacement.binding_guidance)
         self.assertEqual(2, replacement.plan_protocol_version)
-        self.assertEqual(Phase.INIT.value, replacement.phase)
-        self.assertEqual(0, replacement.plan_round)
+        self.assertEqual(self.state.phase, replacement.phase)
+        self.assertEqual(11, replacement.plan_round)
 
     def test_legacy_planning_run_must_restart_not_extend(self) -> None:
         self.state.plan_protocol_version = 1

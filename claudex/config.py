@@ -27,7 +27,7 @@ class Config:
     # Lead-response budgets. A value N permits N complete revise/fix cycles
     # followed by a final fresh review of the Nth response. Exhaustion gates
     # as a budget stop; it is not mislabeled as a model disagreement.
-    max_plan_rounds: int = 5  # lead plan revisions
+    max_plan_rounds: int = 1  # one revision, followed by one fresh audit
     max_checkpoint_rounds: int = 3  # lead fixes per step
     max_test_rounds: int = 2  # fixes after mechanical test failures
     max_verify_rounds: int = 2  # fixes after verification failures
@@ -58,6 +58,9 @@ class Config:
     codex_verification_model: str = ""
     disable_nested_agents: bool = True
     allow_expensive_profiles: bool = False
+    max_evidence_bytes: int = 256 * 1024
+    max_evidence_file_bytes: int = 96 * 1024
+    max_evidence_requests: int = 8
     # Usage-limit handling: when a provider reports a usage/rate limit, wait
     # until the reset time it names (or default_limit_wait when it names
     # none) and retry, instead of failing the run.
@@ -103,6 +106,9 @@ class Config:
         "codex_verification_model",
         "disable_nested_agents",
         "allow_expensive_profiles",
+        "max_evidence_bytes",
+        "max_evidence_file_bytes",
+        "max_evidence_requests",
         "wait_on_limits",
         "default_limit_wait",
         "max_limit_wait",
@@ -167,10 +173,17 @@ class Config:
             "max_run_output_tokens": self.max_run_output_tokens,
             "max_run_tool_calls": self.max_run_tool_calls,
             "max_run_wall_seconds": self.max_run_wall_seconds,
+            "max_evidence_bytes": self.max_evidence_bytes,
+            "max_evidence_file_bytes": self.max_evidence_file_bytes,
+            "max_evidence_requests": self.max_evidence_requests,
         }
         for name, value in non_negative_integers.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if self.max_evidence_file_bytes > self.max_evidence_bytes:
+            raise ValueError(
+                "max_evidence_file_bytes cannot exceed max_evidence_bytes"
+            )
         if (
             not isinstance(self.max_run_cost_usd, (int, float))
             or isinstance(self.max_run_cost_usd, bool)

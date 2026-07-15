@@ -11,8 +11,8 @@
     claudex resolve --notes "..."   answer a concrete decision gate
     claudex resolve --notes-file p   answer from a file (safe for multiline text)
     claudex continue                extend an exhausted quality budget
-    claudex resume --add-...        expand and resume a run economic budget
-    claudex restart                 retire a planning run under the current protocol
+    claudex resume [--add-...]      continue the same run/checkpoint
+    claudex restart [--fresh-plan] replace execution identity without losing state
     claudex status                  show run state and artifacts
     claudex retry                   re-attempt the phase that failed
     claudex abort                   abort the active run
@@ -31,9 +31,10 @@ from importlib import resources
 from pathlib import Path
 
 from . import __version__, gitops
-from . import budgets
+from . import budgets, recovery
 from .agents import AgentError, resolve_claude_bin, resolve_codex_bin
 from .config import Config
+from .lifecycle import Lifecycle
 from .phases import (
     Orchestrator,
     OrchestratorError,
@@ -98,6 +99,9 @@ def _cfg(args) -> Config:
             "codex_verification_model",
             "disable_nested_agents",
             "allow_expensive_profiles",
+            "max_evidence_bytes",
+            "max_evidence_file_bytes",
+            "max_evidence_requests",
         )
     }
     return Config.load(Path(args.repo), overrides)
@@ -244,22 +248,16 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         started_epoch_s=time.time(),
     )
+    state.record_lifecycle_start()
     set_current_run(cfg.repo, state.run_id)
     state.save(run_dir_for(cfg.repo, state.run_id))
     return state, True
 
 
-def _replacement_state(cfg: Config, old: RunState) -> RunState:
-    state = RunState(
-        run_id=new_run_id(),
-        repo=str(cfg.repo),
-        lead=old.lead,
-        driver="headless",
-        mode=old.mode,
-        binding_guidance=list(old.binding_guidance),
-    )
-    state.log(f"restarted from {old.run_id} under plan protocol v2")
-    return state
+def _replacement_state(
+    cfg: Config, old: RunState, *, fresh_plan: bool = False
+) -> RunState:
+    return recovery.clone_state(old, new_run_id(), fresh_plan=fresh_plan)
 
 
 def cmd_run(args) -> int:
@@ -549,7 +547,7 @@ def cmd_continue(args) -> int:
 
 
 def cmd_resume(args) -> int:
-    """Resume only a durable run-budget pause with an explicit override."""
+    """Continue the same durable run; budget pauses require additions."""
     cfg = _cfg(args)
     orch = _active_orchestrator(cfg)
     additions = {
@@ -564,8 +562,41 @@ def cmd_resume(args) -> int:
     }
 
     def go() -> int:
-        orch.resume_budget(additions, args.acknowledge_currency)
-        print(f"run budget expanded; run returns to {orch.state.phase}")
+        has_override = any(value != 0 for value in additions.values()) or bool(
+            args.acknowledge_currency
+        )
+        phase = Phase(orch.state.phase)
+        lifecycle = Lifecycle(orch.state.lifecycle)
+        if phase is Phase.PAUSED_BUDGET:
+            orch.resume_budget(additions, args.acknowledge_currency)
+            print(f"run budget expanded; run returns to {orch.state.phase}")
+        elif has_override:
+            raise OrchestratorError(
+                "budget additions are accepted only while PAUSED_BUDGET"
+            )
+        elif lifecycle is Lifecycle.FAILED_RETRYABLE:
+            orch.state.retry()
+            orch.state.save(orch.run_dir)
+            print(f"retryable failure resumed at {orch.state.phase}")
+        elif lifecycle is Lifecycle.RATE_LIMITED:
+            orch.state.transition_lifecycle(
+                Lifecycle.RUNNING,
+                "operator resumed rate-limited run",
+                "claudex resume",
+            )
+            orch.state.save(orch.run_dir)
+            print(f"rate-limited run resumed at {orch.state.phase}")
+        elif lifecycle is Lifecycle.RUNNING:
+            print(f"resuming run {orch.state.run_id} at {orch.state.phase}")
+        elif lifecycle is Lifecycle.PAUSED:
+            raise OrchestratorError(
+                "run is paused for guidance/quality policy; use claudex resolve "
+                "or claudex continue as shown by claudex status"
+            )
+        else:
+            raise OrchestratorError(
+                f"run lifecycle {lifecycle.value} is not resumable"
+            )
         if orch.state.driver == "live":
             _next_live_hint(orch)
         else:
@@ -576,34 +607,61 @@ def cmd_resume(args) -> int:
 
 
 def cmd_restart(args) -> int:
-    """Retire a planning-stage headless run and immediately start a clean
-    run under the current protocol while preserving binding guidance."""
+    """Create a replacement identity from the latest durable checkpoint."""
     cfg = _cfg(args)
     old = _active_orchestrator(cfg)
-    phase = Phase(old.state.phase)
-    planning = phase in {
-        Phase.PLAN_DRAFT,
-        Phase.PLAN_CRITIQUE,
-        Phase.PLAN_REVISE,
-        Phase.AWAIT_GUIDANCE,
-        Phase.FAILED,
-    }
-    if old.state.driver != "headless" or not planning or old.state.worktree:
+    lifecycle = Lifecycle(old.state.lifecycle)
+    if old.state.driver != "headless":
         raise OrchestratorError(
-            "restart is only safe for a headless planning run with no worktree; "
-            "use abort/clean explicitly for implementation-stage runs"
+            "restart currently requires a headless run"
+        )
+    if lifecycle in (
+        Lifecycle.COMPLETED,
+        Lifecycle.CANCELLED,
+        Lifecycle.FAILED_TERMINAL,
+    ):
+        raise OrchestratorError(f"cannot restart terminal lifecycle {lifecycle.value}")
+    if args.fresh_plan and old.state.worktree:
+        raise OrchestratorError(
+            "--fresh-plan would discard an implementation checkpoint; abort/clean "
+            "or restart without --fresh-plan"
         )
     acquire_run_lock(old.run_dir)
     try:
+        old_state_backup = old.run_dir / "state.pre-restart.json"
+        if not old_state_backup.exists():
+            backup_tmp = old_state_backup.with_suffix(
+                old_state_backup.suffix + ".tmp"
+            )
+            backup_tmp.write_bytes((old.run_dir / "state.json").read_bytes())
+            backup_tmp.replace(old_state_backup)
+        before = recovery.checkpoint_digest(old.state, old.run_dir)
+        state = _replacement_state(cfg, old.state, fresh_plan=args.fresh_plan)
+        new_dir = run_dir_for(cfg.repo, state.run_id)
+        recovery.copy_checkpoint_artifacts(old.run_dir, new_dir)
+        if args.fresh_plan:
+            recovery.discard_plan_artifacts(new_dir)
+            if not (new_dir / "task.md").exists():
+                state.phase = Phase.INIT.value
+        recovery.remap_run_paths(state, old.run_dir, new_dir)
+        if not args.fresh_plan:
+            after = recovery.checkpoint_digest(state, new_dir)
+            if after != before:
+                raise OrchestratorError(
+                    f"restart checkpoint mismatch: {before} != {after}; old run retained"
+                )
+        state.save(new_dir)
         old.abort()
-        state = _replacement_state(cfg, old.state)
+        if state.lifecycle == Lifecycle.FAILED_RETRYABLE.value:
+            state.retry()
+            state.save(new_dir)
         set_current_run(cfg.repo, state.run_id)
-        state.save(run_dir_for(cfg.repo, state.run_id))
     finally:
         release_run_lock(old.run_dir)
     print(
-        f"retired {old.state.run_id}; restarting as {state.run_id} with "
-        f"{len(state.binding_guidance)} preserved decision(s)"
+        f"retired {old.state.run_id}; restarting as {state.run_id} from "
+        + ("an explicit fresh plan" if args.fresh_plan else "the canonical checkpoint")
+        + f" with {len(state.binding_guidance)} preserved decision(s)"
     )
     orch = Orchestrator(cfg, state)
     return _locked(cfg, orch, lambda: _run_headless(orch))
@@ -620,6 +678,7 @@ def cmd_status(args) -> int:
     rd = run_dir_for(cfg.repo, rid)
     print(f"run:      {rid}   ({state.driver})")
     print(f"phase:    {state.phase}   mode: {state.mode}")
+    print(f"lifecycle:{state.lifecycle}")
     print(f"lead:     {state.lead}   pair: {state.pair}")
     protocol = (
         "compact-plan v2+"
@@ -627,6 +686,11 @@ def cmd_status(args) -> int:
         else "legacy exhaustive-plan v1 (restart required while planning)"
     )
     print(f"protocol: {protocol}")
+    if state.canonical_plan_sha256:
+        print(
+            f"canonical: plan round {state.canonical_plan_round} · "
+            f"sha256 {state.canonical_plan_sha256}"
+        )
     if state.steps:
         print(f"step:     {min(state.step_index + 1, len(state.steps))}/{len(state.steps)}")
     if state.implementation_checks:
@@ -736,6 +800,12 @@ def cmd_status(args) -> int:
     if state.gate_reason:
         kind = state.gate_kind or "unknown"
         print(f"gate:     [{kind}] {state.gate_reason}")
+    if state.lifecycle_history:
+        transition = state.lifecycle_history[-1]
+        print(
+            f"resume:   {transition.get('resume_instruction', '')}"
+            f" · {transition.get('reason', '')}"
+        )
     if state.error:
         print(f"error:    {state.error}")
     print(f"run dir:  {rd}")
@@ -909,6 +979,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--codex-planning-model", default=None)
         sp.add_argument("--codex-implementation-model", default=None)
         sp.add_argument("--codex-verification-model", default=None)
+        sp.add_argument("--max-evidence-bytes", type=int, default=None)
+        sp.add_argument("--max-evidence-file-bytes", type=int, default=None)
+        sp.add_argument("--max-evidence-requests", type=int, default=None)
         sp.add_argument(
             "--allow-expensive-profiles",
             action="store_true",
@@ -984,7 +1057,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_continue)
 
     sp = sub.add_parser(
-        "resume", help="resume a run-budget pause with an explicit budget addition"
+        "resume", help="continue the same durable run; add capacity for budget pauses"
     )
     common(sp)
     sp.add_argument("--add-invocations", type=int, default=0)
@@ -1006,9 +1079,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "restart",
-        help="retire a planning run and restart compactly, preserving guidance",
+        help="replace execution identity while preserving the canonical checkpoint",
     )
     common(sp)
+    sp.add_argument(
+        "--fresh-plan",
+        action="store_true",
+        help="explicitly discard planning artifacts while preserving decisions/budgets",
+    )
     sp.set_defaults(func=cmd_restart)
 
     sp = sub.add_parser("status", help="show run state and artifacts")

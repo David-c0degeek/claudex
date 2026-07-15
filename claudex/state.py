@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-STATE_SCHEMA_VERSION = 3
+from .lifecycle import Lifecycle, transition_allowed
+
+STATE_SCHEMA_VERSION = 4
 
 
 class Phase(str, Enum):
@@ -48,12 +50,11 @@ GATE_PHASES = {Phase.AWAIT_GUIDANCE, Phase.PAUSED_BUDGET}
 
 AGENTS = ("claude", "codex")
 
-# Session lineages. Codex `exec resume` pins the session's original cwd and
-# Claude `--resume` is per-project-dir, so a session created in the main repo
-# must never be resumed for worktree work (it would silently read stale
-# code). Plan lineages live at cwd=repo; impl/review lineages at cwd=worktree;
-# no lineage ever crosses. VERIFY deliberately uses no lineage at all.
-SESSION_KEYS = ("lead_plan", "lead_impl", "pair_plan", "pair_review")
+# Only implementation/review lineages may resume. Planning and final
+# verification are fresh and consume coordinator-built bounded evidence.
+# Codex `exec resume` pins the original cwd and Claude resume is per project,
+# so even these worktree lineages never cross cwd boundaries.
+SESSION_KEYS = ("lead_impl", "pair_review")
 
 _MAILBOX_GUIDANCE_RE = re.compile(
     r"===== \[HUMAN\][^\r\n]*STATUS: GUIDANCE =====\r?\n"
@@ -71,6 +72,7 @@ class RunState:
     run_id: str
     repo: str
     lead: str  # holds the pen: drafts the plan, implements, fixes
+    predecessor_run_id: str = ""
     state_schema_version: int = STATE_SCHEMA_VERSION
     # "headless": `claudex run` drives both agents as subprocesses.
     # "live": an interactive session IS the lead; `claudex pair` subcommands
@@ -85,6 +87,8 @@ class RunState:
     phase: str = Phase.INIT.value
     created_at: str = ""
     started_epoch_s: float = 0.0
+    lifecycle: str = Lifecycle.RUNNING.value
+    lifecycle_history: list = field(default_factory=list)
     base_commit: str = ""
     branch: str = ""
     worktree: str = ""
@@ -92,6 +96,8 @@ class RunState:
     sessions: dict = field(default_factory=dict)
     # Agreed plan's ordered steps: [{title, description, files, tests}, ...]
     steps: list = field(default_factory=list)
+    canonical_plan_round: int = -1
+    canonical_plan_sha256: str = ""
     step_index: int = 0
     # Round counters identify critique/review artifacts and only ever
     # increase (artifact names embed them, so a reset would silently replay
@@ -162,6 +168,11 @@ class RunState:
     # existing implementation step. They do not force plan rewrites; the
     # coordinator carries them into implementation, checkpoints, and verify.
     implementation_checks: list = field(default_factory=list)
+    accepted_findings: list = field(default_factory=list)
+    unresolved_findings: list = field(default_factory=list)
+    evidence_requests: list = field(default_factory=list)
+    evidence_expansions: int = 0
+    last_evidence_manifest: str = ""
     findings_file: str = ""  # findings the next FIX must address
     # Where FIX hands control back to: checkpoint | tests | verify —
     # fixes re-enter the loop that produced the findings.
@@ -187,6 +198,55 @@ class RunState:
         self.log(f"{self.phase} -> {new_phase.value}" + (f" ({note})" if note else ""))
         self.phase = new_phase.value
 
+    def record_lifecycle_start(self, reason: str = "run created") -> None:
+        if self.lifecycle_history:
+            raise ValueError("lifecycle start is already recorded")
+        self._append_lifecycle(
+            "",
+            Lifecycle(self.lifecycle),
+            reason,
+            "claudex resume",
+        )
+
+    def transition_lifecycle(
+        self,
+        target: Lifecycle,
+        reason: str,
+        resume_instruction: str,
+    ) -> None:
+        previous = Lifecycle(self.lifecycle)
+        if not transition_allowed(previous, target):
+            raise ValueError(
+                f"illegal lifecycle transition {previous.value} -> {target.value}"
+            )
+        self.lifecycle = target.value
+        self._append_lifecycle(
+            previous.value,
+            target,
+            reason,
+            resume_instruction,
+        )
+
+    def _append_lifecycle(
+        self,
+        previous: str,
+        target: Lifecycle,
+        reason: str,
+        resume_instruction: str,
+    ) -> None:
+        self.lifecycle_history.append(
+            {
+                "version": 1,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "from": previous,
+                "to": target.value,
+                "reason": reason,
+                "phase": self.phase,
+                "attempt_id": self.active_attempt_id,
+                "resume_instruction": resume_instruction,
+            }
+        )
+
     def gate(
         self, reason: str, return_phase: Phase, *, kind: str = "decision"
     ) -> None:
@@ -196,6 +256,11 @@ class RunState:
         self.gate_reason = reason
         self.gate_kind = kind
         self.return_phase = return_phase.value
+        self.transition_lifecycle(
+            Lifecycle.PAUSED,
+            reason,
+            "claudex resolve --notes ..." if kind == "decision" else "claudex continue",
+        )
         self.advance(Phase.AWAIT_GUIDANCE, reason[:200])
 
     def pause_budget(self, reason: str, return_phase: Phase) -> None:
@@ -203,21 +268,42 @@ class RunState:
         self.gate_reason = reason
         self.gate_kind = "run_budget"
         self.return_phase = return_phase.value
+        self.transition_lifecycle(
+            Lifecycle.PAUSED_BUDGET,
+            reason,
+            "claudex resume --add-...",
+        )
         self.advance(Phase.PAUSED_BUDGET, reason[:200])
 
-    def fail(self, error: str) -> None:
+    def fail(self, error: str, *, retryable: bool = True) -> None:
         self.failed_phase = self.phase
         self.error = error
+        self.transition_lifecycle(
+            Lifecycle.FAILED_RETRYABLE if retryable else Lifecycle.FAILED_TERMINAL,
+            error,
+            "claudex retry" if retryable else "inspect artifacts; start a new run",
+        )
         self.advance(Phase.FAILED, error[:200])
 
     def retry(self) -> None:
         """Rewind FAILED back to the phase that failed, for a re-attempt."""
         if Phase(self.phase) is not Phase.FAILED or not self.failed_phase:
             raise ValueError("run is not in a retryable failed state")
+        if Lifecycle(self.lifecycle) is Lifecycle.RUNNING:
+            self.transition_lifecycle(
+                Lifecycle.FAILED_RETRYABLE,
+                "reconciled legacy retryable failure",
+                "claudex retry",
+            )
         self.log(f"retry: failed -> {self.failed_phase}")
         self.phase = self.failed_phase
         self.error = ""
         self.failed_phase = ""
+        self.transition_lifecycle(
+            Lifecycle.RUNNING,
+            "retry requested",
+            "claudex resume",
+        )
 
     def log(self, message: str) -> None:
         self.events.append(
@@ -235,7 +321,9 @@ class RunState:
 
     @staticmethod
     def load(run_dir: Path) -> "RunState":
-        data = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        state_path = run_dir / "state.json"
+        original = state_path.read_text(encoding="utf-8")
+        data = json.loads(original)
         version = int(data.get("state_schema_version", 1))
         if version > STATE_SCHEMA_VERSION:
             raise ValueError(
@@ -243,6 +331,15 @@ class RunState:
                 f"schema {STATE_SCHEMA_VERSION}; upgrade Claudex before resuming"
             )
         data["state_schema_version"] = STATE_SCHEMA_VERSION
+        if "lifecycle" not in data:
+            phase = data.get("phase", Phase.INIT.value)
+            data["lifecycle"] = {
+                Phase.DONE.value: Lifecycle.COMPLETED.value,
+                Phase.ABORTED.value: Lifecycle.CANCELLED.value,
+                Phase.FAILED.value: Lifecycle.FAILED_RETRYABLE.value,
+                Phase.AWAIT_GUIDANCE.value: Lifecycle.PAUSED.value,
+                Phase.PAUSED_BUDGET.value: Lifecycle.PAUSED_BUDGET.value,
+            }.get(phase, Lifecycle.RUNNING.value)
         known = {f.name for f in dataclasses.fields(RunState)}
         # Pre-pair state files called the lead "owner"; accept them.
         if "lead" not in data and "owner" in data:
@@ -276,11 +373,47 @@ class RunState:
                 except (IndexError, ValueError):
                     continue
             data["plan_revisions"] = max(revisions, default=0)
+        if not data.get("canonical_plan_sha256"):
+            from .planops import plan_digest  # local import keeps state lightweight
+
+            candidates = []
+            for path in run_dir.glob("plan-round-*.json"):
+                try:
+                    candidates.append((int(path.stem.rsplit("-", 1)[1]), path))
+                except (IndexError, ValueError):
+                    continue
+            for round_no, path in sorted(candidates, reverse=True):
+                try:
+                    plan = json.loads(path.read_text(encoding="utf-8"))
+                    if not str(plan.get("plan_markdown", "")).strip() or not plan.get("steps"):
+                        continue
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    continue
+                data["canonical_plan_round"] = round_no
+                data["canonical_plan_sha256"] = plan_digest(plan)
+                break
         if data.get("gate_reason") and not data.get("gate_kind"):
             data["gate_kind"] = "budget"
         if data.get("provider_cost_usd") and not data.get("provider_costs"):
             data["provider_costs"] = {"USD": data["provider_cost_usd"]}
-        return RunState(**{k: v for k, v in data.items() if k in known})
+        state = RunState(**{k: v for k, v in data.items() if k in known})
+        synthesized_history = not state.lifecycle_history
+        if synthesized_history:
+            state._append_lifecycle(
+                "",
+                Lifecycle(state.lifecycle),
+                f"migrated from run state schema {version}",
+                "claudex resume",
+            )
+        if version < STATE_SCHEMA_VERSION:
+            backup = run_dir / f"state.v{version}.bak.json"
+            if not backup.exists():
+                backup_tmp = backup.with_suffix(backup.suffix + ".tmp")
+                backup_tmp.write_text(original, encoding="utf-8")
+                backup_tmp.replace(backup)
+        if version < STATE_SCHEMA_VERSION or synthesized_history:
+            state.save(run_dir)
+        return state
 
 
 # ------------------------------------------------------------------ run lock

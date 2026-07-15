@@ -42,6 +42,9 @@ Protocol:
    verification. Fix failures, commit, verify again. On pass: run is DONE;
    tell the human to `git merge <branch>` and `claudex clean`.
 
-`claudex status` always shows the phase, step, response budgets, and the next
-command. At a budget gate use `claudex continue`; at a decision gate use
-`claudex resolve`. `mailbox.md` in the run dir is the full transcript.
+`claudex status` shows lifecycle, phase, active attempt, canonical plan hash,
+usage, response/run budgets, and the next command. At a quality budget gate
+use `claudex continue`; at a decision gate use `claudex resolve`; at a run
+economic pause use `claudex resume --add-...`. Plain `claudex resume`
+continues the same durable identity. `mailbox.md` is the concise turn ledger;
+immutable attempt event journals hold live provider text and tools.

@@ -45,7 +45,7 @@ forever):
 - plan findings are limited to architecture, scope, step safety, and
   validation strategy; volatile facts/content details are carried forward as
   implementation checks and reviewed against committed artifacts;
-- lead-response budgets: plan revisions (5), checkpoint fixes per step (3),
+- lead-response budgets: plan revisions (1), checkpoint fixes per step (3),
   test fixes (2), verify fixes (2) — all configurable; every budget permits
   the final lead response before a fresh review. Exhaustion is reported as a
   quality-budget stop, not falsely labeled a disagreement;
@@ -74,8 +74,10 @@ claudex resolve --notes "..."      # answer a concrete decision gate
 claudex resolve --notes-file decision.md  # multiline/shell-safe alternative
 claudex continue                   # allow one response + fresh audit, no guidance
 claudex continue --responses 2     # larger extension only when explicitly chosen
+claudex resume                     # continue this exact durable run/checkpoint
 claudex resume --add-invocations 2 # expand an exhausted run envelope explicitly
-claudex restart                    # retire a legacy/stuck plan; preserve decisions
+claudex restart                    # new execution ID, hash-equivalent checkpoint
+claudex restart --fresh-plan       # explicitly discard planning state only
 git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
 ```
@@ -171,6 +173,7 @@ winner-picking: ownership is resolved by initiation.
 | convergence is checkable | `AGREE` + zero blocking/major, evaluated by the coordinator |
 | planning stays planning | plan-level finding categories are schema-constrained; content obligations persist separately as implementation checks |
 | inconclusive reviews don't cause churn | tool/evidence failures retry the reviewer fresh without charging a lead response |
+| review context stays bounded | fresh plan reviewers receive hashed size-capped manifests, canonical plan/decision/finding ledgers, and selected repo files—never a critique glob |
 | no infinite loops | explicit lead-response budgets plus a final fresh-context audit |
 | economic admission | durable run caps are checked before every provider call; Claude also receives its native USD/turn caps |
 | conservative provider policy | phase-specific effort; Claude Agent/Task and Codex multi-agent features disabled unless explicitly enabled |
@@ -180,10 +183,27 @@ winner-picking: ownership is resolved by initiation.
 | verification is independent | verify turn never resumes any session |
 | test results are real | coordinator runs `test_command` itself, exit code decides |
 
-Session continuity without contamination: each role keeps its own session
-lineage (`lead_plan`, `pair_plan` in the repo; `lead_impl`, `pair_review`
-in the worktree — resume pins the original cwd, so lineages never cross),
-and the verifier gets none of them.
+Session continuity without contamination: planning/revision reviewers and the
+final verifier are fresh and consume coordinator-built evidence. Only
+`lead_impl` and `pair_review` may resume inside the unchanged worktree; resume
+pins the original cwd, so those lineages never cross.
+
+The default planning ceiling is one draft, one critique, one hash-guarded
+section-replacement revision, and at most one conditional fresh audit. A human
+gate exists only when structured output contains both explicit
+`requires_human_decision: true` and a concrete non-empty question; finding
+labels cannot infer a gate. Inconsistent combinations are retryable provider
+protocol failures.
+
+Run state also has a durable macro lifecycle (`running`, `paused`,
+`paused_budget`, `rate_limited`, `cancelled`, `failed_retryable`,
+`failed_terminal`, or `completed`). Every lifecycle entry records the phase,
+attempt, reason, timestamp, and exact resume instruction. `claudex resume`
+continues the same run ID. `restart` creates a new execution ID only after a
+hash-equivalence check of the copied canonical checkpoint—including decisions,
+findings, checks, budgets, worktree/base identity, and safe sessions. State
+migrations and restart retain an original-state backup; only `--fresh-plan`
+deliberately removes planning artifacts.
 
 ## Report mode
 
@@ -202,7 +222,7 @@ flags):
 {
   "lead": "claude",             // who holds the pen by default
   "mode": "auto",               // auto | change | report
-  "max_plan_rounds": 5,       // plan-revision budget
+  "max_plan_rounds": 1,       // one revision + one conditional fresh audit
   "max_checkpoint_rounds": 3, // fix budget per step
   "max_test_rounds": 2,       // fixes after test failures
   "max_verify_rounds": 2,     // fixes after verification failures
@@ -223,6 +243,9 @@ flags):
   "verification_effort": "high",
   "claude_planning_model": "", // empty falls back to claude_model
   "codex_planning_model": "",  // implementation/verification variants exist
+  "max_evidence_bytes": 262144,
+  "max_evidence_file_bytes": 98304,
+  "max_evidence_requests": 8,
   "disable_nested_agents": true,
   "allow_expensive_profiles": false,
   "wait_on_limits": true,       // wait out provider usage limits and resume

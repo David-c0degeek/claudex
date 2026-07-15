@@ -41,7 +41,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import artifacts, budgets, gitops, prompts, schemas
+from . import artifacts, budgets, evidence, gitops, planops, prompts, schemas
 from .agents import (
     AgentError,
     ClaudeAgent,
@@ -52,6 +52,7 @@ from .agents import (
 )
 from .config import Config
 from .events import AgentEvent
+from .lifecycle import Lifecycle
 from .state import (
     Phase,
     RunState,
@@ -436,33 +437,63 @@ class Orchestrator:
         label: str,
         artifact_path: Path | None = None,
     ) -> None:
-        if not schemas.is_inconclusive_review(review):
+        try:
+            inconclusive = schemas.is_inconclusive_review(review)
+        except schemas.ProtocolViolation as exc:
+            self.state.sessions[lineage] = ""
+            self._quarantine_review_artifact(artifact_path, "protocol-violation")
+            raise OrchestratorError(f"{label} protocol violation: {exc}") from exc
+        if not inconclusive:
             return
+        requested = evidence.requested_repo_paths(
+            self.cfg, list(review.get("missing_evidence") or [])
+        )
+        new_requests = [
+            value for value in requested if value not in self.state.evidence_requests
+        ]
+        expanded = False
+        if new_requests and self.state.evidence_expansions < 1:
+            remaining = self.cfg.max_evidence_requests - len(self.state.evidence_requests)
+            additions = new_requests[: max(0, remaining)]
+            if additions:
+                self.state.evidence_requests.extend(additions)
+                self.state.evidence_expansions += 1
+                expanded = True
         # A fresh retry should not inherit a session whose tool/evidence
         # state made it unable to review. Quarantine legacy artifacts so
         # artifact-presence retry logic does not replay them forever.
         self.state.sessions[lineage] = ""
-        if artifact_path and artifact_path.exists():
-            target = artifact_path.with_name(
-                f"{artifact_path.stem}.inconclusive{artifact_path.suffix}"
-            )
-            n = 2
-            while target.exists():
-                target = artifact_path.with_name(
-                    f"{artifact_path.stem}.inconclusive-{n}{artifact_path.suffix}"
-                )
-                n += 1
-            artifact_path.replace(target)
-            rendered = artifact_path.with_suffix(".md")
-            if rendered.exists():
-                rendered.replace(target.with_suffix(".md"))
+        self._quarantine_review_artifact(artifact_path, "inconclusive")
         details = review.get("missing_evidence") or [
             review.get("tests_critique") or review.get("notes") or "no actionable finding"
         ]
         raise OrchestratorError(
             f"{label} was inconclusive and will not consume a lead response: "
             + "; ".join(str(item) for item in details if item)
+            + (
+                "; requested paths were added to the bounded retry packet"
+                if expanded
+                else ""
+            )
         )
+
+    def _quarantine_review_artifact(
+        self, artifact_path: Path | None, suffix: str
+    ) -> None:
+        if artifact_path and artifact_path.exists():
+            target = artifact_path.with_name(
+                f"{artifact_path.stem}.{suffix}{artifact_path.suffix}"
+            )
+            n = 2
+            while target.exists():
+                target = artifact_path.with_name(
+                    f"{artifact_path.stem}.{suffix}-{n}{artifact_path.suffix}"
+                )
+                n += 1
+            artifact_path.replace(target)
+            rendered = artifact_path.with_suffix(".md")
+            if rendered.exists():
+                rendered.replace(target.with_suffix(".md"))
 
     # ----------------------------------------------------------------- driver
     def _require_current_plan_protocol(self) -> None:
@@ -622,13 +653,15 @@ class Orchestrator:
                 label="plan-draft",
             )
             plan = res.require_structured()
-            self._remember_session("lead_plan", res.session_id)
             self._store_plan(plan, 0)
         self.state.advance(Phase.PLAN_CRITIQUE)
 
     def _store_plan(self, plan: dict, round_no: int) -> None:
+        plan = planops.canonical_plan(plan)
         validate_plan_shape(plan)
         artifacts.save_json(self._plan_path(round_no), plan)
+        self.state.canonical_plan_round = round_no
+        self.state.canonical_plan_sha256 = planops.plan_digest(plan)
         self._art(f"plan-round-{round_no}.md").write_text(
             artifacts.render_plan(self.state.lead, round_no, plan), encoding="utf-8"
         )
@@ -681,35 +714,45 @@ class Orchestrator:
         else:
             budget = self.cfg.max_plan_rounds + self.state.plan_cap_extra
             final_audit = self.state.plan_revisions >= budget
+            try:
+                manifest = evidence.build_plan_review_packet(
+                    self.cfg, self.state, self.run_dir, self._plan_path(rnd)
+                )
+            except evidence.EvidenceError as exc:
+                raise OrchestratorError(f"plan review evidence: {exc}") from exc
+            self.state.last_evidence_manifest = str(manifest)
+            self._save()
             res = self._run_agent(
                 self.state.pair,
                 prompts.plan_critique(
-                    self.task_snapshot,
-                    self._plan_path(rnd),
+                    manifest,
                     rnd,
                     guidance=self._binding_guidance(),
                     final_audit=final_audit,
                 ),
-                cwd=self.cfg.repo,
+                cwd=self.run_dir,
                 read_only=True,
                 schema=schemas.PLAN_CRITIQUE_SCHEMA,
-                # Normal rounds retain concessions; the cap-boundary audit is
-                # deliberately fresh so accumulated context cannot hide a
-                # regression or an uncovered acceptance criterion.
-                resume="" if final_audit else self.state.sessions.get("pair_plan", ""),
+                # Every review is fresh; bounded ledgers carry only canonical
+                # concessions and unresolved evidence across rounds.
+                resume="",
                 label=f"plan-critique-{rnd}",
             )
             critique = res.require_structured()
             self._require_conclusive_review(
                 critique, lineage="pair_plan", label=f"plan critique {rnd}"
             )
-            self._remember_session("pair_plan", res.session_id)
             artifacts.save_json(cpath, critique)
             self._art(f"plan-critique-{rnd}.md").write_text(
                 artifacts.render_critique(self.state.pair, "Plan critique", rnd, critique),
                 encoding="utf-8",
             )
         self._merge_implementation_checks(critique, self._plan_path(rnd))
+        self.state.unresolved_findings = [
+            dict(item)
+            for item in critique.get("findings", [])
+            if item.get("severity") in ("blocking", "major")
+        ]
         checks = critique.get("implementation_checks", [])
         digest = artifacts.findings_digest(critique.get("findings", []))
         if checks:
@@ -722,7 +765,13 @@ class Orchestrator:
             critique.get("verdict", "?"),
             digest,
         )
-        if schemas.requires_human_decision(critique):
+        try:
+            decision_requested = schemas.requires_human_decision(critique)
+        except schemas.ProtocolViolation as exc:
+            raise OrchestratorError(
+                f"plan critique {rnd} protocol violation: {exc}"
+            ) from exc
+        if decision_requested:
             self.state.plan_round = rnd + 1  # round consumed
             self.state.gate(
                 critique.get("decision_question")
@@ -731,6 +780,7 @@ class Orchestrator:
                 kind="decision",
             )
         elif schemas.is_converged(critique):
+            self.state.unresolved_findings = []
             self._lock_agreed_plan(rnd)
             self.state.advance(Phase.IMPLEMENT_STEP, f"plan agreed at round {rnd}")
         else:
@@ -780,9 +830,26 @@ class Orchestrator:
         """Headless only: the lead agent revises. In live mode the
         interactive lead revises and re-submits via `pair plan`."""
         rnd = self.state.plan_round  # the version this revision will become
-        if self._plan_path(rnd).exists():
+        revision_path = self._art(f"plan-revision-{rnd}.json")
+        baseline = json.loads(
+            self._plan_path(rnd - 1).read_text(encoding="utf-8")
+        )
+        manifest = Path(self.state.last_evidence_manifest)
+        if not manifest.exists():
+            try:
+                manifest = evidence.build_plan_review_packet(
+                    self.cfg,
+                    self.state,
+                    self.run_dir,
+                    self._plan_path(rnd - 1),
+                    round_no=rnd - 1,
+                )
+            except evidence.EvidenceError as exc:
+                raise OrchestratorError(f"plan revision evidence: {exc}") from exc
+            self.state.last_evidence_manifest = str(manifest)
+        if self._plan_path(rnd).exists() and revision_path.exists():
             self.say(f"plan revision {rnd} already present, skipping")
-            revision = json.loads(self._plan_path(rnd).read_text(encoding="utf-8"))
+            revision = json.loads(revision_path.read_text(encoding="utf-8"))
         else:
             res = self._run_agent(
                 self.state.lead,
@@ -791,22 +858,50 @@ class Orchestrator:
                     self._plan_path(rnd - 1),
                     self._critique_path(rnd - 1),
                     rnd - 1,
+                    planops.plan_digest(baseline),
+                    manifest,
                     guidance=self._binding_guidance(),
                 ),
-                cwd=self.cfg.repo,
+                cwd=self.run_dir,
                 read_only=True,
                 schema=schemas.PLAN_REVISION_SCHEMA,
-                resume=self.state.sessions.get("lead_plan", ""),
+                resume="",
                 label=f"plan-revise-{rnd}",
             )
             revision = res.require_structured()
-            self._remember_session("lead_plan", res.session_id)
+            artifacts.save_json(revision_path, revision)
         critique = json.loads(
             self._critique_path(rnd - 1).read_text(encoding="utf-8")
         )
-        validate_revision_responses(critique, revision)
+        try:
+            validate_revision_responses(critique, revision)
+            canonical = planops.apply_revision_delta(baseline, revision)
+            validate_plan_shape(canonical)
+        except (planops.PlanDeltaError, OrchestratorError) as exc:
+            self._quarantine_review_artifact(revision_path, "rejected")
+            raise OrchestratorError(
+                f"plan revision {rnd} rejected; canonical round {rnd - 1} "
+                f"is unchanged: {exc}"
+            ) from exc
         if not self._plan_path(rnd).exists():
-            self._store_plan(revision, rnd)
+            self._store_plan(canonical, rnd)
+        finding_by_key = {
+            str(item.get("key", "")): item
+            for item in critique.get("findings", [])
+        }
+        known_accepted = {
+            str(item.get("response", {}).get("finding_key", ""))
+            for item in self.state.accepted_findings
+        }
+        for response in revision.get("responses", []):
+            key = str(response.get("finding_key", ""))
+            if response.get("action") == "accepted" and key not in known_accepted:
+                self.state.accepted_findings.append(
+                    {
+                        "finding": finding_by_key.get(key, {}),
+                        "response": dict(response),
+                    }
+                )
         self.state.plan_revisions = max(self.state.plan_revisions, rnd)
         self.state.advance(Phase.PLAN_CRITIQUE)
 
@@ -1224,6 +1319,11 @@ class Orchestrator:
 
     def _finish(self) -> None:
         self.state.advance(Phase.DONE, "verified")
+        self.state.transition_lifecycle(
+            Lifecycle.COMPLETED,
+            "all acceptance criteria verified",
+            "git merge then claudex clean",
+        )
         self._post("COORD", "done", "DONE", f"merge with: git merge {self.state.branch}")
         # Persist DONE before the history write: a failing append_history
         # must not leave state.json behind the in-memory phase.
@@ -1245,6 +1345,25 @@ class Orchestrator:
         )
 
     # ------------------------------------------------------------------ gates
+    def _reconcile_gate_lifecycle(self) -> None:
+        """Migrate legacy/manual gate state before applying a resume action."""
+        phase = Phase(self.state.phase)
+        current = Lifecycle(self.state.lifecycle)
+        if current is not Lifecycle.RUNNING:
+            return
+        if phase is Phase.AWAIT_GUIDANCE:
+            self.state.transition_lifecycle(
+                Lifecycle.PAUSED,
+                "reconciled legacy guidance gate",
+                "claudex resolve or claudex continue",
+            )
+        elif phase is Phase.PAUSED_BUDGET:
+            self.state.transition_lifecycle(
+                Lifecycle.PAUSED_BUDGET,
+                "reconciled legacy run-budget gate",
+                "claudex resume --add-...",
+            )
+
     def resolve_guidance(self, notes: str) -> None:
         """Record a persistent human decision and resume the interrupted
         phase. A budget is expanded only when budget exhaustion caused the
@@ -1256,6 +1375,7 @@ class Orchestrator:
             )
         if not notes.strip():
             raise OrchestratorError("guidance notes must not be empty")
+        self._reconcile_gate_lifecycle()
         self.state.binding_guidance.append(notes.strip())
         self.state.guidance_notes = ""
         self._post("HUMAN", "guidance", "GUIDANCE", notes)
@@ -1271,6 +1391,11 @@ class Orchestrator:
             # must buy enough room for the corresponding revision and audit.
             self._extend_active_budget(ret)
         self._clear_gate()
+        self.state.transition_lifecycle(
+            Lifecycle.RUNNING,
+            "binding guidance recorded",
+            "claudex resume",
+        )
         self.state.advance(ret, "guidance received")
         self._save()
 
@@ -1291,6 +1416,7 @@ class Orchestrator:
             )
         if responses < 1:
             raise OrchestratorError("additional response budget must be at least 1")
+        self._reconcile_gate_lifecycle()
         ret = Phase(self.state.return_phase or Phase.PLAN_REVISE.value)
         extended = self._budget_exhausted(ret)
         if extended:
@@ -1302,6 +1428,11 @@ class Orchestrator:
         )
         self._post("HUMAN", "guidance", "CONTINUE", action)
         self._clear_gate()
+        self.state.transition_lifecycle(
+            Lifecycle.RUNNING,
+            action,
+            "claudex resume",
+        )
         self.state.advance(ret, action)
         self._save()
         return extended
@@ -1316,6 +1447,7 @@ class Orchestrator:
             raise OrchestratorError(
                 f"run is in phase {self.state.phase}, not paused for run budget"
             )
+        self._reconcile_gate_lifecycle()
         if not any(value > 0 for value in additions.values()) and not acknowledged_currencies:
             raise OrchestratorError(
                 "resume requires a positive budget addition or --acknowledge-currency"
@@ -1349,6 +1481,11 @@ class Orchestrator:
                 value.upper() for value in acknowledged_currencies
             )
         self._clear_gate()
+        self.state.transition_lifecycle(
+            Lifecycle.RUNNING,
+            f"run budget override: {detail}",
+            "claudex resume",
+        )
         self.state.advance(ret, f"run budget override: {detail}")
         self._save()
 
@@ -1438,6 +1575,11 @@ class Orchestrator:
 
     def abort(self) -> None:
         self.state.advance(Phase.ABORTED)
+        self.state.transition_lifecycle(
+            Lifecycle.CANCELLED,
+            "operator aborted run",
+            "start a new run or inspect retained artifacts",
+        )
         self._save()
 
     def clean(self) -> None:

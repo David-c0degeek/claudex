@@ -14,6 +14,10 @@ instead of a merged schema full of noise fields.
 from __future__ import annotations
 
 
+class ProtocolViolation(ValueError):
+    """Structured provider output is internally inconsistent."""
+
+
 def _obj(properties: dict, required: list[str] | None = None) -> dict:
     return {
         "type": "object",
@@ -156,7 +160,11 @@ PLAN_CRITIQUE_SCHEMA = _obj(
             "type": ["string", "null"],
             "description": "The concrete question for the human, else null",
         },
-        "missing_evidence": _arr(_STR),
+        "missing_evidence": {
+            "type": "array",
+            "items": _STR,
+            "description": "Existing repo-relative file paths omitted from the evidence manifest; empty when review is conclusive",
+        },
         "simpler_alternative": {
             "type": ["string", "null"],
             "description": "A simpler valid plan if one exists, else null",
@@ -165,21 +173,22 @@ PLAN_CRITIQUE_SCHEMA = _obj(
     }
 )
 
-# Plan revisions re-emit the FULL plan (markdown AND steps), never a delta —
-# otherwise state.steps drifts from plan_markdown across rounds.
+# Plan revisions use hash-guarded section replacement. Null preserves the
+# canonical baseline section.
 PLAN_REVISION_SCHEMA = _obj(
     {
+        "base_plan_sha256": _STR,
         "plan_markdown": {
-            "type": "string",
-            "description": "Complete revised architecture and decisions without duplicating the structured steps, risks, or open questions",
+            "type": ["string", "null"],
+            "description": "Replacement architecture/decisions, or null to preserve the baseline section",
         },
         "steps": {
-            "type": "array",
+            "type": ["array", "null"],
             "items": _PLAN_STEP,
-            "description": "Full revised step list, not a delta",
+            "description": "Replacement full step list, or null to preserve it",
         },
-        "risks": _arr(_STR),
-        "open_questions": _arr(_STR),
+        "risks": {"type": ["array", "null"], "items": _STR},
+        "open_questions": {"type": ["array", "null"], "items": _STR},
         "responses": _arr(
             _obj(
                 {
@@ -273,12 +282,18 @@ def is_inconclusive_review(review: dict) -> bool:
 
 
 def requires_human_decision(critique: dict) -> bool:
-    """A model may request guidance only for an actual choice or durable
-    evidence-backed disagreement, never merely because work remains."""
-    if critique.get("requires_human_decision"):
-        return True
-    return any(
-        f.get("kind") == "decision"
-        and f.get("severity") in ("blocking", "major")
-        for f in critique.get("findings", [])
-    )
+    """Accept only an explicit flag paired with one concrete question.
+
+    Finding labels never synthesize human intent. A mismatched flag/question
+    pair is a provider protocol failure so it cannot become either a false gate
+    or an unanswerable gate.
+    """
+    requested = critique.get("requires_human_decision") is True
+    question = critique.get("decision_question")
+    has_question = isinstance(question, str) and bool(question.strip())
+    if requested != has_question:
+        raise ProtocolViolation(
+            "requires_human_decision and decision_question are inconsistent: "
+            "a human gate requires explicit true plus a concrete non-empty question"
+        )
+    return requested

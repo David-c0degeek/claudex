@@ -96,14 +96,17 @@ run is DONE — tell the human to `git merge <branch>` and `claudex clean`.
 
 ## When stuck
 
-- `claudex status` — phase, step k/N, response budgets, next command.
+- `claudex status` — lifecycle, phase, step, active attempt, usage, budgets,
+  canonical plan hash, and next command.
 - Budget gate (`await_guidance`): run `claudex continue` for one response and
   a fresh audit; do not invent a human decision just to resume.
 - Decision gate (`await_guidance`): summarize BOTH positions for the human
   honestly, then `claudex resolve --notes "<their decision>"`, or place a
   multiline answer in a file and use `--notes-file <path>`. The decision is
   persistent and binding — treat it like a contract Answer: line.
-- Crash/error mid-turn: `claudex status`; `claudex retry` re-attempts a
-  failed phase. Round counters and artifacts survive restarts.
-- `mailbox.md` in the run dir is the full transcript — cite it when
-  reporting to the human.
+- Crash/interruption: `claudex resume` continues the same durable run;
+  `claudex retry` re-attempts a retryable failed phase. `claudex restart`
+  creates a replacement identity only after copying a hash-equivalent
+  checkpoint; `--fresh-plan` is the explicit destructive planning reset.
+- `mailbox.md` is the concise coordinator turn ledger. Provider text/tools
+  live in each immutable attempt event journal.

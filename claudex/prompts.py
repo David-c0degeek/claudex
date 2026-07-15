@@ -109,8 +109,7 @@ do not repeat the ordered step descriptions there.
 
 
 def plan_critique(
-    task_path: Path,
-    plan_path: Path,
+    evidence_manifest: Path,
     round_no: int,
     guidance: str = "",
     final_audit: bool = False,
@@ -126,12 +125,14 @@ not defer discoveries to another round.
     return f"""{TEAM}
 You are the PAIR. Critique round {round_no} of your lead's plan.
 
-Task contract: {task_path}
-Lead's current plan (JSON: plan_markdown + steps): {plan_path}
-Prior critiques for regression/key history: {plan_path.parent / 'plan-critique-*.json'}
+Bounded evidence manifest: {evidence_manifest}
 {guidance_block(guidance)}
 {audit_block}
-Verify every material claim against the repository — do not assume the plan
+Read only the files listed in the manifest. Do not browse the repository or
+prior critique history outside it. If decisive evidence is absent, return
+REVISE with no findings and put only the needed existing repo-relative file
+paths in `missing_evidence`; the coordinator can build one bounded retry packet.
+Verify every material claim from the supplied evidence — do not assume the plan
 is correct. Find: incorrect assumptions, missing affected paths, unnecessary
 scope, architectural inconsistencies, compatibility risks, insufficient
 tests, steps that are not independently committable, and simpler valid
@@ -180,6 +181,8 @@ def plan_revise(
     current_plan_path: Path,
     critique_path: Path,
     round_no: int,
+    baseline_sha256: str,
+    evidence_manifest: Path,
     guidance: str = "",
 ) -> str:
     return f"""{TEAM}
@@ -188,6 +191,7 @@ You are the LEAD. Your pair critiqued your plan (round {round_no}).
 Task contract: {task_path}
 Current plan to preserve as the exact baseline (JSON): {current_plan_path}
 Pair's critique (JSON): {critique_path}
+Bounded evidence manifest and ledgers: {evidence_manifest}
 {guidance_block(guidance)}
 Read the current plan directly. Do not reconstruct it from session memory.
 Make the smallest edits that resolve this critique while preserving every
@@ -207,18 +211,20 @@ otherwise. Do not silently drop any blocking/major finding.
 
 In each response, copy the critique's exact stable key into `finding_key`.
 
-Re-emit the COMPLETE revised plan — full plan_markdown and the full ordered
-steps array, not a delta. Keep steps independently implementable and
-committable.
+Set `base_plan_sha256` to `{baseline_sha256}`. For each canonical section
+(`plan_markdown`, `steps`, `risks`, `open_questions`), return a complete
+replacement only when this critique requires changing it; otherwise return
+null so the coordinator preserves the validated baseline. Replacement steps
+must remain independently implementable and committable.
 
-The structured `steps`, `risks`, and `open_questions` fields are canonical.
-Do not duplicate them inside `plan_markdown`.
+The coordinator applies replacements only when the baseline hash matches, then
+validates and stores a new complete canonical plan. Do not duplicate structured
+steps, risks, or open questions inside `plan_markdown`.
 
 Before returning, compare the complete revision against the baseline. If any
 requirement, test, path, or prior fix disappeared without being demanded by
-this critique, restore it. Re-check the prior critique artifacts in
-{current_plan_path.parent / 'plan-critique-*.json'} when needed; regressions
-are blocking defects.
+this critique, restore it. The bounded finding ledger next to the critique is
+the only prior-history summary; do not glob or reconstruct older critiques.
 
 This phase is read-only. Do not edit any files.
 
