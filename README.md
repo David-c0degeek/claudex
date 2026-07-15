@@ -35,6 +35,8 @@ INIT
   → DONE             automatically on verify pass
 AWAIT_GUIDANCE       actual choice → `claudex resolve --notes "..."`;
                      exhausted quality budget → `claudex continue`
+PAUSED_BUDGET        run economic envelope exhausted → explicit
+                     `claudex resume --add-...` override
 ```
 
 **Stop conditions** (the "good enough" metric — they can never loop
@@ -67,11 +69,12 @@ claudex init                       # scaffold .claudex/task.md + config
 claudex task "one paragraph..."    # optional: agent-drafted task contract
 claudex run --lead claude          # or --lead codex — the lead is YOUR call
 # ...
-claudex status                     # phase, step k/N, response budgets
+claudex status                     # phase, live attempt, usage, remaining caps
 claudex resolve --notes "..."      # answer a concrete decision gate
 claudex resolve --notes-file decision.md  # multiline/shell-safe alternative
 claudex continue                   # allow one response + fresh audit, no guidance
 claudex continue --responses 2     # larger extension only when explicitly chosen
+claudex resume --add-invocations 2 # expand an exhausted run envelope explicitly
 claudex restart                    # retire a legacy/stuck plan; preserve decisions
 git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
@@ -169,6 +172,8 @@ winner-picking: ownership is resolved by initiation.
 | planning stays planning | plan-level finding categories are schema-constrained; content obligations persist separately as implementation checks |
 | inconclusive reviews don't cause churn | tool/evidence failures retry the reviewer fresh without charging a lead response |
 | no infinite loops | explicit lead-response budgets plus a final fresh-context audit |
+| economic admission | durable run caps are checked before every provider call; Claude also receives its native USD/turn caps |
+| conservative provider policy | phase-specific effort; Claude Agent/Task and Codex multi-agent features disabled unless explicitly enabled |
 | guidance stays binding | persistent guidance ledger included in every later agent turn |
 | crash safety | state.json written after every round; artifact-presence skip on retry |
 | no cross-process races | run-dir lockfile around every state-mutating command |
@@ -203,11 +208,50 @@ flags):
   "max_verify_rounds": 2,     // fixes after verification failures
   "test_command": "",           // mechanical gate, run by the coordinator
   "agent_timeout": 3600,
+  "max_invocation_cost_usd": 3.0, // native Claude cap; Codex admission only
+  "max_invocation_turns": 12,
+  "max_invocation_output_tokens": 50000,
+  "max_invocation_tool_calls": 50,
+  "max_run_invocations": 20,
+  "max_run_input_tokens": 5000000,
+  "max_run_output_tokens": 250000,
+  "max_run_cost_usd": 12.0,
+  "max_run_tool_calls": 250,
+  "max_run_wall_seconds": 10800,
+  "planning_effort": "high",
+  "implementation_effort": "high",
+  "verification_effort": "high",
+  "claude_planning_model": "", // empty falls back to claude_model
+  "codex_planning_model": "",  // implementation/verification variants exist
+  "disable_nested_agents": true,
+  "allow_expensive_profiles": false,
   "wait_on_limits": true,       // wait out provider usage limits and resume
   "claude_model": "",           // pin models if you want reproducibility
   "codex_model": ""
 }
 ```
+
+The effective run envelope is frozen into `state.json` when a run starts, so
+later config edits cannot silently enlarge or shrink it. Claudex admits a call
+only while every durable cap has room. A call can still report an overshoot
+after it finishes; that terminal result is charged once and the next call is
+blocked as `PAUSED_BUDGET`. Resume requires naming the added capacity, for
+example `claudex resume --add-input-tokens 100000`. Non-USD costs are retained
+without conversion and require an explicit `--acknowledge-currency CODE` before
+work continues.
+
+Token and cost labels are deliberately literal: status shows provider-reported
+categories and USD cost, plus counts of attempts whose usage, tools, or cost
+were not reported. Claudex does not scrape prices or relabel estimates as
+provider facts. Maximum-cost effort values (`xhigh` or `max`) require
+`allow_expensive_profiles`; nested agents require
+`--allow-nested-agents`.
+
+Each provider can select a model per `planning`, `implementation`, and
+`verification` profile (for example `claude_verification_model` or the matching
+`--claude-verification-model` flag); an empty phase value falls back to the
+provider's global model. The run-start summary prints every effective
+model/effort profile and marks maximum-effort opt-ins prominently.
 
 Binary discovery: `CLAUDEX_CLAUDE_BIN` / `CLAUDEX_CODEX_BIN` env vars win;
 on Windows the Codex desktop-app binary is preferred over npm shims.

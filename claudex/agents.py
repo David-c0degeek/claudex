@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .budgets import InvocationPolicy, normalize_usage
 from .events import AgentEvent
 from .limits import classify_limit
 from .processes import (
@@ -35,6 +36,7 @@ class AgentError(RuntimeError):
 @dataclass
 class AgentResult:
     ok: bool
+    accounting_schema_version: int = 1
     text: str = ""
     structured: dict | None = None
     session_id: str = ""
@@ -46,10 +48,17 @@ class AgentResult:
     attempt_id: str = ""
     events_path: str = ""
     usage: dict = field(default_factory=dict)
+    normalized_usage: dict = field(default_factory=dict)
+    usage_quality: str = "unknown"
+    reported_cost: float | None = None
     cost_usd: float | None = None
     num_turns: int | None = None
     model: str = ""
     tool_calls: int = 0
+    tool_calls_observed: bool = False
+    usage_source: str = "provider_terminal"
+    cost_currency: str = ""
+    cost_quality: str = "unknown"
 
     def require_structured(self) -> dict:
         if not self.ok:
@@ -81,6 +90,11 @@ def _truncate(value: object, limit: int = 500) -> str:
 
 
 def _finalize_attempt(execution: ExecResult, result: AgentResult) -> AgentResult:
+    cost = result.reported_cost
+    if cost is None and result.cost_usd is not None:
+        cost = result.cost_usd
+    result.normalized_usage = normalize_usage(result.usage)
+    result.usage_quality = "provider_reported" if result.usage else "unknown"
     result.attempt_id = execution.attempt.attempt_id
     result.events_path = str(execution.attempt.events)
     result.stdout_path = str(execution.attempt.stdout)
@@ -90,8 +104,8 @@ def _finalize_attempt(execution: ExecResult, result: AgentResult) -> AgentResult
         "provider result accepted" if result.ok else _truncate(result.error),
         provider_type="agent_result",
         usage=result.usage,
-        cost=result.cost_usd,
-        currency="USD" if result.cost_usd is not None else "",
+        cost=cost,
+        currency=result.cost_currency,
         metadata={
             "exit_code": result.exit_code,
             "duration_s": result.duration_s,
@@ -111,8 +125,16 @@ def _finalize_attempt(execution: ExecResult, result: AgentResult) -> AgentResult
             "duration_s": result.duration_s,
             "session_id": result.session_id,
             "usage": result.usage,
+            "normalized_usage": result.normalized_usage,
+            "usage_quality": result.usage_quality,
             "cost_usd": result.cost_usd,
+            "reported_cost": cost,
+            "cost_currency": result.cost_currency,
+            "cost_quality": result.cost_quality,
+            "usage_source": result.usage_source,
+            "accounting_schema_version": result.accounting_schema_version,
             "tool_calls": result.tool_calls,
+            "tool_calls_observed": result.tool_calls_observed,
             "error": result.error,
         },
     )
@@ -168,6 +190,7 @@ class ClaudeAgent:
         schema: dict | None = None,
         resume: str = "",
         timeout: int = 3600,
+        policy: InvocationPolicy | None = None,
         event_handler: Callable[[AgentEvent], None] | None = None,
     ) -> AgentResult:
         attempt = AttemptPaths.create(run_dir, label)
@@ -192,9 +215,17 @@ class ClaudeAgent:
             cmd += ["--json-schema", json.dumps(schema)]
         if resume:
             cmd += ["--resume", resume]
-        if self.model:
-            cmd += ["--model", self.model]
+        model = policy.model if policy and policy.model else self.model
+        if model:
+            cmd += ["--model", model]
         cmd += self.extra_args
+        if policy is not None:
+            cmd += ["--effort", policy.effort]
+            if policy.max_budget_usd is not None:
+                cmd += ["--max-budget-usd", str(policy.max_budget_usd)]
+            cmd += ["--max-turns", str(policy.max_turns)]
+            if policy.disable_nested_agents:
+                cmd += ["--disallowedTools", "Agent", "Task"]
         try:
             execution = stream_process(
                 cmd,
@@ -229,6 +260,7 @@ class ClaudeAgent:
             stderr_path=str(stderr_path),
         )
         payload = None
+        tool_calls = 0
         for chunk in reversed(out.strip().splitlines() or [""]):
             if not chunk.startswith("{"):
                 continue
@@ -239,6 +271,18 @@ class ClaudeAgent:
             if candidate.get("type") == "result" or "structured_output" in candidate:
                 payload = candidate
                 break
+        for chunk in out.splitlines():
+            try:
+                candidate = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if candidate.get("type") != "assistant":
+                continue
+            content = (candidate.get("message") or {}).get("content") or []
+            tool_calls += sum(
+                1 for item in content
+                if isinstance(item, dict) and item.get("type") == "tool_use"
+            )
         if payload is None:
             result.error = (
                 f"claude exited {rc}, unparseable output: "
@@ -250,8 +294,14 @@ class ClaudeAgent:
         result.usage = (
             payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         )
+        result.tool_calls = tool_calls
+        result.tool_calls_observed = True
         cost = payload.get("total_cost_usd")
         result.cost_usd = float(cost) if isinstance(cost, (int, float)) else None
+        if result.cost_usd is not None:
+            result.reported_cost = result.cost_usd
+            result.cost_currency = "USD"
+            result.cost_quality = "provider_reported"
         turns = payload.get("num_turns")
         result.num_turns = int(turns) if isinstance(turns, int) else None
         model_usage = payload.get("modelUsage") or payload.get("model_usage") or {}
@@ -292,6 +342,7 @@ class CodexAgent:
         schema: dict | None = None,
         resume: str = "",
         timeout: int = 3600,
+        policy: InvocationPolicy | None = None,
         event_handler: Callable[[AgentEvent], None] | None = None,
     ) -> AgentResult:
         attempt = AttemptPaths.create(run_dir, label)
@@ -317,9 +368,14 @@ class CodexAgent:
         if schema is not None:
             attempt.schema.write_text(json.dumps(schema, indent=2), encoding="utf-8")
             cmd += ["--output-schema", str(attempt.schema)]
-        if self.model:
-            cmd += ["-m", self.model]
+        model = policy.model if policy and policy.model else self.model
+        if model:
+            cmd += ["-m", model]
         cmd += self.extra_args
+        if policy is not None:
+            cmd += ["-c", f'model_reasoning_effort="{policy.effort}"']
+            if policy.disable_nested_agents:
+                cmd += ["--disable", "multi_agent"]
         try:
             execution = stream_process(
                 cmd,
@@ -399,4 +455,5 @@ class CodexAgent:
         result.ok = True
         result.usage = usage
         result.tool_calls = tool_calls
+        result.tool_calls_observed = True
         return result

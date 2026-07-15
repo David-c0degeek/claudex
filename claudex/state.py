@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+STATE_SCHEMA_VERSION = 3
+
 
 class Phase(str, Enum):
     INIT = "init"
@@ -35,13 +37,14 @@ class Phase(str, Enum):
     TESTS = "tests"
     VERIFY = "verify"
     AWAIT_GUIDANCE = "await_guidance"
+    PAUSED_BUDGET = "paused_budget"
     DONE = "done"
     FAILED = "failed"
     ABORTED = "aborted"
 
 
 TERMINAL_PHASES = {Phase.DONE, Phase.FAILED, Phase.ABORTED}
-GATE_PHASES = {Phase.AWAIT_GUIDANCE}
+GATE_PHASES = {Phase.AWAIT_GUIDANCE, Phase.PAUSED_BUDGET}
 
 AGENTS = ("claude", "codex")
 
@@ -68,6 +71,7 @@ class RunState:
     run_id: str
     repo: str
     lead: str  # holds the pen: drafts the plan, implements, fixes
+    state_schema_version: int = STATE_SCHEMA_VERSION
     # "headless": `claudex run` drives both agents as subprocesses.
     # "live": an interactive session IS the lead; `claudex pair` subcommands
     # run only the pair agent's turns. The two drivers must not share a run.
@@ -80,6 +84,7 @@ class RunState:
     mode: str = "change"
     phase: str = Phase.INIT.value
     created_at: str = ""
+    started_epoch_s: float = 0.0
     base_commit: str = ""
     branch: str = ""
     worktree: str = ""
@@ -110,6 +115,33 @@ class RunState:
     checkpoint_cap_extra: int = 0
     test_cap_extra: int = 0
     verify_cap_extra: int = 0
+    # Provider-terminal accounting. Intermediate streamed usage is deliberately
+    # excluded because provider event values may be cumulative. Missing cost is
+    # counted as unknown and is never replaced with a local price estimate.
+    provider_usage: dict = field(default_factory=dict)
+    provider_cost_usd: float = 0.0
+    provider_costs: dict = field(default_factory=dict)
+    provider_invocations: int = 0
+    provider_duration_s: float = 0.0
+    provider_tool_calls: int = 0
+    known_cost_attempts: int = 0
+    unknown_cost_attempts: int = 0
+    known_usage_attempts: int = 0
+    unknown_usage_attempts: int = 0
+    known_tool_attempts: int = 0
+    unknown_tool_attempts: int = 0
+    unbudgeted_currency_attempts: int = 0
+    usage_source: str = "provider_terminal"
+    cost_currency: str = "USD"
+    budget_overrides: dict = field(default_factory=dict)
+    run_policy: dict = field(default_factory=dict)
+    acknowledged_cost_currencies: list = field(default_factory=list)
+    last_invocation_policy: dict = field(default_factory=dict)
+    active_attempt_id: str = ""
+    last_attempt_id: str = ""
+    last_attempt_usage: dict = field(default_factory=dict)
+    last_attempt_tool_calls: int = 0
+    accounted_attempt_ids: list = field(default_factory=list)
     # Last commit the pair has AGREEd to; checkpoint diffs are
     # last_reviewed_commit..HEAD.
     last_reviewed_commit: str = ""
@@ -166,6 +198,13 @@ class RunState:
         self.return_phase = return_phase.value
         self.advance(Phase.AWAIT_GUIDANCE, reason[:200])
 
+    def pause_budget(self, reason: str, return_phase: Phase) -> None:
+        """Persist a run-budget stop without mislabelling it as guidance."""
+        self.gate_reason = reason
+        self.gate_kind = "run_budget"
+        self.return_phase = return_phase.value
+        self.advance(Phase.PAUSED_BUDGET, reason[:200])
+
     def fail(self, error: str) -> None:
         self.failed_phase = self.phase
         self.error = error
@@ -197,6 +236,13 @@ class RunState:
     @staticmethod
     def load(run_dir: Path) -> "RunState":
         data = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        version = int(data.get("state_schema_version", 1))
+        if version > STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"run state schema {version} is newer than supported "
+                f"schema {STATE_SCHEMA_VERSION}; upgrade Claudex before resuming"
+            )
+        data["state_schema_version"] = STATE_SCHEMA_VERSION
         known = {f.name for f in dataclasses.fields(RunState)}
         # Pre-pair state files called the lead "owner"; accept them.
         if "lead" not in data and "owner" in data:
@@ -232,6 +278,8 @@ class RunState:
             data["plan_revisions"] = max(revisions, default=0)
         if data.get("gate_reason") and not data.get("gate_kind"):
             data["gate_kind"] = "budget"
+        if data.get("provider_cost_usd") and not data.get("provider_costs"):
+            data["provider_costs"] = {"USD": data["provider_cost_usd"]}
         return RunState(**{k: v for k, v in data.items() if k in known})
 
 

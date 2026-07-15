@@ -11,6 +11,7 @@
     claudex resolve --notes "..."   answer a concrete decision gate
     claudex resolve --notes-file p   answer from a file (safe for multiline text)
     claudex continue                extend an exhausted quality budget
+    claudex resume --add-...        expand and resume a run economic budget
     claudex restart                 retire a planning run under the current protocol
     claudex status                  show run state and artifacts
     claudex retry                   re-attempt the phase that failed
@@ -25,10 +26,12 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from importlib import resources
 from pathlib import Path
 
 from . import __version__, gitops
+from . import budgets
 from .agents import AgentError, resolve_claude_bin, resolve_codex_bin
 from .config import Config
 from .phases import (
@@ -74,6 +77,27 @@ def _cfg(args) -> Config:
             "agent_timeout",
             "claude_model",
             "codex_model",
+            "max_invocation_cost_usd",
+            "max_invocation_turns",
+            "max_invocation_output_tokens",
+            "max_invocation_tool_calls",
+            "max_run_invocations",
+            "max_run_input_tokens",
+            "max_run_output_tokens",
+            "max_run_cost_usd",
+            "max_run_tool_calls",
+            "max_run_wall_seconds",
+            "planning_effort",
+            "implementation_effort",
+            "verification_effort",
+            "claude_planning_model",
+            "claude_implementation_model",
+            "claude_verification_model",
+            "codex_planning_model",
+            "codex_implementation_model",
+            "codex_verification_model",
+            "disable_nested_agents",
+            "allow_expensive_profiles",
         )
     }
     return Config.load(Path(args.repo), overrides)
@@ -170,6 +194,37 @@ def _print_task_summary(task_md: str) -> None:
         print()
 
 
+def _print_economic_summary(cfg: Config, state: RunState) -> None:
+    limits = budgets.budget_limits(cfg, state)
+    print(
+        "economic envelope: "
+        f"{limits['invocations']} calls · {limits['input_tokens']} reported input · "
+        f"{limits['output_tokens']} reported output · ${limits['cost_usd']:.2f} "
+        f"reported USD · {limits['wall_seconds']}s wall time"
+    )
+    print(
+        "per invocation: "
+        f"{state.run_policy.get('agent_timeout', cfg.agent_timeout)}s · "
+        f"{state.run_policy.get('max_invocation_output_tokens', cfg.max_invocation_output_tokens)} "
+        "reported output · "
+        f"{state.run_policy.get('max_invocation_tool_calls', cfg.max_invocation_tool_calls)} "
+        "observable tools · "
+        f"${state.run_policy.get('max_invocation_cost_usd', cfg.max_invocation_cost_usd):.2f} "
+        "Claude native cap"
+    )
+    for profile in ("planning", "implementation", "verification"):
+        effort = state.run_policy.get(f"{profile}_effort", getattr(cfg, f"{profile}_effort"))
+        claude_model = state.run_policy.get(f"claude_{profile}_model") or state.run_policy.get("claude_model") or "default"
+        codex_model = state.run_policy.get(f"codex_{profile}_model") or state.run_policy.get("codex_model") or "default"
+        marker = " [EXPLICIT HIGH-COST OPT-IN]" if effort in budgets.EXPENSIVE_EFFORTS else ""
+        print(
+            f"profile {profile}: effort={effort}{marker} · "
+            f"claude={claude_model} · codex={codex_model}"
+        )
+    nested = state.run_policy.get("disable_nested_agents", cfg.disable_nested_agents)
+    print(f"nested provider agents: {'disabled' if nested else 'ENABLED (explicit opt-in)'}")
+
+
 def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunState, bool]:
     """Returns (state, is_new). A terminal previous run rolls off."""
     rid = get_current_run(cfg.repo)
@@ -181,7 +236,13 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
     if lead not in AGENTS:
         raise OrchestratorError(f"lead must be one of {AGENTS}, got {lead!r}")
     state = RunState(
-        run_id=new_run_id(), repo=str(cfg.repo), lead=lead, driver=driver
+        run_id=new_run_id(),
+        repo=str(cfg.repo),
+        lead=lead,
+        driver=driver,
+        run_policy=budgets.capture_run_policy(cfg),
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        started_epoch_s=time.time(),
     )
     set_current_run(cfg.repo, state.run_id)
     state.save(run_dir_for(cfg.repo, state.run_id))
@@ -215,6 +276,7 @@ def cmd_run(args) -> int:
             f"new run {state.run_id}: lead={state.lead} (plans, implements), "
             f"pair={state.pair} (critiques, reviews, verifies)"
         )
+        _print_economic_summary(cfg, state)
     else:
         print(f"resuming run {state.run_id} (phase: {state.phase})")
     orch = Orchestrator(cfg, state)
@@ -263,6 +325,7 @@ def cmd_pair_start(args) -> int:
         orch.state.save(orch.run_dir)
         print(f"live run {state.run_id}: you are the LEAD ({state.lead}); "
               f"pair={state.pair}")
+        _print_economic_summary(cfg, state)
         print(f"run dir: {orch.run_dir}")
         if orch.report_mode:
             print(f"worktree: {state.worktree}")
@@ -312,8 +375,19 @@ def _next_live_hint(orch: Orchestrator) -> None:
             )
         else:
             print("quality budget exhausted: claudex continue")
+    elif phase is Phase.PAUSED_BUDGET:
+        print(f"run budget paused: {s.gate_reason}")
+        print("resume with: claudex resume --add-invocations N [other additions]")
     elif phase is Phase.DONE:
         print(f"DONE — merge with: git merge {s.branch}")
+        used = budgets.budget_usage(s)
+        print(
+            f"usage: {used['invocations']} invocation(s), "
+            f"{used['input_tokens']} reported input, "
+            f"{used['output_tokens']} reported output, "
+            f"${used['cost_usd']:.4f} reported USD, "
+            f"{s.unknown_cost_attempts} unknown-cost attempt(s)"
+        )
 
 
 def cmd_pair_plan(args) -> int:
@@ -474,6 +548,33 @@ def cmd_continue(args) -> int:
     return _locked(cfg, orch, go)
 
 
+def cmd_resume(args) -> int:
+    """Resume only a durable run-budget pause with an explicit override."""
+    cfg = _cfg(args)
+    orch = _active_orchestrator(cfg)
+    additions = {
+        "invocations": args.add_invocations,
+        "input_tokens": args.add_input_tokens,
+        "output_tokens": args.add_output_tokens,
+        "cost_usd": args.add_cost_usd,
+        "tool_calls": args.add_tool_calls,
+        "wall_seconds": args.add_wall_seconds,
+        "invocation_output_tokens": args.add_invocation_output_tokens,
+        "invocation_tool_calls": args.add_invocation_tool_calls,
+    }
+
+    def go() -> int:
+        orch.resume_budget(additions, args.acknowledge_currency)
+        print(f"run budget expanded; run returns to {orch.state.phase}")
+        if orch.state.driver == "live":
+            _next_live_hint(orch)
+        else:
+            orch.run_until_gate()
+        return 0 if orch.state.phase != Phase.FAILED.value else 1
+
+    return _locked(cfg, orch, go)
+
+
 def cmd_restart(args) -> int:
     """Retire a planning-stage headless run and immediately start a clean
     run under the current protocol while preserving binding guidance."""
@@ -558,6 +659,76 @@ def cmd_status(args) -> int:
         f" · verify fixes {state.verify_fixes_used}/"
         f"{cfg.max_verify_rounds + state.verify_cap_extra}"
     )
+    limits = budgets.budget_limits(cfg, state)
+    used = budgets.budget_usage(state)
+    remaining = budgets.remaining_budgets(cfg, state)
+    print(
+        "provider: "
+        f"calls {used['invocations']}/{limits['invocations']} "
+        f"(remaining {remaining['invocations']})"
+        f" · input {used['input_tokens']}/{limits['input_tokens']} reported"
+        f" · output {used['output_tokens']}/{limits['output_tokens']} reported"
+    )
+    usage = state.provider_usage
+    print(
+        "tokens:   "
+        f"input uncached={usage.get('input_tokens', 0)}, "
+        f"cached={usage.get('cached_input_tokens', 0)}, "
+        f"cache-create={usage.get('cache_creation_input_tokens', 0)}"
+        f" · output={usage.get('output_tokens', 0)}, "
+        f"reasoning={usage.get('reasoning_output_tokens', 0)}"
+    )
+    print(
+        "spend:    "
+        f"${used['cost_usd']:.4f}/${limits['cost_usd']:.4f} provider-reported USD "
+        f"(remaining ${remaining['cost_usd']:.4f})"
+        f" · {state.unknown_cost_attempts} unknown-cost attempt(s)"
+    )
+    foreign = {
+        key: value for key, value in state.provider_costs.items() if key != "USD"
+    }
+    if foreign:
+        rendered = ", ".join(f"{value:.4f} {key}" for key, value in foreign.items())
+        print(f"currency: separately reported, not converted: {rendered}")
+    print(
+        "activity: "
+        f"tools {used['tool_calls']}/{limits['tool_calls']} where observable"
+        f" ({state.unknown_tool_attempts} attempt(s) unknown)"
+        f" · provider time {used['provider_seconds']:.1f}s"
+        f" · run wall time {used['wall_seconds']:.1f}/{limits['wall_seconds']}s"
+    )
+    invocation_output_limit = state.run_policy.get(
+        "max_invocation_output_tokens", cfg.max_invocation_output_tokens
+    ) + state.budget_overrides.get("invocation_output_tokens", 0)
+    invocation_tool_limit = state.run_policy.get(
+        "max_invocation_tool_calls", cfg.max_invocation_tool_calls
+    ) + state.budget_overrides.get("invocation_tool_calls", 0)
+    print(
+        "last call: "
+        f"output {budgets.total_reported_output(state.last_attempt_usage)}/"
+        f"{invocation_output_limit} reported"
+        f" · tools {state.last_attempt_tool_calls}/{invocation_tool_limit} observable"
+    )
+    if state.unknown_usage_attempts:
+        print(f"usage:    {state.unknown_usage_attempts} attempt(s) did not report token usage")
+    if state.active_attempt_id:
+        print(f"active:   {state.active_attempt_id}")
+    if state.last_attempt_id:
+        print(f"last:     {state.last_attempt_id}")
+    if state.last_invocation_policy:
+        policy = state.last_invocation_policy
+        effort = policy.get("effort", "?")
+        requested = policy.get("requested_effort", effort)
+        if requested != effort:
+            effort = f"{effort} (requested {requested})"
+        print(
+            "policy:   "
+            f"{policy.get('profile', '?')} · effort={effort}"
+            f" · model={policy.get('model') or 'provider default'}"
+            f" · turns={policy.get('max_turns', '?')}"
+            f" · timeout={policy.get('timeout_seconds', '?')}s"
+            f" · nested agents={'disabled' if policy.get('disable_nested_agents') else 'allowed'}"
+        )
     if state.branch:
         print(f"branch:   {state.branch}")
     if state.worktree:
@@ -718,6 +889,47 @@ def build_parser() -> argparse.ArgumentParser:
                         help="seconds per agent invocation")
         sp.add_argument("--claude-model", dest="claude_model", default=None)
         sp.add_argument("--codex-model", dest="codex_model", default=None)
+        sp.add_argument("--max-invocation-cost-usd", type=float, default=None)
+        sp.add_argument("--max-invocation-turns", type=int, default=None)
+        sp.add_argument("--max-invocation-output-tokens", type=int, default=None)
+        sp.add_argument("--max-invocation-tool-calls", type=int, default=None)
+        sp.add_argument("--max-run-invocations", type=int, default=None)
+        sp.add_argument("--max-run-input-tokens", type=int, default=None)
+        sp.add_argument("--max-run-output-tokens", type=int, default=None)
+        sp.add_argument("--max-run-cost-usd", type=float, default=None)
+        sp.add_argument("--max-run-tool-calls", type=int, default=None)
+        sp.add_argument("--max-run-wall-seconds", type=int, default=None)
+        effort = ("low", "medium", "high", "xhigh", "max")
+        sp.add_argument("--planning-effort", choices=effort, default=None)
+        sp.add_argument("--implementation-effort", choices=effort, default=None)
+        sp.add_argument("--verification-effort", choices=effort, default=None)
+        sp.add_argument("--claude-planning-model", default=None)
+        sp.add_argument("--claude-implementation-model", default=None)
+        sp.add_argument("--claude-verification-model", default=None)
+        sp.add_argument("--codex-planning-model", default=None)
+        sp.add_argument("--codex-implementation-model", default=None)
+        sp.add_argument("--codex-verification-model", default=None)
+        sp.add_argument(
+            "--allow-expensive-profiles",
+            action="store_true",
+            default=None,
+            help="explicitly permit maximum-cost effort profiles",
+        )
+        nested = sp.add_mutually_exclusive_group()
+        nested.add_argument(
+            "--allow-nested-agents",
+            dest="disable_nested_agents",
+            action="store_false",
+            default=None,
+            help="opt in to provider sub-agent features",
+        )
+        nested.add_argument(
+            "--disable-nested-agents",
+            dest="disable_nested_agents",
+            action="store_true",
+            default=None,
+            help="explicitly retain the safe default",
+        )
 
     sp = sub.add_parser("run", help="start or resume a headless pair run")
     common(sp)
@@ -772,6 +984,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_continue)
 
     sp = sub.add_parser(
+        "resume", help="resume a run-budget pause with an explicit budget addition"
+    )
+    common(sp)
+    sp.add_argument("--add-invocations", type=int, default=0)
+    sp.add_argument("--add-input-tokens", type=int, default=0)
+    sp.add_argument("--add-output-tokens", type=int, default=0)
+    sp.add_argument("--add-cost-usd", type=float, default=0.0)
+    sp.add_argument("--add-tool-calls", type=int, default=0)
+    sp.add_argument("--add-wall-seconds", type=int, default=0)
+    sp.add_argument("--add-invocation-output-tokens", type=int, default=0)
+    sp.add_argument("--add-invocation-tool-calls", type=int, default=0)
+    sp.add_argument(
+        "--acknowledge-currency",
+        action="append",
+        default=[],
+        metavar="CODE",
+        help="resume without converting a separately reported non-USD cost",
+    )
+    sp.set_defaults(func=cmd_resume)
+
+    sp = sub.add_parser(
         "restart",
         help="retire a planning run and restart compactly, preserving guidance",
     )
@@ -805,7 +1038,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (OrchestratorError, AgentError, gitops.GitError, RunLockError) as exc:
+    except (
+        OrchestratorError,
+        AgentError,
+        gitops.GitError,
+        RunLockError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

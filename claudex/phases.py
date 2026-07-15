@@ -41,7 +41,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import artifacts, gitops, prompts, schemas
+from . import artifacts, budgets, gitops, prompts, schemas
 from .agents import (
     AgentError,
     ClaudeAgent,
@@ -62,6 +62,10 @@ from .state import (
 
 class OrchestratorError(RuntimeError):
     pass
+
+
+class BudgetPause(OrchestratorError):
+    """Control-flow signal: state is already durably paused, not failed."""
 
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -125,6 +129,7 @@ def draft_task(cfg: Config, description: str, agent_name: str = "claude") -> Pat
         read_only=True,
         schema=schemas.TASK_CONTRACT_SCHEMA,
         timeout=cfg.agent_timeout,
+        policy=budgets.standalone_policy(cfg, "planning", agent_name),
     )
     if not result.ok:
         raise OrchestratorError(f"{agent_name}/task-draft: {result.error}")
@@ -333,14 +338,41 @@ class Orchestrator:
         )
         waits = 0
         while True:
-            result = agent.run(
-                prompt,
-                run_dir=self.run_dir,
-                label=label,
-                timeout=self.cfg.agent_timeout,
-                event_handler=self._on_agent_event,
-                **kw,
+            violations = budgets.budget_violations(self.cfg, self.state)
+            if violations:
+                reason = "; ".join(violations)
+                self.state.pause_budget(reason, Phase(self.state.phase))
+                self._save()
+                raise BudgetPause(reason)
+            policy = budgets.invocation_policy(self.cfg, self.state, label, agent_name)
+            budgets.record_attempt_started(self.state, policy)
+            self._save()
+            model = policy.model or getattr(agent, "model", "") or "provider default"
+            remaining = budgets.remaining_budgets(self.cfg, self.state)
+            effort_label = policy.effort
+            if policy.requested_effort != policy.effort:
+                effort_label += f" (requested {policy.requested_effort})"
+            self.say(
+                f"{agent_name}: policy {policy.profile}, model={model}, "
+                f"effort={effort_label}, remaining calls={remaining['invocations']}, "
+                f"reported cost=${remaining['cost_usd']:.2f}"
             )
+            try:
+                result = agent.run(
+                    prompt,
+                    run_dir=self.run_dir,
+                    label=label,
+                    timeout=policy.timeout_seconds,
+                    policy=policy,
+                    event_handler=self._on_agent_event,
+                    **kw,
+                )
+            except AgentError:
+                budgets.record_unreported_attempt(self.state)
+                self._save()
+                raise
+            budgets.record_result(self.state, result)
+            self._save()
             self.say(
                 f"{agent_name}: {label} finished in {result.duration_s:.0f}s "
                 f"(ok={result.ok})"
@@ -366,6 +398,10 @@ class Orchestrator:
 
     def _on_agent_event(self, event: AgentEvent) -> None:
         """High-signal live console view; the JSONL journal remains canonical."""
+        if event.kind == "started":
+            self.state.active_attempt_id = event.attempt_id
+            self._save()
+            return
         if event.kind == "text_delta":
             self._live_text_attempts.add(event.attempt_id)
             print(event.summary, end="", flush=True)
@@ -470,6 +506,9 @@ class Orchestrator:
             handler = handlers[phase]
             try:
                 handler()
+            except BudgetPause:
+                self._report_gate()
+                return
             except (AgentError, gitops.GitError, OrchestratorError) as exc:
                 self.state.fail(str(exc))
                 self._save()
@@ -479,6 +518,11 @@ class Orchestrator:
             self._save()
 
     def _report_gate(self) -> None:
+        if Phase(self.state.phase) is Phase.PAUSED_BUDGET:
+            self.say("PAUSED_BUDGET: the run economic envelope is exhausted.")
+            self.say(f"  Why: {self.state.gate_reason}")
+            self.say("  Then: claudex resume --add-invocations N [other additions]")
+            return
         if self.state.gate_kind == "decision":
             self.say("GATE: a concrete human decision is required.")
         else:
@@ -501,6 +545,17 @@ class Orchestrator:
             self.say(f"FAILED: {self.state.error}")
         else:
             self.say("Run aborted.")
+        used = budgets.budget_usage(self.state)
+        self.say(
+            "Usage: "
+            f"{used['invocations']} invocation(s), "
+            f"{used['input_tokens']} reported input token(s), "
+            f"{used['output_tokens']} reported output token(s), "
+            f"${used['cost_usd']:.4f} provider-reported USD "
+            f"({self.state.unknown_cost_attempts} unknown-cost attempt(s)), "
+            f"{used['provider_seconds']:.1f}s provider time, "
+            f"{used['wall_seconds']:.1f}s run wall time"
+        )
 
     # ----------------------------------------------------------------- phases
     def phase_init(self) -> None:
@@ -1250,6 +1305,52 @@ class Orchestrator:
         self.state.advance(ret, action)
         self._save()
         return extended
+
+    def resume_budget(
+        self,
+        additions: dict[str, int | float],
+        acknowledged_currencies: list[str] | None = None,
+    ) -> None:
+        """Explicitly expand a run envelope and resume its exact phase."""
+        if Phase(self.state.phase) is not Phase.PAUSED_BUDGET:
+            raise OrchestratorError(
+                f"run is in phase {self.state.phase}, not paused for run budget"
+            )
+        if not any(value > 0 for value in additions.values()) and not acknowledged_currencies:
+            raise OrchestratorError(
+                "resume requires a positive budget addition or --acknowledge-currency"
+            )
+        previous_overrides = dict(self.state.budget_overrides)
+        previous_ack = list(self.state.acknowledged_cost_currencies)
+        budgets.add_overrides(self.state, additions)
+        for value in acknowledged_currencies or []:
+            currency = value.strip().upper()
+            if not currency or len(currency) != 3 or not currency.isalpha():
+                self.state.budget_overrides = previous_overrides
+                raise OrchestratorError(
+                    f"currency must be a three-letter code, got {value!r}"
+                )
+            if currency not in self.state.acknowledged_cost_currencies:
+                self.state.acknowledged_cost_currencies.append(currency)
+        violations = budgets.budget_violations(self.cfg, self.state)
+        if violations:
+            self.state.budget_overrides = previous_overrides
+            self.state.acknowledged_cost_currencies = previous_ack
+            raise OrchestratorError(
+                "override does not clear the exhausted envelope: "
+                + "; ".join(violations)
+            )
+        ret = Phase(self.state.return_phase)
+        detail = ", ".join(
+            f"+{value} {key}" for key, value in additions.items() if value
+        )
+        if acknowledged_currencies:
+            detail += (", " if detail else "") + "acknowledged " + ", ".join(
+                value.upper() for value in acknowledged_currencies
+            )
+        self._clear_gate()
+        self.state.advance(ret, f"run budget override: {detail}")
+        self._save()
 
     def resume_interrupted_continue(self) -> bool:
         """Recognize a continuation whose transition was saved before the
