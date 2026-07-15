@@ -187,19 +187,6 @@ class EventEmitter:
         return event
 
 
-def latest_run_events(run_dir: Path, *, agent: str = "all") -> list[AgentEvent]:
-    """Replay all attempt journals in stable timestamp/attempt/sequence order."""
-    events: list[AgentEvent] = []
-    attempts = run_dir / "attempts"
-    if not attempts.exists():
-        return events
-    for path in attempts.glob("*/events.jsonl"):
-        for event in EventJournal(path).read():
-            if agent == "all" or event.agent == agent:
-                events.append(event)
-    return sorted(events, key=lambda item: (item.timestamp, item.attempt_id, item.sequence))
-
-
 def project_attempts(events: Iterable[AgentEvent]) -> list[dict]:
     """Build a deterministic status read-model without creating another store."""
     attempts: dict[str, dict] = {}

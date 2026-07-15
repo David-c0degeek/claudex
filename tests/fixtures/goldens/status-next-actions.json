@@ -1,4 +1,5 @@
 {
+  "running": "claudex run",
   "completed": "git merge claudex/run",
   "cancelled": "inspect retained artifacts; start a new run when ready",
   "failed_retryable": "claudex retry",

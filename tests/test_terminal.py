@@ -135,6 +135,7 @@ class StatusGoldenTests(unittest.TestCase):
         )
         cases = {}
         for lifecycle in (
+            Lifecycle.RUNNING,
             Lifecycle.COMPLETED,
             Lifecycle.CANCELLED,
             Lifecycle.FAILED_RETRYABLE,
@@ -154,21 +155,27 @@ class StatusGoldenTests(unittest.TestCase):
         expected = json.loads(
             (GOLDENS / "status-next-actions.json").read_text(encoding="utf-8")
         )
-        phase_for = {
-            Lifecycle.COMPLETED: Phase.DONE,
-            Lifecycle.CANCELLED: Phase.ABORTED,
-            Lifecycle.FAILED_RETRYABLE: Phase.FAILED,
-            Lifecycle.FAILED_TERMINAL: Phase.FAILED,
-        }
+        cases = (
+            (Lifecycle.RUNNING, Phase.INIT, "running"),
+            (Lifecycle.COMPLETED, Phase.DONE, "completed"),
+            (Lifecycle.CANCELLED, Phase.ABORTED, "cancelled"),
+            (Lifecycle.FAILED_RETRYABLE, Phase.FAILED, "failed_retryable"),
+            (Lifecycle.FAILED_TERMINAL, Phase.FAILED, "failed_terminal"),
+            (Lifecycle.RATE_LIMITED, Phase.PLAN_DRAFT, "rate_limited"),
+            (Lifecycle.PAUSED_BUDGET, Phase.PAUSED_BUDGET, "paused_budget"),
+            (Lifecycle.PAUSED, Phase.AWAIT_GUIDANCE, "paused_decision"),
+        )
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
-            for lifecycle, phase in phase_for.items():
+            for lifecycle, phase, golden_key in cases:
                 run_id = lifecycle.value
                 state = RunState(
                     run_id, str(repo), "claude",
                     phase=phase.value, lifecycle=lifecycle.value,
                     branch="claudex/run",
                 )
+                if lifecycle is Lifecycle.PAUSED:
+                    state.gate_kind = "decision"
                 state.lifecycle_history = [
                     {
                         "reason": f"golden {lifecycle.value}",
@@ -189,7 +196,7 @@ class StatusGoldenTests(unittest.TestCase):
                 rendered = output.getvalue()
                 self.assertIn(f"lifecycle:{lifecycle.value}", rendered)
                 self.assertIn(f"golden {lifecycle.value}", rendered)
-                self.assertIn(f"next:     {expected[lifecycle.value]}", rendered)
+                self.assertIn(f"next:     {expected[golden_key]}", rendered)
 
     def test_state_rendering_redacts_reason(self) -> None:
         state = RunState("run", ".", "claude", lifecycle=Lifecycle.CANCELLED.value)

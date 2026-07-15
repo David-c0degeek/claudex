@@ -407,6 +407,13 @@ class BlackBoxCoordinatorTests(unittest.TestCase):
         self.assertEqual(7 * 11, state.provider_usage["input_tokens"])
         self.assertEqual(7 * 7, state.provider_usage["output_tokens"])
         self.assertLess(time.monotonic() - started, 60)
+        status = self._cli("status", run_id)
+        self.assertEqual(0, status.returncode, status.stderr)
+        self.assertIn("lifecycle:completed", status.stdout)
+        self.assertIn("provider: calls 7/10", status.stdout)
+        self.assertIn("input uncached=77", status.stdout)
+        self.assertIn("output=49", status.stdout)
+        self.assertIn("next:     git merge claudex/", status.stdout)
         identity = json.loads(
             (run_dir_for(self.repo, run_id) / "diff-final-identity.json").read_text(
                 encoding="utf-8"
