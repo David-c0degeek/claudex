@@ -12,11 +12,20 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
 
-	r2, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
+	// The accepted phase is bound to the pre-transition phase, so move into
+	// IMPLEMENT_STEP before accepting.
+	r1b, err := s.Mutate(r1.Revision, func(_ uint64, next *RunState) error {
+		next.Phase = PhaseImplementStep
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("to implement: %v", err)
+	}
+	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
 		next.AcceptedTurns["t1"] = AcceptedTurn{
 			ArtifactDigest: hex64("c"),
 			Receipt:        Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")},
-			Role:           "lead", Phase: PhaseImplementStep, MessageType: "implementation_report",
+			Phase:          PhaseImplementStep,
 		}
 		return nil
 	})
@@ -24,11 +33,11 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 		t.Fatalf("accept t1: %v", err)
 	}
 	r3, err := s.Mutate(r2.Revision, func(rev uint64, next *RunState) error {
-		next.Phase = PhasePlanDraft // an unrelated field must not affect the ledger
+		next.Phase = PhasePlanDraft // the resulting phase must not affect the ledger
 		next.AcceptedTurns["t2"] = AcceptedTurn{
 			ArtifactDigest: hex64("d"),
 			Receipt:        Receipt{TurnID: "t2", Revision: rev, ArtifactDigest: hex64("d")},
-			Role:           "pair", Phase: PhaseCheckpoint, MessageType: "checkpoint_review",
+			Phase:          PhaseImplementStep, // == the pre-transition phase (r2)
 		}
 		return nil
 	})
@@ -37,8 +46,8 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	}
 
 	want := []LedgerEntry{
-		{Revision: 2, TurnID: "t1", ArtifactDigest: hex64("c"), Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"},
-		{Revision: 3, TurnID: "t2", ArtifactDigest: hex64("d"), Role: "pair", Phase: PhaseCheckpoint, MessageType: "checkpoint_review"},
+		{Revision: 3, TurnID: "t1", ArtifactDigest: hex64("c"), Phase: PhaseImplementStep},
+		{Revision: 4, TurnID: "t2", ArtifactDigest: hex64("d"), Phase: PhaseImplementStep},
 	}
 	if got := Ledger(r3); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ledger = %+v, want %+v", got, want)

@@ -3,14 +3,13 @@ package state
 import "sort"
 
 // LedgerEntry is one accepted artifact, projected for a human-readable ledger,
-// with the coordinator-authored role/phase/message_type carried through.
+// carrying the coordinator-authored accepted Phase (role and artifact type are
+// derived from it by the consumer via the turn spec).
 type LedgerEntry struct {
 	Revision       uint64 `json:"revision"`
 	TurnID         string `json:"turn_id"`
 	ArtifactDigest string `json:"artifact_digest"`
-	Role           string `json:"role"`
 	Phase          Phase  `json:"phase"`
-	MessageType    string `json:"message_type"`
 }
 
 // Ledger derives the append-only ledger purely from the accepted artifacts. It
@@ -27,9 +26,7 @@ func Ledger(rs RunState) []LedgerEntry {
 			Revision:       t.Receipt.Revision,
 			TurnID:         id,
 			ArtifactDigest: t.ArtifactDigest,
-			Role:           t.Role,
 			Phase:          t.Phase,
-			MessageType:    t.MessageType,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {

@@ -196,8 +196,15 @@ func validateTransition(old, next *RunState) error {
 		}
 	}
 	for k, v := range next.AcceptedTurns {
-		if _, existed := old.AcceptedTurns[k]; !existed && v.Receipt.Revision != next.Revision {
-			return fmt.Errorf("newly accepted turn %q must bind to revision %d, got %d", k, next.Revision, v.Receipt.Revision)
+		if _, existed := old.AcceptedTurns[k]; !existed {
+			if v.Receipt.Revision != next.Revision {
+				return fmt.Errorf("newly accepted turn %q must bind to revision %d, got %d", k, next.Revision, v.Receipt.Revision)
+			}
+			// The accepted phase is authoritative: it is the phase the turn was in
+			// (the phase before this transition advanced it), never a caller claim.
+			if v.Phase != old.Phase {
+				return fmt.Errorf("newly accepted turn %q phase %q must equal the pre-transition phase %q", k, v.Phase, old.Phase)
+			}
 		}
 	}
 	// A newly-set or replaced ref must bind to the resulting revision.
@@ -289,14 +296,8 @@ func validateAcceptedTurns(rs *RunState) error {
 		if v.Receipt.Revision == 0 || v.Receipt.Revision > rs.Revision {
 			return fmt.Errorf("accepted turn %q receipt revision %d out of range (1..%d)", k, v.Receipt.Revision, rs.Revision)
 		}
-		if v.Role != "lead" && v.Role != "pair" {
-			return fmt.Errorf("accepted turn %q has an unknown role %q", k, v.Role)
-		}
 		if !knownPhases[v.Phase] {
 			return fmt.Errorf("accepted turn %q has an unknown phase %q", k, v.Phase)
-		}
-		if len(v.MessageType) == 0 || len(v.MessageType) > 64 {
-			return fmt.Errorf("accepted turn %q has an invalid message_type", k)
 		}
 	}
 	return nil

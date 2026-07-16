@@ -8,13 +8,49 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/canonjson"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
+
+// syncFailSink models a sink that committed the visible bytes but could not
+// durably sync them (a *PostCommitSyncError).
+type syncFailSink struct{ calls int }
+
+func (s *syncFailSink) Put(turnID, digest string, _ []byte) error {
+	s.calls++
+	return &atomicfile.PostCommitSyncError{Path: turnID + "/" + digest, Err: errors.New("dir sync failed")}
+}
+
+// A sink that cannot durably persist the artifact must block acceptance: Submit
+// surfaces the post-commit sync error and does NOT advance the run, so a later
+// retry (against a healthy sink) re-confirms durability before accepting.
+func TestSubmitDoesNotAdvanceOnSinkSyncFailure(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	sink := &syncFailSink{}
+	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		next.Phase = state.PhaseCheckpoint
+		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		return nil
+	}
+	_, err := Submit(context.Background(), store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
+	var pce *atomicfile.PostCommitSyncError
+	if !errors.As(err, &pce) {
+		t.Fatalf("submit err = %v, want *atomicfile.PostCommitSyncError", err)
+	}
+	rs, _, _ := store.Load()
+	if rs.Revision != rev {
+		t.Fatalf("state advanced to rev %d despite the sink sync failure", rs.Revision)
+	}
+	if _, ok := rs.AcceptedTurns["turn-1"]; ok {
+		t.Fatalf("acceptance was recorded despite the sink sync failure")
+	}
+}
 
 // validArtifact builds a canonical implementation_report for turnID with roughly
 // n padding entries, and returns its canonical bytes and digest.
@@ -34,13 +70,20 @@ func validArtifact(t *testing.T, turnID string, n int) ([]byte, string) {
 	return canon, hex.EncodeToString(sum[:])
 }
 
-func newStore(t *testing.T) *ArtifactStore {
+func newStoreDir(t *testing.T) (*ArtifactStore, string) {
 	t.Helper()
-	s, err := NewArtifactStore(t.TempDir())
+	dir := t.TempDir()
+	s, err := NewArtifactStore(dir)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
+	return s, dir
+}
+
+func newStore(t *testing.T) *ArtifactStore {
+	t.Helper()
+	s, _ := newStoreDir(t)
 	return s
 }
 
@@ -86,20 +129,51 @@ func TestArtifactStoreRejects(t *testing.T) {
 	}
 }
 
-func TestArtifactStoreCollision(t *testing.T) {
-	s := newStore(t)
+// A same-key write whose bytes differ from an already-published artifact is a
+// collision. verify() passes (the supplied bytes hash to d), so the no-clobber
+// link fails and the store reads the existing, different bytes — reaching the
+// collision branch without replacing anything.
+func TestArtifactStoreCollisionReachesHandling(t *testing.T) {
+	s, dir := newStoreDir(t)
 	a, d := validArtifact(t, "turn-1", 1)
-	if err := s.Put("turn-1", d, a); err != nil {
-		t.Fatalf("put a: %v", err)
+	// Pre-place different bytes at the exact target path via a side channel.
+	if err := os.MkdirAll(filepath.Join(dir, "turn-1"), 0o700); err != nil {
+		t.Fatalf("pre-mkdir: %v", err)
 	}
-	// Same key, different bytes: impossible via a real digest, but a caller could
-	// present mismatched (turn,digest,bytes). Craft bytes that hash to d but
-	// differ — use the stored digest with different content via a forced write.
-	// Simpler: a different valid artifact keyed under the same (turn, digest).
-	b, _ := validArtifact(t, "turn-1", 2)
-	if err := s.Put("turn-1", d, b); !errors.Is(err, ErrArtifactMismatch) {
-		// b's bytes don't hash to d, so verify rejects before publication.
-		t.Fatalf("mismatched-content put err = %v, want ErrArtifactMismatch", err)
+	target := filepath.Join(dir, "turn-1", d+".json")
+	if err := os.WriteFile(target, []byte("different-prior-bytes"), 0o600); err != nil {
+		t.Fatalf("pre-place: %v", err)
+	}
+	// a hashes to d and verifies, but the target already holds other bytes.
+	if err := s.Put("turn-1", d, a); !errors.Is(err, ErrArtifactCollision) {
+		t.Fatalf("collision put err = %v, want ErrArtifactCollision", err)
+	}
+	// The prior file was not replaced.
+	got, _ := os.ReadFile(target)
+	if string(got) != "different-prior-bytes" {
+		t.Fatalf("collision replaced the existing artifact: %q", got)
+	}
+}
+
+// A canonical, correctly-hashed message that is NOT one of the submit artifact
+// types is refused — only a real assignment-produced artifact may be stored.
+func TestArtifactStoreRejectsNonArtifactType(t *testing.T) {
+	s := newStore(t)
+	body, d := canonArtifact(t, `{"message_type":"assignment","turn_id":"turn-1"}`)
+	if err := s.Put("turn-1", d, body); !errors.Is(err, ErrArtifactMismatch) {
+		t.Fatalf("non-artifact type err = %v, want ErrArtifactMismatch", err)
+	}
+}
+
+// Persistence-boundary redaction: bytes carrying a secret in a free-text field
+// are not already redacted, so the store refuses them rather than rewriting
+// (which would change the digest).
+func TestArtifactStoreRejectsUnredacted(t *testing.T) {
+	s := newStore(t)
+	secret := "sk-ant-" + "abcdefghijklmnopqrstuvwx"
+	body, d := canonArtifact(t, `{"protocol_version":1,"message_type":"implementation_report","turn_id":"turn-1","state_revision":2,"human_context":null,"requires_human_decision":false,"decision_question":null,"files_changed":[],"deviations_from_plan":[],"notes":"`+secret+`"}`)
+	if err := s.Put("turn-1", d, body); !errors.Is(err, ErrArtifactMismatch) {
+		t.Fatalf("unredacted put err = %v, want ErrArtifactMismatch", err)
 	}
 }
 

@@ -46,6 +46,13 @@ func isTransientRename(err error) bool {
 		errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
 
+// isTransientOpen reports the transient sharing/access errors a reader or a
+// hard-link/rename publisher hits while another process holds the target.
+func isTransientOpen(err error) bool { return isTransientRename(err) }
+
+// syncRootDir is a no-op on Windows: there is no directory fsync (see syncDir).
+func syncRootDir(*os.Root, string) error { return nil }
+
 // syncDir is a no-op on Windows: there is no directory fsync. Power-loss
 // durability would additionally require MOVEFILE_WRITE_THROUGH, which the
 // default os.Rename does not request.

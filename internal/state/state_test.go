@@ -114,7 +114,7 @@ func TestNewReceiptMustBindToRevision(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
 	if _, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: 1, ArtifactDigest: hex64("c")}, Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: 1, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
 		return nil
 	}); err == nil {
 		t.Fatalf("a new receipt with a stale revision should be rejected")
@@ -149,7 +149,7 @@ func TestSecretTurnIDRejected(t *testing.T) {
 	r1 := mustInit(t, s)
 	secretID := "sk-ant-abcdefghijklmnopqrstuvwx"
 	if _, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns[secretID] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: secretID, Revision: rev, ArtifactDigest: hex64("c")}, Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"}
+		next.AcceptedTurns[secretID] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: secretID, Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
 		return nil
 	}); err == nil {
 		t.Fatalf("a secret-shaped turn id should be rejected")
@@ -238,14 +238,14 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
 	r2, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("add turn: %v", err)
 	}
 	if _, err := s.Mutate(r2.Revision, func(_ uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Phase: PhaseInit}
 		return nil
 	}); err == nil {
 		t.Fatalf("changing an accepted turn should be rejected")
@@ -261,7 +261,7 @@ func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	}
 	r3, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
 		next.Assignment = &Ref{ID: "assign-1", IssuedRevision: rev}
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
 		return nil
 	})
 	if err != nil {

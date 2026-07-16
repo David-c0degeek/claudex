@@ -2,19 +2,18 @@ package transport
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 
 	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/canonjson"
 	"github.com/David-c0degeek/claudex/internal/protocol"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -29,13 +28,26 @@ var (
 	// ErrBadArtifactKey means the turn id or digest is not a safe key.
 	ErrBadArtifactKey = errors.New("transport: invalid artifact key")
 	// ErrArtifactMismatch means the bytes do not match their key (not canonical,
-	// wrong digest, wrong envelope turn id, or schema-invalid).
+	// not redacted, wrong digest, wrong envelope turn id, not a submit artifact
+	// type, or schema-invalid).
 	ErrArtifactMismatch = errors.New("transport: artifact does not match its key")
 )
 
-// ArtifactStore persists immutable, content-addressed artifacts under a confined
-// os.Root, so a symlink in the tree cannot escape it. It is the durable
-// ArtifactSink the submit path writes to before recording acceptance.
+// artifactMessageTypes is the allowlist of submit artifact types, derived from
+// the single TurnSpec source, so a non-artifact message (an assignment, a
+// receipt) can never be persisted as an artifact.
+var artifactMessageTypes = func() map[string]bool {
+	m := make(map[string]bool)
+	for _, spec := range turnSpecs {
+		m[spec.ArtifactMessageType] = true
+	}
+	return m
+}()
+
+// ArtifactStore persists immutable, content-addressed submit artifacts under a
+// confined os.Root (so a symlink cannot escape it) via internal/atomicfile's
+// rooted, no-clobber publication. It is the durable ArtifactSink the submit path
+// writes to before recording acceptance.
 type ArtifactStore struct {
 	root *os.Root
 }
@@ -58,26 +70,29 @@ func NewArtifactStore(dir string) (*ArtifactStore, error) {
 // Close releases the root handle.
 func (s *ArtifactStore) Close() error { return s.root.Close() }
 
-// Put verifies the artifact against its key and publishes it atomically without
-// replacing an existing one. A repeat write of the same content is idempotent
-// (and durably re-confirmed); a same-key byte mismatch is a collision.
+// Put verifies the artifact against its key and publishes it without replacing an
+// existing one. A repeat write of the same content is idempotent and durably
+// re-confirmed; a same-key byte mismatch is a collision.
 func (s *ArtifactStore) Put(turnID, digest string, canonical []byte) error {
 	if err := s.verify(turnID, digest, canonical); err != nil {
 		return err
 	}
+	if err := atomicfile.MkdirInRoot(s.root, turnID, 0o700); err != nil {
+		return err
+	}
 	rel := turnID + "/" + digest + ".json"
-	if existing, err := s.read(rel); err == nil {
+	err := atomicfile.InstallInRoot(s.root, rel, canonical, artifactPerm)
+	if errors.Is(err, fs.ErrExist) {
+		existing, rerr := s.read(rel)
+		if rerr != nil {
+			return rerr
+		}
 		if !bytes.Equal(existing, canonical) {
 			return fmt.Errorf("%w: %s", ErrArtifactCollision, rel)
 		}
-		return s.syncDir(turnID) // durably confirm even on an idempotent re-put
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return atomicfile.SyncInRoot(s.root, rel) // durably re-confirm the existing file
 	}
-	if err := s.root.Mkdir(turnID, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	return s.publish(turnID, rel, canonical)
+	return err // nil, or a committed *PostCommitSyncError the submit path treats as not-durable
 }
 
 // Get reads an artifact and re-verifies every key check before returning bytes.
@@ -95,9 +110,13 @@ func (s *ArtifactStore) Get(turnID, digest string) ([]byte, error) {
 	return b, nil
 }
 
-// verify enforces that the bytes are canonical JSON, hash to the digest, carry an
-// envelope turn_id matching the path, and validate against their registered
-// schema.
+func (s *ArtifactStore) read(rel string) ([]byte, error) {
+	return atomicfile.ReadInRoot(s.root, rel, maxArtifactBytes)
+}
+
+// verify enforces that the bytes are canonical, already-redacted JSON that hash
+// to the digest, carry an envelope turn_id matching the path, name one of the
+// allowlisted submit artifact types, and validate against that schema.
 func (s *ArtifactStore) verify(turnID, digest string, canonical []byte) error {
 	if !state.IsRunID(turnID) {
 		return fmt.Errorf("%w: turn id", ErrBadArtifactKey)
@@ -112,6 +131,12 @@ func (s *ArtifactStore) verify(turnID, digest string, canonical []byte) error {
 	if err != nil || !bytes.Equal(c, canonical) {
 		return fmt.Errorf("%w: not canonical JSON", ErrArtifactMismatch)
 	}
+	// Persistence boundary: the bytes must already be redacted (rewriting would
+	// change the digest).
+	r, err := canonjson.Canonicalize(redact.Bytes(canonical))
+	if err != nil || !bytes.Equal(r, canonical) {
+		return fmt.Errorf("%w: not redacted", ErrArtifactMismatch)
+	}
 	sum := sha256.Sum256(canonical)
 	if hex.EncodeToString(sum[:]) != digest {
 		return fmt.Errorf("%w: digest", ErrArtifactMismatch)
@@ -123,6 +148,9 @@ func (s *ArtifactStore) verify(turnID, digest string, canonical []byte) error {
 	if err := json.Unmarshal(canonical, &env); err != nil {
 		return fmt.Errorf("%w: envelope", ErrArtifactMismatch)
 	}
+	if !artifactMessageTypes[env.MessageType] {
+		return fmt.Errorf("%w: %q is not a submit artifact type", ErrArtifactMismatch, env.MessageType)
+	}
 	if env.TurnID != turnID {
 		return fmt.Errorf("%w: envelope turn id", ErrArtifactMismatch)
 	}
@@ -130,79 +158,4 @@ func (s *ArtifactStore) verify(turnID, digest string, canonical []byte) error {
 		return fmt.Errorf("%w: schema", ErrArtifactMismatch)
 	}
 	return nil
-}
-
-func (s *ArtifactStore) read(rel string) ([]byte, error) {
-	f, err := s.root.Open(rel)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxArtifactBytes+1))
-}
-
-// publish links a fully-written, fsynced temp file into place under the root; a
-// concurrent reader sees the complete file or nothing, and two publishers cannot
-// overwrite each other.
-func (s *ArtifactStore) publish(turnID, rel string, data []byte) (err error) {
-	tmp := turnID + "/.claudex-tmp-" + randHex()
-	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, artifactPerm)
-	if err != nil {
-		return err
-	}
-	linked := false
-	defer func() {
-		if !linked {
-			_ = s.root.Remove(tmp)
-		}
-	}()
-	if _, err = f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = s.root.Link(tmp, rel); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			// A concurrent publisher won; reconcile as idempotent or collision.
-			existing, rerr := s.read(rel)
-			if rerr != nil {
-				return rerr
-			}
-			if !bytes.Equal(existing, data) {
-				return fmt.Errorf("%w: %s", ErrArtifactCollision, rel)
-			}
-			return s.syncDir(turnID)
-		}
-		return err
-	}
-	linked = true
-	_ = s.root.Remove(tmp)
-	return s.syncDir(turnID)
-}
-
-// syncDir fsyncs the turn directory so the newly linked entry is durable. On
-// Windows there is no directory fsync (see atomicfile), so it is a no-op there.
-func (s *ArtifactStore) syncDir(turnID string) error {
-	d, err := s.root.Open(turnID)
-	if err != nil {
-		return err
-	}
-	serr := syncDirHandle(d)
-	_ = d.Close()
-	if serr != nil {
-		return &atomicfile.PostCommitSyncError{Path: turnID, Err: serr}
-	}
-	return nil
-}
-
-func randHex() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }

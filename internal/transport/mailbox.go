@@ -1,30 +1,40 @@
 package transport
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
+	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/protocol"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-const inboxPerm = 0o600
+const (
+	inboxPerm      = 0o600
+	maxInboxBytes  = 1 << 20
+	maxMailboxSize = 8 << 20
+)
 
 var (
 	// ErrBadSession means a session id is not canonical or does not match the
 	// assignment.
 	ErrBadSession = errors.New("transport: invalid session")
 	// ErrMailboxMismatch means an accepted-turn ledger entry disagrees with its
-	// stored artifact.
+	// stored artifact, or the ledger is out of order.
 	ErrMailboxMismatch = errors.New("transport: mailbox entry disagrees with its artifact")
 )
 
-// SessionStore writes role-addressed assignment inboxes under a confined session
-// root, so a session id can never escape it. The inbox is a mutable, rebuildable
-// projection: it is atomically replaced each turn.
+// SessionStore writes and reads role-addressed assignment inboxes under a
+// confined session root, so a session id can never escape it. The inbox is a
+// mutable, rebuildable projection, atomically replaced each turn.
 type SessionStore struct {
 	root *os.Root
 }
@@ -44,9 +54,8 @@ func NewSessionStore(dir string) (*SessionStore, error) {
 // Close releases the root handle.
 func (s *SessionStore) Close() error { return s.root.Close() }
 
-// WriteAssignment delivers the assignment to sessionID's inbox. sessionID must
-// be canonical and equal the assignment's SessionID; the canonical assignment
-// bytes replace <sessionID>/assignment.json atomically within the root.
+// WriteAssignment delivers the assignment to sessionID's inbox atomically.
+// sessionID must be canonical and equal the assignment's SessionID.
 func (s *SessionStore) WriteAssignment(sessionID string, a Assignment) error {
 	if !state.IsRunID(sessionID) {
 		return fmt.Errorf("%w: session id", ErrBadSession)
@@ -58,90 +67,146 @@ func (s *SessionStore) WriteAssignment(sessionID string, a Assignment) error {
 	if err != nil {
 		return err
 	}
-	if err := s.root.Mkdir(sessionID, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := atomicfile.MkdirInRoot(s.root, sessionID, 0o700); err != nil {
 		return err
 	}
-	return s.replaceInRoot(sessionID+"/assignment.json", canon)
+	return atomicfile.ReplaceInRoot(s.root, sessionID+"/assignment.json", canon, inboxPerm)
 }
 
-// ReadAssignment reads a session's current inbox bytes.
-func (s *SessionStore) ReadAssignment(sessionID string) ([]byte, error) {
+// ReadAssignment reads and fully validates a session's current inbox: a bounded
+// regular file whose canonical, schema-valid, semantically-valid assignment is
+// addressed to sessionID. It never returns torn or tampered bytes.
+func (s *SessionStore) ReadAssignment(sessionID string) (Assignment, error) {
 	if !state.IsRunID(sessionID) {
-		return nil, fmt.Errorf("%w: session id", ErrBadSession)
+		return Assignment{}, fmt.Errorf("%w: session id", ErrBadSession)
 	}
-	f, err := s.root.Open(sessionID + "/assignment.json")
+	raw, err := atomicfile.ReadInRoot(s.root, sessionID+"/assignment.json", maxInboxBytes)
+	if err != nil {
+		return Assignment{}, err
+	}
+	if _, err := protocol.Validate(assignmentType, raw); err != nil {
+		return Assignment{}, fmt.Errorf("%w: inbox schema", ErrBadSession)
+	}
+	var a Assignment
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return Assignment{}, fmt.Errorf("%w: inbox decode", ErrBadSession)
+	}
+	if err := a.Validate(); err != nil {
+		return Assignment{}, fmt.Errorf("%w: %v", ErrBadSession, err)
+	}
+	if a.SessionID != sessionID {
+		return Assignment{}, fmt.Errorf("%w: inbox session id disagrees", ErrBadSession)
+	}
+	return a, nil
+}
+
+// MailboxStore writes the single human-readable transcript under a confined root.
+type MailboxStore struct {
+	root *os.Root
+}
+
+// NewMailboxStore roots the mailbox at dir (e.g. .claudex).
+func NewMailboxStore(dir string) (*MailboxStore, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	r, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxArtifactBytes+1))
+	return &MailboxStore{root: r}, nil
 }
 
-// replaceInRoot writes data to a fresh temp within the root, then renames it over
-// the target — an atomic replace on POSIX; on Windows the OS provides no
-// old-or-new guarantee (see atomicfile), which is acceptable for a rebuildable
-// mutable projection.
-func (s *SessionStore) replaceInRoot(rel string, data []byte) (err error) {
-	dir := rel[:strings.LastIndex(rel, "/")]
-	tmp := dir + "/.claudex-tmp-" + randHex()
-	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, inboxPerm)
+// Close releases the root handle.
+func (m *MailboxStore) Close() error { return m.root.Close() }
+
+// Write renders the transcript from the ledger and artifacts and atomically
+// replaces mailbox.md. The transcript is a rebuildable projection.
+func (m *MailboxStore) Write(ledger []state.LedgerEntry, load func(turnID, digest string) ([]byte, error)) error {
+	md, err := RenderMailbox(ledger, load)
 	if err != nil {
 		return err
 	}
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = s.root.Remove(tmp)
-		}
-	}()
-	if _, err = f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = s.root.Rename(tmp, rel); err != nil {
-		return err
-	}
-	renamed = true
-	return nil
+	return atomicfile.ReplaceInRoot(m.root, "mailbox.md", []byte(md), inboxPerm)
 }
 
-// RenderMailbox derives the append-only human-readable transcript from the
-// accepted-turn ledger (in order) and the immutable artifacts. It fails closed
-// if an entry disagrees with its artifact, and every block is built from
-// coordinator-known role/phase plus injection-safe typed summaries — no raw
-// free text — so a longer ledger's rendering has a shorter one's as an exact
-// prefix.
+// Read returns the current transcript bytes.
+func (m *MailboxStore) Read() ([]byte, error) {
+	return atomicfile.ReadInRoot(m.root, "mailbox.md", maxMailboxSize)
+}
+
+// RenderMailbox derives the append-only transcript from the accepted-turn ledger
+// (in strictly-increasing revision order) and the immutable artifacts. It fails
+// closed and independently re-validates every artifact — recomputed digest,
+// canonical and redacted bytes, and the schema for the type derived from
+// TurnSpec(entry.Phase) — so the loader cannot feed corrupt or unaddressed bytes.
+// Role and artifact type come solely from the phase; summaries are injection-safe
+// typed counts and allowlisted enums. A longer ledger's render has a shorter
+// one's as an exact prefix.
 func RenderMailbox(ledger []state.LedgerEntry, load func(turnID, digest string) ([]byte, error)) (string, error) {
 	var b strings.Builder
-	for _, e := range ledger {
-		if !state.IsRunID(e.TurnID) || (e.Role != "lead" && e.Role != "pair") || e.MessageType == "" {
+	var prevRevision uint64
+	seen := make(map[string]bool)
+	for i, e := range ledger {
+		if i > 0 && e.Revision <= prevRevision {
+			return "", fmt.Errorf("%w: ledger revisions are not strictly increasing", ErrMailboxMismatch)
+		}
+		prevRevision = e.Revision
+		if seen[e.TurnID] {
+			return "", fmt.Errorf("%w: duplicate turn in the ledger", ErrMailboxMismatch)
+		}
+		seen[e.TurnID] = true
+
+		if !state.IsRunID(e.TurnID) || !state.IsHex64(e.ArtifactDigest) {
 			return "", fmt.Errorf("%w: malformed ledger entry", ErrMailboxMismatch)
 		}
+		spec, ok := TurnSpec(e.Phase)
+		if !ok {
+			return "", fmt.Errorf("%w: ledger phase %s is not actionable", ErrMailboxMismatch, e.Phase)
+		}
+
 		artifact, err := load(e.TurnID, e.ArtifactDigest)
 		if err != nil {
 			return "", err
 		}
-		var env struct {
-			MessageType string `json:"message_type"`
-			TurnID      string `json:"turn_id"`
+		if err := validateForRender(e, spec, artifact); err != nil {
+			return "", err
 		}
-		if err := json.Unmarshal(artifact, &env); err != nil {
-			return "", fmt.Errorf("%w: envelope", ErrMailboxMismatch)
-		}
-		if env.TurnID != e.TurnID || env.MessageType != e.MessageType {
-			return "", fmt.Errorf("%w: artifact does not match the ledger entry", ErrMailboxMismatch)
-		}
-		fmt.Fprintf(&b, "===== [%s] turn %s | %s | ACCEPTED =====\n", strings.ToUpper(e.Role), e.TurnID, e.Phase)
-		fmt.Fprintf(&b, "%s: %s\n\n", e.MessageType, summarize(e.MessageType, artifact))
+
+		fmt.Fprintf(&b, "===== [%s] turn %s | %s | ACCEPTED =====\n", strings.ToUpper(string(spec.Role)), e.TurnID, e.Phase)
+		fmt.Fprintf(&b, "%s: %s\n\n", spec.ArtifactMessageType, summarize(spec.ArtifactMessageType, artifact))
 	}
 	return b.String(), nil
+}
+
+// validateForRender re-verifies an artifact against its ledger entry and the
+// phase's expected type, independent of whatever the loader returned.
+func validateForRender(e state.LedgerEntry, spec TurnSpecEntry, artifact []byte) error {
+	if int64(len(artifact)) == 0 || int64(len(artifact)) > maxArtifactBytes {
+		return fmt.Errorf("%w: artifact size", ErrMailboxMismatch)
+	}
+	c, err := canonjson.Canonicalize(artifact)
+	if err != nil || !bytes.Equal(c, artifact) {
+		return fmt.Errorf("%w: artifact not canonical", ErrMailboxMismatch)
+	}
+	r, err := canonjson.Canonicalize(redact.Bytes(artifact))
+	if err != nil || !bytes.Equal(r, artifact) {
+		return fmt.Errorf("%w: artifact not redacted", ErrMailboxMismatch)
+	}
+	sum := sha256.Sum256(artifact)
+	if hex.EncodeToString(sum[:]) != e.ArtifactDigest {
+		return fmt.Errorf("%w: artifact digest", ErrMailboxMismatch)
+	}
+	if _, err := protocol.Validate(spec.ArtifactMessageType, artifact); err != nil {
+		return fmt.Errorf("%w: artifact schema", ErrMailboxMismatch)
+	}
+	var env struct {
+		TurnID string `json:"turn_id"`
+	}
+	if err := json.Unmarshal(artifact, &env); err != nil || env.TurnID != e.TurnID {
+		return fmt.Errorf("%w: artifact turn id", ErrMailboxMismatch)
+	}
+	return nil
 }
 
 // summarize renders an injection-safe, redacted one-line summary using only
@@ -188,6 +253,5 @@ func enumField(raw json.RawMessage) string {
 	case "AGREE", "REVISE", "pass", "fail":
 		return s
 	}
-	// Defense: never echo an unexpected value.
 	return "?"
 }
