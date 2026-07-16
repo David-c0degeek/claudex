@@ -147,14 +147,14 @@ func TestSessionStoreInbox(t *testing.T) {
 	}
 	defer ss.Close()
 
-	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), editInputs()) // SessionID "sess-1"
+	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), editInputs()) // SessionID sessLead
 	if err != nil {
 		t.Fatalf("build assignment: %v", err)
 	}
-	if err := ss.WriteAssignment("sess-1", a); err != nil {
+	if err := ss.WriteAssignment(sessLead, a); err != nil {
 		t.Fatalf("write inbox: %v", err)
 	}
-	got, err := ss.ReadAssignment("sess-1")
+	got, err := ss.ReadAssignment(sessLead)
 	if err != nil {
 		t.Fatalf("read inbox: %v", err)
 	}
@@ -164,16 +164,17 @@ func TestSessionStoreInbox(t *testing.T) {
 	if !bytes.Equal(gotCanon, canon) {
 		t.Fatalf("inbox assignment does not round-trip to the canonical bytes")
 	}
-	if got.SessionID != "sess-1" {
+	if got.SessionID != sessLead {
 		t.Fatalf("inbox session id = %q", got.SessionID)
 	}
 
-	// Session id must match the assignment.
-	if err := ss.WriteAssignment("sess-2", a); !errors.Is(err, ErrBadSession) {
+	// Session id must match the assignment (a different valid id mismatches).
+	if err := ss.WriteAssignment(sessPair, a); !errors.Is(err, ErrBadSession) {
 		t.Fatalf("mismatched session err = %v, want ErrBadSession", err)
 	}
-	// Traversal / non-canonical session ids are rejected.
-	for _, bad := range []string{"../escape", "a/b", ".."} {
+	// Traversal, non-canonical, and non-minted (mixed-case / near-shape) session
+	// ids are all rejected as directory names.
+	for _, bad := range []string{"../escape", "a/b", "..", "sess-1", "sess-" + strings.Repeat("A", 32), "sess-" + strings.Repeat("a", 31)} {
 		if err := ss.WriteAssignment(bad, a); !errors.Is(err, ErrBadSession) {
 			t.Fatalf("session id %q err = %v, want ErrBadSession", bad, err)
 		}
@@ -194,15 +195,15 @@ func TestReadAssignmentRejectsTamperedInbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build assignment: %v", err)
 	}
-	if err := ss.WriteAssignment("sess-1", a); err != nil {
+	if err := ss.WriteAssignment(sessLead, a); err != nil {
 		t.Fatalf("write inbox: %v", err)
 	}
 	// Corrupt the durable inbox bytes out from under the reader.
-	inbox := filepath.Join(dir, "sess-1", "assignment.json")
+	inbox := filepath.Join(dir, sessLead, "assignment.json")
 	if err := os.WriteFile(inbox, []byte(`{"message_type":"assignment"`), 0o600); err != nil {
 		t.Fatalf("corrupt inbox: %v", err)
 	}
-	if _, err := ss.ReadAssignment("sess-1"); !errors.Is(err, ErrBadSession) {
+	if _, err := ss.ReadAssignment(sessLead); !errors.Is(err, ErrBadSession) {
 		t.Fatalf("read tampered inbox err = %v, want ErrBadSession", err)
 	}
 }
@@ -261,13 +262,13 @@ func TestReadAssignmentRejectsNonCanonical(t *testing.T) {
 	if err := json.Indent(&pretty, canon, "", "  "); err != nil { // valid JSON, non-canonical bytes
 		t.Fatalf("indent: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "sess-1"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, sessLead), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "sess-1", "assignment.json"), pretty.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, sessLead, "assignment.json"), pretty.Bytes(), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := ss.ReadAssignment("sess-1"); !errors.Is(err, ErrBadSession) {
+	if _, err := ss.ReadAssignment(sessLead); !errors.Is(err, ErrBadSession) {
 		t.Fatalf("non-canonical inbox err = %v, want ErrBadSession", err)
 	}
 }

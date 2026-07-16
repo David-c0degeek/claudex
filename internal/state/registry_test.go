@@ -234,6 +234,27 @@ func TestMintSessionID(t *testing.T) {
 	if _, err := MintSessionID(bytes.NewReader(nil), nil); err == nil {
 		t.Fatalf("RNG failure should fail closed")
 	}
+	// Every one of the eight draws colliding exhausts with a typed error.
+	if _, err := MintSessionID(bytes.NewReader(bytes.Repeat([]byte{0x5a}, 16*8)), func(string) bool { return true }); !errors.Is(err, ErrSessionIDExhausted) {
+		t.Fatalf("all-collision mint err = %v, want ErrSessionIDExhausted", err)
+	}
+}
+
+// Filling the pair with the same agent as the lead is rejected and leaves the
+// registry head unchanged.
+func TestRegistryRejectsSameAgentPair(t *testing.T) {
+	s := newRegistry(t)
+	reg := bootstrapLead(t, s) // lead is claude
+	if _, err := s.Mutate(reg.Revision, func(gen uint64, next *Registry) error {
+		next.Pair = leadSlot(AgentClaude, sid("3"), 1, gen) // same agent as lead
+		return nil
+	}); err == nil {
+		t.Fatalf("filling the pair with the lead's agent should be rejected")
+	}
+	got, _, _ := s.Load()
+	if got.Revision != reg.Revision || got.Pair != nil {
+		t.Fatalf("registry head changed despite the rejection: %+v", got)
+	}
 }
 
 // The older schema fails to decode with clear version remediation.

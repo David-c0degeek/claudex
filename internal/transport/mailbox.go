@@ -60,7 +60,7 @@ func (s *SessionStore) Close() error { return s.root.Close() }
 // WriteAssignment delivers the assignment to sessionID's inbox atomically.
 // sessionID must be canonical and equal the assignment's SessionID.
 func (s *SessionStore) WriteAssignment(sessionID string, a Assignment) error {
-	if !state.IsRunID(sessionID) {
+	if !state.IsSessionID(sessionID) {
 		return fmt.Errorf("%w: session id", ErrBadSession)
 	}
 	if a.SessionID != sessionID {

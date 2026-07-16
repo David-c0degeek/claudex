@@ -149,8 +149,8 @@ func BuildAssignment(rs state.RunState, in PullInputs) (Assignment, error) {
 	if rs.Assignment.IssuedRevision != rs.Revision {
 		return Assignment{}, fmt.Errorf("%w: turn issued at %d, state at %d", ErrStaleAssignment, rs.Assignment.IssuedRevision, rs.Revision)
 	}
-	if in.SessionID == "" {
-		return Assignment{}, fmt.Errorf("transport: session_id is required")
+	if !state.IsSessionID(in.SessionID) {
+		return Assignment{}, fmt.Errorf("transport: session_id must be a canonical minted session id")
 	}
 
 	schemaBytes, err := protocol.Schema(spec.ArtifactMessageType, protocol.SupportedVersion)
@@ -212,8 +212,14 @@ func (a Assignment) validateSemantics() error {
 	if a.MessageType != assignmentType {
 		return fmt.Errorf("%w: wrong message_type", ErrAssignmentInvalid)
 	}
-	if a.RunID == "" || a.SessionID == "" || a.TurnID == "" || a.ExpectedStateRevision == 0 {
+	if a.RunID == "" || a.TurnID == "" || a.ExpectedStateRevision == 0 {
 		return fmt.Errorf("%w: missing identity fields", ErrAssignmentInvalid)
+	}
+	// The schema bounds session_id to the minted length; semantic validation
+	// enforces the exact prefix/lower-hex grammar (the schema profile has no
+	// pattern keyword), so a non-minted/mixed-case id can never reach the wire.
+	if !state.IsSessionID(a.SessionID) {
+		return fmt.Errorf("%w: session_id is not a canonical minted session id", ErrAssignmentInvalid)
 	}
 
 	spec, ok := TurnSpec(a.Phase)

@@ -8,8 +8,15 @@ func IsHex64(s string) bool { return isHex64(s) }
 
 // IsRunID reports whether s is a canonical, filename-safe identifier — the same
 // grammar the state store applies to run, turn, and gate ids. Other packages
-// reuse it for session and artifact keys rather than a divergent validator.
+// reuse it for artifact keys rather than a divergent validator.
 func IsRunID(s string) bool { return validRunID(s) }
+
+// IsSessionID reports whether s is a canonical coordinator-minted session id
+// ("sess-" + 32 lowercase hex). Session ids become directory names and cross the
+// protocol wire, so this is stricter than the general id grammar (lowercase-only)
+// to avoid case aliasing on a case-insensitive filesystem. Every session-path and
+// assignment boundary uses this, not IsRunID.
+func IsSessionID(s string) bool { return isSessionID(s) }
 
 // IsLocalRelPath reports whether p is a canonical, forward-slash, relative,
 // traversal-free, platform-local path — the same rule the state store applies to

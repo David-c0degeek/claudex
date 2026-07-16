@@ -17,6 +17,12 @@ import (
 
 func hex64() string { return strings.Repeat("a", 64) }
 
+// Minted-shape session ids for fixtures ("sess-" + 32 lower-hex).
+var (
+	sessLead = "sess-" + strings.Repeat("a", 31) + "1"
+	sessPair = "sess-" + strings.Repeat("b", 31) + "2"
+)
+
 func ptr(s string) *string { return &s }
 
 func absWorktree() string { return filepath.Join(os.TempDir(), "claudex-wt", "run-a") }
@@ -31,11 +37,22 @@ func runStateAt(phase state.Phase) state.RunState {
 }
 
 func editInputs() PullInputs {
-	return PullInputs{SessionID: "sess-1", Role: RoleLead, BindingGuidance: []string{"prefer small steps"}, Worktree: ptr(absWorktree())}
+	return PullInputs{SessionID: sessLead, Role: RoleLead, BindingGuidance: []string{"prefer small steps"}, Worktree: ptr(absWorktree())}
 }
 
 func evidenceInputs(role Role) PullInputs {
-	return PullInputs{SessionID: "sess-2", Role: role, Evidence: &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()}}
+	return PullInputs{SessionID: sessPair, Role: role, Evidence: &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()}}
+}
+
+// A non-minted (mixed-case / wrong-shape) session id never builds an assignment.
+func TestBuildRejectsNonMintedSession(t *testing.T) {
+	for _, bad := range []string{"sess-1", "SESS-" + strings.Repeat("a", 32), "sess-" + strings.Repeat("A", 32), "sess-" + strings.Repeat("a", 31)} {
+		in := editInputs()
+		in.SessionID = bad
+		if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); err == nil {
+			t.Fatalf("session id %q should be rejected by BuildAssignment", bad)
+		}
+	}
 }
 
 func TestEditPhaseCarriesWorktree(t *testing.T) {

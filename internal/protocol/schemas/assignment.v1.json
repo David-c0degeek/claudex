@@ -38,10 +38,10 @@
       "maxLength": 128
     },
     "session_id": {
-      "description": "The session this assignment is addressed to.",
+      "description": "The session this assignment is addressed to (a minted session id: 'sess-' + 32 lower-hex; the exact grammar is enforced by semantic validation).",
       "type": "string",
-      "minLength": 1,
-      "maxLength": 128
+      "minLength": 37,
+      "maxLength": 37
     },
     "turn_id": {
       "description": "The turn the preceding transition issued; pull never mints this.",
