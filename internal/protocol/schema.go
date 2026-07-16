@@ -80,11 +80,19 @@ func compileNode(m map[string]json.RawMessage) (*schemaNode, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
+		raw := m[k]
+		// Go's json.Unmarshal accepts a JSON null as the zero value for a string,
+		// bool, int, slice, or map, which would let null silently satisfy a keyword.
+		// null is legal only as a schema literal (const, or an enum member); reject
+		// it as the value of any other keyword or annotation.
+		if k != "const" && isNull(raw) {
+			return nil, fmt.Errorf("schema: %q must not be null", k)
+		}
 		if ignoredAnnotations[k] {
 			// Recognized annotations have no evaluation effect but are still
 			// type-checked: they must be strings.
 			var s string
-			if err := json.Unmarshal(m[k], &s); err != nil {
+			if err := json.Unmarshal(raw, &s); err != nil {
 				return nil, fmt.Errorf("schema: annotation %q must be a string", k)
 			}
 			continue
@@ -92,7 +100,7 @@ func compileNode(m map[string]json.RawMessage) (*schemaNode, error) {
 		if !supportedKeywords[k] {
 			return nil, fmt.Errorf("schema: unsupported keyword %q", k)
 		}
-		if err := n.applyKeyword(k, m[k]); err != nil {
+		if err := n.applyKeyword(k, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -229,7 +237,12 @@ func (n *schemaNode) applyKeyword(k string, raw json.RawMessage) error {
 		return n.compileProperties(raw)
 	case "required":
 		n.hasRequired = true
-		return decodeInto(raw, &n.required, "required")
+		ss, err := decodeStringArray(raw)
+		if err != nil {
+			return err
+		}
+		n.required = ss
+		return nil
 	case "additionalProperties":
 		var b bool
 		if err := decodeInto(raw, &b, "additionalProperties"); err != nil {
@@ -470,6 +483,32 @@ func decodeInto(raw json.RawMessage, dst interface{}, what string) error {
 		return fmt.Errorf("schema: %s: %w", what, err)
 	}
 	return nil
+}
+
+// isNull reports whether raw is the JSON null literal.
+func isNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// decodeStringArray decodes a JSON array of strings, rejecting a null element
+// (which []string decoding would otherwise turn into an empty-string name).
+func decodeStringArray(raw json.RawMessage) ([]string, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("schema: expected an array of strings: %w", err)
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if isNull(it) {
+			return nil, fmt.Errorf("schema: an array-of-strings element must not be null")
+		}
+		var s string
+		if err := json.Unmarshal(it, &s); err != nil {
+			return nil, fmt.Errorf("schema: array element must be a string: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 func decodeIntPtr(raw json.RawMessage, dst **int) error {

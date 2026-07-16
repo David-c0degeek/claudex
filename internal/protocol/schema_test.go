@@ -92,6 +92,44 @@ func TestConstEnumTypeConsistency(t *testing.T) {
 	}
 }
 
+// A JSON null must not silently satisfy a keyword via Go's zero-value decoding.
+func TestNullIsNotAcceptedAsKeywordValue(t *testing.T) {
+	bad := map[string]string{
+		"null annotation":           `{"type":"string","description":null}`,
+		"null properties":           `{"type":"object","properties":null,"required":[],"additionalProperties":false}`,
+		"null required":             `{"type":"object","properties":{},"required":null,"additionalProperties":false}`,
+		"null additionalProperties": `{"type":"object","properties":{},"required":[],"additionalProperties":null}`,
+		"null minLength":            `{"type":"string","minLength":null}`,
+		"null type":                 `{"type":null}`,
+		"null enum container":       `{"enum":null}`,
+		"null in required array":    `{"type":"object","properties":{},"required":[null],"additionalProperties":false}`,
+	}
+	for name, body := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := compile([]byte(body)); err == nil {
+				t.Fatalf("%s should fail compilation", name)
+			}
+		})
+	}
+}
+
+// null remains legal as a schema literal (const, enum member, declared type).
+func TestNullLegalAsLiteral(t *testing.T) {
+	sch, err := compile([]byte(`{"const":null}`))
+	if err != nil {
+		t.Fatalf("const null should compile: %v", err)
+	}
+	if err := sch.validate(nil, "$"); err != nil {
+		t.Fatalf("null should satisfy const null: %v", err)
+	}
+	if err := sch.validate("x", "$"); err == nil {
+		t.Fatalf("a non-null should not satisfy const null")
+	}
+	if _, err := compile([]byte(`{"enum":["a",null]}`)); err != nil {
+		t.Fatalf("enum with a null member should compile: %v", err)
+	}
+}
+
 func TestCompileRejectsNumberType(t *testing.T) {
 	if _, err := compile([]byte(`{"type":"number"}`)); err == nil {
 		t.Fatalf("type number should be rejected (integer-only domain)")
