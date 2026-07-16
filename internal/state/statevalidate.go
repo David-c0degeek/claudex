@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -436,18 +437,8 @@ func isGitOID(s string) bool {
 }
 
 // validID is the canonical bounded identity grammar for turn/assignment/gate/txn
-// ids. It must be safe to use as (part of) a filename when txn/transport later
-// derive paths from these ids: alphanumeric start, no reserved dot names.
-func validID(s string) bool {
-	if !validRunID(s) { // charset + length
-		return false
-	}
-	if s == "." || s == ".." {
-		return false
-	}
-	c := s[0]
-	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
-}
+// ids. validRunID already enforces the same filename-safe rules.
+func validID(s string) bool { return validRunID(s) }
 
 func isHex64(s string) bool {
 	if len(s) != 64 {
@@ -469,16 +460,18 @@ func isLocalRelPath(p string) bool {
 	if p == "" || p == "." || p == ".." {
 		return false
 	}
-	if strings.ContainsRune(p, '\\') {
-		return false // backslashes are never a canonical stored separator
+	// Reject anything that is not a plain forward-slash relative path.
+	if strings.ContainsRune(p, '\\') || strings.ContainsRune(p, ':') || strings.ContainsRune(p, 0) {
+		return false // backslash separators, drive/ADS colons, NUL
 	}
-	if path.IsAbs(p) || path.Clean(p) != p {
+	if path.IsAbs(p) || path.Clean(p) != p || strings.HasPrefix(p, "../") {
 		return false
 	}
-	if strings.HasPrefix(p, "../") {
-		return false
-	}
-	return true
+	// Filesystem boundary: on the running platform the concrete path must be
+	// local (rejects Windows volume-qualified/UNC forms and reserved devices such
+	// as NUL/CON that path.Clean cannot see). These locators are coordinator-
+	// generated, so a conservative rule is safe.
+	return filepath.IsLocal(filepath.FromSlash(p))
 }
 
 // locatorKey normalizes a locator for uniqueness comparison. It folds case so a
@@ -486,8 +479,14 @@ func isLocalRelPath(p string) bool {
 // directory; on a case-sensitive filesystem this is merely conservative.
 func locatorKey(p string) string { return strings.ToLower(p) }
 
+// validRunID is the filename-safe identifier grammar. Run ids become run
+// directory names, refs, and branch segments, so it requires an alphanumeric
+// start and rejects the reserved dot names.
 func validRunID(s string) bool {
-	if len(s) == 0 || len(s) > 128 {
+	if len(s) == 0 || len(s) > 128 || s == "." || s == ".." {
+		return false
+	}
+	if c := s[0]; !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
 		return false
 	}
 	for _, c := range s {

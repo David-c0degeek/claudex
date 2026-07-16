@@ -76,7 +76,7 @@ func TestCatalogRequiresRunIDAndDir(t *testing.T) {
 
 func TestCatalogRejectsTraversalLocators(t *testing.T) {
 	c := newCatalog(t)
-	bad := []string{"../escape", "runs/../../../etc", ".", "runs/./x", "runs//x"}
+	bad := []string{"../escape", "runs/../../../etc", ".", "runs/./x", "runs//x", "C:/outside", "C:outside", "//server/share", "runs\\x"}
 	for _, d := range bad {
 		if _, err := c.Allocate(0, RunRef{RunID: "r", RelDir: d}); err == nil {
 			t.Fatalf("rel_dir %q should be rejected", d)
