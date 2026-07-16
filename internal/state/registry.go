@@ -66,7 +66,9 @@ type RoleSlot struct {
 // immutable generations under the SAME per-run lock as RunState, but as a
 // SEPARATE store, so a same-role session replacement can supersede a crashed TUI
 // WITHOUT advancing RunState.Revision (which would invalidate the other role's
-// live, revision-bound assignment). Absent slots are nil.
+// live, revision-bound assignment). Absent slots are nil. RunID binds it to the
+// run; a cross-store consumer must confirm Registry.RunID == RunState.RunID
+// (sharing a lock path alone does not bind the two identities).
 type Registry struct {
 	SchemaVersion int       `json:"schema_version"`
 	RunID         string    `json:"run_id"`
@@ -182,7 +184,10 @@ func (s *RegistryStore) Mutate(expectedRevision uint64, fn func(nextRevision uin
 }
 
 // MutateLocked appends the next generation under an already-held guard, so a
-// caller can mutate the registry and the run state atomically-under-one-lock.
+// caller can mutate the registry and the run state serialized under one lock.
+// This composes the two writers; it does NOT make them crash-atomic (a crash
+// between the two appends leaves one committed) — cross-store atomicity is the
+// prepared-transaction journal's job at the attach layer.
 func (s *RegistryStore) MutateLocked(g *genstore.Guard, expectedRevision uint64, fn func(nextRevision uint64, next *Registry) error) (Registry, error) {
 	rec, ok, err := s.gs.Latest()
 	if err != nil {
@@ -213,16 +218,27 @@ func (s *RegistryStore) MutateLocked(g *genstore.Guard, expectedRevision uint64,
 		if err := fn(gen, next); err != nil {
 			return nil, err
 		}
+		// The callback must not poison the generation identity: a changed revision
+		// or schema version would be committed here and only caught post-commit by
+		// decodeRegistry (bricking the head), so reject it before serialization.
+		if next.Revision != gen {
+			return nil, fmt.Errorf("registry mutation must not change the revision (want %d)", gen)
+		}
+		if next.SchemaVersion != RegistryVersion {
+			return nil, fmt.Errorf("registry mutation must not change the schema version")
+		}
 		if err := registryGuard(next); err != nil {
 			return nil, err
 		}
 		if err := validateRegistry(next); err != nil {
 			return nil, err
 		}
-		if prev != nil {
-			if err := validateRegistryTransition(prev, next); err != nil {
+		if prev == nil {
+			if err := validateRegistryInit(next); err != nil {
 				return nil, err
 			}
+		} else if err := validateRegistryTransition(prev, next); err != nil {
+			return nil, err
 		}
 		return json.Marshal(next)
 	})

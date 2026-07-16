@@ -7,9 +7,32 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
+
+const sessionIDPrefix = "sess-"
+
+// isSessionID enforces the EXACT coordinator-minted grammar: "sess-" + 32
+// lowercase hex. Session ids become directory names, so the general mixed-case id
+// grammar is too loose — on a case-insensitive filesystem `Sess-X` and `sess-x`
+// would alias one directory while the registry treated them as distinct. The
+// lowercase-only rule makes global uniqueness case-safe.
+func isSessionID(s string) bool {
+	if len(s) != len(sessionIDPrefix)+32 {
+		return false
+	}
+	if s[:len(sessionIDPrefix)] != sessionIDPrefix {
+		return false
+	}
+	for _, c := range s[len(sessionIDPrefix):] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // strictDecodeRegistry decodes exactly one JSON value with no unknown fields and
 // no trailing content.
@@ -64,8 +87,8 @@ func validateSlot(role SlotRole, slot *RoleSlot, rev uint64, seen map[string]Slo
 	}
 	var prevIssued uint64
 	for i, s := range slot.Sessions {
-		if !validID(s.SessionID) {
-			return fmt.Errorf("%s slot session %d id is not canonical", role, i)
+		if !isSessionID(s.SessionID) {
+			return fmt.Errorf("%s slot session %d id is not a canonical minted session id", role, i)
 		}
 		if s.Generation != uint64(i+1) {
 			return fmt.Errorf("%s slot generations must be consecutive from 1", role)
@@ -88,54 +111,90 @@ func validateSlot(role SlotRole, slot *RoleSlot, rev uint64, seen map[string]Slo
 	return nil
 }
 
-// validateRegistryTransition enforces run-id immutability and append-only,
-// agent-immutable slot history.
-func validateRegistryTransition(old, next *Registry) error {
-	if old.RunID != next.RunID {
-		return fmt.Errorf("registry run_id is immutable")
+// validateRegistryInit enforces the only legal first generation: the lead slot
+// filled with exactly one generation-1 session bound to this revision, pair empty.
+func validateRegistryInit(r *Registry) error {
+	if r.Lead == nil || r.Pair != nil {
+		return fmt.Errorf("initial registry must have the lead slot filled and the pair empty")
 	}
-	if err := slotAppendOnly(SlotLead, old.Lead, next.Lead, next.Revision); err != nil {
-		return err
+	if len(r.Lead.Sessions) != 1 || r.Lead.Sessions[0].Generation != 1 {
+		return fmt.Errorf("initial registry lead must have exactly one generation-1 session")
 	}
-	if err := slotAppendOnly(SlotPair, old.Pair, next.Pair, next.Revision); err != nil {
-		return err
+	if r.Lead.Sessions[0].IssuedRegistryRevision != r.Revision {
+		return fmt.Errorf("initial registry lead session must bind to revision %d", r.Revision)
 	}
 	return nil
 }
 
-func slotAppendOnly(role SlotRole, old, next *RoleSlot, rev uint64) error {
-	if old == nil {
-		// A first registration is fine; every record it adds binds to this revision.
-		if next != nil {
-			for i := range next.Sessions {
-				if next.Sessions[i].IssuedRegistryRevision != rev {
-					return fmt.Errorf("%s slot: a newly registered session must bind to registry revision %d", role, rev)
-				}
-			}
-		}
-		return nil
+// validateRegistrytransition enforces run-id immutability and that every registry
+// revision records EXACTLY ONE attach or replacement: a slot either gains one new
+// generation (bound to this revision) or is byte-identical to its old value, and
+// the total new sessions across both slots is exactly one — so a bulk append, a
+// two-slot change, and a no-op generation are all rejected, and issued revisions
+// strictly increase per slot.
+func validateRegistryTransition(old, next *Registry) error {
+	if old.RunID != next.RunID {
+		return fmt.Errorf("registry run_id is immutable")
 	}
-	if next == nil {
-		return fmt.Errorf("%s slot cannot be cleared once filled", role)
+	leadAdded, err := slotTransition(SlotLead, old.Lead, next.Lead, next.Revision)
+	if err != nil {
+		return err
 	}
-	if old.Agent != next.Agent {
-		return fmt.Errorf("%s slot agent is immutable", role)
+	pairAdded, err := slotTransition(SlotPair, old.Pair, next.Pair, next.Revision)
+	if err != nil {
+		return err
 	}
-	if len(next.Sessions) < len(old.Sessions) {
-		return fmt.Errorf("%s slot history must not shrink", role)
-	}
-	// Existing records are frozen; only appended ones are new.
-	for i := range old.Sessions {
-		if next.Sessions[i] != old.Sessions[i] {
-			return fmt.Errorf("%s slot history is append-only", role)
-		}
-	}
-	for i := len(old.Sessions); i < len(next.Sessions); i++ {
-		if next.Sessions[i].IssuedRegistryRevision != rev {
-			return fmt.Errorf("%s slot: a newly registered session must bind to registry revision %d", role, rev)
-		}
+	if leadAdded+pairAdded != 1 {
+		return fmt.Errorf("a registry mutation must record exactly one attach/replacement, got %d", leadAdded+pairAdded)
 	}
 	return nil
+}
+
+// slotTransition returns the number of newly appended sessions (0 or 1) and
+// enforces the per-slot rules: agent immutable, no clear, existing records
+// frozen, an unchanged slot byte-identical, and at most one new record bound to
+// this revision.
+func slotTransition(role SlotRole, old, next *RoleSlot, rev uint64) (int, error) {
+	if old == nil {
+		if next == nil {
+			return 0, nil
+		}
+		if len(next.Sessions) != 1 {
+			return 0, fmt.Errorf("%s slot must be filled with exactly one session", role)
+		}
+		if next.Sessions[0].IssuedRegistryRevision != rev {
+			return 0, fmt.Errorf("%s slot: a newly registered session must bind to registry revision %d", role, rev)
+		}
+		return 1, nil
+	}
+	if next == nil {
+		return 0, fmt.Errorf("%s slot cannot be cleared once filled", role)
+	}
+	if old.Agent != next.Agent {
+		return 0, fmt.Errorf("%s slot agent is immutable", role)
+	}
+	if len(next.Sessions) < len(old.Sessions) {
+		return 0, fmt.Errorf("%s slot history must not shrink", role)
+	}
+	for i := range old.Sessions {
+		if next.Sessions[i] != old.Sessions[i] {
+			return 0, fmt.Errorf("%s slot history is append-only", role)
+		}
+	}
+	switch added := len(next.Sessions) - len(old.Sessions); added {
+	case 0:
+		if !reflect.DeepEqual(old, next) {
+			return 0, fmt.Errorf("%s slot changed without adding a session", role)
+		}
+		return 0, nil
+	case 1:
+		if next.Sessions[len(next.Sessions)-1].IssuedRegistryRevision != rev {
+			return 0, fmt.Errorf("%s slot: a newly registered session must bind to registry revision %d", role, rev)
+		}
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("%s slot appended %d sessions; exactly one attach/replacement per revision", role, added)
+	}
 }
 
 // registryGuard rejects a secret in any registry control field (a session id,
@@ -169,14 +228,17 @@ var ErrSessionIDExhausted = errors.New("state: session id minting exhausted atte
 // retrying on a collision reported by taken, and failing closed on an RNG error.
 // taken should report whether an id already exists in either slot history.
 func MintSessionID(rng io.Reader, taken func(string) bool) (string, error) {
+	if rng == nil {
+		return "", errors.New("state: mint session id: nil RNG")
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		var b [16]byte
 		if _, err := io.ReadFull(rng, b[:]); err != nil {
 			return "", fmt.Errorf("state: mint session id: %w", err)
 		}
-		id := "sess-" + hex.EncodeToString(b[:])
-		if !validID(id) || redact.Text(id) != id {
-			continue // grammar/secret guard (asserted; unreachable for hex)
+		id := sessionIDPrefix + hex.EncodeToString(b[:])
+		if !isSessionID(id) || redact.Text(id) != id {
+			continue // grammar/secret guard (asserted; unreachable for lower-hex)
 		}
 		if taken != nil && taken(id) {
 			continue

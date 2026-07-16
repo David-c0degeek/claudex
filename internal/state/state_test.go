@@ -125,6 +125,22 @@ func TestFreeTextRedactedAndReturnEqualsLoad(t *testing.T) {
 	}
 }
 
+// A callback that changes the revision or schema version is rejected before any
+// generation is written (it would otherwise brick the head post-commit).
+func TestMutateRejectsRevisionPoisoning(t *testing.T) {
+	s := newStore(t)
+	r1 := mustInit(t, s)
+	if _, err := s.Mutate(r1.Revision, func(_ uint64, next *RunState) error {
+		next.Revision = 999
+		return nil
+	}); err == nil {
+		t.Fatalf("a callback that changes the revision should be rejected")
+	}
+	if got, _, _ := s.Load(); got.Revision != r1.Revision {
+		t.Fatalf("a generation was written despite revision poisoning (rev=%d)", got.Revision)
+	}
+}
+
 func TestNewReceiptMustBindToRevision(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)

@@ -231,6 +231,15 @@ func (s *Store) MutateLocked(g *genstore.Guard, expectedRevision uint64, fn func
 		if err := fn(gen, next); err != nil {
 			return nil, err
 		}
+		// The callback must not poison the generation identity: a changed revision
+		// or schema version would be committed and only caught post-commit by
+		// decodeRunState (bricking the head), so reject it before serialization.
+		if next.Revision != gen {
+			return nil, fmt.Errorf("mutation must not change the revision (want %d)", gen)
+		}
+		if next.SchemaVersion != RunStateVersion {
+			return nil, fmt.Errorf("mutation must not change the schema version")
+		}
 		// Schema-aware redaction: redact free text, reject secrets in control
 		// fields. Then validate the new state and the transition from prev.
 		if err := redactAndGuard(next); err != nil {
