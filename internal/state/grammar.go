@@ -6,6 +6,11 @@ package state
 // IsHex64 reports whether s is exactly 64 lower-hex characters (a sha256 digest).
 func IsHex64(s string) bool { return isHex64(s) }
 
+// IsRunID reports whether s is a canonical, filename-safe identifier — the same
+// grammar the state store applies to run, turn, and gate ids. Other packages
+// reuse it for session and artifact keys rather than a divergent validator.
+func IsRunID(s string) bool { return validRunID(s) }
+
 // IsLocalRelPath reports whether p is a canonical, forward-slash, relative,
 // traversal-free, platform-local path — the same rule the state store applies to
 // stored locators. It rejects absolute, volume-qualified, backslash, colon, NUL,

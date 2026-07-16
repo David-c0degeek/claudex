@@ -289,6 +289,15 @@ func validateAcceptedTurns(rs *RunState) error {
 		if v.Receipt.Revision == 0 || v.Receipt.Revision > rs.Revision {
 			return fmt.Errorf("accepted turn %q receipt revision %d out of range (1..%d)", k, v.Receipt.Revision, rs.Revision)
 		}
+		if v.Role != "lead" && v.Role != "pair" {
+			return fmt.Errorf("accepted turn %q has an unknown role %q", k, v.Role)
+		}
+		if !knownPhases[v.Phase] {
+			return fmt.Errorf("accepted turn %q has an unknown phase %q", k, v.Phase)
+		}
+		if len(v.MessageType) == 0 || len(v.MessageType) > 64 {
+			return fmt.Errorf("accepted turn %q has an invalid message_type", k)
+		}
 	}
 	return nil
 }

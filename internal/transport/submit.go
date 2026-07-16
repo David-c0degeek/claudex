@@ -231,7 +231,16 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 				return err
 			}
 			receipt = state.Receipt{TurnID: env.TurnID, Revision: gen, ArtifactDigest: digest}
-			next.AcceptedTurns[env.TurnID] = state.AcceptedTurn{ArtifactDigest: digest, Receipt: receipt}
+			// Record the authoritative acceptance metadata (the phase the turn was
+			// for, and its spec role/artifact type), so the mailbox projection never
+			// guesses a turn's phase.
+			next.AcceptedTurns[env.TurnID] = state.AcceptedTurn{
+				ArtifactDigest: digest,
+				Receipt:        receipt,
+				Role:           string(spec.Role),
+				Phase:          snap.phase,
+				MessageType:    spec.ArtifactMessageType,
+			}
 			return nil
 		})
 		if merr == nil {

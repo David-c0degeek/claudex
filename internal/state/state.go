@@ -99,9 +99,15 @@ type Receipt struct {
 }
 
 // AcceptedTurn records what was accepted for a turn (keyed by turn_id in the map).
+// Role/Phase/MessageType are the coordinator-authored acceptance metadata, so a
+// human-readable projection (the mailbox mirror) never has to guess a turn's
+// phase from its artifact type.
 type AcceptedTurn struct {
 	ArtifactDigest string  `json:"artifact_digest"`
 	Receipt        Receipt `json:"receipt"`
+	Role           string  `json:"role"`
+	Phase          Phase   `json:"phase"`
+	MessageType    string  `json:"message_type"`
 }
 
 // Projection is a typed recovery or failure summary.

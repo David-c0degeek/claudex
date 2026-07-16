@@ -16,6 +16,7 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 		next.AcceptedTurns["t1"] = AcceptedTurn{
 			ArtifactDigest: hex64("c"),
 			Receipt:        Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")},
+			Role:           "lead", Phase: PhaseImplementStep, MessageType: "implementation_report",
 		}
 		return nil
 	})
@@ -27,6 +28,7 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 		next.AcceptedTurns["t2"] = AcceptedTurn{
 			ArtifactDigest: hex64("d"),
 			Receipt:        Receipt{TurnID: "t2", Revision: rev, ArtifactDigest: hex64("d")},
+			Role:           "pair", Phase: PhaseCheckpoint, MessageType: "checkpoint_review",
 		}
 		return nil
 	})
@@ -35,8 +37,8 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	}
 
 	want := []LedgerEntry{
-		{Revision: 2, TurnID: "t1", ArtifactDigest: hex64("c")},
-		{Revision: 3, TurnID: "t2", ArtifactDigest: hex64("d")},
+		{Revision: 2, TurnID: "t1", ArtifactDigest: hex64("c"), Role: "lead", Phase: PhaseImplementStep, MessageType: "implementation_report"},
+		{Revision: 3, TurnID: "t2", ArtifactDigest: hex64("d"), Role: "pair", Phase: PhaseCheckpoint, MessageType: "checkpoint_review"},
 	}
 	if got := Ledger(r3); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ledger = %+v, want %+v", got, want)
