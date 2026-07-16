@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/David-c0degeek/claudex/internal/protocol"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -20,6 +21,9 @@ const (
 	WaitUnchanged        WaitKind = "unchanged"
 	WaitAssignment       WaitKind = "assignment"
 	WaitGate             WaitKind = "gate"
+	WaitPaused           WaitKind = "paused"
+	WaitPausedBudget     WaitKind = "paused_budget"
+	WaitRateLimited      WaitKind = "rate_limited"
 	WaitCancelled        WaitKind = "cancelled"
 	WaitCompleted        WaitKind = "completed"
 	WaitFailed           WaitKind = "failed"
@@ -30,6 +34,11 @@ const (
 var (
 	// ErrInvalidTimeout means the wait timeout is not in the allowed range.
 	ErrInvalidTimeout = errors.New("transport: wait timeout must be > 0 and <= the maximum")
+	// ErrCorruptState means durable state is internally inconsistent (e.g. an
+	// AWAIT_GUIDANCE phase with no gate), so wait fails closed.
+	ErrCorruptState = errors.New("transport: run state is internally inconsistent")
+	// ErrSessionView means the session seam failed or returned invalid facts.
+	ErrSessionView = errors.New("transport: session view")
 )
 
 const (
@@ -38,8 +47,7 @@ const (
 	waitPollMax     = 250 * time.Millisecond
 )
 
-// ClientAheadError means the caller's cursor is beyond the durable revision, so
-// its view is inconsistent with the coordinator.
+// ClientAheadError means the caller's cursor is beyond the durable revision.
 type ClientAheadError struct {
 	SinceRevision   uint64
 	CurrentRevision uint64
@@ -52,8 +60,7 @@ func (e *ClientAheadError) Error() string {
 		e.SinceRevision, e.CurrentRevision, e.Phase, e.Lifecycle)
 }
 
-// WaitEvent is the wire message a wait returns: the wake reason plus the observed
-// status and every discriminant needed to act.
+// WaitEvent is the wire message a wait returns.
 type WaitEvent struct {
 	ProtocolVersion       int             `json:"protocol_version"`
 	MessageType           string          `json:"message_type"`
@@ -64,12 +71,23 @@ type WaitEvent struct {
 	TurnID                *string         `json:"turn_id"`
 	GateID                *string         `json:"gate_id"`
 	ReplacementGeneration *uint64         `json:"replacement_generation"`
+	Code                  *string         `json:"code"`
+	Reason                *string         `json:"reason"`
+	NextAction            *string         `json:"next_action"`
 }
 
-// SessionView is the immutable projection the session seam returns: whether this
-// session owns the active turn, and whether it has been replaced. Wait builds the
-// authoritative event fields and applies the wake priority, so a seam can neither
-// forge state fields nor suppress a global stop.
+// SessionInput is the immutable, value-only projection handed to the session
+// seam, so the seam cannot alias or mutate authoritative state.
+type SessionInput struct {
+	Revision     uint64
+	Phase        state.Phase
+	Lifecycle    state.Lifecycle
+	ActiveTurnID string // "" when no turn is assigned
+}
+
+// SessionView is the fact projection the seam returns. Wait constructs the
+// authoritative event; the seam only reports whether this session owns the
+// active turn and whether it has been replaced (with the superseding generation).
 type SessionView struct {
 	OwnsActiveTurn        bool
 	Replaced              bool
@@ -77,10 +95,10 @@ type SessionView struct {
 }
 
 // SessionViewer answers the session-specific facts from durable registration. It
-// MUST be pure and side-effect-free and return only facts, not events.
-type SessionViewer func(rs state.RunState, sessionID string) SessionView
+// MUST be pure and side-effect-free and return value-free errors. An unknown or
+// corrupt session registration must return an error so wait fails closed.
+type SessionViewer func(in SessionInput, sessionID string) (SessionView, error)
 
-// waitClock is the injectable clock so tests drive time deterministically.
 type waitClock interface {
 	timeout(d time.Duration) <-chan time.Time
 	poll(d time.Duration) <-chan time.Time
@@ -91,13 +109,10 @@ type realClock struct{}
 func (realClock) timeout(d time.Duration) <-chan time.Time { return time.After(d) }
 func (realClock) poll(d time.Duration) <-chan time.Time    { return time.After(d) }
 
-// Wait is a bounded, lock-free long-poll. It returns the next event relevant to
-// this session once the revision advances past sinceRevision, or WaitUnchanged on
-// timeout. It reads state without the mutation lock and never mutates, so it is
-// idempotent and Ctrl-C-safe: a cancelled ctx returns ctx.Err(). Missing or
-// corrupt state is an error, never unchanged, and a client cursor ahead of the
-// durable revision is a typed ClientAheadError. The poll interval is internal
-// (a caller cannot force a hot loop).
+// Wait is a bounded, lock-free long-poll returning the next event relevant to a
+// session, or WaitUnchanged on timeout. It never acquires the mutation lock and
+// never mutates. Missing/corrupt state and a client-ahead cursor are typed
+// errors; every returned event is fully validated against its schema.
 func Wait(ctx context.Context, store *state.Store, sessionID string, sinceRevision uint64, timeout time.Duration, view SessionViewer) (WaitEvent, error) {
 	return waitWithClock(ctx, store, sessionID, sinceRevision, timeout, view, realClock{})
 }
@@ -125,8 +140,6 @@ func waitWithClock(ctx context.Context, store *state.Store, sessionID string, si
 		case <-ctx.Done():
 			return WaitEvent{}, ctx.Err()
 		case <-deadline:
-			// One final read, so an event committed at the boundary is not missed.
-			// pollOnce returns the wake event, or the freshest unchanged snapshot.
 			ev, _, err := pollOnce(store, sessionID, sinceRevision, view)
 			if err != nil {
 				return WaitEvent{}, err
@@ -140,8 +153,6 @@ func waitWithClock(ctx context.Context, store *state.Store, sessionID string, si
 			if wake {
 				return ev, nil
 			}
-			// Reset the backoff when the revision moves (activity), otherwise grow
-			// it toward the ceiling so an idle wait does not re-enumerate history.
 			if ev.Revision != last.Revision {
 				interval = waitPollInitial
 			} else if interval < waitPollMax {
@@ -155,9 +166,8 @@ func waitWithClock(ctx context.Context, store *state.Store, sessionID string, si
 	}
 }
 
-// pollOnce reads state once (lock-free) and classifies it. It returns the wake
-// event (wake=true), or the current unchanged snapshot (wake=false); an error for
-// missing/corrupt state or a client-ahead cursor.
+// pollOnce reads state once (lock-free), classifies it, and validates the
+// resulting event so every wait return is a valid wire message.
 func pollOnce(store *state.Store, sessionID string, since uint64, view SessionViewer) (WaitEvent, bool, error) {
 	rs, ok, err := store.Load()
 	if err != nil {
@@ -169,109 +179,194 @@ func pollOnce(store *state.Store, sessionID string, since uint64, view SessionVi
 	if rs.Revision < since {
 		return WaitEvent{}, false, &ClientAheadError{SinceRevision: since, CurrentRevision: rs.Revision, Phase: rs.Phase, Lifecycle: rs.Lifecycle}
 	}
+
+	facts := captureFacts(rs)
+	ev := newEvent(WaitUnchanged, facts)
+	wake := false
 	if rs.Revision > since {
-		if ev, wake := classifyWait(rs, sessionID, view); wake {
-			return ev, true, nil
+		classified, w, cerr := classify(facts, sessionID, view)
+		if cerr != nil {
+			return WaitEvent{}, false, cerr
+		}
+		if w {
+			ev, wake = classified, true
 		}
 	}
-	return newEvent(WaitUnchanged, rs), false, nil
+	if err := ev.validate(); err != nil {
+		return WaitEvent{}, false, fmt.Errorf("transport: constructed wait event is invalid: %w", err)
+	}
+	return ev, wake, nil
 }
 
-// classifyWait applies the wake priority: a terminal/failure lifecycle dominates
-// everything; then session replacement (the obsolete session must learn first);
-// then a gate/paused stop; then a required recovery; then this session's own
-// assignment. Global stops are read from durable state, never from the seam.
-func classifyWait(rs state.RunState, sessionID string, view SessionViewer) (WaitEvent, bool) {
-	if state.IsTerminalLifecycle(rs.Lifecycle) {
-		return newEvent(terminalKind(rs.Lifecycle), rs), true
+// runFacts is the authoritative snapshot captured before the seam runs, so the
+// seam cannot influence classification.
+type runFacts struct {
+	revision     uint64
+	phase        state.Phase
+	lifecycle    state.Lifecycle
+	assignmentID string
+	gateID       string
+	recovery     *projFacts
+	failure      *projFacts
+}
+
+type projFacts struct{ code, reason, nextAction string }
+
+func captureFacts(rs state.RunState) runFacts {
+	f := runFacts{revision: rs.Revision, phase: rs.Phase, lifecycle: rs.Lifecycle}
+	if rs.Assignment != nil {
+		f.assignmentID = rs.Assignment.ID
 	}
-	v := view(rs, sessionID)
-	if v.Replaced {
-		ev := newEvent(WaitSessionReplaced, rs)
-		if v.ReplacementGeneration > 0 {
-			g := v.ReplacementGeneration
-			ev.ReplacementGeneration = &g
-		}
-		return ev, true
-	}
-	if rs.Gate != nil || state.IsPausedLifecycle(rs.Lifecycle) || rs.Phase == state.PhaseAwaitGuidance {
-		ev := newEvent(WaitGate, rs)
-		if rs.Gate != nil {
-			id := rs.Gate.ID
-			ev.GateID = &id
-		}
-		return ev, true
+	if rs.Gate != nil {
+		f.gateID = rs.Gate.ID
 	}
 	if rs.Recovery != nil {
-		return newEvent(WaitRecoveryRequired, rs), true
+		f.recovery = &projFacts{rs.Recovery.Code, redact.Text(rs.Recovery.Reason), rs.Recovery.NextAction}
 	}
-	if v.OwnsActiveTurn && rs.Assignment != nil {
-		ev := newEvent(WaitAssignment, rs)
-		id := rs.Assignment.ID
+	if rs.Failure != nil {
+		f.failure = &projFacts{rs.Failure.Code, redact.Text(rs.Failure.Reason), rs.Failure.NextAction}
+	}
+	return f
+}
+
+// classify applies the wake priority from captured facts and the seam's facts.
+func classify(f runFacts, sessionID string, view SessionViewer) (WaitEvent, bool, error) {
+	if state.IsTerminalLifecycle(f.lifecycle) {
+		return terminalEvent(f)
+	}
+
+	v, err := view(SessionInput{Revision: f.revision, Phase: f.phase, Lifecycle: f.lifecycle, ActiveTurnID: f.assignmentID}, sessionID)
+	if err != nil {
+		return WaitEvent{}, false, fmt.Errorf("%w: %s", ErrSessionView, redact.Text(err.Error()))
+	}
+	if v.Replaced == (v.ReplacementGeneration == 0) {
+		return WaitEvent{}, false, fmt.Errorf("%w: replaced and replacement generation disagree", ErrSessionView)
+	}
+	if v.Replaced {
+		ev := newEvent(WaitSessionReplaced, f)
+		g := v.ReplacementGeneration
+		ev.ReplacementGeneration = &g
+		return ev, true, nil
+	}
+
+	if f.phase == state.PhaseAwaitGuidance {
+		if f.gateID == "" {
+			return WaitEvent{}, false, fmt.Errorf("%w: AWAIT_GUIDANCE without a gate", ErrCorruptState)
+		}
+		ev := newEvent(WaitGate, f)
+		id := f.gateID
+		ev.GateID = &id
+		return ev, true, nil
+	}
+	switch f.lifecycle {
+	case state.LifecyclePausedBudget:
+		return newEvent(WaitPausedBudget, f), true, nil
+	case state.LifecycleRateLimited:
+		return newEvent(WaitRateLimited, f), true, nil
+	case state.LifecyclePaused:
+		return newEvent(WaitPaused, f), true, nil
+	}
+
+	if f.recovery != nil {
+		ev := newEvent(WaitRecoveryRequired, f)
+		setProjection(&ev, f.recovery)
+		return ev, true, nil
+	}
+
+	if v.OwnsActiveTurn && f.assignmentID != "" {
+		ev := newEvent(WaitAssignment, f)
+		id := f.assignmentID
 		ev.TurnID = &id
-		return ev, true
+		return ev, true, nil
 	}
-	return WaitEvent{}, false
+	return WaitEvent{}, false, nil
 }
 
-func terminalKind(lc state.Lifecycle) WaitKind {
-	switch lc {
+func terminalEvent(f runFacts) (WaitEvent, bool, error) {
+	switch f.lifecycle {
 	case state.LifecycleCancelled:
-		return WaitCancelled
+		return newEvent(WaitCancelled, f), true, nil
 	case state.LifecycleCompleted:
-		return WaitCompleted
+		return newEvent(WaitCompleted, f), true, nil
 	default: // failed_terminal, failed_retryable
-		return WaitFailed
+		if f.failure == nil {
+			return WaitEvent{}, false, fmt.Errorf("%w: a failed lifecycle has no failure projection", ErrCorruptState)
+		}
+		ev := newEvent(WaitFailed, f)
+		setProjection(&ev, f.failure)
+		return ev, true, nil
 	}
 }
 
-func newEvent(kind WaitKind, rs state.RunState) WaitEvent {
+func setProjection(ev *WaitEvent, p *projFacts) {
+	code, reason, action := p.code, p.reason, p.nextAction
+	ev.Code, ev.Reason, ev.NextAction = &code, &reason, &action
+}
+
+func newEvent(kind WaitKind, f runFacts) WaitEvent {
 	return WaitEvent{
 		ProtocolVersion: protocol.SupportedVersion,
 		MessageType:     waitEventType,
 		Kind:            kind,
-		Revision:        rs.Revision,
-		Phase:           rs.Phase,
-		Lifecycle:       rs.Lifecycle,
+		Revision:        f.revision,
+		Phase:           f.phase,
+		Lifecycle:       f.lifecycle,
 	}
 }
 
-// Validate checks the per-kind discriminant invariants the JSON schema cannot
-// express (which optional field each kind requires or forbids).
-func (e WaitEvent) Validate() error {
+// semanticValidate checks the per-kind discriminant invariants the JSON schema
+// cannot express.
+func (e WaitEvent) semanticValidate() error {
+	has := func(p any) bool {
+		switch v := p.(type) {
+		case *string:
+			return v != nil
+		case *uint64:
+			return v != nil
+		}
+		return false
+	}
+	turn, gate, gen := has(e.TurnID), has(e.GateID), has(e.ReplacementGeneration)
+	proj := has(e.Code) && has(e.Reason) && has(e.NextAction)
+	anyProj := has(e.Code) || has(e.Reason) || has(e.NextAction)
+
+	fail := func(msg string) error { return fmt.Errorf("%w: %s", ErrAssignmentInvalid, msg) }
 	switch e.Kind {
 	case WaitAssignment:
-		if e.TurnID == nil {
-			return fmt.Errorf("%w: assignment needs a turn_id", ErrAssignmentInvalid)
-		}
-		if e.GateID != nil || e.ReplacementGeneration != nil {
-			return fmt.Errorf("%w: assignment must not carry a gate or replacement", ErrAssignmentInvalid)
+		if !turn || gate || gen || anyProj {
+			return fail("assignment needs a turn_id only")
 		}
 	case WaitGate:
-		if e.TurnID != nil || e.ReplacementGeneration != nil {
-			return fmt.Errorf("%w: a gate must not carry a turn or replacement", ErrAssignmentInvalid)
+		if !gate || turn || gen || anyProj {
+			return fail("gate needs a gate_id only")
 		}
 	case WaitSessionReplaced:
-		if e.ReplacementGeneration == nil {
-			return fmt.Errorf("%w: session_replaced needs a replacement_generation", ErrAssignmentInvalid)
+		if !gen || turn || gate || anyProj {
+			return fail("session_replaced needs a replacement_generation only")
 		}
-		if e.TurnID != nil || e.GateID != nil {
-			return fmt.Errorf("%w: session_replaced must not carry a turn or gate", ErrAssignmentInvalid)
+	case WaitFailed, WaitRecoveryRequired:
+		if !proj || turn || gate || gen {
+			return fail(string(e.Kind) + " needs code, reason, and next_action")
 		}
-	case WaitUnchanged, WaitCancelled, WaitCompleted, WaitFailed, WaitRecoveryRequired:
-		if e.TurnID != nil || e.GateID != nil || e.ReplacementGeneration != nil {
-			return fmt.Errorf("%w: %s must not carry a turn, gate, or replacement", ErrAssignmentInvalid, e.Kind)
+	case WaitUnchanged, WaitPaused, WaitPausedBudget, WaitRateLimited, WaitCancelled, WaitCompleted:
+		if turn || gate || gen || anyProj {
+			return fail(string(e.Kind) + " carries no discriminant")
 		}
 	default:
-		return fmt.Errorf("%w: unknown wait kind %q", ErrAssignmentInvalid, e.Kind)
+		return fail("unknown wait kind " + string(e.Kind))
 	}
 	return nil
 }
 
-// Marshal validates the event (discriminants + schema) and returns canonical wire
-// bytes.
+// validate fully checks the event: discriminant invariants plus the schema.
+func (e WaitEvent) validate() error {
+	_, err := e.Marshal()
+	return err
+}
+
+// Marshal validates the event and returns canonical wire bytes.
 func (e WaitEvent) Marshal() ([]byte, error) {
-	if err := e.Validate(); err != nil {
+	if err := e.semanticValidate(); err != nil {
 		return nil, err
 	}
 	raw, err := json.Marshal(e)
