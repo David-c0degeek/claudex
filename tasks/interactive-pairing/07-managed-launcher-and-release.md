@@ -11,11 +11,11 @@ for Windows + Linux (+ macOS best-effort), and rewrite the docs.
 
 ## Integration analysis
 > Greenfield Go (D013/D014) — there is no Python launch surface to extend. Build
-> against the **07.1 provider research** (relocated here from 00.5) and the
+> against the **07.10 provider research** (relocated here from 00.5) and the
 > harvested requirements.
 - **New Go packages** — `internal/launch` (managed launch via `os/exec` with **inherited stdio**), `internal/provider` (capability/flag table + `doctor`), and `internal/pty` **only if** 07.3 needs a telemetry proxy/capture path (ConPTY/PTY is not required for plain inherited-stdio interactivity). The Python `cli.py:open_watch_terminals` + `agents.py`/`providers.py` flags are **reference-only** for *what* each provider needs.
 - **Behaviour to preserve** (as requirements) — provider capability discovery (`doctor`); Claude tool restrictions + Codex sandbox/network flags; honest capability labels.
-- **Reuse / extend** — harvest the provider flag matrix + `doctor` capability list as a Go table; reuse 00.5's inherited-stdio + telemetry findings.
+- **Reuse / extend** — harvest the provider flag matrix + `doctor` capability list as a Go table; build on 07.10's inherited-stdio + telemetry findings.
 - **Do not duplicate** — one launcher, one capability-discovery path.
 - **Integration point + why** — `internal/launch` inherits the real terminal handles (no allocated PTY by default) and applies flags; `doctor` reports the capability matrix **and** the 01.8 filesystem classification (enforcement already happened at 03 bootstrap — 07 only reports).
 - **Vision fit** — realizes D005 (managed tier) + D007 (per-capability labels) + D015 (cross-platform, local-fs).
