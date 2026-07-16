@@ -164,6 +164,22 @@ func TestWaitReplacementDominatesOwnTurn(t *testing.T) {
 	}
 }
 
+// A newer terminal run state wins over a concurrent valid replacement.
+func TestWaitTerminalBeatsReplacement(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	mutate(t, store, rev, func(_ uint64, n *state.RunState) {
+		n.Lifecycle = state.LifecycleCancelled
+		n.Assignment = nil
+	})
+	ev, err := Wait(context.Background(), store, "old-pair", rev, time.Second, viewForRole(RolePair, map[string]uint64{"old-pair": 9}))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if ev.Kind != WaitCancelled {
+		t.Fatalf("ev = %+v, want cancelled to win over the replacement", ev)
+	}
+}
+
 // --- adversarial / trust tests ---
 
 func TestWaitViewerError(t *testing.T) {
@@ -431,5 +447,23 @@ func TestWaitEventDiscriminantValidation(t *testing.T) {
 	good.TurnID = &id
 	if err := good.semanticValidate(); err != nil {
 		t.Fatalf("a valid assignment should pass: %v", err)
+	}
+}
+
+// unchanged and session_replaced legitimately allow many states, but the schema
+// enums still reject an unknown or empty phase/lifecycle at Marshal.
+func TestWaitEventMarshalRejectsUnknownStatus(t *testing.T) {
+	unknownPhase := WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: WaitUnchanged, Revision: 1, Phase: "BOGUS", Lifecycle: "running"}
+	if _, err := unknownPhase.Marshal(); err == nil {
+		t.Fatalf("an unknown phase should fail Marshal")
+	}
+	emptyLifecycle := WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: WaitUnchanged, Revision: 1, Phase: "IMPLEMENT_STEP", Lifecycle: ""}
+	if _, err := emptyLifecycle.Marshal(); err == nil {
+		t.Fatalf("an empty lifecycle should fail Marshal")
+	}
+	gen := uint64(3)
+	replacedBogus := WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: WaitSessionReplaced, Revision: 1, Phase: "nope", Lifecycle: "running", ReplacementGeneration: &gen}
+	if _, err := replacedBogus.Marshal(); err == nil {
+		t.Fatalf("session_replaced with an unknown phase should fail Marshal")
 	}
 }

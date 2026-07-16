@@ -245,6 +245,12 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return WaitEvent{}, false, err
 	}
 
+	// A newer terminal/failure run state dominates everything, including a valid
+	// replacement — the obsolete session still learns the run stopped.
+	if f.revision > since && state.IsTerminalLifecycle(f.lifecycle) {
+		return terminalEvent(f)
+	}
+	// A replacement is registration-driven and wakes even at the same revision.
 	if v.Replaced {
 		ev := newEvent(WaitSessionReplaced, f)
 		g := v.ReplacementGeneration
@@ -252,13 +258,11 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return ev, true, nil
 	}
 
+	// The remaining events are revision-gated. Terminal was already handled above.
 	if f.revision <= since {
 		return WaitEvent{}, false, nil
 	}
 
-	if state.IsTerminalLifecycle(f.lifecycle) {
-		return terminalEvent(f)
-	}
 	if f.phase == state.PhaseAwaitGuidance {
 		ev := newEvent(WaitGate, f) // coherence guarantees a gate id + paused lifecycle
 		id := f.gateID

@@ -53,14 +53,33 @@
     "phase": {
       "description": "The observed phase.",
       "type": "string",
-      "minLength": 1,
-      "maxLength": 64
+      "enum": [
+        "INIT",
+        "PLAN_DRAFT",
+        "PLAN_CRITIQUE",
+        "PLAN_REVISE",
+        "IMPLEMENT_STEP",
+        "CHECKPOINT",
+        "FIX",
+        "TESTS",
+        "VERIFY",
+        "AWAIT_GUIDANCE",
+        "DONE"
+      ]
     },
     "lifecycle": {
       "description": "The observed lifecycle.",
       "type": "string",
-      "minLength": 1,
-      "maxLength": 64
+      "enum": [
+        "running",
+        "paused",
+        "paused_budget",
+        "rate_limited",
+        "cancelled",
+        "failed_retryable",
+        "failed_terminal",
+        "completed"
+      ]
     },
     "turn_id": {
       "description": "The turn to act on, present only for an assignment; null otherwise.",
