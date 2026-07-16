@@ -21,7 +21,6 @@ const (
 	WaitUnchanged        WaitKind = "unchanged"
 	WaitAssignment       WaitKind = "assignment"
 	WaitGate             WaitKind = "gate"
-	WaitPaused           WaitKind = "paused"
 	WaitPausedBudget     WaitKind = "paused_budget"
 	WaitRateLimited      WaitKind = "rate_limited"
 	WaitCancelled        WaitKind = "cancelled"
@@ -181,16 +180,13 @@ func pollOnce(store *state.Store, sessionID string, since uint64, view SessionVi
 	}
 
 	facts := captureFacts(rs)
-	ev := newEvent(WaitUnchanged, facts)
-	wake := false
-	if rs.Revision > since {
-		classified, w, cerr := classify(facts, sessionID, view)
-		if cerr != nil {
-			return WaitEvent{}, false, cerr
-		}
-		if w {
-			ev, wake = classified, true
-		}
+	classified, wake, cerr := classify(facts, sessionID, since, view)
+	if cerr != nil {
+		return WaitEvent{}, false, cerr
+	}
+	ev := classified
+	if !wake {
+		ev = newEvent(WaitUnchanged, facts)
 	}
 	if err := ev.validate(); err != nil {
 		return WaitEvent{}, false, fmt.Errorf("transport: constructed wait event is invalid: %w", err)
@@ -229,19 +225,26 @@ func captureFacts(rs state.RunState) runFacts {
 	return f
 }
 
-// classify applies the wake priority from captured facts and the seam's facts.
-func classify(f runFacts, sessionID string, view SessionViewer) (WaitEvent, bool, error) {
-	if state.IsTerminalLifecycle(f.lifecycle) {
-		return terminalEvent(f)
+// classify applies the wake priority. Order: state coherence (fail closed on a
+// corrupt gate/pause shape); the session seam, which runs on EVERY poll and fails
+// closed for an unknown/corrupt session before any event priority; a replacement,
+// which is registration-driven and wakes even at the same run revision; then the
+// revision-gated run-state events (terminal, gate, budget/rate pause, recovery,
+// own assignment).
+func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (WaitEvent, bool, error) {
+	if err := coherenceCheck(f); err != nil {
+		return WaitEvent{}, false, err
 	}
 
 	v, err := view(SessionInput{Revision: f.revision, Phase: f.phase, Lifecycle: f.lifecycle, ActiveTurnID: f.assignmentID}, sessionID)
 	if err != nil {
-		return WaitEvent{}, false, fmt.Errorf("%w: %s", ErrSessionView, redact.Text(err.Error()))
+		// The viewer's error string is arbitrary; surface only the stable sentinel.
+		return WaitEvent{}, false, ErrSessionView
 	}
-	if v.Replaced == (v.ReplacementGeneration == 0) {
-		return WaitEvent{}, false, fmt.Errorf("%w: replaced and replacement generation disagree", ErrSessionView)
+	if err := validateView(v, f.assignmentID); err != nil {
+		return WaitEvent{}, false, err
 	}
+
 	if v.Replaced {
 		ev := newEvent(WaitSessionReplaced, f)
 		g := v.ReplacementGeneration
@@ -249,11 +252,15 @@ func classify(f runFacts, sessionID string, view SessionViewer) (WaitEvent, bool
 		return ev, true, nil
 	}
 
+	if f.revision <= since {
+		return WaitEvent{}, false, nil
+	}
+
+	if state.IsTerminalLifecycle(f.lifecycle) {
+		return terminalEvent(f)
+	}
 	if f.phase == state.PhaseAwaitGuidance {
-		if f.gateID == "" {
-			return WaitEvent{}, false, fmt.Errorf("%w: AWAIT_GUIDANCE without a gate", ErrCorruptState)
-		}
-		ev := newEvent(WaitGate, f)
+		ev := newEvent(WaitGate, f) // coherence guarantees a gate id + paused lifecycle
 		id := f.gateID
 		ev.GateID = &id
 		return ev, true, nil
@@ -263,23 +270,55 @@ func classify(f runFacts, sessionID string, view SessionViewer) (WaitEvent, bool
 		return newEvent(WaitPausedBudget, f), true, nil
 	case state.LifecycleRateLimited:
 		return newEvent(WaitRateLimited, f), true, nil
-	case state.LifecyclePaused:
-		return newEvent(WaitPaused, f), true, nil
 	}
-
 	if f.recovery != nil {
 		ev := newEvent(WaitRecoveryRequired, f)
 		setProjection(&ev, f.recovery)
 		return ev, true, nil
 	}
-
-	if v.OwnsActiveTurn && f.assignmentID != "" {
+	if v.OwnsActiveTurn {
 		ev := newEvent(WaitAssignment, f)
 		id := f.assignmentID
 		ev.TurnID = &id
 		return ev, true, nil
 	}
 	return WaitEvent{}, false, nil
+}
+
+// coherenceCheck fails closed on an internally inconsistent gate/pause shape: a
+// human-decision gate is exactly AWAIT_GUIDANCE with a gate and a paused
+// lifecycle, and none of those three appears without the others.
+func coherenceCheck(f runFacts) error {
+	atGate := f.phase == state.PhaseAwaitGuidance
+	hasGate := f.gateID != ""
+	isPaused := f.lifecycle == state.LifecyclePaused
+	if atGate {
+		if !hasGate || !isPaused {
+			return fmt.Errorf("%w: AWAIT_GUIDANCE requires a gate and a paused lifecycle", ErrCorruptState)
+		}
+		return nil
+	}
+	if hasGate {
+		return fmt.Errorf("%w: a gate is set outside AWAIT_GUIDANCE", ErrCorruptState)
+	}
+	if isPaused {
+		return fmt.Errorf("%w: a paused lifecycle outside AWAIT_GUIDANCE", ErrCorruptState)
+	}
+	return nil
+}
+
+// validateView rejects contradictory seam facts.
+func validateView(v SessionView, activeTurnID string) error {
+	if v.Replaced == (v.ReplacementGeneration == 0) {
+		return fmt.Errorf("%w: replaced and replacement generation disagree", ErrSessionView)
+	}
+	if v.OwnsActiveTurn && v.Replaced {
+		return fmt.Errorf("%w: a session cannot both own a turn and be replaced", ErrSessionView)
+	}
+	if v.OwnsActiveTurn && activeTurnID == "" {
+		return fmt.Errorf("%w: claims turn ownership but no turn is active", ErrSessionView)
+	}
+	return nil
 }
 
 func terminalEvent(f runFacts) (WaitEvent, bool, error) {
@@ -331,26 +370,65 @@ func (e WaitEvent) semanticValidate() error {
 	anyProj := has(e.Code) || has(e.Reason) || has(e.NextAction)
 
 	fail := func(msg string) error { return fmt.Errorf("%w: %s", ErrAssignmentInvalid, msg) }
+	_, agentPhase := TurnSpec(e.Phase)
 	switch e.Kind {
 	case WaitAssignment:
 		if !turn || gate || gen || anyProj {
 			return fail("assignment needs a turn_id only")
 		}
+		if !agentPhase || e.Lifecycle != state.LifecycleRunning {
+			return fail("assignment must be a running agent phase")
+		}
 	case WaitGate:
 		if !gate || turn || gen || anyProj {
 			return fail("gate needs a gate_id only")
+		}
+		if e.Phase != state.PhaseAwaitGuidance || e.Lifecycle != state.LifecyclePaused {
+			return fail("gate must be AWAIT_GUIDANCE and paused")
+		}
+	case WaitPausedBudget:
+		if turn || gate || gen || anyProj {
+			return fail("paused_budget carries no discriminant")
+		}
+		if e.Lifecycle != state.LifecyclePausedBudget {
+			return fail("paused_budget requires a paused_budget lifecycle")
+		}
+	case WaitRateLimited:
+		if turn || gate || gen || anyProj {
+			return fail("rate_limited carries no discriminant")
+		}
+		if e.Lifecycle != state.LifecycleRateLimited {
+			return fail("rate_limited requires a rate_limited lifecycle")
+		}
+	case WaitCancelled:
+		if turn || gate || gen || anyProj || e.Lifecycle != state.LifecycleCancelled {
+			return fail("cancelled requires a cancelled lifecycle and no discriminant")
+		}
+	case WaitCompleted:
+		if turn || gate || gen || anyProj || e.Lifecycle != state.LifecycleCompleted {
+			return fail("completed requires a completed lifecycle and no discriminant")
+		}
+	case WaitFailed:
+		if !proj || turn || gate || gen {
+			return fail("failed needs code, reason, and next_action")
+		}
+		if !state.IsFailureLifecycle(e.Lifecycle) {
+			return fail("failed requires a failure lifecycle")
+		}
+	case WaitRecoveryRequired:
+		if !proj || turn || gate || gen {
+			return fail("recovery_required needs code, reason, and next_action")
+		}
+		if e.Lifecycle != state.LifecycleRunning {
+			return fail("recovery_required requires a running lifecycle")
 		}
 	case WaitSessionReplaced:
 		if !gen || turn || gate || anyProj {
 			return fail("session_replaced needs a replacement_generation only")
 		}
-	case WaitFailed, WaitRecoveryRequired:
-		if !proj || turn || gate || gen {
-			return fail(string(e.Kind) + " needs code, reason, and next_action")
-		}
-	case WaitUnchanged, WaitPaused, WaitPausedBudget, WaitRateLimited, WaitCancelled, WaitCompleted:
+	case WaitUnchanged:
 		if turn || gate || gen || anyProj {
-			return fail(string(e.Kind) + " carries no discriminant")
+			return fail("unchanged carries no discriminant")
 		}
 	default:
 		return fail("unknown wait kind " + string(e.Kind))

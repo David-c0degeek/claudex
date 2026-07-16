@@ -45,11 +45,10 @@ func (c *fakeClock) poll(time.Duration) <-chan time.Time { return c.pollCh }
 
 func viewForRole(role Role, replaced map[string]uint64) SessionViewer {
 	return func(in SessionInput, sessionID string) (SessionView, error) {
-		v := SessionView{}
 		if g, ok := replaced[sessionID]; ok {
-			v.Replaced = true
-			v.ReplacementGeneration = g
+			return SessionView{Replaced: true, ReplacementGeneration: g}, nil
 		}
+		v := SessionView{}
 		if in.ActiveTurnID != "" {
 			if spec, ok := TurnSpec(in.Phase); ok && spec.Role == role {
 				v.OwnsActiveTurn = true
@@ -209,6 +208,73 @@ func TestWaitGatelessAwaitGuidanceFailsClosed(t *testing.T) {
 	}
 }
 
+// The seam runs on every poll, so an unknown session fails immediately even at
+// the caller's current revision, and a registration-only replacement wakes.
+func TestWaitSeamAtSameRevision(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	// Viewer error at since == current: immediate failure, not a timeout.
+	failing := func(SessionInput, string) (SessionView, error) { return SessionView{}, errors.New("boom") }
+	if _, err := Wait(context.Background(), store, "lead", rev, time.Second, failing); !errors.Is(err, ErrSessionView) {
+		t.Fatalf("viewer error at same revision err = %v, want ErrSessionView", err)
+	}
+	// Replacement at since == current (no run mutation): immediate wake.
+	repl := viewForRole(RoleLead, map[string]uint64{"lead": 7})
+	ev, err := Wait(context.Background(), store, "lead", rev, time.Second, repl)
+	if err != nil || ev.Kind != WaitSessionReplaced || ev.ReplacementGeneration == nil || *ev.ReplacementGeneration != 7 {
+		t.Fatalf("replacement at same revision ev=%+v err=%v", ev, err)
+	}
+}
+
+// The viewer's arbitrary error text must not cross the boundary (redaction only
+// catches known secret patterns, not emails/paths/ids).
+func TestWaitViewerErrorValueFree(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	leak := "user@example.com at /home/dave/registry rec=abc123"
+	failing := func(SessionInput, string) (SessionView, error) { return SessionView{}, errors.New(leak) }
+	_, err := Wait(context.Background(), store, "lead", rev, time.Second, failing)
+	if !errors.Is(err, ErrSessionView) || strings.Contains(err.Error(), "example.com") || strings.Contains(err.Error(), "/home/") {
+		t.Fatalf("viewer error leaked arbitrary text: %v", err)
+	}
+}
+
+func TestWaitSeamContradictions(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	next := mutate(t, store, rev, toPairTurn) // pair turn active
+	cases := map[string]SessionViewer{
+		"owns and replaced": func(SessionInput, string) (SessionView, error) {
+			return SessionView{OwnsActiveTurn: true, Replaced: true, ReplacementGeneration: 3}, nil
+		},
+		"owns with no turn": func(in SessionInput, _ string) (SessionView, error) { return SessionView{OwnsActiveTurn: true}, nil },
+	}
+	// "owns with no turn" needs a state with no active turn; use a coherent TESTS phase.
+	mutate(t, store, next, func(_ uint64, n *state.RunState) {
+		n.Phase = state.PhaseTests
+		n.Assignment = nil
+	})
+	after, _, _ := store.Load()
+	for name, view := range cases {
+		if _, err := Wait(context.Background(), store, "pair", after.Revision-1, time.Second, view); !errors.Is(err, ErrSessionView) {
+			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
+		}
+	}
+}
+
+// A gate outside AWAIT_GUIDANCE and a paused lifecycle outside a gate both fail.
+func TestWaitInverseCorruption(t *testing.T) {
+	// Paused lifecycle without AWAIT_GUIDANCE.
+	store, rev := newRunWithActiveTurn(t)
+	mutate(t, store, rev, func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecyclePaused })
+	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("paused outside gate err = %v, want ErrCorruptState", err)
+	}
+	// Gate ref outside AWAIT_GUIDANCE.
+	store2, rev2 := newRunWithActiveTurn(t)
+	mutate(t, store2, rev2, func(gen uint64, n *state.RunState) { n.Gate = &state.Ref{ID: "g", IssuedRevision: gen} })
+	if _, err := Wait(context.Background(), store2, "pair", rev2, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("gate outside AWAIT_GUIDANCE err = %v, want ErrCorruptState", err)
+	}
+}
+
 // --- clock-driven tests ---
 
 func TestWaitUnchangedOnTimeout(t *testing.T) {
@@ -342,13 +408,28 @@ func TestWaitEventMarshalsAndValidates(t *testing.T) {
 
 func TestWaitEventDiscriminantValidation(t *testing.T) {
 	gid := "g"
-	bad := WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: WaitAssignment, Revision: 1, Phase: "CHECKPOINT", Lifecycle: "running", GateID: &gid}
-	if err := bad.semanticValidate(); err == nil {
-		t.Fatalf("assignment carrying a gate_id should be rejected")
-	}
 	code := "c"
-	bad2 := WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: WaitCancelled, Revision: 1, Phase: "IMPLEMENT_STEP", Lifecycle: "cancelled", Code: &code}
-	if err := bad2.semanticValidate(); err == nil {
-		t.Fatalf("cancelled carrying a code should be rejected")
+	base := func(k WaitKind, phase state.Phase, lc state.Lifecycle) WaitEvent {
+		return WaitEvent{ProtocolVersion: 1, MessageType: "wait_event", Kind: k, Revision: 1, Phase: phase, Lifecycle: lc}
+	}
+	cases := map[string]WaitEvent{
+		"assignment with gate_id":     func() WaitEvent { e := base(WaitAssignment, "CHECKPOINT", "running"); e.GateID = &gid; return e }(),
+		"cancelled with code":         func() WaitEvent { e := base(WaitCancelled, "DONE", "cancelled"); e.Code = &code; return e }(),
+		"cancelled but running":       base(WaitCancelled, "IMPLEMENT_STEP", "running"),
+		"gate in TESTS":               func() WaitEvent { e := base(WaitGate, "TESTS", "paused"); e.GateID = &gid; return e }(),
+		"paused_budget but completed": base(WaitPausedBudget, "IMPLEMENT_STEP", "completed"),
+		"assignment not agent phase":  func() WaitEvent { e := base(WaitAssignment, "DONE", "running"); id := "t"; e.TurnID = &id; return e }(),
+	}
+	for name, ev := range cases {
+		if err := ev.semanticValidate(); err == nil {
+			t.Fatalf("%s should be rejected", name)
+		}
+	}
+	// A well-formed assignment passes.
+	good := base(WaitAssignment, "CHECKPOINT", "running")
+	id := "turn-2"
+	good.TurnID = &id
+	if err := good.semanticValidate(); err != nil {
+		t.Fatalf("a valid assignment should pass: %v", err)
 	}
 }

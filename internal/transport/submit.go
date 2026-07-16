@@ -302,7 +302,7 @@ func requireLiveOwner(next *state.RunState, turnID string, gen uint64) error {
 		}
 		return nil
 	case next.Phase == state.PhaseAwaitGuidance:
-		if !state.IsPausedLifecycle(lc) {
+		if lc != state.LifecyclePaused {
 			return fmt.Errorf("%w: a human gate must pause the run, got lifecycle %s", ErrTransitionInvalid, lc)
 		}
 		if next.Gate == nil || next.Gate.ID == "" || next.Gate.IssuedRevision != gen {

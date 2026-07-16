@@ -36,7 +36,6 @@
         "unchanged",
         "assignment",
         "gate",
-        "paused",
         "paused_budget",
         "rate_limited",
         "cancelled",
