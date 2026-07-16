@@ -227,7 +227,7 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 			if err := advance(prepared, gen, next); err != nil {
 				return err
 			}
-			if err := requireTurnConsumed(next, env.TurnID, gen); err != nil {
+			if err := requireLiveOwner(next, env.TurnID, gen); err != nil {
 				return err
 			}
 			receipt = state.Receipt{TurnID: env.TurnID, Revision: gen, ArtifactDigest: digest}
@@ -253,30 +253,65 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 	return SubmitResult{}, fmt.Errorf("transport: submit did not acquire the run lock after %d attempts: %w", submitMaxAttempts, genstore.ErrBusy)
 }
 
-// requireTurnConsumed enforces that the transition left the run in a live shape:
-// if the next assignment is cleared, the resulting phase must be non-agent
-// (a gate/mechanical/terminal phase with no TurnSpec); if an assignment is
-// present, the resulting phase must be an agent phase and the assignment must be
-// a different turn freshly issued at this revision. Either way a no-op or a
-// clear-without-advance is rejected, so the run is never stranded.
-func requireTurnConsumed(next *state.RunState, turnID string, gen uint64) error {
-	_, actionable := TurnSpec(next.Phase)
-	if next.Assignment == nil {
-		if actionable {
-			return fmt.Errorf("%w: the assignment was cleared but phase %s still expects an agent turn", ErrTransitionInvalid, next.Phase)
+// requireLiveOwner enforces that the transition left the run with a real next
+// owner, so accepting the submit can never strand it. The engine owns the exact
+// legal transition; this is the safety postcondition it must satisfy:
+//
+//   - an assignment present  -> an agent phase (has a TurnSpec), lifecycle
+//     RUNNING, and a different turn freshly issued at this revision;
+//   - an assignment absent    -> a terminal/failure lifecycle (a failure carries
+//     its failure projection), or a RUNNING mechanical TESTS gate, or an
+//     AWAIT_GUIDANCE human gate that is paused with a gate issued at this
+//     revision.
+//
+// Every other shape — INIT with no assignment, an actionable phase with no
+// assignment, an assignment under a terminal/paused lifecycle — is ownerless and
+// rejected.
+func requireLiveOwner(next *state.RunState, turnID string, gen uint64) error {
+	lc := next.Lifecycle
+	_, agentPhase := TurnSpec(next.Phase)
+
+	if next.Assignment != nil {
+		if !agentPhase {
+			return fmt.Errorf("%w: an assignment is set but phase %s is not an agent phase", ErrTransitionInvalid, next.Phase)
+		}
+		if lc != state.LifecycleRunning {
+			return fmt.Errorf("%w: an agent turn is assigned but lifecycle is %s", ErrTransitionInvalid, lc)
+		}
+		if next.Assignment.ID == turnID {
+			return fmt.Errorf("%w: the consumed turn is still assigned", ErrTransitionInvalid)
+		}
+		if next.Assignment.IssuedRevision != gen {
+			return fmt.Errorf("%w: the next assignment was not issued at this revision", ErrTransitionInvalid)
 		}
 		return nil
 	}
-	if !actionable {
-		return fmt.Errorf("%w: an assignment is set but phase %s is not an agent phase", ErrTransitionInvalid, next.Phase)
+
+	if agentPhase {
+		return fmt.Errorf("%w: the assignment was cleared but phase %s still expects an agent turn", ErrTransitionInvalid, next.Phase)
 	}
-	if next.Assignment.ID == turnID {
-		return fmt.Errorf("%w: the consumed turn is still assigned", ErrTransitionInvalid)
+	switch {
+	case state.IsTerminalLifecycle(lc):
+		if state.IsFailureLifecycle(lc) && next.Failure == nil {
+			return fmt.Errorf("%w: failure lifecycle %s without a failure projection", ErrTransitionInvalid, lc)
+		}
+		return nil
+	case next.Phase == state.PhaseTests:
+		if lc != state.LifecycleRunning {
+			return fmt.Errorf("%w: the TESTS gate must be running, got %s", ErrTransitionInvalid, lc)
+		}
+		return nil
+	case next.Phase == state.PhaseAwaitGuidance:
+		if !state.IsPausedLifecycle(lc) {
+			return fmt.Errorf("%w: a human gate must pause the run, got lifecycle %s", ErrTransitionInvalid, lc)
+		}
+		if next.Gate == nil || next.Gate.ID == "" || next.Gate.IssuedRevision != gen {
+			return fmt.Errorf("%w: a human gate needs a gate issued at this revision", ErrTransitionInvalid)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: ownerless run shape (phase %s, lifecycle %s)", ErrTransitionInvalid, next.Phase, lc)
 	}
-	if next.Assignment.IssuedRevision != gen {
-		return fmt.Errorf("%w: the next assignment was not issued at this revision", ErrTransitionInvalid)
-	}
-	return nil
 }
 
 // classifyMutateOutcome interprets a store.Mutate result. A committed

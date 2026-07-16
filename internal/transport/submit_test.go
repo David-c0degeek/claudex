@@ -376,33 +376,71 @@ func TestClearWithoutAdvanceRejected(t *testing.T) {
 	}
 }
 
-// Clearing the assignment while moving to a non-agent phase (a gate) is valid.
-func TestClearToNonActionablePhaseAccepted(t *testing.T) {
+// Parking at a human gate requires a paused lifecycle and a gate issued now.
+func TestClearToHumanGateAccepted(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	toGate := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+	toGate := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
 		next.Phase = state.PhaseAwaitGuidance
+		next.Lifecycle = state.LifecyclePaused
 		next.Assignment = nil
+		next.Gate = &state.Ref{ID: "gate-1", IssuedRevision: gen}
 		return nil
 	}
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toGate); err != nil {
-		t.Fatalf("clear to a gate phase should be accepted: %v", err)
+		t.Fatalf("parking at a valid human gate should be accepted: %v", err)
 	}
 	loaded, _, _ := store.Load()
-	if loaded.Phase != state.PhaseAwaitGuidance || loaded.Assignment != nil {
-		t.Fatalf("run not parked at the gate: %s / %+v", loaded.Phase, loaded.Assignment)
+	if loaded.Phase != state.PhaseAwaitGuidance || loaded.Gate == nil || loaded.Lifecycle != state.LifecyclePaused {
+		t.Fatalf("run not parked at the gate: %+v", loaded)
 	}
 }
 
-// An assignment issued in a non-agent phase is inconsistent and rejected.
-func TestAssignmentInNonActionablePhaseRejected(t *testing.T) {
+// A terminal (DONE/completed) shape with no assignment is a valid live owner.
+func TestClearToTerminalAccepted(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	bad := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+	toDone := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
 		next.Phase = state.PhaseDone
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		next.Lifecycle = state.LifecycleCompleted
+		next.Assignment = nil
 		return nil
 	}
-	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), bad); !errors.Is(err, ErrTransitionInvalid) {
-		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
+	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toDone); err != nil {
+		t.Fatalf("completing the run should be accepted: %v", err)
+	}
+}
+
+// Ownerless and inconsistent shapes are rejected.
+func TestOwnerlessShapesRejected(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	cases := map[string]Transition{
+		"init + nil": func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+			next.Phase = state.PhaseInit
+			next.Assignment = nil
+			return nil
+		},
+		"await-guidance without a gate": func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+			next.Phase = state.PhaseAwaitGuidance
+			next.Assignment = nil // no gate, lifecycle still running
+			return nil
+		},
+		"assignment under a terminal lifecycle": func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+			next.Phase = state.PhaseCheckpoint
+			next.Lifecycle = state.LifecycleCompleted
+			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			return nil
+		},
+		"assignment in a non-agent phase": func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+			next.Phase = state.PhaseDone
+			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			return nil
+		},
+	}
+	for name, adv := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), adv); !errors.Is(err, ErrTransitionInvalid) {
+				t.Fatalf("%s err = %v, want ErrTransitionInvalid", name, err)
+			}
+		})
 	}
 }
 
