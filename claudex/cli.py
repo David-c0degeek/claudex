@@ -46,6 +46,7 @@ from .phases import (
     OrchestratorError,
     draft_task,
     task_has_content,
+    validate_run_start,
     validate_plan_shape,
 )
 from .state import (
@@ -247,6 +248,10 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
     lead = lead or cfg.lead
     if lead not in AGENTS:
         raise OrchestratorError(f"lead must be one of {AGENTS}, got {lead!r}")
+    # Everything above is read-only. Do not mint a run ID, move the current
+    # pointer, create state, launch watchers, or probe providers until the
+    # repository can produce an exact base snapshot.
+    validate_run_start(cfg)
     state = RunState(
         run_id=new_run_id(),
         repo=str(cfg.repo),

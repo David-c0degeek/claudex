@@ -114,6 +114,55 @@ def task_has_content(task_md: str) -> bool:
     return len(" ".join(substantive)) >= 20
 
 
+def validate_run_start(cfg: Config) -> tuple[Path, str]:
+    """Validate a new run without creating coordinator artifacts or processes."""
+    from .state import task_file
+
+    task = task_file(cfg.repo)
+    if not task.exists():
+        raise OrchestratorError(
+            f"task contract missing: {task} — run `claudex init` first"
+        )
+    task_text = task.read_text(encoding="utf-8")
+    if not task_has_content(task_text):
+        raise OrchestratorError(
+            f"task contract is an unfilled template: {task} — fill it in, "
+            'or draft it from a description with `claudex task "..."`'
+        )
+    if not gitops.is_git_repo(cfg.repo):
+        raise OrchestratorError(f"{cfg.repo} is not a git repository")
+
+    tracked_runtime = gitops.tracked_paths(
+        cfg.repo, ".claudex/current", ".claudex/runs"
+    )
+    if tracked_runtime:
+        sample = ", ".join(tracked_runtime[:3])
+        suffix = " …" if len(tracked_runtime) > 3 else ""
+        raise OrchestratorError(
+            "Claudex runtime state is tracked by Git "
+            f"({sample}{suffix}). Restore `.claudex/` ignore coverage and run "
+            "`git rm --cached -r .claudex`; local task/run files are retained. "
+            "Commit that repair before starting a run"
+        )
+
+    runtime_probes = (
+        ".claudex/current",
+        ".claudex/runs/claudex-preflight/state.json",
+    )
+    if not all(gitops.path_is_ignored(cfg.repo, path) for path in runtime_probes):
+        raise OrchestratorError(
+            "Claudex runtime paths are not ignored by Git. Run `claudex init` "
+            "to add `.claudex/` to .gitignore, then commit the .gitignore repair; "
+            "no run was created"
+        )
+    if gitops.has_uncommitted_changes(cfg.repo):
+        raise OrchestratorError(
+            "repository has tracked or untracked changes before run start; "
+            "commit, ignore, or remove them so the base snapshot is exact"
+        )
+    return task, task_text
+
+
 def detect_mode(task_md: str, configured: str = "auto") -> str:
     """"report": the deliverable IS analysis — the report draft is the single
     step and no plan-about-a-plan layer exists. "change": the deliverable is
@@ -677,27 +726,8 @@ class Orchestrator:
 
     # ----------------------------------------------------------------- phases
     def phase_init(self) -> None:
-        from .state import task_file
-
-        task = task_file(self.cfg.repo)
-        if not task.exists():
-            raise OrchestratorError(
-                f"task contract missing: {task} — run `claudex init` first"
-            )
-        task_text = task.read_text(encoding="utf-8")
-        if not task_has_content(task_text):
-            raise OrchestratorError(
-                f"task contract is an unfilled template: {task} — fill it in, "
-                'or draft it from a description with `claudex task "..."`'
-            )
+        task, task_text = validate_run_start(self.cfg)
         self.state.mode = detect_mode(task_text, self.cfg.mode)
-        if not gitops.is_git_repo(self.cfg.repo):
-            raise OrchestratorError(f"{self.cfg.repo} is not a git repository")
-        if gitops.has_uncommitted_changes(self.cfg.repo):
-            raise OrchestratorError(
-                "repository has tracked or untracked changes before run start; "
-                "commit, ignore, or remove them so the base snapshot is exact"
-            )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         # Immutable snapshot: both agents get the exact same contract, and a
         # later edit of .claudex/task.md cannot skew a run in flight.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-07-16
+
+- Validate the task contract, Git repository, runtime ignore coverage, tracked
+  runtime artifacts, and exact starting tree before creating a run ID, state
+  directory, current pointer, provider process, or watcher window.
+- Fail with non-destructive repair guidance when `.claudex/current` or
+  `.claudex/runs` were accidentally committed, or `.claudex/` ignore coverage
+  is missing.
+
 ## 0.5.0 — 2026-07-16
 
 - Stream Claude, Codex, and coordinator test activity into normalized,

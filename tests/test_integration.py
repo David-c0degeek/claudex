@@ -15,7 +15,13 @@ from claudex.agents import ClaudeAgent, CodexAgent
 from claudex.config import Config
 from claudex.lifecycle import Lifecycle
 from claudex.events import EventJournal
-from claudex.state import RunState, get_current_run, run_dir_for
+from claudex.state import (
+    Phase,
+    RunState,
+    get_current_run,
+    run_dir_for,
+    set_current_run,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -342,7 +348,53 @@ class BlackBoxCoordinatorTests(unittest.TestCase):
         )
         result = self._cli("run")
         self.assertEqual(1, result.returncode)
-        self.assertIn("tracked or untracked changes before run start", result.stdout)
+        self.assertIn(
+            "tracked or untracked changes before run start",
+            result.stdout + result.stderr,
+        )
+        self.assertFalse(self.call_log.exists())
+        self.assertIsNone(get_current_run(self.repo))
+        self.assertFalse((self.repo / ".claudex" / "runs").exists())
+
+    def test_missing_runtime_ignore_fails_before_creating_run_artifacts(self) -> None:
+        gitops.git(self.repo, "rm", ".gitignore")
+        gitops.git(self.repo, "commit", "-m", "remove runtime ignore")
+        result = self._cli("run")
+        self.assertEqual(1, result.returncode)
+        output = result.stdout + result.stderr
+        self.assertIn("runtime paths are not ignored", output)
+        self.assertIn("no run was created", output)
+        self.assertFalse(self.call_log.exists())
+        self.assertIsNone(get_current_run(self.repo))
+        self.assertFalse((self.repo / ".claudex" / "runs").exists())
+
+    def test_tracked_runtime_state_fails_with_non_destructive_repair_guidance(self) -> None:
+        state = RunState(
+            "tracked-run",
+            str(self.repo),
+            "claude",
+            phase=Phase.DONE.value,
+            lifecycle=Lifecycle.COMPLETED.value,
+        )
+        state.save(run_dir_for(self.repo, state.run_id))
+        set_current_run(self.repo, state.run_id)
+        gitops.git(
+            self.repo,
+            "add",
+            "-f",
+            ".claudex/current",
+            f".claudex/runs/{state.run_id}/state.json",
+        )
+        gitops.git(self.repo, "commit", "-m", "track runtime by mistake")
+        before = sorted(path.name for path in (self.repo / ".claudex" / "runs").iterdir())
+        result = self._cli("run")
+        self.assertEqual(1, result.returncode)
+        output = result.stdout + result.stderr
+        self.assertIn("runtime state is tracked by Git", output)
+        self.assertIn("git rm --cached -r .claudex", output)
+        self.assertIn("local task/run files are retained", output)
+        after = sorted(path.name for path in (self.repo / ".claudex" / "runs").iterdir())
+        self.assertEqual(before, after)
         self.assertFalse(self.call_log.exists())
 
     def test_slow_acceptance_exposes_live_events_to_both_watchers(self) -> None:

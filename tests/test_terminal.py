@@ -6,14 +6,20 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from claudex.cli import _active_orchestrator, cmd_status, open_watch_terminals
+from claudex.cli import (
+    _active_orchestrator,
+    cmd_status,
+    main,
+    open_watch_terminals,
+)
 from claudex.config import Config
 from claudex.events import AgentEvent, EventJournal
+from claudex import gitops
 from claudex.lifecycle import Lifecycle
 from claudex.state import Phase, RunState
 from claudex.terminal import next_action, render_event, render_state, watch_run
@@ -258,6 +264,31 @@ class TerminalLauncherTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("--agent claude", rendered)
         self.assertIn("--agent codex", rendered)
+
+    def test_failed_preflight_does_not_create_run_or_open_terminals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            gitops.git(repo, "init")
+            gitops.git(repo, "config", "user.email", "tests@example.invalid")
+            gitops.git(repo, "config", "user.name", "Claudex Tests")
+            (repo / ".gitignore").write_text(".claudex/\n", encoding="utf-8")
+            gitops.git(repo, "add", ".gitignore")
+            gitops.git(repo, "commit", "-m", "base")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("claudex.cli.open_watch_terminals") as launch,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                code = main(
+                    ["run", "--open-terminals", "--repo", str(repo)]
+                )
+            self.assertEqual(1, code)
+            self.assertIn("task contract missing", stderr.getvalue())
+            launch.assert_not_called()
+            self.assertFalse((repo / ".claudex" / "current").exists())
+            self.assertFalse((repo / ".claudex" / "runs").exists())
 
 
 if __name__ == "__main__":

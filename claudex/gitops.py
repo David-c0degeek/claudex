@@ -87,6 +87,17 @@ def has_uncommitted_changes(worktree: Path) -> bool:
     return bool(status_porcelain(worktree))
 
 
+def tracked_paths(repo: Path, *pathspecs: str) -> list[str]:
+    """Return tracked files under the supplied repository-relative pathspecs."""
+    output = git(repo, "ls-files", "--", *pathspecs)
+    return [line for line in output.splitlines() if line]
+
+
+def path_is_ignored(repo: Path, path: str) -> bool:
+    """Check ignore coverage even when the probe path does not exist."""
+    return bool(git(repo, "check-ignore", "--no-index", "--", path, check=False))
+
+
 def status_porcelain(worktree: Path) -> str:
     """Return all tracked and untracked changes; ignored files stay ignored."""
     return git(

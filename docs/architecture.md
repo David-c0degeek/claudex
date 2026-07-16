@@ -22,6 +22,11 @@ admission, worktree identity, and artifacts. Providers return typed results;
 they do not choose phase transitions. A human gate exists only for explicit
 `requires_human_decision: true` plus a concrete question.
 
+Before minting a new run identity, Claudex performs a read-only repository
+preflight: substantive task, Git repository, ignored and untracked runtime
+paths, and a clean exact base. A failed preflight cannot create state, move the
+current pointer, resolve providers, or launch terminal views.
+
 ## Process and event boundary
 
 Every provider or mechanical-test call has a unique attempt directory. The
