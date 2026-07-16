@@ -9,6 +9,7 @@ including concurrency and crash/fault scenarios. Reaching `DONE` here is the
 MVP (BYO-attach tier).
 
 ## Integration analysis
+> **Note (D013/D014):** the coordinator is Go, but the agent-side skills are language-neutral — a Claude Code skill (markdown/SKILL.md) + a Codex prompt teaching the `pull→work→submit→wait` loop against the Go CLI. The fake-executable e2e harness is new Go test code (`internal/harness` / `*_test.go`) driving the real protocol; the old Python `tests/test_integration.py` fixtures are harvested as scenarios (00.2), not ported. Re-fill in Go terms before ticking any box.
 > Fill/confirm against 00.2 before ticking any box.
 - **Existing code found** — README "Two ways to run it" live-pair skill (`.claude/skills/claudex-pair/SKILL.md`) + `codex-lead-prompt.md`; `claudex/templates/SKILL.md` (per project memory); the `.mailbox/` PoC loop-prompt from this session (the exact behaviour to formalize); existing `tests/test_integration.py` + scenario-driven fake executables (per lessons: "Scenario-driven fake executables are the authoritative integration boundary").
 - **Behaviour to preserve** — the fake-executable integration harness; "run pair turns in the background"; worktree is a sibling dir (grant `--add-dir`).

@@ -9,7 +9,8 @@ prepared-transaction journal so git+state operations survive a crash between the
 git ref move and the state CAS.
 
 ## Integration analysis
-> Fill/confirm against the 00.2 prior-art map before ticking any box.
+> **Superseded by D013/D014 (Go greenfield):** the Python module names below are *reference-only requirements*, not reuse targets — implement fresh in Go (`internal/state`, `internal/txn`, `internal/osprim`). "Reuse" means the harvested test vectors/schemas from 00.2, not ported code. Re-fill in Go terms before ticking any box.
+> Fill/confirm against the 00.2 harvest before ticking any box.
 - **Existing code found** — `claudex/state.py` (run state, likely schema-versioned + `.bak` migration per README), `claudex/schemas.py` (typed artifact schemas), `claudex/lifecycle.py` (macro lifecycle: running/paused/rate_limited/…), run-dir lockfile logic (README: "run-dir lockfile around every state-mutating command"), `claudex/recovery.py`.
 - **Behaviour to preserve** — schema-versioned state with `.bak` retention + fail-closed on unknown schema; lifecycle records phase/attempt/reason/next-action; lockfile serializes cross-process mutation.
 - **Reuse / extend** — extend `state.py` with `state_revision` + CAS write; reuse `schemas.py` validation; reuse lockfile primitive. Confirm exact symbols in 00.2.

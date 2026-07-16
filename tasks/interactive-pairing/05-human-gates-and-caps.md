@@ -11,7 +11,8 @@ coordinator can observe. Operator commands (`cancel`, `clean`, `export`,
 `recover`) keep an abandoned run recoverable; `status` stays read-only.
 
 ## Integration analysis
-> Fill/confirm against the 00.2 corrected source map before ticking any box.
+> **Superseded by D013/D014 (Go greenfield):** implement fresh in Go (`internal/gates`, `internal/caps`, `internal/lifecycle`) — the Python `budgets.py`/`limits.py`/`cli.py` names below are reference-only. This subject owns cap *policy/admission/labels* (observable-only); subject 03 owns phase counters. "Reuse" = harvested test vectors from 00.2. Re-fill in Go terms before ticking any box.
+> Fill/confirm against the 00.2 harvest before ticking any box.
 - **Existing code found** — `claudex/cli.py` `cmd_resolve`/`cmd_continue`/`cmd_status`/`cmd_cancel`/`cmd_clean`/`cmd_export` (operator surface to repurpose); `claudex/budgets.py` = provider **usage/economic accounting**; `claudex/limits.py` = provider **rate-limit text parsing** (neither is a general cap engine — do not reuse wholesale); AWAIT_GUIDANCE is a **`state.py` `Phase`**, while `claudex/lifecycle.py` holds the macro states PAUSED / PAUSED_BUDGET / RATE_LIMITED; README guidance-ledger semantics.
 - **Behaviour to preserve** — a gate needs both `requires_human_decision: true` and a concrete non-empty question; budget exhaustion is a quality stop, not a gate; guidance is persistent and binding; lifecycle records the exact resume/resolve/continue action; idempotent cancel terminates the process tree and keeps partial evidence.
 - **Reuse / extend** — repurpose `cmd_resolve`/`cmd_continue` to carry `gate_id` + revision; reuse `cmd_cancel`/`cmd_clean`/`cmd_export` operator plumbing; **this subject owns cap policy/admission** (artifact-byte + wall-time checks, extension/gate UX, honesty labels) while subject 03 owns phase counters + the threshold transition. Retire provider rate/cost logic unless subject 07 proves telemetry.

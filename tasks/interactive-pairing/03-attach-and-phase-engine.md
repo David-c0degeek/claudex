@@ -11,7 +11,8 @@ durably issues the *next* assignment before releasing the lock, and convergence
 is `AGREE` + zero blocking/major, evaluated by the coordinator.
 
 ## Integration analysis
-> Fill/confirm against the 00.2 corrected source map before ticking any box.
+> **Superseded by D013/D014 (Go greenfield):** the Python module names below are *reference-only requirements*, not reuse targets — implement fresh in Go (`internal/engine`, `internal/state`). The single authoritative phase-transition table/evaluator is new Go (03.4), informed by — not ported from — the old `phases.py:Orchestrator`. "Reuse" means the harvested test vectors from 00.2. Re-fill in Go terms before ticking any box.
+> Fill/confirm against the 00.2 harvest before ticking any box.
 - **Existing code found** — `claudex/state.py` holds `Phase` and `RunState.advance` (the real phase state, **not** `phases.py`). `claudex/phases.py` is a large **subprocess-coupled `Orchestrator`** — a candidate to adapt or retire, not a reusable transition table. `claudex/schemas.py` holds convergence helpers + finding/verdict schemas. `claudex/agents.py` holds provider command/result adapters (`ClaudeAgent`/`CodexAgent`), not reusable role concepts. README convergence semantics + lead-response budgets.
 - **Behaviour to preserve** — phase order and convergence definition; lead-response budgets; "planning stays planning" finding categories; the fresh-verifier intent (now via D010, made explicit).
 - **Reuse / extend** — extend `state.py`'s `Phase`/`advance` for submit-driven transitions + assignment issuance; reuse `schemas.py` convergence helpers; harvest any reusable step logic out of the `phases.py` `Orchestrator` while retiring its subprocess coupling.

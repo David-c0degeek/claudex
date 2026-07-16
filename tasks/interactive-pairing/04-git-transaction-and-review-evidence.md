@@ -11,7 +11,8 @@ live worktree. The mechanical test gate runs as a separate coordinator-owned
 subprocess **outside the mutation lock**.
 
 ## Integration analysis
-> Fill/confirm against the 00.2 corrected source map before ticking any box.
+> **Superseded by D013/D014 (Go greenfield):** implement fresh in Go (`internal/gitx`, `internal/evidence`) shelling out to native `git` via `exec.CommandContext` with argv (§6.24) — no go-git. Tree-identity, snapshot, and cancellation behaviours are pinned by the harvested test vectors from 00.2 (the old tests/counterexamples, not the old code). `git update-ref <new> <old>` supplies the native ref CAS. Re-fill in Go terms before ticking any box.
+> Fill/confirm against the 00.2 harvest before ticking any box.
 - **Existing code found** — `claudex/gitops.py` (worktree, diff, dirty/tree identity incl. untracked bytes per lessons); `claudex/processes.py` streamed timeout/cancel primitive (reuse for the test gate only); `claudex/evidence.py` (**currently copies selected files from the live `cfg.repo`** — must be changed to materialize from a committed Git object); `claudex/artifacts.py` (non-atomic — see 02).
 - **Behaviour to preserve** — tree identity semantics; test result decided by subprocess exit code + unchanged exact tree, never agent testimony; worktree is a sibling dir on a run branch.
 - **Reuse / extend** — reuse `gitops.py` plumbing for snapshot/tree-hash; reuse the `processes.py` streamed timeout/cancel for the test command; **rewrite** `evidence.py` to build a committed-object packet; drive commits through 01's journal.

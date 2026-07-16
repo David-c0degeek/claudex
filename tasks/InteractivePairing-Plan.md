@@ -41,9 +41,11 @@ Before considering a box done:
 
 ## 1. Subject
 
+**Implementation substrate.** A greenfield **Go** binary (D013), rederived from scratch — the existing Python code is discarded, reference-only in git history; the refactor branch's schemas/fixtures/tests are harvested as executable requirements (D014). Native `git` is shelled out to, never a library (D013). Targets Windows + Linux first-class, macOS best-effort, with OS primitives behind build-tagged packages and local-filesystem-only state (D015).
+
 **In scope.** Pivot claudex's execution model from "coordinator spawns both agents as headless subprocesses" to "coordinator arbitrates two already-running, fully human-interactive agent terminals over a durable file protocol." Deliver: a **processless durable coordinator** (short-lived CLI + locked durable state + CAS transitions + crash-reconciled git/state transaction journal); a **transport protocol** (`pull` / `submit` / `wait --timeout` / `status`) over a role-addressed file mailbox with idempotent receipts; an **attach + phase engine** (register a terminal to a role, run PLAN→IMPLEMENT→CHECKPOINT→TESTS→VERIFY→DONE firing on `submit`, converge on AGREE + zero blocking/major); **coordinator-owned git** (snapshot-and-commit on submit, immutable review evidence, mechanical test gate, merge gating); **human gates + observable-only caps**; **executable agent-side skills** (the `pull→work→submit→wait` loop for Claude and Codex, making BYO autonomous); and a **managed-interactive launcher** (claudex starts each TUI with inherited stdio, pinned cwd, provider sandbox flags — still fully interactive) with individually-labeled enforcement capabilities.
 
-**Out of scope.** Multi-user / cross-machine auth (same-user filesystem assumed — stated, not solved). Network/RPC transport (files only). Rotating leadership or model-vs-model authority. A second headless orchestration engine (the old subprocess driver is retired; a future headless adapter, if ever built, is just another `pull/submit` client and is not part of this plan). Metered token/cost caps in BYO attach (impossible to observe honestly). Sandboxing an untrusted repository (a worktree is an isolation boundary for commits, not an OS sandbox).
+**Out of scope.** Multi-user / cross-machine auth (same-user filesystem assumed — stated, not solved). Network/RPC transport (files only). Rotating leadership or model-vs-model authority. A second headless orchestration engine (a future headless adapter, if ever built, is just another `pull/submit` client and is not part of this plan). Metered token/cost caps in BYO attach (impossible to observe honestly). Sandboxing an untrusted repository (a worktree is an isolation boundary for commits, not an OS sandbox). **Porting the Python implementation** (D014 — it is reference-only). A git library / go-git (D013 — shell out to native git). Coordinator state on network/sync filesystems (D015). Rust (D013).
 
 ### Risks and rollback
 
@@ -51,13 +53,16 @@ Before considering a box done:
 |---|---|---|
 | Git ref update and state CAS cannot commit atomically; crash between them corrupts run | High — orphaned commit or lost turn | Prepared-transaction journal written before ref move; startup reconciliation replays or rolls back the incomplete transaction; review evidence is the committed tree, never the live worktree (D006, subject 01/04) |
 | BYO attach cannot detect out-of-worktree writes; false sense of enforcement | Med — user trusts a boundary that doesn't exist | Label BYO capability `protocol-only`; individually-labeled managed capabilities; docs state the threat model plainly (D005/D007, subject 05/07) |
-| Retiring headless `run` deletes working (if wrong-shaped) code | Med — regression / lost salvage | 00 reuse audit decides survivors before deletion; git retains history; deletions land as their own reviewable checkpoints |
+| Coordinator state placed on a network/sync filesystem (OneDrive/SMB/NFS) | High — advisory locks + atomic rename silently don't hold → corruption | Preflight/`doctor` detects and rejects or labels non-local state locations; local-filesystem-only is a documented constraint (D015) |
+| Go OS-primitive layer assumed uniform across Windows/POSIX | High — Windows process-tree kill / lock death-semantics differ from Linux | Build-tagged per-OS packages + real Windows + Linux integration tests; Windows kill uses create-suspended→assign-job→resume, not best-effort (D015) |
+| Rederiving subtle logic (git tree identity, cancellation, redaction, usage) reintroduces solved bugs | Med — known failure modes rediscovered | Harvest the refactor branch's tests/fixtures/counterexamples as Go test vectors first, implement against them (D014, subject 00.2) |
+| Distribution/trust for a shipped binary (Windows SmartScreen/signing, checksums, provenance/SBOM) unaddressed | Med — users can't safely install | Release subject (07) owns signing/checksums/SBOM + the cross-build target matrix |
 | Two humans submit/resolve concurrently against stale generations | Med — wrong turn/gate answered | Unique immutable `turn_id`/`gate_id` + `state_revision`, accept-once under lock; stale/conflicting rejected with current status (D004, subject 01/03) |
 | Managed launch promises telemetry it can't deliver | Med — dishonest caps | Research metering channel in 00; label `sandboxed` vs `telemetry-observed` separately; never a blanket "enforced" (D007, subject 07) |
 | Interactive agent commits or edits after snapshot | Med — review sees wrong tree | Skill instructs agents never to `git commit`; post-snapshot edits are uncommitted protocol violations that block the next lead submit and are surfaced, never absorbed (subject 04/06) |
 | Pre-pivot in-flight headless run reinterpreted under attach semantics | High — silent state corruption of an existing run | State major-version bump; `resume` fails closed with remediation; inspect/export only; converter is opt-in and proven (D011, subject 00.8/01.7) |
 | Coordinator commit leaves the checked-out index describing old HEAD → worktree always looks dirty → the next-submit block trips forever | High — MVP deadlocks after the first commit | 04.2 synchronizes the real index to the new tree (safe mixed reset, no file overwrite) and re-verifies clean; the index step is in the journal crash-cut matrix (subject 04) |
-| Reviewer evidence sourced from the live worktree instead of the committed object | High — pair reviews mutable, wrong, or racing content | `evidence.py` materializes files from the committed Git object + hashes the packet; never copies from live `cfg.repo`; skills point the pair at the packet, never the lead worktree (subject 04/06) |
+| Reviewer evidence sourced from the live worktree instead of the committed object | High — pair reviews mutable, wrong, or racing content | The evidence builder materializes files from the committed Git object (`git cat-file`/`archive` off the commit) + hashes the packet; never reads the live worktree; skills point the pair at the packet, never the lead worktree (subject 04/06) |
 | Two simultaneous first-attaches race before the run dir exists | Med — split-brain run allocation | Repository-level nonce-based allocation/current-pointer lock+CAS, not only a run-dir lock; release only the acquired lock instance (subject 01.4) |
 | A crashed short-lived CLI leaves a lock that no PID-only check can safely reclaim → repo bricked | Med — no run can ever start again | 00.4 chooses + 01.4 implements a proven liveness/reclaim mechanism (OS-held advisory lock, or nonce + process-start identity), with crash/reclaim tests; "no PID-only detection" must not mean "never reclaimable" (subject 01.4) |
 
@@ -68,21 +73,28 @@ Before considering a box done:
 | Source | Contribution |
 |---|---|
 | `main` branch (base, confirmed) | Merge base / target this plan branches from and merges back into; work happens on `interactive-pairing` (D009) |
-| Current `reliability-observability-refactor` branch | Existing engine modules audited for reuse (`state.py`, `schemas.py`, `gitops.py`, `budgets.py`/`limits.py`, `phases.py`, `lifecycle.py`, `security.py`, `evidence.py`) |
-| `README.md` | Documents the intended pair-programming loop, convergence semantics, artifact/mailbox formats — the vision the code must now actually realize |
-| `docs/architecture.md`, `docs/decisions.md` | Prior architecture + durable rationale to update, not fork |
+| `reliability-observability-refactor` branch (git history) | **Evidence harvest only** (D014): its 17 test files, fixtures, golden outputs, JSON schemas, and crash-cut scenarios become Go test vectors. The Python modules are NOT ported — reference-only |
+| Python code (main v2 + refactor), git history | Reference-only spec: reveals the problems solved (tree identity incl. untracked bytes, usage-at-boundary, cancellation via process-group, redaction boundaries, resume-vs-restart) — the *requirements*, not the implementation |
+| `README.md` | Documents the intended pair-programming loop, convergence semantics, artifact/mailbox formats — the vision the Go code must realize |
+| `docs/architecture.md`, `docs/decisions.md` | Prior architecture + durable rationale to update (promote D001–D015), not fork |
 | `.mailbox/` proof-of-concept (this session) | Working reference implementation of the attach transport (`to-codex.md`/`to-claude.md`, TURN sequencing, blocking-poll loop) |
-| `tasks/claudex-refactor/lessons.md` + `tasks/lessons.md` | Prior-run lessons (streaming safety, usage-at-boundary, lifecycle vs phase, evidence manifests, resume-vs-restart, cancellation, tree identity) — reuse where they still apply |
-| CC↔CX design exchange (mailbox TURN 3–4) | The converged architecture — source of the §4 decision seeds |
+| `tasks/claudex-refactor/lessons.md` + `tasks/lessons.md` | Prior-run lessons (streaming safety, usage-at-boundary, lifecycle vs phase, evidence manifests, resume-vs-restart, cancellation, tree identity) — reuse as requirements |
+| CC↔CX design exchange (mailbox TURN 3–8) | The converged architecture + Go/greenfield decision — source of the §4 decisions |
+| RFC 8785 (JSON Canonicalization) | Canonical-JSON standard for whitespace-independent digests/idempotency (D014); or a deliberately restricted equivalent |
+| `git update-ref <ref> <newvalue> <oldvalue>` | Native old-OID compare-and-swap for the run-branch move (D006) — https://git-scm.com/docs/git-update-ref |
+| `golang.org/x/sys/windows` | Windows OS primitives: `LockFileEx`, job objects, `CreateProcess`, ConPTY (D015) — https://pkg.go.dev/golang.org/x/sys/windows |
 
 ### Verification commands
 
 | Purpose | Command | Notes |
 |---|---|---|
-| Build / install | `python -m pip install -e .` | Confirm in 00.3 |
-| Compile-check | `python -m compileall claudex` | Fast structural check |
-| Test | `python -m unittest discover -s tests` | Existing suite is stdlib `unittest`; confirm exact invocation in 00.3 |
-| Lint/format | TBD | `n/a` unless 00.3 finds ruff/black config |
+| Build | `go build ./...` | Cross-build matrix (`GOOS=windows/linux/darwin`) confirmed in subject 00 / 07 |
+| Test | `go test ./...` | Table-driven + harvested test vectors (D014); confirm module path in 00 |
+| Vet | `go vet ./...` | Static checks |
+| Race | `go test -race ./...` | CI-only where a C toolchain exists (race detector on Windows needs one) — not a universal local gate (D015) |
+| Fuzz | `go test -run=^$ -fuzz=... -fuzztime=...` | Seed corpus from harvested counterexamples for canonical-JSON/parsing |
+| Lint/format | `gofmt -l .` (+ optional `golangci-lint`) | `gofmt` clean is mandatory; `golangci-lint` if adopted in 00.6 |
+| Platform integration | build-tagged OS tests on real Windows + Linux | Locks, atomic rename, process-tree kill, PTY/ConPTY — not provable in unit tests (D015) |
 | Plan-specific gate | Two-session attach e2e (subject 06) | Scenario-driven fake TUIs drive `pull/submit/wait`; asserts state advance + evidence |
 
 ---
@@ -91,14 +103,14 @@ Before considering a box done:
 
 | # | File | Subject | Depends on |
 |---|---|---|---|
-| 00 | `tasks/interactive-pairing/00-tooling-research-and-readiness.md` | Tooling research, reuse audit, protocol ADR, base-branch decision | — |
+| 00 | `tasks/interactive-pairing/00-tooling-research-and-readiness.md` | Evidence harvest, Go toolchain + skeleton, protocol ADR, readiness | — |
 | 01 | `tasks/interactive-pairing/01-durable-state-core.md` | Durable state, CAS transitions, git/state transaction journal, crash reconciliation | 00 |
 | 02 | `tasks/interactive-pairing/02-transport-protocol.md` | `pull`/`submit`/`wait`/`status` CLI, role-addressed mailbox, atomic artifacts, idempotent receipts | 01 |
 | 03 | `tasks/interactive-pairing/03-attach-and-phase-engine.md` | `attach`/registration, assignment issuance, phase graph, convergence | 02 |
 | 04 | `tasks/interactive-pairing/04-git-transaction-and-review-evidence.md` | Coordinator snapshot/commit, immutable review evidence, test + merge gate | 03 |
 | 05 | `tasks/interactive-pairing/05-human-gates-and-caps.md` | Human gates (`resolve`/`continue`), observable-only caps, operator lifecycle, status/recovery UX | 04 |
 | 06 | `tasks/interactive-pairing/06-agent-skills-and-byo-integration.md` | Executable Claude/Codex skill clients + BYO end-to-end, concurrency, crash/fault tests (**MVP milestone**) | 05 |
-| 07 | `tasks/interactive-pairing/07-managed-launcher-and-release.md` | Managed-interactive launcher, enforcement capability matrix, docs/release | 06 |
+| 07 | `tasks/interactive-pairing/07-managed-launcher-and-release.md` | Managed-interactive launcher, enforcement capability matrix, cross-build/signing distribution, docs/release | 06 |
 
 ---
 
@@ -117,6 +129,10 @@ Before considering a box done:
 | D009 | 2026-07-16 | Base branch | RESOLVED: fresh branch `interactive-pairing` from `main`. The prior `reliability-observability-refactor` WIP is stashed/parked (not carried forward); its committed engine modules are audited for reuse from git history in subject 00 | Human chose a clean base over continuing the throwaway-driver branch; reuse is by deliberate audit, not by inheriting uncommitted WIP | 00.1/00.3 + `manual-actions.md` |
 | D010 | 2026-07-16 | Verifier context independence | VERIFY **blocks until a new same-role session generation attaches** (single locked behavior — no silent proceed-with-downgrade). The incumbent pair generation is invalid for VERIFY. BYO reports `fresh-session-declared` (session generation enforced; model-context freshness is not); managed reports `fresh-process` only when it truly launches one. Allowing a downgrade requires a later explicit decision/gate | A long-lived attached pair terminal is not context-fresh; the README's fresh-verifier promise cannot silently carry over to attach, and a nondeterministic "refuse-or-label" outcome is not a spec | subject 03.8, 06 skills, 07 labels |
 | D011 | 2026-07-16 | Legacy in-flight run compatibility | Pre-pivot active `state.json`/`current` runs are NOT silently migrated into attach semantics. Bump the state major version; behavior is: inspect/export allowed, `resume` fails closed with remediation, unless a proven converter is written | 01.7-style field migration could otherwise reinterpret an in-flight headless run as an attach run and corrupt it | 00.8, 01.7, §1 risks |
+| D012 | 2026-07-16 | Reuse posture — SUPERSEDED by D014 | Original: cherry-pick Python modules by evidence from `main` + refactor history. Superseded once the language changed to Go (D013): there are no Python modules to port into a Go binary. Retained for history | Superseded same day by D013/D014 | see D013, D014 |
+| D013 | 2026-07-16 | Language: Go | Implement claudex in Go, not Python. The existing Python implementation (main v2 + refactor branch) is discarded — reference-only in git history. Targets: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin/arm64`+`amd64` from one codebase | Human wants a distributable multi-machine tool (incl. Linux), is not a Python maintainer (the app was AI-generated), and the tool's shape — a processless coordinator around files/git/child-processes — fits Go's single-binary distribution, typed contracts, concurrency, and native-git shell-out. Rust rejected as over-ceremony for an I/O-bound state machine + Windows MSVC-linker friction. Startup latency was NOT a deciding factor (once-per-turn commands) | all subjects; §2; §6 |
+| D014 | 2026-07-16 | Greenfield core + evidence harvesting | Rederive every implementation fresh in Go. Do NOT transplant old code. Reuse the *language-neutral assets* from the refactor-branch history as **executable requirements**: JSON schemas, adversarial fixtures, golden outputs, and the 17 test files / crash-cut scenarios — turned into Go test vectors. Subtle areas (git tree identity, process cancellation, redaction, usage normalization) are pinned by the OLD TESTS + counterexamples, not the old code | Human's concern: porting broken code loops into fixing it instead of building right. The tests/schemas encode the hard-won failure modes without the broken implementation; harvesting them prevents rediscovery of known bugs while keeping the rebuild clean | 00.2 (harvest), all subject IAs |
+| D015 | 2026-07-16 | Platform + filesystem support | Support `windows/amd64` + `linux/amd64` first-class (macOS/arm64 best-effort). OS primitives (advisory locks that die with the process, atomic rename, process-tree kill, PTY/ConPTY) live behind tiny build-tagged packages, integration-tested on real Windows + POSIX — Go does not unify them. Coordinator state is supported only on **local filesystems**; OneDrive/SMB/NFS/sync-root locations are rejected or labeled unsupported (advisory-lock + atomic-rename guarantees don't hold there), checked at preflight/`doctor` | Codex flagged that Go gives OS access, not OS-uniformity; and that lock/rename semantics silently break on network/sync filesystems | 00 (skeleton), 01 (locks), 04 (process kill), 07 (launch/PTY); §1 risks |
 
 ---
 
@@ -158,7 +174,12 @@ Before considering a box done:
 19. **Immutable evidence, never the live worktree.** Reviews, diffs, and convergence checks read committed/immutable artifacts identified by hash. The mutable worktree is never a review input; post-snapshot edits are surfaced as protocol violations, never silently absorbed.
 20. **Honesty labels — never label a capability enforced without a mechanism.** BYO attach is `protocol-only`; managed capabilities are labeled individually (`sandboxed`, `telemetry-observed`, …). Agent self-report is never enforcement. Every cap/label in `status` names the mechanism that backs it.
 21. **Two-store operations are journaled + reconciled.** Any operation spanning git and coordinator state writes a prepared-transaction record first and is replayed or rolled back on startup; the code never assumes the two stores committed atomically.
-22. *(plan-specific principles above are 18–21; keep numbering stable)*
+22. **Greenfield, not ported (D014).** No line of the old Python is transplanted. Reuse enters only as harvested *test vectors / schemas / fixtures*; every implementation is rederived in Go against those vectors. A subtle behaviour is pinned by a harvested counterexample test before it is coded.
+23. **OS primitives are build-tagged and integration-tested (D015).** Locks, atomic rename, process-tree kill, and PTY/ConPTY live in tiny per-OS packages (`_windows.go` / `_unix.go`) behind one interface; each is proven on real Windows + Linux, never assumed uniform. Windows process-tree kill uses create-suspended → assign-job → resume, not best-effort.
+24. **Shell out to native git, never a library (D013).** Git operations use `exec.CommandContext` with argv (never a shell string), parse only machine formats (`-z`, object IDs), preflight a minimum git version, and use plumbing (`read-tree` + temp `GIT_INDEX_FILE`, `write-tree`, `commit-tree`, `update-ref <new> <old>` for CAS). No go-git.
+25. **Canonical bytes for identity (D014).** Any digest/idempotency/receipt is computed over canonical JSON (RFC 8785 or a restricted equivalent) — never a serializer's incidental map ordering or whitespace. The same versioned schema bytes are embedded in the binary and used for both provider instruction and coordinator validation.
+26. **Local filesystem only (D015).** Coordinator state requires a local filesystem; network/sync roots (OneDrive/SMB/NFS) are detected and rejected/labelled at preflight — never silently trusted.
+27. *(plan-specific principles above are 18–26; keep numbering stable)*
 
 ---
 
@@ -166,8 +187,9 @@ Before considering a box done:
 
 - [ ] All §5 subjects done (or explicitly `ABANDONED` with a §4 row)
 - [ ] Subject 00 completed, or explicitly waived/abandoned with a §4 row
-- [ ] Build/install + compile-check commands from §2 pass
-- [ ] Test command from §2 passes; the two-session attach e2e (subject 06) passes
+- [ ] `go build ./...`, `go vet ./...`, and `gofmt -l .` (clean) from §2 pass on the target matrix
+- [ ] `go test ./...` passes; `go test -race ./...` passes in capable CI; the two-session attach e2e (subject 06) passes
+- [ ] Platform integration tests (locks, atomic rename, process-tree kill, PTY/ConPTY) pass on real Windows + Linux (D015)
 - [ ] Behaviour verification done for every runtime-behaviour box — the changed flow driven end-to-end with observed-vs-expected output recorded (canonical: two attached sessions complete a real turn)
 - [ ] Remaining §2 rows (lint/format, plan-specific gates) pass or recorded `n/a`
 - [ ] §1 Risks-and-rollback table reviewed; rollback steps still accurate for what shipped
@@ -176,14 +198,15 @@ Before considering a box done:
 - [ ] New public surface wired to a non-test caller, or disclosed library-only/unwired
 - [ ] Every non-abandoned subject has a Captain Hindsight verdict `CLOSE`
 - [ ] Every ticked box has a Progress-log entry + pushed checkpoint commit (or no-remote note)
-- [ ] Durable architecture decisions (D001–D009 + protocol ADR) promoted to `docs/decisions.md`/ADR
+- [ ] Durable architecture decisions (D001–D015 + protocol ADR) promoted to `docs/decisions.md`/ADR
 - [ ] Documentation-impact review done — README + architecture/decision docs + skill docs match shipped behaviour, or `n/a` + reason
 - [ ] Current branch pushed (or no-remote note); `git status --short` clean except deferred/ignored
 - [ ] Shipped code/tests/comments/identifiers plan-agnostic — grep excluding `tasks/` for box IDs (`\b\d\d\.\d+\b`), decision IDs (`\bD\d{3}\b`), `tasks/interactive-pairing/`, `InteractivePairing-Plan.md`, `\bslices?\b`; zero hits after triage
 - [ ] Commit messages plan-agnostic — `git log <base>..HEAD`
 - [ ] Branch names / PR titles plan-agnostic if used
 - [ ] `manual-actions.md` — every human-owned box resolved or explicitly deferred
-- [ ] Retirement of the old headless driver (`run`, `processes.py` Popen path, `agents.py`) is complete or explicitly deferred with a §4 row; no dead half-removed engine left
+- [ ] No Python remains in the shipped tree (the old implementation is git-history reference only, D014); the repo builds as a pure Go module
+- [ ] Distribution addressed (07): cross-build matrix (windows/amd64, linux/amd64, linux/arm64, darwin) + checksums + signing/SmartScreen decision recorded; local-filesystem-only preflight shipped (D015)
 - [ ] Managed-launch capabilities are individually labeled in `status`; no blanket "enforced" bit shipped
 - [ ] `cleanup-audit` teardown review run before sign-off, or waived by a §4 row; findings triaged (fix-now / new plan / won't-fix)
 - [ ] `tasks/interactive-pairing/lessons.md` reconciled; lasting lessons migrated to `tasks/lessons.md`

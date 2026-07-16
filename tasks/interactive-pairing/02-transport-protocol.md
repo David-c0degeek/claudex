@@ -8,6 +8,7 @@ the next assignment, holding no lock), and `status`. Atomic artifact writes,
 idempotent receipts, and a protocol/schema version on every message.
 
 ## Integration analysis
+> **Superseded by D013/D014 (Go greenfield):** the Python module names below are *reference-only requirements*, not reuse targets — implement fresh in Go (`internal/transport`, `cmd/claudex`, `internal/schema`). "Reuse" means the harvested test vectors/schemas from 00.2, not ported code. Canonical JSON (RFC 8785) backs digests (§6.25). Re-fill in Go terms before ticking any box.
 > Fill/confirm against 00.2 before ticking any box.
 - **Existing code found** — `README.md` mailbox block format (`===== [ROLE] turn N | phase | STATUS =====`); `.mailbox/` PoC from this session (TURN sequencing + blocking-poll loop); `claudex/schemas.py` (artifact schemas + convergence helpers); `claudex/cli.py` (argparse subcommands, `cmd_*` pattern); `claudex/artifacts.py:save_json`/`mailbox_append` (**non-atomic** — must be made atomic here, not reused as-is); `claudex/security.py` (redaction).
 - **Behaviour to preserve** — human-readable mailbox ledger; typed JSON artifacts backing every claim; redaction at persistence/display boundaries (`security.py`).
