@@ -18,6 +18,7 @@ type schemaNode struct {
 	types           []string // allowed JSON types; empty = any
 	properties      map[string]*schemaNode
 	required        []string
+	hasRequired     bool
 	additionalProps bool // meaningful only when properties is set
 	hasProperties   bool
 	hasAdditional   bool
@@ -112,6 +113,13 @@ func compileNode(m map[string]json.RawMessage) (*schemaNode, error) {
 //   - bounds must be coherent (min <= max), enum must be non-empty, and the type
 //     list must not repeat an alternative.
 func (n *schemaNode) enforceProfile() error {
+	hasType := len(n.types) > 0
+	// A node must constrain its value: it declares a type, a const, or a
+	// non-empty enum. An otherwise-empty node accepts any JSON, silently turning
+	// off structural validation, so it is rejected.
+	if !hasType && !n.hasConst && !(n.hasEnum && len(n.enum) > 0) {
+		return fmt.Errorf("schema: a node must declare a type, a const, or a non-empty enum")
+	}
 	seen := make(map[string]bool, len(n.types))
 	for _, t := range n.types {
 		if seen[t] {
@@ -146,12 +154,36 @@ func (n *schemaNode) enforceProfile() error {
 		if !n.hasAdditional || n.additionalProps {
 			return fmt.Errorf("schema: an object must set additionalProperties:false")
 		}
+		if !n.hasRequired {
+			return fmt.Errorf("schema: an object must declare required (empty is allowed)")
+		}
 		if err := n.checkRequiredExact(); err != nil {
 			return err
 		}
 	}
 	if isArray && n.items == nil {
 		return fmt.Errorf("schema: an array must declare items")
+	}
+
+	// const/enum must be satisfiable against the declared type.
+	if hasType && n.hasConst && !containsString(n.types, jsonType(n.constVal)) {
+		return fmt.Errorf("schema: const value is not among the declared types")
+	}
+	if hasType && n.hasEnum {
+		for _, e := range n.enum {
+			if !containsString(n.types, jsonType(e)) {
+				return fmt.Errorf("schema: an enum value is not among the declared types")
+			}
+		}
+	}
+	if n.hasEnum {
+		for i := range n.enum {
+			for j := i + 1; j < len(n.enum); j++ {
+				if valueEquals(n.enum[i], n.enum[j]) {
+					return fmt.Errorf("schema: duplicate enum value")
+				}
+			}
+		}
 	}
 
 	// Coherent bounds and non-empty enum.
@@ -196,6 +228,7 @@ func (n *schemaNode) applyKeyword(k string, raw json.RawMessage) error {
 	case "properties":
 		return n.compileProperties(raw)
 	case "required":
+		n.hasRequired = true
 		return decodeInto(raw, &n.required, "required")
 	case "additionalProperties":
 		var b bool

@@ -213,6 +213,25 @@ func TestRegistryIdentityBinding(t *testing.T) {
 	if err := checkIdentity(node2, "receipt", 1); err == nil {
 		t.Fatalf("a mismatched protocol_version const must fail identity binding")
 	}
+	// A union root type (object|null) must not satisfy identity: negotiate only
+	// accepts an object, so provider schema and coordinator gate must agree.
+	union := []byte(`{"type":["object","null"],"additionalProperties":false,"required":["protocol_version","message_type"],"properties":{"protocol_version":{"type":"integer","const":1},"message_type":{"type":"string","const":"receipt"}}}`)
+	node3, err := compile(union)
+	if err != nil {
+		t.Fatalf("compile union: %v", err)
+	}
+	if err := checkIdentity(node3, "receipt", 1); err == nil {
+		t.Fatalf("a union root type must fail identity binding")
+	}
+	// A union type on an identity property must also fail.
+	unionProp := []byte(`{"type":"object","additionalProperties":false,"required":["protocol_version","message_type"],"properties":{"protocol_version":{"type":"integer","const":1},"message_type":{"type":["string","null"],"const":"receipt"}}}`)
+	node4, err := compile(unionProp)
+	if err != nil {
+		t.Fatalf("compile unionProp: %v", err)
+	}
+	if err := checkIdentity(node4, "receipt", 1); err == nil {
+		t.Fatalf("a union type on message_type must fail identity binding")
+	}
 }
 
 func keys(m map[schemaKey]*entry) []schemaKey {

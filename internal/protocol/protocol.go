@@ -108,18 +108,24 @@ func loadAll() (map[schemaKey]*entry, error) {
 // filename major. A mislabeled or inert schema fails startup, never registers
 // silently.
 func checkIdentity(n *schemaNode, typ string, major int) error {
-	if !containsString(n.types, "object") {
-		return fmt.Errorf("schema root must be an object")
+	if !typesExactly(n, "object") {
+		return fmt.Errorf("schema root must be exactly an object")
 	}
 	mt := n.properties["message_type"]
-	if mt == nil || !mt.hasConst || !containsString(mt.types, "string") || !valueEquals(mt.constVal, typ) {
+	if mt == nil || !mt.hasConst || !typesExactly(mt, "string") || !valueEquals(mt.constVal, typ) {
 		return fmt.Errorf("message_type must be a string const equal to %q", typ)
 	}
 	pv := n.properties["protocol_version"]
-	if pv == nil || !pv.hasConst || !containsString(pv.types, "integer") || !valueEquals(pv.constVal, major) {
+	if pv == nil || !pv.hasConst || !typesExactly(pv, "integer") || !valueEquals(pv.constVal, major) {
 		return fmt.Errorf("protocol_version must be an integer const equal to %d", major)
 	}
 	return nil
+}
+
+// typesExactly reports whether the node declares exactly the one type t (not a
+// union that merely contains it).
+func typesExactly(n *schemaNode, t string) bool {
+	return len(n.types) == 1 && n.types[0] == t
 }
 
 func parseSchemaName(name string) (typ string, major int, ok bool) {

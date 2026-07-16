@@ -46,6 +46,52 @@ func TestStrictObjectProfile(t *testing.T) {
 	}
 }
 
+func TestRejectsUnconstrainedNodes(t *testing.T) {
+	bad := map[string]string{
+		"empty root":            `{}`,
+		"array of empty items":  `{"type":"array","items":{}}`,
+		"empty property schema": `{"type":"object","additionalProperties":false,"required":["payload"],"properties":{"payload":{}}}`,
+	}
+	for name, body := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := compile([]byte(body)); err == nil {
+				t.Fatalf("%s should fail compilation", name)
+			}
+		})
+	}
+	// A typeless const or non-empty enum is still allowed.
+	for _, ok := range []string{`{"const":1}`, `{"enum":["a","b"]}`} {
+		if _, err := compile([]byte(ok)); err != nil {
+			t.Fatalf("%s should compile: %v", ok, err)
+		}
+	}
+}
+
+func TestObjectMustDeclareRequired(t *testing.T) {
+	if _, err := compile([]byte(`{"type":"object","additionalProperties":false,"properties":{}}`)); err == nil {
+		t.Fatalf("an object without a required keyword should fail")
+	}
+	// An explicitly empty strict object compiles.
+	if _, err := compile([]byte(`{"type":"object","additionalProperties":false,"required":[],"properties":{}}`)); err != nil {
+		t.Fatalf("an empty strict object should compile: %v", err)
+	}
+}
+
+func TestConstEnumTypeConsistency(t *testing.T) {
+	bad := map[string]string{
+		"const type mismatch": `{"type":"string","const":1}`,
+		"enum type mismatch":  `{"type":"string","enum":["a",1]}`,
+		"duplicate enum":      `{"enum":["a","a"]}`,
+	}
+	for name, body := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := compile([]byte(body)); err == nil {
+				t.Fatalf("%s should fail compilation", name)
+			}
+		})
+	}
+}
+
 func TestCompileRejectsNumberType(t *testing.T) {
 	if _, err := compile([]byte(`{"type":"number"}`)); err == nil {
 		t.Fatalf("type number should be rejected (integer-only domain)")
