@@ -28,10 +28,12 @@ import (
 // v2 added the authoritative accepted Phase to each accepted turn (v1 recorded
 // only the artifact digest and receipt). v3 added the frozen workspace identity
 // (worktree relative locator + run branch) so pull/git work never has to mine a
-// completed bootstrap journal for it. An older generation is missing a required
-// field, so it fails with version remediation, not a vague error (see
-// checkSchemaVersion).
-const RunStateVersion = 3
+// completed bootstrap journal for it. v4 added the write-once FirstTurn issuance
+// record — append-only assignment history that durably proves which first turn
+// was issued at INIT->PLAN_DRAFT even after the mutable Assignment has moved on.
+// An older generation is missing a required field, so it fails with version
+// remediation, not a vague error (see checkSchemaVersion).
+const RunStateVersion = 4
 
 // ErrRevisionConflict is returned when a mutation's expected revision does not
 // match the current head.
@@ -147,6 +149,7 @@ type RunState struct {
 	RunBranch       string                  `json:"run_branch"`
 	Counters        Counters                `json:"counters"`
 	Assignment      *Ref                    `json:"assignment,omitempty"`
+	FirstTurn       *Ref                    `json:"first_turn,omitempty"`
 	Gate            *Ref                    `json:"gate,omitempty"`
 	AcceptedTurns   map[string]AcceptedTurn `json:"accepted_turns"`
 	PendingTxnID    string                  `json:"pending_txn_id"`
@@ -284,6 +287,10 @@ func cloneForNext(prev *RunState) *RunState {
 	if prev.Assignment != nil {
 		a := *prev.Assignment
 		n.Assignment = &a
+	}
+	if prev.FirstTurn != nil {
+		f := *prev.FirstTurn
+		n.FirstTurn = &f
 	}
 	if prev.Gate != nil {
 		g := *prev.Gate

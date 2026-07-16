@@ -166,13 +166,13 @@ func pairMatches(slot *state.RoleSlot, in PairAttachIntent, regRevision uint64) 
 		slot.Sessions[0].IssuedRegistryRevision == regRevision
 }
 
-// planDraftStep advances INIT -> PLAN_DRAFT, issuing the lead's first turn.
-// NotApplied is the EXACT frozen INIT baseline (by digest); Applied is DURABLY
-// MONOTONIC (see planDraftApplied): the run's write-once started/deadline equal
-// the frozen values and every other field normalizes back to the frozen INIT
-// baseline. Because started_unix is write-once (no transition can clear it), the
-// observation survives ANY downstream RunState transition — Submit, cancel, or
-// operator action — so none of them need to know about this attach journal.
+// planDraftStep advances INIT -> PLAN_DRAFT, issuing the lead's first turn as both
+// the mutable Assignment and the write-once FirstTurn record. NotApplied is the
+// EXACT frozen INIT baseline (by digest); Applied is DURABLY MONOTONIC (see
+// planDraftApplied): the write-once FirstTurn proves THIS turn was issued and the
+// normalized baseline proves the immutable remainder is intact, so the observation
+// survives ANY downstream RunState transition — Submit, cancel, or operator action
+// — and none of them need to know about this attach journal.
 func planDraftStep(store *state.Store, g *genstore.Guard, in PairAttachIntent) txn.Step {
 	return txn.Step{
 		Name: "state-plan-draft",
@@ -204,6 +204,7 @@ func planDraftStep(store *state.Store, g *genstore.Guard, in PairAttachIntent) t
 			_, err := store.MutateLocked(g, in.ExpectedStateRevision, func(gen uint64, next *state.RunState) error {
 				next.Phase = state.PhasePlanDraft
 				next.Assignment = &state.Ref{ID: in.FirstTurnID, IssuedRevision: gen}
+				next.FirstTurn = &state.Ref{ID: in.FirstTurnID, IssuedRevision: gen} // write-once issuance proof
 				next.StartedUnix = in.StartedUnix
 				next.DeadlineUnix = in.DeadlineUnix
 				return nil
@@ -222,15 +223,19 @@ func isBaseline(rs state.RunState, in PairAttachIntent) (bool, error) {
 	return d == in.BaseStateDigest, nil
 }
 
-// planDraftApplied is the DURABLE, monotonic applied proof. started_unix and
-// deadline_unix are write-once in state (a transition can neither change nor clear
-// a set value), and are set only by this plan-draft, so requiring them to equal
-// the frozen values proves the transition happened. Normalizing every known
-// mutable field back to pristine INIT and requiring the baseline digest proves the
-// immutable/bootstrap baseline is intact — so no forged journal can select an
-// unrelated later state, and the proof holds through Submit acceptance,
-// cancellation, and operator mutations alike.
+// planDraftApplied is the DURABLE, monotonic applied proof. RunState.FirstTurn is
+// a write-once record of which turn this plan-draft issued: it is set only by the
+// exact INIT->PLAN_DRAFT transition (with Assignment and the clock, enforced by
+// state), and can never change or be cleared — so it proves THIS FirstTurnID was
+// issued even after cancel/Submit/operator actions have moved the mutable
+// Assignment on. Combined with the frozen clock and the normalized baseline digest
+// (which proves the immutable remainder is intact), the observation is monotonic
+// through every downstream RunState transition.
 func planDraftApplied(rs state.RunState, in PairAttachIntent) (bool, error) {
+	if rs.FirstTurn == nil || rs.FirstTurn.ID != in.FirstTurnID ||
+		rs.FirstTurn.IssuedRevision == 0 || rs.FirstTurn.IssuedRevision > rs.Revision {
+		return false, nil
+	}
 	if rs.StartedUnix != in.StartedUnix || rs.DeadlineUnix != in.DeadlineUnix {
 		return false, nil
 	}
@@ -249,6 +254,7 @@ func normalizeToBaseline(rs state.RunState, in PairAttachIntent) state.RunState 
 	rs.Lifecycle = state.LifecycleRunning
 	rs.Phase = state.PhaseInit
 	rs.Assignment = nil
+	rs.FirstTurn = nil
 	rs.Gate = nil
 	rs.Recovery = nil
 	rs.Failure = nil

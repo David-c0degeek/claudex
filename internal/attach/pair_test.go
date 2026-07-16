@@ -367,12 +367,50 @@ func TestJoinAttachRecoversAfterCancel(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 
-	// Recovery still completes via the write-once started_unix proof.
-	if _, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b"))); err != nil {
+	// Recovery still completes via the write-once FirstTurn proof.
+	res, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b")))
+	if err != nil {
 		t.Fatalf("recovery after cancel: %v", err)
 	}
 	if rec, _, _ := txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest(); !rec.Complete {
 		t.Fatalf("attach journal not completed after cancel+recovery")
+	}
+	// The mutable assignment is gone, but the write-once FirstTurn still records it.
+	rs2, _, _ := st.Load()
+	if rs2.Assignment != nil {
+		t.Fatalf("assignment should be cleared by the cancel")
+	}
+	if rs2.FirstTurn == nil || rs2.FirstTurn.ID != res.FirstTurnID {
+		t.Fatalf("first_turn lost after cancel: %+v want %s", rs2.FirstTurn, res.FirstTurnID)
+	}
+}
+
+// A pair intent with correct timestamps/baseline but a DIFFERENT FirstTurnID than
+// the one actually issued is not Applied — the write-once FirstTurn proves which
+// turn was issued, so a forged id can't be claimed.
+func TestPlanDraftAppliedRejectsForgedFirstTurn(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	res, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	rec, _, _ := txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest()
+	var pin PairAttachIntent
+	if err := json.Unmarshal(rec.Intent.Payload, &pin); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	rs, _, _ := state.Open(filepath.Join(runDir, "state"), runLock(runDir)).Load()
+
+	if ok, _ := planDraftApplied(rs, pin); !ok {
+		t.Fatalf("the real intent should be applied")
+	}
+	forged := pin
+	forged.FirstTurnID = "turn-forged"
+	if ok, _ := planDraftApplied(rs, forged); ok {
+		t.Fatalf("a forged FirstTurnID (%s vs issued %s) was accepted as applied", forged.FirstTurnID, res.FirstTurnID)
 	}
 }
 

@@ -114,6 +114,12 @@ func validate(rs *RunState) error {
 	if err := validateRef("assignment", rs.Assignment, rs.Revision); err != nil {
 		return err
 	}
+	if err := validateRef("first_turn", rs.FirstTurn, rs.Revision); err != nil {
+		return err
+	}
+	if rs.Phase == PhaseInit && rs.FirstTurn != nil {
+		return fmt.Errorf("INIT state must not have a first_turn")
+	}
 	if err := validateRef("gate", rs.Gate, rs.Revision); err != nil {
 		return err
 	}
@@ -244,6 +250,28 @@ func validateTransition(old, next *RunState) error {
 			if v.Phase != old.Phase {
 				return fmt.Errorf("newly accepted turn %q phase %q must equal the pre-transition phase %q", k, v.Phase, old.Phase)
 			}
+		}
+	}
+	// FirstTurn is write-once append-only issuance history: it proves which first
+	// turn was issued at INIT->PLAN_DRAFT and survives every later transition
+	// (cancel/operator/terminal), so an external effect can be recognized after the
+	// mutable Assignment moves on.
+	if old.FirstTurn != nil {
+		if next.FirstTurn == nil || *next.FirstTurn != *old.FirstTurn {
+			return fmt.Errorf("first_turn is immutable once issued")
+		}
+	} else if next.FirstTurn != nil {
+		if old.Phase != PhaseInit || next.Phase != PhasePlanDraft {
+			return fmt.Errorf("first_turn may only be issued on an INIT->PLAN_DRAFT transition")
+		}
+		if next.Assignment == nil || next.Assignment.ID != next.FirstTurn.ID {
+			return fmt.Errorf("first_turn must equal the issued assignment")
+		}
+		if next.FirstTurn.IssuedRevision != next.Revision {
+			return fmt.Errorf("first_turn must be issued at the resulting revision")
+		}
+		if next.StartedUnix == 0 || next.DeadlineUnix == 0 {
+			return fmt.Errorf("first_turn issuance must set the run clock")
 		}
 	}
 	// A newly-set or replaced ref must bind to the resulting revision.
@@ -404,6 +432,9 @@ func redactAndGuard(rs *RunState) error {
 	}
 	if rs.Assignment != nil {
 		control["assignment.id"] = rs.Assignment.ID
+	}
+	if rs.FirstTurn != nil {
+		control["first_turn.id"] = rs.FirstTurn.ID
 	}
 	if rs.Gate != nil {
 		control["gate.id"] = rs.Gate.ID

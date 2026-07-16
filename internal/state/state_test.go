@@ -450,3 +450,70 @@ func TestMutateLockedComposes(t *testing.T) {
 		t.Fatalf("revision = %d, want 2", r2.Revision)
 	}
 }
+
+// FirstTurn is write-once issuance history: it may only appear on the exact
+// INIT->PLAN_DRAFT transition equal to the issued assignment, and is immutable.
+func TestFirstTurnIssuance(t *testing.T) {
+	s := newStore(t)
+	r1 := mustInit(t, s)
+	r2, err := s.Mutate(r1.Revision, func(gen uint64, next *RunState) error {
+		next.Phase = PhasePlanDraft
+		next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.StartedUnix = 2000
+		next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("valid first-turn issuance: %v", err)
+	}
+	if r2.FirstTurn == nil || r2.FirstTurn.ID != "turn-1" {
+		t.Fatalf("first_turn not recorded: %+v", r2.FirstTurn)
+	}
+	// Immutable: cannot change or clear it.
+	if _, err := s.Mutate(r2.Revision, func(_ uint64, next *RunState) error {
+		next.FirstTurn = &Ref{ID: "turn-2", IssuedRevision: 2}
+		return nil
+	}); err == nil {
+		t.Fatalf("changing first_turn should be rejected")
+	}
+	if _, err := s.Mutate(r2.Revision, func(_ uint64, next *RunState) error { next.FirstTurn = nil; return nil }); err == nil {
+		t.Fatalf("clearing first_turn should be rejected")
+	}
+}
+
+func TestFirstTurnIssuanceRejections(t *testing.T) {
+	cases := map[string]func(gen uint64, next *RunState){
+		"wrong phase": func(gen uint64, next *RunState) {
+			next.Phase = PhaseImplementStep
+			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.StartedUnix = 2000
+			next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
+		},
+		"first_turn != assignment": func(gen uint64, next *RunState) {
+			next.Phase = PhasePlanDraft
+			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.FirstTurn = &Ref{ID: "turn-other", IssuedRevision: gen}
+			next.StartedUnix = 2000
+			next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
+		},
+		"first_turn without clock": func(gen uint64, next *RunState) {
+			next.Phase = PhasePlanDraft
+			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
+		},
+		"first_turn in INIT": func(gen uint64, next *RunState) {
+			next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
+		},
+	}
+	for name, mut := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			r1 := mustInit(t, s)
+			if _, err := s.Mutate(r1.Revision, func(gen uint64, next *RunState) error { mut(gen, next); return nil }); err == nil {
+				t.Fatalf("%s should be rejected", name)
+			}
+		})
+	}
+}
