@@ -1,0 +1,13 @@
+# Normalize line endings: LF in the repo and in every checkout, so gofmt and
+# cross-platform builds stay stable regardless of core.autocrlf.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.sh   text eol=lf
+
+# Golden/fixture bytes are exact — never touch them.
+*.golden -text
