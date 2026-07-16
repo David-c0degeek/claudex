@@ -67,3 +67,24 @@ func TestCatalogRequiresRunIDAndDir(t *testing.T) {
 		t.Fatalf("empty rel dir should be rejected")
 	}
 }
+
+func TestCatalogRejectsTraversalLocators(t *testing.T) {
+	c := newCatalog(t)
+	bad := []string{"../escape", "runs/../../../etc", ".", "runs/./x", "runs//x"}
+	for _, d := range bad {
+		if _, err := c.Allocate(0, RunRef{RunID: "r", RelDir: d}); err == nil {
+			t.Fatalf("rel_dir %q should be rejected", d)
+		}
+	}
+}
+
+func TestCatalogRejectsDuplicateRelDir(t *testing.T) {
+	c := newCatalog(t)
+	cat1, err := c.Allocate(0, RunRef{RunID: "a", RelDir: "runs/shared"})
+	if err != nil {
+		t.Fatalf("allocate a: %v", err)
+	}
+	if _, err := c.Allocate(cat1.Revision, RunRef{RunID: "b", RelDir: "runs/shared"}); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("duplicate rel_dir err = %v, want ErrRunExists", err)
+	}
+}
