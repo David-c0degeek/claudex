@@ -305,10 +305,16 @@ func requireJoinableInitShape(runID string, cur state.CurrentRun, reg state.Regi
 	if !stateOK || rs.RunID != runID {
 		return fmt.Errorf("%w: run state missing", ErrJoinUnauthorized)
 	}
-	if rs.Lifecycle != state.LifecycleRunning || rs.Phase != state.PhaseInit ||
+	if rs.Revision != 1 || rs.Lifecycle != state.LifecycleRunning || rs.Phase != state.PhaseInit ||
 		rs.Assignment != nil || rs.Gate != nil || rs.Recovery != nil || rs.Failure != nil ||
 		rs.StartedUnix != 0 || rs.DeadlineUnix != 0 || rs.PendingTxnID != "" || len(rs.AcceptedTurns) != 0 {
 		return fmt.Errorf("%w: run is not a pristine INIT awaiting a pair", ErrJoinUnauthorized)
+	}
+	// First attach creates run state at revision 1 with zero budgets; any drift means
+	// a stray pre-pair mutation that must not be silently frozen as the baseline.
+	c := rs.Counters
+	if c.PlanRevisions != 0 || c.TestFixes != 0 || c.VerifyFixes != 0 || len(c.StepFixes) != 0 {
+		return fmt.Errorf("%w: run has non-zero budgets before pairing", ErrJoinUnauthorized)
 	}
 	return nil
 }
@@ -316,6 +322,11 @@ func requireJoinableInitShape(runID string, cur state.CurrentRun, reg state.Regi
 // preparePair freezes the pair-attach intent read-only under the run guard,
 // including digests of the exact lead slot and INIT run-state baseline.
 func preparePair(req JoinAttachRequest, reg state.Registry, rs state.RunState) (PairAttachIntent, error) {
+	// The clock must not precede the run's creation, or the frozen transaction would
+	// be permanently rejected by state validation after Registry already filled.
+	if req.Now < rs.CreatedUnix {
+		return PairAttachIntent{}, fmt.Errorf("attach: clock precedes the run's creation")
+	}
 	taken := func(id string) bool { return reg.Resolve(id).Status != state.RegUnknown }
 	pairSession, err := state.MintSessionID(req.RNG, taken)
 	if err != nil {

@@ -279,3 +279,145 @@ func TestPairPlanForRejectsForgedLeadDigest(t *testing.T) {
 		t.Fatalf("pairPlanFor accepted a forged lead digest")
 	}
 }
+
+// A forged BaseStateDigest is rejected before any effect; Registry stays lead-only.
+func TestPairPlanForRejectsForgedBaseDigest(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	reg, _, _ := state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load()
+	rs, _, _ := state.Open(filepath.Join(runDir, "state"), runLock(runDir)).Load()
+	leadDigest, _ := canonDigest(reg.Lead)
+
+	in := PairAttachIntent{
+		RunID: a.RunID, TxnID: "pair-forged", OperationID: opID("b"),
+		PairSessionID: "sess-" + strings.Repeat("f", 32), PairAgent: state.AgentCodex, FirstTurnID: "turn-forged",
+		ExpectedRegistryRevision: reg.Revision, ExpectedStateRevision: rs.Revision,
+		StartedUnix: 2000, DeadlineUnix: 2000 + rs.EffectivePolicy.Limits.MaxWallSeconds,
+		LeadDigest: leadDigest, BaseStateDigest: strings.Repeat("0", 64), // wrong base digest
+	}
+	payload, _ := in.marshal()
+	g, ok, err := genstore.Acquire(runLock(runDir))
+	if err != nil || !ok {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, perr := pairPlanFor(lay, g, a.RunID, txn.Intent{Version: txn.IntentVersion, Kind: pairIntentKind, TxnID: in.TxnID, ExpectedStateRevision: rs.Revision, Payload: payload}); perr == nil {
+		g.Release()
+		t.Fatalf("pairPlanFor accepted a forged base digest")
+	}
+	g.Release()
+	reg2, _, _ := state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load()
+	if reg2.Pair != nil {
+		t.Fatalf("registry was mutated by a rejected plan")
+	}
+}
+
+// A clock preceding the run's creation is refused before Registry fills or a
+// journal is written.
+func TestJoinAttachRejectsPreCreatedClock(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	jr := joinRequest(repo, a.RunID, opID("b"), 0x10)
+	jr.Now = 500 // < CreatedUnix (1000)
+	if _, err := JoinAttach(jr); err == nil {
+		t.Fatalf("pre-created clock should be rejected")
+	}
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	reg, _, _ := state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load()
+	if reg.Pair != nil {
+		t.Fatalf("registry pair filled despite the clock rejection")
+	}
+	if _, ok, _ := txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest(); ok {
+		t.Fatalf("an attach journal was written despite the clock rejection")
+	}
+}
+
+// The durable issuance proof survives a downstream CANCEL: recovery completes
+// rather than bricking, even though the assignment was cleared.
+func TestJoinAttachRecoversAfterCancel(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+
+	fired := false
+	stepFailpoint = func(s string) error {
+		if s == "state-plan-draft" && !fired {
+			fired = true
+			return errors.New("crash after plan-draft")
+		}
+		return nil
+	}
+	defer func() { stepFailpoint = nil }()
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+		t.Fatalf("expected a crash after plan-draft")
+	}
+	stepFailpoint = nil
+
+	// A downstream cancel clears the assignment (no accepted turn).
+	st := state.Open(filepath.Join(runDir, "state"), runLock(runDir))
+	rs, _, _ := st.Load()
+	if _, err := st.Mutate(rs.Revision, func(_ uint64, n *state.RunState) error {
+		n.Lifecycle = state.LifecycleCancelled
+		n.Assignment = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	// Recovery still completes via the write-once started_unix proof.
+	if _, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b"))); err != nil {
+		t.Fatalf("recovery after cancel: %v", err)
+	}
+	if rec, _, _ := txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest(); !rec.Complete {
+		t.Fatalf("attach journal not completed after cancel+recovery")
+	}
+}
+
+// A pending pair transaction is recovered by a same-op minimal retry, and a
+// different minimal operation recovers it forward but is told the pair exists.
+func TestJoinAttachPendingRecoveryOps(t *testing.T) {
+	t.Run("same op minimal", func(t *testing.T) {
+		repo := t.TempDir()
+		a := bootstrapRun(t, repo)
+		fired := false
+		stepFailpoint = func(s string) error {
+			if s == "registry-pair-fill" && !fired {
+				fired = true
+				return errors.New("cut")
+			}
+			return nil
+		}
+		defer func() { stepFailpoint = nil }()
+		if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+			t.Fatalf("expected a crash")
+		}
+		stepFailpoint = nil
+		if _, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b"))); err != nil {
+			t.Fatalf("same-op minimal recovery: %v", err)
+		}
+	})
+	t.Run("different op minimal", func(t *testing.T) {
+		repo := t.TempDir()
+		a := bootstrapRun(t, repo)
+		fired := false
+		stepFailpoint = func(s string) error {
+			if s == "registry-pair-fill" && !fired {
+				fired = true
+				return errors.New("cut")
+			}
+			return nil
+		}
+		defer func() { stepFailpoint = nil }()
+		if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+			t.Fatalf("expected a crash")
+		}
+		stepFailpoint = nil
+		// A different op recovers the pending transaction forward but is refused.
+		if _, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("c"))); !errors.Is(err, ErrPairFilled) {
+			t.Fatalf("different-op recovery err = %v, want ErrPairFilled", err)
+		}
+	})
+}
