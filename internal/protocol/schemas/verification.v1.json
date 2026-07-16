@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex verification artifact, version 1",
+  "description": "The final acceptance check: each acceptance criterion with its evidence, any scope expansion, whether tests are meaningful, unsupported claims, an overall pass/fail verdict, and notes. Submitted for a verify phase.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "turn_id",
+    "state_revision",
+    "human_context",
+    "requires_human_decision",
+    "decision_question",
+    "criteria",
+    "scope_expansion",
+    "tests_meaningful",
+    "unsupported_claims",
+    "verdict",
+    "notes"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "verification"
+    },
+    "turn_id": {
+      "description": "The turn this verification is submitted for.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_revision": {
+      "description": "The run-state revision this submit must compare-and-swap against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "human_context": {
+      "description": "Optional free-text context for the human; null when none.",
+      "type": ["string", "null"],
+      "maxLength": 16384
+    },
+    "requires_human_decision": {
+      "description": "True only when an unresolved choice must escalate to the human.",
+      "type": "boolean"
+    },
+    "decision_question": {
+      "description": "The concrete question for the human, else null.",
+      "type": ["string", "null"],
+      "maxLength": 4096
+    },
+    "criteria": {
+      "description": "Each acceptance criterion with whether it is met and its evidence.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion", "met", "evidence"],
+        "properties": {
+          "criterion": {
+            "description": "The acceptance criterion being checked.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "met": {
+            "description": "Whether the criterion is met.",
+            "type": "boolean"
+          },
+          "evidence": {
+            "description": "Concrete file/test evidence, not agent testimony.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
+      }
+    },
+    "scope_expansion": {
+      "description": "Work done beyond the agreed scope.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192
+      }
+    },
+    "tests_meaningful": {
+      "description": "Whether the tests actually exercise the acceptance criteria.",
+      "type": "boolean"
+    },
+    "unsupported_claims": {
+      "description": "Claims made without supporting evidence.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192
+      }
+    },
+    "verdict": {
+      "description": "The overall acceptance verdict.",
+      "type": "string",
+      "enum": ["pass", "fail"]
+    },
+    "notes": {
+      "description": "Additional verifier notes.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    }
+  }
+}

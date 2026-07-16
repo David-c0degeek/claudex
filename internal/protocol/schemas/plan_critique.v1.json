@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex plan critique artifact, version 1",
+  "description": "The pair's critique of a proposed plan: an agree/revise verdict, plan-level findings, non-blocking implementation obligations to carry forward, missing evidence, an optional simpler alternative, and notes. Submitted for a plan-critique phase.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "turn_id",
+    "state_revision",
+    "human_context",
+    "requires_human_decision",
+    "decision_question",
+    "verdict",
+    "findings",
+    "implementation_checks",
+    "missing_evidence",
+    "simpler_alternative",
+    "notes"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "plan_critique"
+    },
+    "turn_id": {
+      "description": "The turn this critique is submitted for.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_revision": {
+      "description": "The run-state revision this submit must compare-and-swap against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "human_context": {
+      "description": "Optional free-text context for the human; null when none.",
+      "type": ["string", "null"],
+      "maxLength": 16384
+    },
+    "requires_human_decision": {
+      "description": "True only for an unresolved value choice or repeated evidence-backed disagreement.",
+      "type": "boolean"
+    },
+    "decision_question": {
+      "description": "The concrete question for the human, else null.",
+      "type": ["string", "null"],
+      "maxLength": 4096
+    },
+    "verdict": {
+      "description": "Whether the critic agrees with the plan or requires a revision.",
+      "type": "string",
+      "enum": ["AGREE", "REVISE"]
+    },
+    "findings": {
+      "description": "Plan-level findings; content facts belong in implementation_checks.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "kind",
+          "category",
+          "severity",
+          "file",
+          "line",
+          "problem",
+          "evidence",
+          "suggested_fix"
+        ],
+        "properties": {
+          "key": {
+            "description": "Stable lowercase-hyphen identifier; reuse it when the same issue recurs.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "kind": {
+            "description": "Whether this finding is new, repeated, a regression, or a decision.",
+            "type": "string",
+            "enum": ["new", "repeated", "regression", "decision"]
+          },
+          "category": {
+            "description": "The plan-level concern this finding raises.",
+            "type": "string",
+            "enum": [
+              "architecture",
+              "scope",
+              "sequencing",
+              "safety",
+              "validation",
+              "decision"
+            ]
+          },
+          "severity": {
+            "description": "How serious the finding is.",
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"]
+          },
+          "file": {
+            "description": "Repository-relative file the finding references, or null for a plan section.",
+            "type": ["string", "null"],
+            "maxLength": 4096
+          },
+          "line": {
+            "description": "Line the finding references, or null.",
+            "type": ["integer", "null"]
+          },
+          "problem": {
+            "description": "What is wrong.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "evidence": {
+            "description": "Concrete evidence for the problem.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "suggested_fix": {
+            "description": "How to resolve the finding.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
+      }
+    },
+    "implementation_checks": {
+      "description": "Non-plan-blocking obligations carried into implementation and verification.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "description", "evidence", "action", "target_step"],
+        "properties": {
+          "key": {
+            "description": "Stable lowercase-hyphen identifier.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": {
+            "description": "Concrete fact, edge case, or content requirement to verify while implementing.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "evidence": {
+            "description": "Concrete evidence supporting the obligation.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "action": {
+            "description": "Add/update this obligation, or retract it with evidence.",
+            "type": "string",
+            "enum": ["add", "remove"]
+          },
+          "target_step": {
+            "description": "Exact plan step title, or null when cross-cutting.",
+            "type": ["string", "null"],
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "missing_evidence": {
+      "description": "Existing repo-relative file paths omitted from the evidence manifest; empty when review is conclusive.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      }
+    },
+    "simpler_alternative": {
+      "description": "A simpler valid plan if one exists, else null.",
+      "type": ["string", "null"],
+      "maxLength": 8192
+    },
+    "notes": {
+      "description": "Additional reviewer notes.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    }
+  }
+}

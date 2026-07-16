@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "claudex plan artifact, version 1",
-  "description": "The lead's proposed implementation plan: prose rationale plus the ordered, independently-committable steps a run will execute, with risks and open questions. Submitted for a planning phase.",
+  "title": "claudex plan revision artifact, version 1",
+  "description": "A hash-guarded revision of an agreed plan: a baseline digest plus section replacements (null preserves the baseline section) and point-by-point responses to critique findings. Submitted for a plan-revise phase.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,10 +12,12 @@
     "human_context",
     "requires_human_decision",
     "decision_question",
+    "base_plan_sha256",
     "plan_markdown",
     "steps",
     "risks",
-    "open_questions"
+    "open_questions",
+    "responses"
   ],
   "properties": {
     "protocol_version": {
@@ -26,10 +28,10 @@
     "message_type": {
       "description": "Discriminates this message from other protocol messages.",
       "type": "string",
-      "const": "plan"
+      "const": "plan_revision"
     },
     "turn_id": {
-      "description": "The turn this plan is submitted for.",
+      "description": "The turn this revision is submitted for.",
       "type": "string",
       "minLength": 1,
       "maxLength": 128
@@ -53,15 +55,20 @@
       "type": ["string", "null"],
       "maxLength": 4096
     },
-    "plan_markdown": {
-      "description": "Architecture, decisions, delivery contract, and rationale; does not duplicate the structured steps, risks, or open questions.",
+    "base_plan_sha256": {
+      "description": "Lower-hex sha256 of the baseline plan this revision is guarded against.",
       "type": "string",
-      "minLength": 1,
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "plan_markdown": {
+      "description": "Replacement architecture/decisions, or null to preserve the baseline section.",
+      "type": ["string", "null"],
       "maxLength": 65536
     },
     "steps": {
-      "description": "Ordered implementation steps; each becomes one commit and checkpoint review.",
-      "type": "array",
+      "description": "Replacement full step list, or null to preserve it.",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -101,8 +108,8 @@
       }
     },
     "risks": {
-      "description": "Risks the plan carries and how they are mitigated.",
-      "type": "array",
+      "description": "Replacement risk list, or null to preserve it.",
+      "type": ["array", "null"],
       "items": {
         "type": "string",
         "minLength": 1,
@@ -110,12 +117,46 @@
       }
     },
     "open_questions": {
-      "description": "Unresolved questions that do not block starting the plan.",
-      "type": "array",
+      "description": "Replacement open-question list, or null to preserve it.",
+      "type": ["array", "null"],
       "items": {
         "type": "string",
         "minLength": 1,
         "maxLength": 8192
+      }
+    },
+    "responses": {
+      "description": "Point-by-point responses to critique findings.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_key", "finding", "action", "rationale"],
+        "properties": {
+          "finding_key": {
+            "description": "The critique finding key this responds to.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "finding": {
+            "description": "Restatement of the finding being answered.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "action": {
+            "description": "Whether the finding was accepted or rebutted.",
+            "type": "string",
+            "enum": ["accepted", "rebutted"]
+          },
+          "rationale": {
+            "description": "For rebuttals: direct repository evidence, or it does not count.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
       }
     }
   }

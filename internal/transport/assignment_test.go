@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +19,8 @@ func hex64() string { return strings.Repeat("a", 64) }
 
 func ptr(s string) *string { return &s }
 
+func absWorktree() string { return filepath.Join(os.TempDir(), "claudex-wt", "run-a") }
+
 func runStateAt(phase state.Phase) state.RunState {
 	return state.RunState{
 		RunID:      "run-a",
@@ -26,145 +30,123 @@ func runStateAt(phase state.Phase) state.RunState {
 	}
 }
 
-func leadEditInputs() PullInputs {
-	return PullInputs{
-		SessionID:           "sess-1",
-		Role:                RoleLead,
-		BindingGuidance:     []string{"prefer small steps"},
-		ArtifactMessageType: "plan",
-		Worktree:            ptr("/wt/run-a"),
-	}
+func editInputs() PullInputs {
+	return PullInputs{SessionID: "sess-1", Role: RoleLead, BindingGuidance: []string{"prefer small steps"}, Worktree: ptr(absWorktree())}
 }
 
-func reviewInputs(role Role) PullInputs {
-	return PullInputs{
-		SessionID:           "sess-2",
-		Role:                role,
-		ArtifactMessageType: "plan",
-		Evidence:            &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()},
-	}
+func evidenceInputs(role Role) PullInputs {
+	return PullInputs{SessionID: "sess-2", Role: role, Evidence: &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()}}
 }
 
 func TestEditPhaseCarriesWorktree(t *testing.T) {
-	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), leadEditInputs())
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	if a.Worktree == nil || *a.Worktree != "/wt/run-a" || a.Evidence != nil {
-		t.Fatalf("edit assignment should carry only a worktree: %+v", a)
-	}
-	if a.TurnID != "turn-1" || a.ExpectedStateRevision != 5 {
-		t.Fatalf("assignment did not project the issued turn/revision: %+v", a)
-	}
-	// The exact embedded artifact schema and its digest are present.
-	embedded, _ := protocol.Schema("plan", 1)
-	if a.ArtifactSchemaJSON != string(embedded) {
-		t.Fatalf("assignment did not embed the exact artifact schema")
-	}
-	sum := sha256.Sum256(embedded)
-	if a.ArtifactSchemaSHA256 != hex.EncodeToString(sum[:]) {
-		t.Fatalf("artifact schema digest mismatch")
+	for _, phase := range []state.Phase{state.PhaseImplementStep, state.PhaseFix} {
+		a, err := BuildAssignment(runStateAt(phase), editInputs())
+		if err != nil {
+			t.Fatalf("build %s: %v", phase, err)
+		}
+		if a.Worktree == nil || *a.Worktree != absWorktree() || a.Evidence != nil {
+			t.Fatalf("%s should carry only a worktree: %+v", phase, a)
+		}
+		if a.TurnID != "turn-1" || a.ExpectedStateRevision != 5 || a.ArtifactMessageType != "implementation_report" {
+			t.Fatalf("%s projection wrong: %+v", phase, a)
+		}
+		embedded, _ := protocol.Schema("implementation_report", 1)
+		if a.ArtifactSchemaJSON != string(embedded) {
+			t.Fatalf("%s did not embed the exact artifact schema", phase)
+		}
+		sum := sha256.Sum256(embedded)
+		if a.ArtifactSchemaSHA256 != hex.EncodeToString(sum[:]) {
+			t.Fatalf("%s artifact digest mismatch", phase)
+		}
 	}
 }
 
-func TestReviewAndVerifyCarryEvidence(t *testing.T) {
-	for _, phase := range []state.Phase{state.PhaseCheckpoint, state.PhaseVerify, state.PhasePlanCritique} {
-		a, err := BuildAssignment(runStateAt(phase), reviewInputs(RolePair))
+func TestReadOnlyPhasesCarryEvidence(t *testing.T) {
+	cases := map[state.Phase]Role{
+		state.PhasePlanDraft:    RoleLead, // lead but read-only (planning)
+		state.PhasePlanRevise:   RoleLead,
+		state.PhasePlanCritique: RolePair,
+		state.PhaseCheckpoint:   RolePair,
+		state.PhaseVerify:       RolePair,
+	}
+	for phase, role := range cases {
+		a, err := BuildAssignment(runStateAt(phase), evidenceInputs(role))
 		if err != nil {
 			t.Fatalf("build %s: %v", phase, err)
 		}
 		if a.Evidence == nil || a.Evidence.RootDigest != hex64() || a.Worktree != nil {
-			t.Fatalf("%s assignment should carry only evidence: %+v", phase, a)
+			t.Fatalf("%s should carry only evidence: %+v", phase, a)
+		}
+		if a.Role != role {
+			t.Fatalf("%s role = %s, want %s", phase, a.Role, role)
 		}
 	}
 }
 
-// A pair turn is always read-only, even in an edit phase: a defensive engine
-// input pairing a pair with IMPLEMENT_STEP must not yield a worktree.
-func TestPairIsAlwaysReadOnly(t *testing.T) {
-	// pair + IMPLEMENT + worktree is a mismatch (pair may not edit).
-	in := PullInputs{SessionID: "s", Role: RolePair, ArtifactMessageType: "plan", Worktree: ptr("/wt")}
-	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); !errors.Is(err, ErrWorkspaceMismatch) {
-		t.Fatalf("pair+IMPLEMENT+worktree err = %v, want ErrWorkspaceMismatch", err)
+// A role that disagrees with the phase turn spec is rejected — including the
+// defensive pair+IMPLEMENT case (a pair may never be handed an edit turn).
+func TestRoleMustMatchTurnSpec(t *testing.T) {
+	in := evidenceInputs(RolePair)
+	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); !errors.Is(err, ErrTurnSpecMismatch) {
+		t.Fatalf("pair in IMPLEMENT err = %v, want ErrTurnSpecMismatch", err)
 	}
-	// pair + IMPLEMENT + evidence is read-only and accepted.
-	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), reviewInputs(RolePair))
-	if err != nil {
-		t.Fatalf("pair+IMPLEMENT+evidence build: %v", err)
-	}
-	if a.Worktree != nil || a.Evidence == nil {
-		t.Fatalf("a pair edit-phase turn must be read-only: %+v", a)
+	in2 := evidenceInputs(RoleLead)
+	if _, err := BuildAssignment(runStateAt(state.PhaseCheckpoint), in2); !errors.Is(err, ErrTurnSpecMismatch) {
+		t.Fatalf("lead in CHECKPOINT err = %v, want ErrTurnSpecMismatch", err)
 	}
 }
 
 func TestWorkspaceMismatchRejected(t *testing.T) {
-	// Lead edit phase given evidence.
-	in := leadEditInputs()
+	// Edit turn with no worktree.
+	in := editInputs()
 	in.Worktree = nil
-	in.Evidence = &EvidenceRef{ManifestRelPath: "e", RootDigest: hex64()}
+	in.Evidence = &EvidenceRef{ManifestRelPath: "e/m.json", RootDigest: hex64()}
 	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); !errors.Is(err, ErrWorkspaceMismatch) {
-		t.Fatalf("lead edit with evidence err = %v, want ErrWorkspaceMismatch", err)
+		t.Fatalf("edit turn without worktree err = %v, want ErrWorkspaceMismatch", err)
 	}
-	// Read-only phase given a worktree.
-	in2 := reviewInputs(RolePair)
+	// Read-only turn with no evidence.
+	in2 := evidenceInputs(RolePair)
 	in2.Evidence = nil
-	in2.Worktree = ptr("/wt")
 	if _, err := BuildAssignment(runStateAt(state.PhaseCheckpoint), in2); !errors.Is(err, ErrWorkspaceMismatch) {
-		t.Fatalf("review with worktree err = %v, want ErrWorkspaceMismatch", err)
-	}
-	// Evidence missing its digest.
-	in3 := reviewInputs(RolePair)
-	in3.Evidence = &EvidenceRef{ManifestRelPath: "e", RootDigest: "short"}
-	if _, err := BuildAssignment(runStateAt(state.PhaseCheckpoint), in3); !errors.Is(err, ErrWorkspaceMismatch) {
-		t.Fatalf("evidence with a bad digest err = %v, want ErrWorkspaceMismatch", err)
+		t.Fatalf("read-only turn without evidence err = %v, want ErrWorkspaceMismatch", err)
 	}
 }
 
 func TestPullNeverMints(t *testing.T) {
 	rs := runStateAt(state.PhaseImplementStep)
 	rs.Assignment = nil
-	if _, err := BuildAssignment(rs, leadEditInputs()); !errors.Is(err, ErrNoActiveTurn) {
+	if _, err := BuildAssignment(rs, editInputs()); !errors.Is(err, ErrNoActiveTurn) {
 		t.Fatalf("err = %v, want ErrNoActiveTurn", err)
 	}
 }
 
 func TestStaleAssignmentRejected(t *testing.T) {
 	rs := runStateAt(state.PhaseImplementStep)
-	rs.Assignment.IssuedRevision = 4 // state advanced to 5 without reissuing
-	if _, err := BuildAssignment(rs, leadEditInputs()); !errors.Is(err, ErrStaleAssignment) {
+	rs.Assignment.IssuedRevision = 4
+	if _, err := BuildAssignment(rs, editInputs()); !errors.Is(err, ErrStaleAssignment) {
 		t.Fatalf("err = %v, want ErrStaleAssignment", err)
 	}
 }
 
 func TestNonActionablePhasesRejected(t *testing.T) {
 	for _, phase := range []state.Phase{state.PhaseInit, state.PhaseAwaitGuidance, state.PhaseDone, state.PhaseTests} {
-		if _, err := BuildAssignment(runStateAt(phase), reviewInputs(RolePair)); !errors.Is(err, ErrPhaseNotActionable) {
+		if _, err := BuildAssignment(runStateAt(phase), evidenceInputs(RolePair)); !errors.Is(err, ErrPhaseNotActionable) {
 			t.Fatalf("%s err = %v, want ErrPhaseNotActionable", phase, err)
 		}
 	}
 }
 
-func TestUnknownArtifactSchemaRejected(t *testing.T) {
-	in := leadEditInputs()
-	in.ArtifactMessageType = "does-not-exist"
-	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); err == nil {
-		t.Fatalf("an unknown artifact schema should be rejected")
-	}
-}
-
 func TestTwoPullsAreIdentical(t *testing.T) {
 	rs := runStateAt(state.PhaseImplementStep)
-	a1, _ := BuildAssignment(rs, leadEditInputs())
-	a2, _ := BuildAssignment(rs, leadEditInputs())
+	a1, _ := BuildAssignment(rs, editInputs())
+	a2, _ := BuildAssignment(rs, editInputs())
 	if !reflect.DeepEqual(a1, a2) {
-		t.Fatalf("two pulls of the same state differ:\n%+v\n%+v", a1, a2)
+		t.Fatalf("two pulls of the same state differ")
 	}
 }
 
-// The build must not mutate its inputs, and mutating the returned assignment
-// must not reach back into the caller's inputs.
 func TestBuildDoesNotAliasInputs(t *testing.T) {
-	in := reviewInputs(RolePair)
+	in := evidenceInputs(RolePair)
 	in.BindingGuidance = []string{"g1"}
 	guidBefore := append([]string{}, in.BindingGuidance...)
 	evBefore := *in.Evidence
@@ -175,7 +157,6 @@ func TestBuildDoesNotAliasInputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	// Mutate the returned assignment.
 	a.BindingGuidance = append(a.BindingGuidance, "x")
 	a.Evidence.RootDigest = strings.Repeat("b", 64)
 
@@ -191,7 +172,7 @@ func TestBuildDoesNotAliasInputs(t *testing.T) {
 }
 
 func TestMarshalValidatesAndRoundTrips(t *testing.T) {
-	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), leadEditInputs())
+	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), editInputs())
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -207,13 +188,12 @@ func TestMarshalValidatesAndRoundTrips(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if !reflect.DeepEqual(a, back) {
-		t.Fatalf("round-trip differs:\n%+v\n%+v", a, back)
+		t.Fatalf("round-trip differs")
 	}
 }
 
-// A read-only assignment marshals with a null worktree and a present evidence.
 func TestReviewMarshalHasNullWorktree(t *testing.T) {
-	a, _ := BuildAssignment(runStateAt(state.PhaseVerify), reviewInputs(RolePair))
+	a, _ := BuildAssignment(runStateAt(state.PhaseVerify), evidenceInputs(RolePair))
 	canon, err := a.Marshal()
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -227,5 +207,90 @@ func TestReviewMarshalHasNullWorktree(t *testing.T) {
 	}
 	if string(m["evidence"]) == "null" {
 		t.Fatalf("evidence should be present")
+	}
+}
+
+// Mutating any semantic field after the build must be caught by Validate/Marshal,
+// since the JSON schema alone cannot express these constraints.
+func TestMutateAfterBuildRejected(t *testing.T) {
+	base := func() Assignment {
+		a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), editInputs())
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		return a
+	}
+	mutations := map[string]func(a *Assignment){
+		"schema bytes":  func(a *Assignment) { a.ArtifactSchemaJSON = strings.Repeat("x", len(a.ArtifactSchemaJSON)) },
+		"schema digest": func(a *Assignment) { a.ArtifactSchemaSHA256 = strings.Repeat("0", 64) },
+		"both spaces":   func(a *Assignment) { a.Evidence = &EvidenceRef{ManifestRelPath: "e/m.json", RootDigest: hex64()} },
+		"wrong role":    func(a *Assignment) { a.Role = RolePair },
+		"wrong type":    func(a *Assignment) { a.ArtifactMessageType = "verification" },
+		"drop worktree": func(a *Assignment) { a.Worktree = nil },
+	}
+	for name, mut := range mutations {
+		t.Run(name, func(t *testing.T) {
+			a := base()
+			mut(&a)
+			if err := a.Validate(); err == nil {
+				t.Fatalf("%s: Validate should reject the mutation", name)
+			}
+			if _, err := a.Marshal(); err == nil {
+				t.Fatalf("%s: Marshal should reject the mutation", name)
+			}
+		})
+	}
+}
+
+func TestBindingGuidanceRedacted(t *testing.T) {
+	secret := "sk-ant-abcdefghijklmnopqrstuvwx"
+	in := editInputs()
+	in.BindingGuidance = []string{"use token=" + secret + " sparingly"}
+	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if strings.Contains(a.BindingGuidance[0], secret) {
+		t.Fatalf("guidance not redacted: %q", a.BindingGuidance[0])
+	}
+	canon, err := a.Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(canon), "sk-ant-") {
+		t.Fatalf("secret leaked into wire bytes")
+	}
+}
+
+func TestEvidenceGrammarEnforced(t *testing.T) {
+	bad := []EvidenceRef{
+		{ManifestRelPath: "../escape.json", RootDigest: hex64()},
+		{ManifestRelPath: "/abs/manifest.json", RootDigest: hex64()},
+		{ManifestRelPath: "a\\b.json", RootDigest: hex64()},
+		{ManifestRelPath: "evidence/m.json", RootDigest: strings.Repeat("A", 64)}, // uppercase
+		{ManifestRelPath: "evidence/m.json", RootDigest: "short"},
+	}
+	for _, ev := range bad {
+		in := evidenceInputs(RolePair)
+		e := ev
+		in.Evidence = &e
+		if _, err := BuildAssignment(runStateAt(state.PhaseCheckpoint), in); !errors.Is(err, ErrWorkspaceMismatch) {
+			t.Fatalf("evidence %+v err = %v, want ErrWorkspaceMismatch", ev, err)
+		}
+	}
+}
+
+func TestWorktreeGrammarEnforced(t *testing.T) {
+	bad := []string{
+		"relative/path",
+		absWorktree() + "/../escape",
+		absWorktree() + "\x01ctrl",
+	}
+	for _, wt := range bad {
+		in := editInputs()
+		in.Worktree = ptr(wt)
+		if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); !errors.Is(err, ErrWorkspaceMismatch) {
+			t.Fatalf("worktree %q err = %v, want ErrWorkspaceMismatch", wt, err)
+		}
 	}
 }

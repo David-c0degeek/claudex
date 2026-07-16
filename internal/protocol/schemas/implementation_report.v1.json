@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex implementation report artifact, version 1",
+  "description": "The lead's report after implementing a step: the commits made, files changed, the test command and its result, deviations from the plan, and notes. Submitted for an implement-step phase.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "turn_id",
+    "state_revision",
+    "human_context",
+    "requires_human_decision",
+    "decision_question",
+    "commits",
+    "files_changed",
+    "tests_command",
+    "tests_passed",
+    "test_output_summary",
+    "deviations_from_plan",
+    "notes"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "implementation_report"
+    },
+    "turn_id": {
+      "description": "The turn this report is submitted for.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_revision": {
+      "description": "The run-state revision this submit must compare-and-swap against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "human_context": {
+      "description": "Optional free-text context for the human; null when none.",
+      "type": ["string", "null"],
+      "maxLength": 16384
+    },
+    "requires_human_decision": {
+      "description": "True only when an unresolved choice must escalate to the human.",
+      "type": "boolean"
+    },
+    "decision_question": {
+      "description": "The concrete question for the human, else null.",
+      "type": ["string", "null"],
+      "maxLength": 4096
+    },
+    "commits": {
+      "description": "Commits produced by this step.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sha", "message"],
+        "properties": {
+          "sha": {
+            "description": "Commit hash.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "message": {
+            "description": "Commit message.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
+      }
+    },
+    "files_changed": {
+      "description": "Repository-relative paths changed by this step.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      }
+    },
+    "tests_command": {
+      "description": "The exact command run to exercise the change.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "tests_passed": {
+      "description": "Whether the test command succeeded.",
+      "type": "boolean"
+    },
+    "test_output_summary": {
+      "description": "Summary of the test output.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "deviations_from_plan": {
+      "description": "Where the implementation diverged from the agreed plan and why.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192
+      }
+    },
+    "notes": {
+      "description": "Additional implementer notes.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    }
+  }
+}

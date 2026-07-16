@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex checkpoint review artifact, version 1",
+  "description": "The pair's review of an implemented step at a checkpoint: an agree/revise verdict, code-level findings, and a judgement on test adequacy. Submitted for a checkpoint phase.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "turn_id",
+    "state_revision",
+    "human_context",
+    "requires_human_decision",
+    "decision_question",
+    "verdict",
+    "findings",
+    "tests_adequate",
+    "tests_critique"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "checkpoint_review"
+    },
+    "turn_id": {
+      "description": "The turn this review is submitted for.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_revision": {
+      "description": "The run-state revision this submit must compare-and-swap against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "human_context": {
+      "description": "Optional free-text context for the human; null when none.",
+      "type": ["string", "null"],
+      "maxLength": 16384
+    },
+    "requires_human_decision": {
+      "description": "True only for an unresolved value choice or repeated evidence-backed disagreement.",
+      "type": "boolean"
+    },
+    "decision_question": {
+      "description": "The concrete question for the human, else null.",
+      "type": ["string", "null"],
+      "maxLength": 4096
+    },
+    "verdict": {
+      "description": "Whether the reviewer agrees with the step or requires a revision.",
+      "type": "string",
+      "enum": ["AGREE", "REVISE"]
+    },
+    "findings": {
+      "description": "Code-level findings from the review.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "line", "problem", "evidence", "suggested_fix"],
+        "properties": {
+          "severity": {
+            "description": "How serious the finding is.",
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"]
+          },
+          "file": {
+            "description": "Repository-relative file the finding references, or null.",
+            "type": ["string", "null"],
+            "maxLength": 4096
+          },
+          "line": {
+            "description": "Line the finding references, or null.",
+            "type": ["integer", "null"]
+          },
+          "problem": {
+            "description": "What is wrong.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "evidence": {
+            "description": "Concrete evidence for the problem.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "suggested_fix": {
+            "description": "How to resolve the finding.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
+      }
+    },
+    "tests_adequate": {
+      "description": "Whether the tests accompanying the step are adequate.",
+      "type": "boolean"
+    },
+    "tests_critique": {
+      "description": "Critique of the step's tests.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    }
+  }
+}
