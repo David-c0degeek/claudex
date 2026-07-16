@@ -1,18 +1,22 @@
 package config
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
+
+const validTask = `{
+	"schema_version": 1,
+	"goal": "Build the attach protocol",
+	"current_behavior": "headless subprocess driver",
+	"desired_behavior": "two terminals converge by agreement",
+	"scope": "coordinator core",
+	"acceptance_criteria": ["pull returns an assignment", "submit advances state"]
+}`
+
+func validPolicy() string {
+	return `{"schema_version":1,"test_gate":{"command":"go test ./..."},"base_branch":"main"}`
+}
 
 func TestParseTaskContractValid(t *testing.T) {
-	data := []byte(`{
-		"schema_version": 1,
-		"goal": "Build the attach protocol",
-		"desired_behavior": "two terminals converge by agreement",
-		"acceptance_criteria": ["pull returns an assignment", "submit advances state"]
-	}`)
-	tc, err := ParseTaskContract(data)
+	tc, err := ParseTaskContract([]byte(validTask))
 	if err != nil {
 		t.Fatalf("ParseTaskContract: %v", err)
 	}
@@ -21,26 +25,20 @@ func TestParseTaskContractValid(t *testing.T) {
 	}
 }
 
-func TestParseTaskContractDefaultsVersion(t *testing.T) {
-	data := []byte(`{"goal":"g","desired_behavior":"d","acceptance_criteria":["a"]}`)
-	tc, err := ParseTaskContract(data)
-	if err != nil {
-		t.Fatalf("ParseTaskContract: %v", err)
-	}
-	if tc.SchemaVersion != TaskContractVersion {
-		t.Fatalf("version = %d, want %d", tc.SchemaVersion, TaskContractVersion)
-	}
-}
-
 func TestParseTaskContractRejections(t *testing.T) {
 	cases := map[string]string{
-		"bad version":      `{"schema_version":99,"goal":"g","desired_behavior":"d","acceptance_criteria":["a"]}`,
-		"missing goal":     `{"desired_behavior":"d","acceptance_criteria":["a"]}`,
-		"missing desired":  `{"goal":"g","acceptance_criteria":["a"]}`,
-		"no acceptance":    `{"goal":"g","desired_behavior":"d","acceptance_criteria":[]}`,
-		"blank acceptance": `{"goal":"g","desired_behavior":"d","acceptance_criteria":["   "]}`,
-		"unknown field":    `{"goal":"g","desired_behavior":"d","acceptance_criteria":["a"],"typo":1}`,
-		"trailing content": `{"goal":"g","desired_behavior":"d","acceptance_criteria":["a"]} garbage`,
+		"missing version":  `{"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
+		"bad version":      `{"schema_version":99,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
+		"missing goal":     `{"schema_version":1,"current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
+		"missing scope":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","acceptance_criteria":["a"]}`,
+		"no acceptance":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":[]}`,
+		"blank acceptance": `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["  "]}`,
+		"blank req test":   `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"],"required_tests":[""]}`,
+		"unknown field":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"],"typo":1}`,
+		"duplicate key":    `{"schema_version":1,"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
+		"explicit null":    `{"schema_version":1,"goal":null,"current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
+		"trailing content": validTask + ` garbage`,
+		"stray delimiter":  validTask + `}`,
 		"not json":         `not json`,
 	}
 	for name, body := range cases {
@@ -52,41 +50,36 @@ func TestParseTaskContractRejections(t *testing.T) {
 	}
 }
 
-func TestParseRunPolicyDefaults(t *testing.T) {
-	rp, err := ParseRunPolicy(nil)
-	if err != nil {
-		t.Fatalf("ParseRunPolicy(nil): %v", err)
-	}
-	def := DefaultRunPolicy()
-	if rp != def {
-		t.Fatalf("empty policy = %+v, want defaults %+v", rp, def)
-	}
-}
-
-func TestParseRunPolicyOverrideKeepsOtherDefaults(t *testing.T) {
-	rp, err := ParseRunPolicy([]byte(`{"test_command":"go test ./...","caps":{"max_wall_seconds":600}}`))
+func TestParseRunPolicyValidKeepsNestedDefaults(t *testing.T) {
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":1,"test_gate":{"command":"make test"},"base_branch":"trunk","limits":{"max_wall_seconds":600}}`))
 	if err != nil {
 		t.Fatalf("ParseRunPolicy: %v", err)
 	}
-	if rp.TestCommand != "go test ./..." {
-		t.Fatalf("test_command = %q", rp.TestCommand)
+	if rp.BaseBranch != "trunk" || rp.TestGate.Command != "make test" {
+		t.Fatalf("override not applied: %+v", rp)
 	}
-	if rp.Caps.MaxWallSeconds != 600 {
-		t.Fatalf("max_wall_seconds = %d, want overridden 600", rp.Caps.MaxWallSeconds)
+	if rp.Limits.MaxWallSeconds != 600 {
+		t.Fatalf("max_wall_seconds override lost: %d", rp.Limits.MaxWallSeconds)
 	}
-	// An unspecified cap keeps its default.
-	if rp.Caps.MaxCheckpointRounds != DefaultRunPolicy().Caps.MaxCheckpointRounds {
-		t.Fatalf("max_checkpoint_rounds lost its default: %d", rp.Caps.MaxCheckpointRounds)
+	// A sibling limit not in the doc keeps its default.
+	if rp.Limits.EvidenceMaxRequests != DefaultRunPolicy().Limits.EvidenceMaxRequests {
+		t.Fatalf("nested default lost: %d", rp.Limits.EvidenceMaxRequests)
 	}
 }
 
 func TestParseRunPolicyRejections(t *testing.T) {
 	cases := map[string]string{
-		"bad version":   `{"schema_version":42}`,
-		"unknown field": `{"nope":1}`,
-		"negative cap":  `{"caps":{"max_wall_seconds":-1}}`,
-		"zero cap":      `{"caps":{"max_plan_rounds":0}}`,
-		"blank base":    `{"base_branch":"   "}`,
+		"empty":            ``,
+		"missing version":  `{"test_gate":{"command":"x"},"base_branch":"main"}`,
+		"bad version":      `{"schema_version":9,"test_gate":{"command":"x"},"base_branch":"main"}`,
+		"negative budget":  `{"schema_version":1,"budgets":{"plan_rounds":-1}}`,
+		"zero limit":       `{"schema_version":1,"limits":{"max_run_turns":0}}`,
+		"bad fs policy":    `{"schema_version":1,"unknown_fs_policy":"maybe"}`,
+		"blank base":       `{"schema_version":1,"base_branch":"   "}`,
+		"file>total":       `{"schema_version":1,"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`,
+		"null value":       `{"schema_version":1,"base_branch":null}`,
+		"duplicate key":    `{"schema_version":1,"schema_version":1}`,
+		"trailing content": `{"schema_version":1} x`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -97,28 +90,61 @@ func TestParseRunPolicyRejections(t *testing.T) {
 	}
 }
 
-func TestHashStableAndSensitive(t *testing.T) {
-	a := Hash([]byte("one"))
-	b := Hash([]byte("one"))
-	c := Hash([]byte("two"))
-	if a != b {
-		t.Fatalf("Hash not stable: %s vs %s", a, b)
+func TestParseRunPolicyBudgetZeroAllowed(t *testing.T) {
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":1,"test_gate":{"command":"x"},"budgets":{"plan_rounds":0,"checkpoint_rounds":0,"test_rounds":0,"verify_rounds":0}}`))
+	if err != nil {
+		t.Fatalf("zero budgets should be allowed: %v", err)
 	}
-	if a == c {
-		t.Fatalf("Hash collided on different inputs")
-	}
-	if len(a) != 64 {
-		t.Fatalf("Hash length = %d, want 64 hex chars", len(a))
+	if rp.Budgets.PlanRounds != 0 {
+		t.Fatalf("plan_rounds = %d, want 0", rp.Budgets.PlanRounds)
 	}
 }
 
-func TestTestCommandMayBeEmpty(t *testing.T) {
-	// An empty test_command is valid — it means "no mechanical gate".
-	rp, err := ParseRunPolicy([]byte(`{"base_branch":"main"}`))
+func TestValidateEffective(t *testing.T) {
+	tc, err := ParseTaskContract([]byte(validTask))
 	if err != nil {
-		t.Fatalf("ParseRunPolicy: %v", err)
+		t.Fatalf("seed contract: %v", err)
 	}
-	if strings.TrimSpace(rp.TestCommand) != "" {
-		t.Fatalf("expected empty test_command")
+	tcReq := tc
+	tcReq.RequiredTests = []string{"unit tests"}
+
+	cmd := DefaultRunPolicy()
+	cmd.TestGate = TestGate{Command: "go test ./..."}
+
+	disabled := DefaultRunPolicy()
+	disabled.TestGate = TestGate{Disabled: true}
+
+	both := DefaultRunPolicy()
+	both.TestGate = TestGate{Command: "x", Disabled: true}
+
+	neither := DefaultRunPolicy()
+	neither.TestGate = TestGate{}
+
+	if err := ValidateEffective(tc, cmd); err != nil {
+		t.Fatalf("command gate should be valid: %v", err)
+	}
+	if err := ValidateEffective(tc, disabled); err != nil {
+		t.Fatalf("disabled gate with no required tests should be valid: %v", err)
+	}
+	if err := ValidateEffective(tc, both); err == nil {
+		t.Fatalf("command+disabled should be rejected")
+	}
+	if err := ValidateEffective(tc, neither); err == nil {
+		t.Fatalf("neither command nor disabled should be rejected")
+	}
+	if err := ValidateEffective(tcReq, disabled); err == nil {
+		t.Fatalf("disabling the gate with required tests should be rejected")
+	}
+}
+
+func TestHashStableAndSensitive(t *testing.T) {
+	if Hash([]byte("one")) != Hash([]byte("one")) {
+		t.Fatalf("Hash not stable")
+	}
+	if Hash([]byte("one")) == Hash([]byte("two")) {
+		t.Fatalf("Hash collided")
+	}
+	if len(Hash([]byte("x"))) != 64 {
+		t.Fatalf("Hash length wrong")
 	}
 }

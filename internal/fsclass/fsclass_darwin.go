@@ -17,15 +17,18 @@ func classify(path string) (Result, error) {
 	if err := unix.Statfs(p, &st); err != nil {
 		return Result{}, err
 	}
-	name := fstypeName(st.Fstypename[:])
+	return classifyDarwinName(fstypeName(st.Fstypename[:])), nil
+}
 
+// classifyDarwinName maps a macOS statfs f_fstypename to a class. Pure/testable.
+func classifyDarwinName(name string) Result {
 	switch name {
-	case "apfs", "hfs", "hfsx", "exfat", "msdos", "tmpfs":
-		return Result{Class: SupportedLocal, Reason: "local filesystem " + name}, nil
+	case "apfs", "hfs", "hfsx", "exfat", "msdos":
+		return Result{Class: SupportedLocal, Reason: "local filesystem " + name}
 	case "nfs", "smbfs", "webdav", "afpfs", "ftp":
-		return Result{Class: KnownUnsupported, Reason: "network filesystem " + name}, nil
+		return Result{Class: KnownUnsupported, Reason: "network filesystem " + name}
 	default:
-		return Result{Class: Unknown, Reason: "unrecognized filesystem " + name}, nil
+		return Result{Class: Unknown, Reason: "unrecognized filesystem " + name}
 	}
 }
 

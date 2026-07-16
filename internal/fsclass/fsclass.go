@@ -54,16 +54,25 @@ func Classify(path string) (Result, error) {
 }
 
 // nearestExisting returns the nearest ancestor of path (including path itself)
-// that exists on disk, so a not-yet-created run directory can be classified by
-// the filesystem it will live on.
+// that exists on disk, with symlinks/reparse points resolved so a junction
+// cannot hide a remote target behind a local-looking volume. It walks up only on
+// "does not exist"; a permission or I/O error is returned, never walked past.
 func nearestExisting(path string) (string, error) {
 	p, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
 	for {
-		if _, err := os.Stat(p); err == nil {
+		_, err := os.Lstat(p)
+		if err == nil {
+			// Resolve reparse points/symlinks and classify the real target.
+			if resolved, rerr := filepath.EvalSymlinks(p); rerr == nil {
+				return resolved, nil
+			}
 			return p, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
 		}
 		parent := filepath.Dir(p)
 		if parent == p {

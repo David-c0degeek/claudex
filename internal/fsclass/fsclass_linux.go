@@ -25,27 +25,32 @@ func classify(path string) (Result, error) {
 	if err := unix.Statfs(p, &st); err != nil {
 		return Result{}, err
 	}
+	return classifyLinuxMagic(int64(st.Type)), nil
+}
 
-	switch int64(st.Type) {
+// classifyLinuxMagic maps a statfs f_type magic to a class. Pure and testable.
+// OverlayFS is deliberately Unknown: writes copy-up to the upper layer, whose
+// backing store the overlay magic alone does not reveal (it could be network).
+func classifyLinuxMagic(magic int64) Result {
+	switch magic {
 	case unix.EXT4_SUPER_MAGIC, // also EXT2/EXT3 (same magic)
 		unix.XFS_SUPER_MAGIC,
 		unix.BTRFS_SUPER_MAGIC,
 		unix.TMPFS_MAGIC,
 		unix.F2FS_SUPER_MAGIC,
-		unix.OVERLAYFS_SUPER_MAGIC,
 		magicJFS,
 		unix.REISERFS_SUPER_MAGIC:
-		return Result{Class: SupportedLocal, Reason: fmt.Sprintf("local fstype 0x%x", uint64(st.Type))}, nil
+		return Result{Class: SupportedLocal, Reason: fmt.Sprintf("local fstype 0x%x", uint64(magic))}
 	case unix.NFS_SUPER_MAGIC,
 		unix.SMB_SUPER_MAGIC,
 		magicCIFS,
 		magicSMB2,
 		unix.NCP_SUPER_MAGIC,
 		unix.AFS_SUPER_MAGIC:
-		return Result{Class: KnownUnsupported, Reason: fmt.Sprintf("network fstype 0x%x", uint64(st.Type))}, nil
+		return Result{Class: KnownUnsupported, Reason: fmt.Sprintf("network fstype 0x%x", uint64(magic))}
 	default:
-		// FUSE and anything unrecognized: could be a user-space sync client, so
-		// classify honestly as Unknown rather than guessing.
-		return Result{Class: Unknown, Reason: fmt.Sprintf("unrecognized fstype 0x%x", uint64(st.Type))}, nil
+		// OverlayFS, FUSE, and anything unrecognized: could be a user-space sync
+		// client or a network-backed upper layer, so classify honestly as Unknown.
+		return Result{Class: Unknown, Reason: fmt.Sprintf("unrecognized/indirect fstype 0x%x", uint64(magic))}
 	}
 }
