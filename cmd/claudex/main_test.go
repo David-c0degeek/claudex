@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -74,6 +76,53 @@ func TestRunRejectsExtraArgs(t *testing.T) {
 	}
 	if !strings.Contains(errBuf.String(), "takes no arguments") {
 		t.Fatalf("run(version junk) stderr = %q, want arity error", errBuf.String())
+	}
+}
+
+func TestInspectLegacyPrintsRedactedRefusal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	secret := "token=sk-ant-abcdefghijklmnopqrstuvwx"
+	body := `{"run_id":"r1","repo":"/p","lead":"claude","driver":"headless","phase":"await_guidance","guidance_notes":"` + secret + `","steps":[],"events":[]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if code := run(context.Background(), []string{"inspect-legacy", path}, &out, &errBuf); code != 0 {
+		t.Fatalf("inspect-legacy exit = %d (stderr: %s)", code, errBuf.String())
+	}
+	s := out.String()
+	if strings.Contains(s, "sk-ant-") {
+		t.Fatalf("secret leaked into inspect-legacy output:\n%s", s)
+	}
+	if !strings.Contains(s, "resumable") || !strings.Contains(s, "will not resume") {
+		t.Fatalf("inspect-legacy output missing the refusal:\n%s", s)
+	}
+
+	// The read-only inspector must not touch the file.
+	after, _ := os.ReadFile(path)
+	if string(after) != body {
+		t.Fatalf("inspect-legacy modified the input file")
+	}
+}
+
+func TestInspectLegacyRejectsNonLegacyAndArity(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	if code := run(context.Background(), []string{"inspect-legacy"}, &out, &errBuf); code != 2 {
+		t.Fatalf("inspect-legacy with no path exit = %d, want 2", code)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "attach.json")
+	os.WriteFile(path, []byte(`{"schema_version":1,"revision":1,"run_id":"r"}`), 0o600)
+	out.Reset()
+	errBuf.Reset()
+	if code := run(context.Background(), []string{"inspect-legacy", path}, &out, &errBuf); code != 1 {
+		t.Fatalf("inspect-legacy on an attach state exit = %d, want 1", code)
+	}
+	if !strings.Contains(errBuf.String(), "not a pre-pivot") {
+		t.Fatalf("stderr = %q, want not-legacy diagnostic", errBuf.String())
 	}
 }
 

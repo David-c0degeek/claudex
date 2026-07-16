@@ -1,0 +1,43 @@
+{
+  "run_id": "20260714-abc123",
+  "repo": "/home/dev/project",
+  "lead": "claude",
+  "driver": "headless",
+  "mode": "change",
+  "phase": "await_guidance",
+  "created_at": "2026-07-14T10:00:00",
+  "base_commit": "0123456789abcdef0123456789abcdef01234567",
+  "branch": "claudex/20260714-abc123",
+  "worktree": "/home/dev/project/.claudex/wt/20260714-abc123",
+  "sessions": {
+    "lead_plan": "sess-1",
+    "pair_review": "sess-2"
+  },
+  "steps": [
+    {"title": "step one", "description": "do a thing", "files": ["a.go"], "tests": ["a_test.go"]},
+    {"title": "step two", "description": "do another", "files": ["b.go"], "tests": ["b_test.go"]}
+  ],
+  "step_index": 1,
+  "plan_round": 2,
+  "checkpoint_round": 1,
+  "fix_round": 0,
+  "test_round": 0,
+  "verify_round": 0,
+  "plan_cap_extra": 0,
+  "checkpoint_cap_extra": 0,
+  "test_cap_extra": 0,
+  "verify_cap_extra": 0,
+  "last_reviewed_commit": "89abcdef0123456789abcdef0123456789abcdef",
+  "mailbox_turn": 7,
+  "gate_reason": "pair and lead disagree on the retry ceiling",
+  "return_phase": "checkpoint",
+  "guidance_notes": "operator set CLAUDEX_TOKEN=sk-ant-abcdefghijklmnopqrstuvwx for the run",
+  "findings_file": "findings-checkpoint-1.md",
+  "fix_return": "checkpoint",
+  "error": "",
+  "failed_phase": "",
+  "events": [
+    {"ts": "2026-07-14T10:00:01", "message": "init -> plan_draft"},
+    {"ts": "2026-07-14T10:05:00", "message": "checkpoint -> await_guidance (cap hit)"}
+  ]
+}

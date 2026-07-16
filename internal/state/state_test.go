@@ -284,6 +284,26 @@ func TestStrictDecodeRejectsUnknownField(t *testing.T) {
 	}
 }
 
+// A pre-pivot Python state.json is never reinterpreted as an attach run: its
+// legacy-only fields fail the strict attach decoder (01.7/D011). The friendly
+// operator-facing refusal lives in internal/legacy.
+func TestStrictDecodeRejectsLegacyPythonState(t *testing.T) {
+	legacy := []byte(`{"run_id":"r","repo":"/p","lead":"claude","driver":"headless","phase":"init"}`)
+	if _, err := strictDecodeRunState(legacy); err == nil {
+		t.Fatalf("a legacy Python state must be rejected by the attach decoder")
+	}
+}
+
+// An attach state carrying an unknown/future schema version fails closed.
+func TestValidateRejectsUnknownSchemaVersion(t *testing.T) {
+	s := newStore(t)
+	rs := mustInit(t, s)
+	rs.SchemaVersion = RunStateVersion + 1
+	if err := validate(&rs); err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("unknown schema_version err = %v, want a schema_version rejection", err)
+	}
+}
+
 func TestMutateLockedComposes(t *testing.T) {
 	s := newStore(t)
 	g, ok, err := genstore.Acquire(s.LockPath())

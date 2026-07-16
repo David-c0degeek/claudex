@@ -16,6 +16,7 @@ import (
 	"os/signal"
 
 	"github.com/David-c0degeek/claudex/internal/buildinfo"
+	"github.com/David-c0degeek/claudex/internal/legacy"
 )
 
 func main() {
@@ -58,6 +59,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "inspect-legacy":
+		return inspectLegacy(rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "claudex: unknown command %q\n\n%s\n", cmd, usage)
 		return 2
@@ -70,13 +73,40 @@ func usageError(stderr io.Writer, cmd string, extra []string) int {
 	return 2
 }
 
+// inspectLegacy reads a pre-pivot Python state.json read-only and prints a
+// redacted summary plus the refuse-to-resume remediation. It never mutates the
+// file. Exit codes: 0 printed, 1 read/render error, 2 usage.
+func inspectLegacy(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintf(stderr, "claudex: inspect-legacy takes exactly one path, got %v\n", args)
+		return 2
+	}
+	raw, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "claudex: inspect-legacy: %v\n", err)
+		return 1
+	}
+	rep, err := legacy.Inspect(raw)
+	if err != nil {
+		fmt.Fprintf(stderr, "claudex: inspect-legacy: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout, rep.String()); err != nil {
+		fmt.Fprintf(stderr, "claudex: write failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 const usage = `claudex - pair-programming coordinator for two interactive AI agent terminals
 
 Usage:
   claudex <command>
 
 Commands:
-  version   Print version information
-  help      Show this help
+  version          Print version information
+  help             Show this help
+  inspect-legacy   Print a redacted, read-only view of a pre-pivot Python run
+                   (state.json); it is never resumed as an attach run
 
 The attach protocol (attach/pull/submit/wait/status) arrives in a later milestone.`
