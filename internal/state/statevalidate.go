@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
+	"path"
 	"reflect"
 	"strings"
 
@@ -88,7 +88,7 @@ func validate(rs *RunState) error {
 	if hasCmd == rs.EffectivePolicy.TestGate.Disabled {
 		return fmt.Errorf("effective_policy.test_gate must set exactly one of command or disabled")
 	}
-	if rs.TaskSnapshot.RelPath == rs.PolicySnapshot.RelPath {
+	if locatorKey(rs.TaskSnapshot.RelPath) == locatorKey(rs.PolicySnapshot.RelPath) {
 		return fmt.Errorf("task and policy snapshot paths must be distinct")
 	}
 	if rs.PendingTxnID != "" && !validID(rs.PendingTxnID) {
@@ -134,6 +134,12 @@ func validateInit(rs *RunState) error {
 	}
 	if rs.Assignment != nil || rs.Gate != nil || rs.Recovery != nil || rs.Failure != nil {
 		return fmt.Errorf("initial state must have no assignment, gate, recovery, or failure")
+	}
+	if rs.Counters.PlanRevisions != 0 || rs.Counters.TestFixes != 0 || rs.Counters.VerifyFixes != 0 || len(rs.Counters.StepFixes) != 0 {
+		return fmt.Errorf("initial state must have zero counters and no step fixes")
+	}
+	if rs.PendingTxnID != "" {
+		return fmt.Errorf("initial state must have no pending transaction")
 	}
 	return nil
 }
@@ -306,11 +312,11 @@ func validateProjection(field string, p *Projection, rev uint64) error {
 	if strings.TrimSpace(p.Code) == "" || len(p.Code) > 128 {
 		return fmt.Errorf("%s code is required and bounded", field)
 	}
-	if strings.TrimSpace(p.Reason) == "" {
-		return fmt.Errorf("%s reason is required", field)
+	if strings.TrimSpace(p.Reason) == "" || len(p.Reason) > 2048 {
+		return fmt.Errorf("%s reason is required and bounded", field)
 	}
-	if strings.TrimSpace(p.NextAction) == "" {
-		return fmt.Errorf("%s next_action is required", field)
+	if strings.TrimSpace(p.NextAction) == "" || len(p.NextAction) > 512 {
+		return fmt.Errorf("%s next_action is required and bounded", field)
 	}
 	if p.AtRevision == 0 || p.AtRevision > rev {
 		return fmt.Errorf("%s at_revision %d out of range (1..%d)", field, p.AtRevision, rev)
@@ -380,7 +386,9 @@ func validateFS(rs *RunState) error {
 	}
 	switch rs.FS.Class {
 	case "supported-local":
-		// no acknowledgement needed
+		if rs.FS.Acknowledged {
+			return fmt.Errorf("supported-local filesystem must not be acknowledged (ack is only for the unknown override)")
+		}
 	case "unknown":
 		if rs.EffectivePolicy.UnknownFSPolicy != "acknowledge" || !rs.FS.Acknowledged {
 			return fmt.Errorf("unknown filesystem requires unknown_fs_policy=acknowledge and fs.acknowledged=true")
@@ -392,16 +400,27 @@ func validateFS(rs *RunState) error {
 }
 
 func validateTimes(rs *RunState) error {
-	// started/deadline are either both unset (before start) or both positive with
-	// a deadline strictly after the start.
-	switch {
-	case rs.StartedUnix == 0 && rs.DeadlineUnix == 0:
+	// Before start: both unset.
+	if rs.StartedUnix == 0 && rs.DeadlineUnix == 0 {
 		return nil
-	case rs.StartedUnix > 0 && rs.DeadlineUnix > rs.StartedUnix:
-		return nil
-	default:
-		return fmt.Errorf("started_unix/deadline_unix must be both unset or both positive with deadline > started")
 	}
+	if rs.StartedUnix <= 0 || rs.DeadlineUnix <= 0 {
+		return fmt.Errorf("started_unix/deadline_unix must be both unset or both positive")
+	}
+	if rs.StartedUnix < rs.CreatedUnix {
+		return fmt.Errorf("started_unix %d is before created_unix %d", rs.StartedUnix, rs.CreatedUnix)
+	}
+	// The deadline is the frozen run wall cap applied to the start (overflow-safe
+	// via subtraction, since both are positive): an arbitrary deadline must not
+	// silently replace the D016 cap.
+	if rs.DeadlineUnix <= rs.StartedUnix {
+		return fmt.Errorf("deadline_unix must be after started_unix")
+	}
+	if rs.DeadlineUnix-rs.StartedUnix != rs.EffectivePolicy.Limits.MaxWallSeconds {
+		return fmt.Errorf("deadline_unix - started_unix (%d) must equal the frozen max_wall_seconds (%d)",
+			rs.DeadlineUnix-rs.StartedUnix, rs.EffectivePolicy.Limits.MaxWallSeconds)
+	}
+	return nil
 }
 
 func isGitOID(s string) bool {
@@ -417,8 +436,18 @@ func isGitOID(s string) bool {
 }
 
 // validID is the canonical bounded identity grammar for turn/assignment/gate/txn
-// ids: 1..128 chars of [A-Za-z0-9._-].
-func validID(s string) bool { return validRunID(s) }
+// ids. It must be safe to use as (part of) a filename when txn/transport later
+// derive paths from these ids: alphanumeric start, no reserved dot names.
+func validID(s string) bool {
+	if !validRunID(s) { // charset + length
+		return false
+	}
+	if s == "." || s == ".." {
+		return false
+	}
+	c := s[0]
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+}
 
 func isHex64(s string) bool {
 	if len(s) != 64 {
@@ -432,12 +461,30 @@ func isHex64(s string) bool {
 	return true
 }
 
+// isLocalRelPath enforces a single canonical representation for stored locators:
+// a clean, forward-slash, relative path with no backslashes and no traversal.
+// This avoids separator- and case-aliases that could point two allocations at one
+// directory (see locatorKey for uniqueness comparison).
 func isLocalRelPath(p string) bool {
-	if p == "" || p == "." {
+	if p == "" || p == "." || p == ".." {
 		return false
 	}
-	return filepath.IsLocal(p) && filepath.ToSlash(filepath.Clean(p)) == filepath.ToSlash(p)
+	if strings.ContainsRune(p, '\\') {
+		return false // backslashes are never a canonical stored separator
+	}
+	if path.IsAbs(p) || path.Clean(p) != p {
+		return false
+	}
+	if strings.HasPrefix(p, "../") {
+		return false
+	}
+	return true
 }
+
+// locatorKey normalizes a locator for uniqueness comparison. It folds case so a
+// case-insensitive filesystem (Windows) cannot alias two allocations to one
+// directory; on a case-sensitive filesystem this is merely conservative.
+func locatorKey(p string) string { return strings.ToLower(p) }
 
 func validRunID(s string) bool {
 	if len(s) == 0 || len(s) > 128 {

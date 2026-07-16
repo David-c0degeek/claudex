@@ -111,10 +111,10 @@ func (c *CatalogStore) AllocateLocked(g *genstore.Guard, expectedRevision uint64
 	}
 
 	for _, r := range cur.Runs {
-		if r.RunID == ref.RunID {
+		if strings.EqualFold(r.RunID, ref.RunID) {
 			return Catalog{}, fmt.Errorf("%w: run_id %s", ErrRunExists, ref.RunID)
 		}
-		if r.RelDir == ref.RelDir {
+		if locatorKey(r.RelDir) == locatorKey(ref.RelDir) {
 			return Catalog{}, fmt.Errorf("%w: rel_dir %s", ErrRunExists, ref.RelDir)
 		}
 	}
@@ -189,14 +189,16 @@ func validateCatalog(cat *Catalog) error {
 		if err := validateRunRef(r); err != nil {
 			return err
 		}
-		if ids[r.RunID] {
+		idKey := strings.ToLower(r.RunID)
+		dirKey := locatorKey(r.RelDir)
+		if ids[idKey] {
 			return fmt.Errorf("catalog: duplicate run_id %s", r.RunID)
 		}
-		if dirs[r.RelDir] {
+		if dirs[dirKey] {
 			return fmt.Errorf("catalog: duplicate rel_dir %s", r.RelDir)
 		}
-		ids[r.RunID] = true
-		dirs[r.RelDir] = true
+		ids[idKey] = true
+		dirs[dirKey] = true
 	}
 	return nil
 }

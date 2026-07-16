@@ -261,6 +261,7 @@ func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	}
 	r3, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
 		next.Assignment = &Ref{ID: "assign-1", IssuedRevision: rev}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}}
 		return nil
 	})
 	if err != nil {
@@ -268,6 +269,9 @@ func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	}
 	if r3.Revision != 3 || r3.Assignment == nil || r3.Assignment.IssuedRevision != 3 {
 		t.Fatalf("gap issuance = rev %d assignment %+v, want rev 3 / issued 3", r3.Revision, r3.Assignment)
+	}
+	if r3.AcceptedTurns["t1"].Receipt.Revision != 3 {
+		t.Fatalf("accepted-turn receipt revision = %d, want the skipped-to generation 3", r3.AcceptedTurns["t1"].Receipt.Revision)
 	}
 }
 

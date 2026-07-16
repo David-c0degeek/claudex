@@ -100,6 +100,24 @@ func TestCatalogRejectsIncompleteMetadata(t *testing.T) {
 	}
 }
 
+func TestCatalogRejectsBackslashLocator(t *testing.T) {
+	c := newCatalog(t)
+	if _, err := c.Allocate(0, ref("r", `runs\x`)); err == nil {
+		t.Fatalf("a backslash locator should be rejected (single forward-slash representation)")
+	}
+}
+
+func TestCatalogCaseFoldedDuplicateLocator(t *testing.T) {
+	c := newCatalog(t)
+	cat1, err := c.Allocate(0, ref("a", "runs/shared"))
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if _, err := c.Allocate(cat1.Revision, ref("b", "runs/SHARED")); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("case-only locator duplicate err = %v, want ErrRunExists", err)
+	}
+}
+
 func TestCatalogRejectsDuplicateRelDir(t *testing.T) {
 	c := newCatalog(t)
 	cat1, err := c.Allocate(0, ref("a", "runs/shared"))
