@@ -8,10 +8,12 @@
   "properties": {
     "protocol_version": {
       "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
       "const": 1
     },
     "message_type": {
       "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
       "const": "receipt"
     },
     "turn_id": {

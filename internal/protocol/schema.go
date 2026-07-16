@@ -54,12 +54,17 @@ var validTypes = map[string]bool{
 }
 
 // compile parses schema bytes into a validator, rejecting any unsupported
-// keyword or malformed constraint.
+// keyword or malformed constraint. The bytes are canonicalized first, so the
+// embedded contract inherits canonjson's duplicate-key, integer, Unicode, size,
+// depth, and trailing-content rules — a schema with a duplicate keyword or a
+// trailing document never compiles.
 func compile(raw []byte) (*schemaNode, error) {
+	canon, err := canonjson.Canonicalize(raw)
+	if err != nil {
+		return nil, fmt.Errorf("schema: %w", err)
+	}
 	var m map[string]json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
+	if err := json.Unmarshal(canon, &m); err != nil {
 		return nil, fmt.Errorf("schema: parse: %w", err)
 	}
 	return compileNode(m)
@@ -90,24 +95,82 @@ func compileNode(m map[string]json.RawMessage) (*schemaNode, error) {
 			return nil, err
 		}
 	}
-	if err := n.enforceStrictObjectProfile(); err != nil {
+	if err := n.enforceProfile(); err != nil {
 		return nil, err
 	}
 	return n, nil
 }
 
-// enforceStrictObjectProfile applies the authored-schema contract (stricter than
-// generic JSON Schema, matching the harvested provider-strict shape): an object
-// with properties must explicitly set additionalProperties:false, and required
-// must name every property exactly once (optional values are modeled as
-// required-but-nullable via a "null" type union), with no unknown names.
-func (n *schemaNode) enforceStrictObjectProfile() error {
-	if !n.hasProperties {
-		return nil
+// enforceProfile applies the authored-schema contract (stricter than generic
+// JSON Schema, matching the harvested provider-strict shape):
+//   - every object type must declare properties, additionalProperties:false, and
+//     a required list naming every property exactly once (optional values are
+//     modeled as required-but-nullable via a "null" type union);
+//   - every array type must declare items;
+//   - a constraint keyword is rejected unless its applicable type is present
+//     (a typeless const/enum is allowed);
+//   - bounds must be coherent (min <= max), enum must be non-empty, and the type
+//     list must not repeat an alternative.
+func (n *schemaNode) enforceProfile() error {
+	seen := make(map[string]bool, len(n.types))
+	for _, t := range n.types {
+		if seen[t] {
+			return fmt.Errorf("schema: duplicate type alternative %q", t)
+		}
+		seen[t] = true
 	}
-	if !n.hasAdditional || n.additionalProps {
-		return fmt.Errorf("schema: an object with properties must set additionalProperties:false")
+	isObject := containsString(n.types, "object")
+	isArray := containsString(n.types, "array")
+	isString := containsString(n.types, "string")
+	isInteger := containsString(n.types, "integer")
+
+	// Constraint keywords require their applicable type.
+	if (n.hasProperties || len(n.required) > 0 || n.hasAdditional) && !isObject {
+		return fmt.Errorf("schema: object keywords require type object")
 	}
+	if (n.items != nil || n.minItems != nil || n.maxItems != nil) && !isArray {
+		return fmt.Errorf("schema: array keywords require type array")
+	}
+	if (n.minLength != nil || n.maxLength != nil) && !isString {
+		return fmt.Errorf("schema: string keywords require type string")
+	}
+	if (n.minimum != nil || n.maximum != nil) && !isInteger {
+		return fmt.Errorf("schema: numeric keywords require type integer")
+	}
+
+	// Completeness of composite types.
+	if isObject {
+		if !n.hasProperties {
+			return fmt.Errorf("schema: an object must declare properties")
+		}
+		if !n.hasAdditional || n.additionalProps {
+			return fmt.Errorf("schema: an object must set additionalProperties:false")
+		}
+		if err := n.checkRequiredExact(); err != nil {
+			return err
+		}
+	}
+	if isArray && n.items == nil {
+		return fmt.Errorf("schema: an array must declare items")
+	}
+
+	// Coherent bounds and non-empty enum.
+	if n.minLength != nil && n.maxLength != nil && *n.minLength > *n.maxLength {
+		return fmt.Errorf("schema: minLength exceeds maxLength")
+	}
+	if n.minItems != nil && n.maxItems != nil && *n.minItems > *n.maxItems {
+		return fmt.Errorf("schema: minItems exceeds maxItems")
+	}
+	if n.minimum != nil && n.maximum != nil && *n.minimum > *n.maximum {
+		return fmt.Errorf("schema: minimum exceeds maximum")
+	}
+	if n.hasEnum && len(n.enum) == 0 {
+		return fmt.Errorf("schema: enum must not be empty")
+	}
+	return nil
+}
+
+func (n *schemaNode) checkRequiredExact() error {
 	seen := make(map[string]bool, len(n.required))
 	for _, r := range n.required {
 		if seen[r] {
@@ -254,9 +317,10 @@ func (n *schemaNode) validateObject(obj map[string]interface{}, path string) err
 			return fmt.Errorf("%s: missing required property %q", path, req)
 		}
 	}
-	if n.hasProperties && !n.additionalProps {
+	if !n.additionalProps {
 		// Report a count only: an instance key is a submitted value and could
-		// carry a secret, so it is never echoed in a diagnostic.
+		// carry a secret, so it is never echoed in a diagnostic. With no declared
+		// properties every key is unexpected.
 		extra := 0
 		for k := range obj {
 			if _, ok := n.properties[k]; !ok {

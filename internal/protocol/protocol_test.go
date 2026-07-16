@@ -22,8 +22,8 @@ func TestEmbeddedSchemasCompile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embedded schemas failed to compile: %v", err)
 	}
-	if _, ok := set["receipt"]; !ok {
-		t.Fatalf("receipt schema not registered; have %v", keys(set))
+	if _, ok := set[schemaKey{"receipt", 1}]; !ok {
+		t.Fatalf("receipt v1 schema not registered; have %v", keys(set))
 	}
 }
 
@@ -117,8 +117,106 @@ func TestValueFreeDiagnostics(t *testing.T) {
 	}
 }
 
-func keys(m map[string]*schemaNode) []string {
-	out := make([]string, 0, len(m))
+// The exact embedded bytes must be retrievable for provider instruction, the
+// returned copy must not be able to mutate the registry, and Validate must use
+// the compiled node built from the same entry.
+func TestSchemaReturnsEmbeddedBytesAndIsCopy(t *testing.T) {
+	got, err := Schema("receipt", 1)
+	if err != nil {
+		t.Fatalf("Schema: %v", err)
+	}
+	embedded, err := schemaFS.ReadFile("schemas/receipt.v1.json")
+	if err != nil {
+		t.Fatalf("read embedded: %v", err)
+	}
+	if string(got) != string(embedded) {
+		t.Fatalf("Schema bytes differ from the embedded document")
+	}
+	// Mutating the returned slice must not affect a later call.
+	for i := range got {
+		got[i] = 'x'
+	}
+	again, _ := Schema("receipt", 1)
+	if string(again) != string(embedded) {
+		t.Fatalf("caller mutation altered the registry bytes")
+	}
+	if _, err := Schema("nope", 1); err == nil {
+		t.Fatalf("unknown schema should error")
+	}
+}
+
+// A future-major message whose body uses a future-domain construct (1.0) must
+// still get ProtocolVersionError from the preflight, not a canonjson error.
+func TestFutureMajorGetsVersionErrorNotCanonError(t *testing.T) {
+	body := `{"protocol_version":2,"message_type":"receipt","state_revision":1.0,"turn_id":"t","artifact_digest":"` + sixtyFour + `"}`
+	var pv *ProtocolVersionError
+	if _, err := Validate("receipt", []byte(body)); !errors.As(err, &pv) {
+		t.Fatalf("err = %v, want *ProtocolVersionError from preflight", err)
+	}
+}
+
+func TestCompileIsStrictOverItsOwnInput(t *testing.T) {
+	// Duplicate schema keyword (last-wins is not allowed).
+	if _, err := compile([]byte(`{"type":"string","type":"integer"}`)); err == nil {
+		t.Fatalf("a duplicate schema keyword should fail compilation")
+	}
+	// Trailing document after the schema.
+	if _, err := compile([]byte(`{"type":"string"} {}`)); err == nil {
+		t.Fatalf("a trailing document should fail compilation")
+	}
+}
+
+func TestProfileBypassesClosed(t *testing.T) {
+	bad := map[string]string{
+		"object without properties":   `{"type":"object","additionalProperties":false}`,
+		"unconstrained object":        `{"type":"object"}`,
+		"required without properties": `{"type":"object","additionalProperties":false,"required":["a"]}`,
+		"array without items":         `{"type":"array"}`,
+		"string keyword wrong type":   `{"type":"integer","minLength":1}`,
+		"numeric keyword wrong type":  `{"type":"string","minimum":1}`,
+		"incoherent bounds":           `{"type":"integer","minimum":5,"maximum":1}`,
+		"empty enum":                  `{"enum":[]}`,
+		"duplicate type":              `{"type":["string","string"]}`,
+	}
+	for name, body := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := compile([]byte(body)); err == nil {
+				t.Fatalf("%s should fail compilation", name)
+			}
+		})
+	}
+}
+
+// An object that explicitly forbids extras but declares no properties must not
+// then silently accept arbitrary properties at validation time. (Belt-and-
+// suspenders: the profile already rejects such a schema at compile.)
+func TestAdditionalPropsFalseRejectsExtrasWithoutProperties(t *testing.T) {
+	n := &schemaNode{types: []string{"object"}, additionalProps: false, hasAdditional: true}
+	if err := n.validate(map[string]interface{}{"x": "y"}, "$"); err == nil {
+		t.Fatalf("additionalProperties:false must reject an unexpected property")
+	}
+}
+
+func TestRegistryIdentityBinding(t *testing.T) {
+	// message_type const not equal to the filename type.
+	bad := []byte(`{"type":"object","additionalProperties":false,"required":["protocol_version","message_type"],"properties":{"protocol_version":{"type":"integer","const":1},"message_type":{"type":"string","const":"wrong"}}}`)
+	node, err := compile(bad)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := checkIdentity(node, "receipt", 1); err == nil {
+		t.Fatalf("a mismatched message_type const must fail identity binding")
+	}
+	// protocol_version const not equal to the filename major.
+	bad2 := []byte(`{"type":"object","additionalProperties":false,"required":["protocol_version","message_type"],"properties":{"protocol_version":{"type":"integer","const":2},"message_type":{"type":"string","const":"receipt"}}}`)
+	node2, _ := compile(bad2)
+	if err := checkIdentity(node2, "receipt", 1); err == nil {
+		t.Fatalf("a mismatched protocol_version const must fail identity binding")
+	}
+}
+
+func keys(m map[schemaKey]*entry) []schemaKey {
+	out := make([]schemaKey, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
