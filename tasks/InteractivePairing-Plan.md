@@ -95,7 +95,7 @@ Before considering a box done:
 | Race | `go test -race ./...` | CI-only where a C toolchain exists (race detector on Windows needs one) — not a universal local gate (D015) |
 | Fuzz | `go test -run=^$ -fuzz=... -fuzztime=...` | Seed corpus from harvested counterexamples for canonical-JSON/parsing |
 | Lint/format | `gofmt -l .` (+ optional `golangci-lint`) | `gofmt` clean is mandatory; `golangci-lint` if adopted in 00.6 |
-| Platform integration | build-tagged OS tests on real Windows + Linux | Locks, atomic rename, process-tree kill, PTY/ConPTY — not provable in unit tests (D015) |
+| Platform integration | build-tagged OS tests on real Windows + Linux | Locks, atomic rename, process-tree kill (unconditional); PTY/ConPTY only **if** `internal/pty` is built by 07.3 — not provable in unit tests (D015) |
 | Plan-specific gate | Two-session attach e2e (subject 06) | Scenario-driven fake TUIs drive `pull/submit/wait`; asserts state advance + evidence |
 
 ---
@@ -176,10 +176,10 @@ Before considering a box done:
 20. **Honesty labels — never label a capability enforced without a mechanism.** BYO attach is `protocol-only`; managed capabilities are labeled individually (`sandboxed`, `telemetry-observed`, …). Agent self-report is never enforcement. Every cap/label in `status` names the mechanism that backs it.
 21. **Two-store operations are journaled + reconciled.** Any operation spanning git and coordinator state writes a prepared-transaction record first and is replayed or rolled back on startup; the code never assumes the two stores committed atomically.
 22. **Greenfield, not ported (D014).** No line of the old Python is transplanted. Reuse enters only as harvested *test vectors / schemas / fixtures*; every implementation is rederived in Go against those vectors. A subtle behaviour is pinned by a harvested counterexample test before it is coded.
-23. **OS primitives are build-tagged and integration-tested (D015).** Locks, atomic rename, process-tree kill, and PTY/ConPTY live in tiny per-OS packages (`_windows.go` / `_unix.go`) behind one interface; each is proven on real Windows + Linux, never assumed uniform. Windows process-tree kill uses create-suspended → assign-job → resume, not best-effort.
+23. **OS primitives are build-tagged and integration-tested (D015).** Locks, atomic rename, and process-tree kill live in tiny per-OS packages (`_windows.go` / `_unix.go`) behind one interface, each proven on real Windows + Linux, never assumed uniform (Windows process-tree kill uses create-suspended → assign-job → resume, not best-effort). PTY/ConPTY (`internal/pty`) is the same discipline **but conditional** — built and integration-tested only if 07.3 adopts a telemetry proxy; if not built, it has no gate.
 24. **Shell out to native git, never a library (D013).** Git operations use `exec.CommandContext` with argv (never a shell string), parse only machine formats (`-z`, object IDs), preflight a minimum git version, and use plumbing (`read-tree` + temp `GIT_INDEX_FILE`, `write-tree`, `commit-tree`, `update-ref <new> <old>` for CAS). No go-git.
 25. **Canonical bytes for identity (D014).** Any digest/idempotency/receipt is computed over canonical JSON (RFC 8785 or a restricted equivalent) — never a serializer's incidental map ordering or whitespace. The same versioned schema bytes are embedded in the binary and used for both provider instruction and coordinator validation.
-26. **Local filesystem only (D015).** Coordinator state requires a local filesystem; network/sync roots (OneDrive/SMB/NFS) are detected and rejected/labelled at preflight — never silently trusted.
+26. **Local filesystem only (D015).** Coordinator state requires a local filesystem, classified `supported-local | known-unsupported | unknown`. **Known-unsupported** (SMB/NFS + detectable sync roots) is rejected; **unknown** (undetectable third-party sync roots) follows the explicit acknowledgement policy — no claim of perfect detection. Never silently trust a non-local location.
 27. *(plan-specific principles above are 18–26; keep numbering stable)*
 
 ---
@@ -190,7 +190,7 @@ Before considering a box done:
 - [ ] Subject 00 completed, or explicitly waived/abandoned with a §4 row
 - [ ] `go build ./...`, `go vet ./...`, and `gofmt -l .` (clean) from §2 pass on the target matrix
 - [ ] `go test ./...` passes; `go test -race ./...` passes in capable CI; the two-session attach e2e (subject 06) passes
-- [ ] Platform integration tests (locks, atomic rename, process-tree kill, PTY/ConPTY) pass on real Windows + Linux (D015)
+- [ ] Platform integration tests (locks, atomic rename, process-tree kill) pass on real Windows + Linux; PTY/ConPTY tests too **only if** `internal/pty` was built by 07.3 (D015)
 - [ ] Behaviour verification done for every runtime-behaviour box — the changed flow driven end-to-end with observed-vs-expected output recorded (canonical: two attached sessions complete a real turn)
 - [ ] Remaining §2 rows (lint/format, plan-specific gates) pass or recorded `n/a`
 - [ ] §1 Risks-and-rollback table reviewed; rollback steps still accurate for what shipped
