@@ -15,8 +15,10 @@
 //
 // The parser is strict by construction: it rejects duplicate object keys, lone
 // UTF-16 surrogates, invalid UTF-8, leading zeros, trailing content, and input
-// past bounded size/nesting limits — so canonicalization is injective on the
-// inputs it accepts and never silently normalizes an ambiguous document.
+// past bounded size/nesting limits, and never silently normalizes an ambiguous
+// document. It yields exactly one canonical representation per accepted JSON
+// data-model value: insignificant whitespace, object-key order, escape spelling,
+// and a -0 sign all deliberately collapse.
 package canonjson
 
 import (

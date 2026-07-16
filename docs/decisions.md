@@ -163,8 +163,10 @@ subject 01 shapes state.
   strings). This avoids reproducing ECMAScript shortest-round-trip float
   formatting and preserves digest identity under JavaScript providers. The parser
   is strict — it rejects duplicate keys, lone surrogates, invalid UTF-8, leading
-  zeros, trailing content, and oversize/over-nested input — so canonicalization is
-  injective on accepted inputs. Digest is `sha256` over the canonical bytes.
+  zeros, trailing content, and oversize/over-nested input, yielding exactly one
+  canonical representation per accepted JSON data-model value (whitespace, key
+  order, escape spelling, and a −0 sign all collapse). Digest is `sha256` over the
+  canonical bytes.
 
 ## D017 — Immutable-generation persistence (state root of trust)
 Because file replace is not atomic on Windows (D015), the authoritative run state

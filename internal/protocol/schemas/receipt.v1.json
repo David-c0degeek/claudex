@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex submit receipt, version 1",
+  "description": "The durable acknowledgement returned by submit: the accepted turn, the resulting state revision, and the canonical artifact digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "message_type", "turn_id", "state_revision", "artifact_digest"],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "const": "receipt"
+    },
+    "turn_id": {
+      "description": "The turn this receipt acknowledges.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_revision": {
+      "description": "The run-state revision produced by accepting the submit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "artifact_digest": {
+      "description": "Lower-hex sha256 over the canonical artifact bytes.",
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    }
+  }
+}
