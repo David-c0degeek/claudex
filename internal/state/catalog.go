@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/redact"
@@ -157,8 +158,19 @@ func validateRunRef(ref RunRef) error {
 	if !isLocalRelPath(ref.RelDir) {
 		return fmt.Errorf("catalog: rel_dir %q is not a canonical local path", ref.RelDir)
 	}
-	// A secret must never be laundered through an allocation locator.
-	if redact.Text(ref.RunID) != ref.RunID || redact.Text(ref.RelDir) != ref.RelDir {
+	// The allocation is authoritative immutable metadata, not a partial cache:
+	// the base was already resolved by the first attach.
+	if strings.TrimSpace(ref.Base) == "" {
+		return fmt.Errorf("catalog: base is required")
+	}
+	if !isGitOID(ref.BaseCommit) {
+		return fmt.Errorf("catalog: base_commit is not a git object id (40 or 64 lower-hex)")
+	}
+	if ref.CreatedUnix <= 0 {
+		return fmt.Errorf("catalog: created_unix must be positive")
+	}
+	// A secret must never be laundered through an allocation field.
+	if redact.Text(ref.RunID) != ref.RunID || redact.Text(ref.RelDir) != ref.RelDir || redact.Text(ref.Base) != ref.Base {
 		return fmt.Errorf("catalog: a secret was detected in a run allocation field")
 	}
 	return nil

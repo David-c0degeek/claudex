@@ -72,14 +72,30 @@ func validate(rs *RunState) error {
 	if err := rs.EffectivePolicy.Validate(); err != nil {
 		return fmt.Errorf("effective_policy: %w", err)
 	}
-	if !knownFSClasses[rs.FS.Class] {
-		return fmt.Errorf("unknown fs class %q", rs.FS.Class)
+	if err := validateFS(rs); err != nil {
+		return err
 	}
 	if strings.TrimSpace(rs.Base) == "" {
 		return fmt.Errorf("base is required")
 	}
-	if strings.TrimSpace(rs.BaseCommit) == "" {
-		return fmt.Errorf("base_commit is required")
+	if !isGitOID(rs.BaseCommit) {
+		return fmt.Errorf("base_commit is not a git object id (40 or 64 lower-hex)")
+	}
+	if rs.Base != rs.EffectivePolicy.BaseBranch {
+		return fmt.Errorf("base %q must equal effective_policy.base_branch %q", rs.Base, rs.EffectivePolicy.BaseBranch)
+	}
+	hasCmd := strings.TrimSpace(rs.EffectivePolicy.TestGate.Command) != ""
+	if hasCmd == rs.EffectivePolicy.TestGate.Disabled {
+		return fmt.Errorf("effective_policy.test_gate must set exactly one of command or disabled")
+	}
+	if rs.TaskSnapshot.RelPath == rs.PolicySnapshot.RelPath {
+		return fmt.Errorf("task and policy snapshot paths must be distinct")
+	}
+	if rs.PendingTxnID != "" && !validID(rs.PendingTxnID) {
+		return fmt.Errorf("invalid pending_txn_id")
+	}
+	if err := validateTimes(rs); err != nil {
+		return err
 	}
 	if err := validateCounters(rs.Counters); err != nil {
 		return err
@@ -109,6 +125,15 @@ func validateInit(rs *RunState) error {
 	}
 	if rs.Lifecycle != LifecycleRunning {
 		return fmt.Errorf("initial lifecycle must be running, got %q", rs.Lifecycle)
+	}
+	if rs.Phase != PhaseInit {
+		return fmt.Errorf("initial phase must be %q, got %q", PhaseInit, rs.Phase)
+	}
+	if len(rs.AcceptedTurns) != 0 {
+		return fmt.Errorf("initial state must have no accepted turns")
+	}
+	if rs.Assignment != nil || rs.Gate != nil || rs.Recovery != nil || rs.Failure != nil {
+		return fmt.Errorf("initial state must have no assignment, gate, recovery, or failure")
 	}
 	return nil
 }
@@ -155,11 +180,17 @@ func validateTransition(old, next *RunState) error {
 			return fmt.Errorf("step fix %d must not decrease", i)
 		}
 	}
-	// Accepted turns are append-only and existing entries are frozen.
+	// Accepted turns are append-only; existing entries are frozen and a NEW turn
+	// must have been accepted at the resulting revision (D004).
 	for k, v := range old.AcceptedTurns {
 		nv, ok := next.AcceptedTurns[k]
 		if !ok || nv != v {
 			return fmt.Errorf("accepted turn %q is immutable", k)
+		}
+	}
+	for k, v := range next.AcceptedTurns {
+		if _, existed := old.AcceptedTurns[k]; !existed && v.Receipt.Revision != next.Revision {
+			return fmt.Errorf("newly accepted turn %q must bind to revision %d, got %d", k, next.Revision, v.Receipt.Revision)
 		}
 	}
 	// A newly-set or replaced ref must bind to the resulting revision.
@@ -168,6 +199,26 @@ func validateTransition(old, next *RunState) error {
 	}
 	if err := refBindsToRevision("gate", old.Gate, next.Gate, next.Revision); err != nil {
 		return err
+	}
+	// A newly-set or changed projection must bind to the resulting revision.
+	if err := projBindsToRevision("recovery", old.Recovery, next.Recovery, next.Revision); err != nil {
+		return err
+	}
+	if err := projBindsToRevision("failure", old.Failure, next.Failure, next.Revision); err != nil {
+		return err
+	}
+	return nil
+}
+
+func projBindsToRevision(field string, old, next *Projection, rev uint64) error {
+	if next == nil {
+		return nil
+	}
+	if old != nil && *old == *next {
+		return nil // unchanged
+	}
+	if next.AtRevision != rev {
+		return fmt.Errorf("%s was set/changed but bound to revision %d, not the resulting %d", field, next.AtRevision, rev)
 	}
 	return nil
 }
@@ -216,6 +267,9 @@ func validateCounters(c Counters) error {
 
 func validateAcceptedTurns(rs *RunState) error {
 	for k, v := range rs.AcceptedTurns {
+		if !validID(k) {
+			return fmt.Errorf("accepted turn key %q is not a canonical id", k)
+		}
 		if v.Receipt.TurnID != k {
 			return fmt.Errorf("accepted turn key %q != receipt turn_id %q", k, v.Receipt.TurnID)
 		}
@@ -236,8 +290,8 @@ func validateRef(field string, r *Ref, rev uint64) error {
 	if r == nil {
 		return nil
 	}
-	if strings.TrimSpace(r.ID) == "" {
-		return fmt.Errorf("%s id is required when present", field)
+	if !validID(r.ID) {
+		return fmt.Errorf("%s id %q is not a canonical id", field, r.ID)
 	}
 	if r.IssuedRevision == 0 || r.IssuedRevision > rev {
 		return fmt.Errorf("%s issued_revision %d out of range (1..%d)", field, r.IssuedRevision, rev)
@@ -249,8 +303,17 @@ func validateProjection(field string, p *Projection, rev uint64) error {
 	if p == nil {
 		return nil
 	}
-	if p.AtRevision > rev {
-		return fmt.Errorf("%s at_revision %d > state revision %d", field, p.AtRevision, rev)
+	if strings.TrimSpace(p.Code) == "" || len(p.Code) > 128 {
+		return fmt.Errorf("%s code is required and bounded", field)
+	}
+	if strings.TrimSpace(p.Reason) == "" {
+		return fmt.Errorf("%s reason is required", field)
+	}
+	if strings.TrimSpace(p.NextAction) == "" {
+		return fmt.Errorf("%s next_action is required", field)
+	}
+	if p.AtRevision == 0 || p.AtRevision > rev {
+		return fmt.Errorf("%s at_revision %d out of range (1..%d)", field, p.AtRevision, rev)
 	}
 	return nil
 }
@@ -296,6 +359,8 @@ func redactAndGuard(rs *RunState) error {
 		control["failure.next_action"] = rs.Failure.NextAction
 	}
 	for k, v := range rs.AcceptedTurns {
+		control["accepted_turns.key."+k] = k
+		control["accepted_turns."+k+".turn_id"] = v.Receipt.TurnID
 		control["accepted_turns."+k+".digest"] = v.ArtifactDigest
 	}
 	for field, v := range control {
@@ -305,6 +370,55 @@ func redactAndGuard(rs *RunState) error {
 	}
 	return nil
 }
+
+func validateFS(rs *RunState) error {
+	if !knownFSClasses[rs.FS.Class] {
+		return fmt.Errorf("unknown fs class %q", rs.FS.Class)
+	}
+	if strings.TrimSpace(rs.FS.Reason) == "" {
+		return fmt.Errorf("fs.reason is required")
+	}
+	switch rs.FS.Class {
+	case "supported-local":
+		// no acknowledgement needed
+	case "unknown":
+		if rs.EffectivePolicy.UnknownFSPolicy != "acknowledge" || !rs.FS.Acknowledged {
+			return fmt.Errorf("unknown filesystem requires unknown_fs_policy=acknowledge and fs.acknowledged=true")
+		}
+	case "known-unsupported":
+		return fmt.Errorf("a run must not operate on a known-unsupported filesystem")
+	}
+	return nil
+}
+
+func validateTimes(rs *RunState) error {
+	// started/deadline are either both unset (before start) or both positive with
+	// a deadline strictly after the start.
+	switch {
+	case rs.StartedUnix == 0 && rs.DeadlineUnix == 0:
+		return nil
+	case rs.StartedUnix > 0 && rs.DeadlineUnix > rs.StartedUnix:
+		return nil
+	default:
+		return fmt.Errorf("started_unix/deadline_unix must be both unset or both positive with deadline > started")
+	}
+}
+
+func isGitOID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validID is the canonical bounded identity grammar for turn/assignment/gate/txn
+// ids: 1..128 chars of [A-Za-z0-9._-].
+func validID(s string) bool { return validRunID(s) }
 
 func isHex64(s string) bool {
 	if len(s) != 64 {
