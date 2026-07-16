@@ -80,31 +80,44 @@ func TestRunRejectsExtraArgs(t *testing.T) {
 }
 
 func TestInspectLegacyPrintsRedactedRefusal(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
 	secret := "token=sk-ant-abcdefghijklmnopqrstuvwx"
-	body := `{"run_id":"r1","repo":"/p","lead":"claude","driver":"headless","phase":"await_guidance","guidance_notes":"` + secret + `","steps":[],"events":[]}`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	body := `{"run_id":"r1","repo":"/p","lead":"claude","driver":"headless","phase":"await_guidance","gate_reason":"` + secret + `","steps":[],"events":[]}`
+
+	assertRefusal := func(t *testing.T, out, errBuf *bytes.Buffer, code int) {
+		t.Helper()
+		if code != 0 {
+			t.Fatalf("inspect-legacy exit = %d (stderr: %s)", code, errBuf.String())
+		}
+		s := out.String()
+		if strings.Contains(s, "sk-ant-") {
+			t.Fatalf("secret leaked into inspect-legacy output:\n%s", s)
+		}
+		if !strings.Contains(s, "resumable") || !strings.Contains(s, "will not resume") {
+			t.Fatalf("inspect-legacy output missing the refusal:\n%s", s)
+		}
+	}
+
+	// A direct state.json path.
+	filePath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(filePath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-
 	var out, errBuf bytes.Buffer
-	if code := run(context.Background(), []string{"inspect-legacy", path}, &out, &errBuf); code != 0 {
-		t.Fatalf("inspect-legacy exit = %d (stderr: %s)", code, errBuf.String())
-	}
-	s := out.String()
-	if strings.Contains(s, "sk-ant-") {
-		t.Fatalf("secret leaked into inspect-legacy output:\n%s", s)
-	}
-	if !strings.Contains(s, "resumable") || !strings.Contains(s, "will not resume") {
-		t.Fatalf("inspect-legacy output missing the refusal:\n%s", s)
-	}
-
-	// The read-only inspector must not touch the file.
-	after, _ := os.ReadFile(path)
-	if string(after) != body {
+	code := run(context.Background(), []string{"inspect-legacy", filePath}, &out, &errBuf)
+	assertRefusal(t, &out, &errBuf, code)
+	if after, _ := os.ReadFile(filePath); string(after) != body {
 		t.Fatalf("inspect-legacy modified the input file")
 	}
+
+	// A run directory: state.json is located via the CheckRunDir bootstrap guard.
+	runDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "state.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write dir fixture: %v", err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = run(context.Background(), []string{"inspect-legacy", runDir}, &out, &errBuf)
+	assertRefusal(t, &out, &errBuf, code)
 }
 
 func TestInspectLegacyRejectsNonLegacyAndArity(t *testing.T) {

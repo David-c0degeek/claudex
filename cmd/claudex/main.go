@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -73,15 +74,32 @@ func usageError(stderr io.Writer, cmd string, extra []string) int {
 	return 2
 }
 
-// inspectLegacy reads a pre-pivot Python state.json read-only and prints a
-// redacted summary plus the refuse-to-resume remediation. It never mutates the
-// file. Exit codes: 0 printed, 1 read/render error, 2 usage.
+// inspectLegacy reads a pre-pivot Python run read-only and prints a redacted
+// summary plus the refuse-to-resume remediation. The path may be a run
+// directory (its state.json is located via the same CheckRunDir guard the
+// attach bootstrap uses) or the state.json file directly. It never mutates
+// anything. Exit codes: 0 printed, 1 read/render error, 2 usage.
 func inspectLegacy(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
 		fmt.Fprintf(stderr, "claudex: inspect-legacy takes exactly one path, got %v\n", args)
 		return 2
 	}
-	raw, err := os.ReadFile(args[0])
+	path := args[0]
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		var lre *legacy.LegacyRunError
+		switch err := legacy.CheckRunDir(path); {
+		case errors.As(err, &lre):
+			path = lre.StatePath // it is a legacy run; inspect its state.json
+		case err != nil:
+			fmt.Fprintf(stderr, "claudex: inspect-legacy: %v\n", err)
+			return 1
+		default:
+			fmt.Fprintf(stderr, "claudex: inspect-legacy: no pre-pivot state.json in %s\n", path)
+			return 1
+		}
+	}
+
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "claudex: inspect-legacy: %v\n", err)
 		return 1

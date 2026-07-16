@@ -9,10 +9,11 @@ import (
 	"testing"
 )
 
+// The fixture is an exact dataclasses.asdict(RunState(...)) shape from
+// reliability-observability-refactor:claudex/state.py at commit 1b6ceea
+// (state_schema_version 6), with a secret planted in the free-text gate_reason.
 const fixture = "testdata/legacy_state.json"
 
-// The planted secret in the fixture's guidance_notes; the redacted report must
-// never contain it.
 const plantedSecret = "sk-ant-abcdefghijklmnopqrstuvwx"
 
 func readFixture(t *testing.T) []byte {
@@ -28,7 +29,7 @@ func TestDetectPrePivotState(t *testing.T) {
 	if !Detect(readFixture(t)) {
 		t.Fatalf("fixture should be detected as a pre-pivot Python state")
 	}
-	// An attach state (has schema_version + revision) is not legacy: the attach
+	// An attach state (schema_version + revision) is not legacy: the attach
 	// loader's fail-closed schema check owns it, not this package.
 	attach := []byte(`{"schema_version":1,"revision":3,"run_id":"r","phase":"init"}`)
 	if Detect(attach) {
@@ -53,8 +54,14 @@ func TestInspectExportsRedactedReport(t *testing.T) {
 	if rep.RunID != "20260714-abc123" || rep.Lead != "claude" || rep.Pair != "codex" {
 		t.Fatalf("unexpected identity fields: %+v", rep)
 	}
+	if rep.PredecessorRunID != "20260713-def456" {
+		t.Fatalf("predecessor not surfaced: %+v", rep)
+	}
 	if rep.Phase != "await_guidance" || rep.Terminal {
 		t.Fatalf("await_guidance must be non-terminal: %+v", rep)
+	}
+	if rep.Lifecycle != "paused_budget" || rep.GateKind != "budget" {
+		t.Fatalf("unexpected lifecycle/gate fields: %+v", rep)
 	}
 	if rep.Steps != 2 || rep.StepIndex != 1 || rep.MailboxTurn != 7 {
 		t.Fatalf("unexpected counters: %+v", rep)
@@ -64,11 +71,11 @@ func TestInspectExportsRedactedReport(t *testing.T) {
 	}
 
 	// The planted secret must be gone from every rendered surface.
-	if !strings.Contains(rep.GuidanceNotes, "[REDACTED]") {
-		t.Fatalf("guidance_notes not redacted: %q", rep.GuidanceNotes)
+	if !strings.Contains(rep.GateReason, "[REDACTED]") {
+		t.Fatalf("gate_reason not redacted: %q", rep.GateReason)
 	}
 	rendered := rep.String()
-	if strings.Contains(rendered, plantedSecret) || strings.Contains(rep.GuidanceNotes, plantedSecret) {
+	if strings.Contains(rendered, plantedSecret) || strings.Contains(rep.GateReason, plantedSecret) {
 		t.Fatalf("secret leaked into the report:\n%s", rendered)
 	}
 	if !strings.Contains(rendered, Remediation) {
@@ -77,9 +84,6 @@ func TestInspectExportsRedactedReport(t *testing.T) {
 }
 
 func TestInspectIsReadOnly(t *testing.T) {
-	// Inspect must not mutate its input, and the on-disk fixture must be byte
-	// identical afterwards (legacy .bak/state bytes are preserved, D017 retention
-	// supersedes the old single .bak).
 	before := readFixture(t)
 	input := append([]byte(nil), before...)
 	if _, err := Inspect(input); err != nil {
@@ -101,9 +105,66 @@ func TestInspectRejectsNonLegacy(t *testing.T) {
 	}
 }
 
-// Guard against the fixture drifting out of the package directory.
-func TestFixtureExists(t *testing.T) {
-	if _, err := os.Stat(filepath.FromSlash(fixture)); err != nil {
-		t.Fatalf("fixture missing: %v", err)
+// CheckRunDir is the actual bootstrap/resume refusal seam: a legacy run
+// directory (state.json + state.v1.bak.json + current) must be refused with a
+// typed error carrying Remediation, and nothing on disk may change.
+func TestCheckRunDirRefusesLegacyAndPreservesBytes(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	bakPath := filepath.Join(dir, "state.v1.bak.json")
+	curPath := filepath.Join(dir, "current")
+
+	stateBytes := readFixture(t)
+	bakBytes := append([]byte(nil), stateBytes...) // an existing legacy backup
+	curBytes := []byte("20260714-abc123\n")
+	mustWrite(t, statePath, stateBytes)
+	mustWrite(t, bakPath, bakBytes)
+	mustWrite(t, curPath, curBytes)
+
+	err := CheckRunDir(dir)
+	var lre *LegacyRunError
+	if !errors.As(err, &lre) {
+		t.Fatalf("CheckRunDir err = %v, want *LegacyRunError", err)
+	}
+	if lre.StatePath != statePath {
+		t.Fatalf("LegacyRunError.StatePath = %q, want %q", lre.StatePath, statePath)
+	}
+	if !strings.Contains(lre.Error(), Remediation) {
+		t.Fatalf("refusal missing remediation: %v", lre)
+	}
+
+	// .bak and pointer preservation: the read-only guard changed nothing.
+	assertBytes(t, statePath, stateBytes)
+	assertBytes(t, bakPath, bakBytes)
+	assertBytes(t, curPath, curBytes)
+}
+
+func TestCheckRunDirIgnoresMissingAndAttach(t *testing.T) {
+	empty := t.TempDir()
+	if err := CheckRunDir(empty); err != nil {
+		t.Fatalf("empty dir CheckRunDir = %v, want nil", err)
+	}
+	attach := t.TempDir()
+	mustWrite(t, filepath.Join(attach, "state.json"), []byte(`{"schema_version":1,"revision":1,"run_id":"r"}`))
+	if err := CheckRunDir(attach); err != nil {
+		t.Fatalf("attach state.json CheckRunDir = %v, want nil (not legacy)", err)
+	}
+}
+
+func mustWrite(t *testing.T, path string, b []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertBytes(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s changed after a read-only check", path)
 	}
 }

@@ -1,18 +1,23 @@
 // Package legacy reads pre-pivot Python claudex run state read-only. The attach
 // coordinator uses a new, incompatible state major version (D011): a pre-pivot
-// Python state.json is never reinterpreted as an attach run — it is detected,
-// inspectable in a redacted view, and refused for resume/execution.
+// Python run directory is never reinterpreted or resumed as an attach run — it
+// is detected, inspectable in a redacted view, and refused at bootstrap.
 //
-// The old state was dataclasses.asdict(RunState) with fields run_id/repo/lead/
-// driver/mode/phase/sessions/steps/events/... and, crucially, NO schema_version.
-// The Go attach state always carries schema_version (and revision), so the two
-// shapes are distinguishable with certainty.
+// The old state is dataclasses.asdict(RunState) from
+// reliability-observability-refactor:claudex/state.py (state_schema_version 6):
+// run_id/repo/lead/driver/mode/phase/lifecycle/sessions/steps/events/… and,
+// crucially, NO schema_version (its own key is state_schema_version). The Go
+// attach state always carries schema_version (and revision), so the two shapes
+// are distinguishable with certainty.
 package legacy
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -27,7 +32,41 @@ const Remediation = "This is a pre-pivot Python claudex run. The attach coordina
 	"incompatible state major version and will not resume or execute it. Inspect it read-only with " +
 	"`claudex inspect-legacy <path>`, then start a fresh attach run for new work."
 
+// LegacyStateFile is the legacy run's state filename.
+const LegacyStateFile = "state.json"
+
 var terminalPhases = map[string]bool{"done": true, "failed": true, "aborted": true}
+
+// LegacyRunError is a typed refusal for a run directory that holds pre-pivot
+// state; it carries the offending path and the operator remediation so a
+// bootstrap/resume path can fail closed before any allocation or mutation.
+type LegacyRunError struct {
+	StatePath string
+}
+
+func (e *LegacyRunError) Error() string {
+	return fmt.Sprintf("%s is a pre-pivot Python claudex run: %s", e.StatePath, Remediation)
+}
+
+// CheckRunDir reports a pre-pivot legacy run in dir WITHOUT mutating anything.
+// If <dir>/state.json is a legacy Python state it returns a *LegacyRunError so a
+// bootstrap/resume path can fail closed with remediation instead of seeing an
+// empty attach store and allocating over the legacy run. A missing or
+// non-legacy state.json returns nil; an unreadable one returns the read error.
+func CheckRunDir(dir string) error {
+	p := filepath.Join(dir, LegacyStateFile)
+	raw, err := os.ReadFile(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if Detect(raw) {
+		return &LegacyRunError{StatePath: p}
+	}
+	return nil
+}
 
 // Detect reports whether raw is a pre-pivot Python state. It is conservative: a
 // blob carrying schema_version or revision is treated as a (possibly
@@ -58,38 +97,43 @@ func Detect(raw []byte) bool {
 // Report is a redacted, human-readable summary of a legacy run. It is never
 // resumable; Remediation states why.
 type Report struct {
-	RunID         string `json:"run_id"`
-	Repo          string `json:"repo"`
-	Lead          string `json:"lead"`
-	Pair          string `json:"pair"`
-	Driver        string `json:"driver"`
-	Mode          string `json:"mode"`
-	Phase         string `json:"phase"`
-	StepIndex     int    `json:"step_index"`
-	Steps         int    `json:"steps"`
-	MailboxTurn   int    `json:"mailbox_turn"`
-	Terminal      bool   `json:"terminal"`
-	GateReason    string `json:"gate_reason"`
-	GuidanceNotes string `json:"guidance_notes"`
-	Error         string `json:"error"`
-	Resumable     bool   `json:"resumable"`
-	Remediation   string `json:"remediation"`
+	RunID            string `json:"run_id"`
+	PredecessorRunID string `json:"predecessor_run_id"`
+	Repo             string `json:"repo"`
+	Lead             string `json:"lead"`
+	Pair             string `json:"pair"`
+	Driver           string `json:"driver"`
+	Mode             string `json:"mode"`
+	Phase            string `json:"phase"`
+	Lifecycle        string `json:"lifecycle"`
+	GateKind         string `json:"gate_kind"`
+	StepIndex        int    `json:"step_index"`
+	Steps            int    `json:"steps"`
+	MailboxTurn      int    `json:"mailbox_turn"`
+	Terminal         bool   `json:"terminal"`
+	GateReason       string `json:"gate_reason"`
+	Error            string `json:"error"`
+	Resumable        bool   `json:"resumable"`
+	Remediation      string `json:"remediation"`
 }
 
-// pyState mirrors the legacy Python dataclass fields the inspector surfaces.
+// pyState mirrors the pivot-schema (state_schema_version 6) dataclass fields the
+// inspector surfaces.
 type pyState struct {
-	RunID         string            `json:"run_id"`
-	Repo          string            `json:"repo"`
-	Lead          string            `json:"lead"`
-	Driver        string            `json:"driver"`
-	Mode          string            `json:"mode"`
-	Phase         string            `json:"phase"`
-	StepIndex     int               `json:"step_index"`
-	Steps         []json.RawMessage `json:"steps"`
-	MailboxTurn   int               `json:"mailbox_turn"`
-	GateReason    string            `json:"gate_reason"`
-	GuidanceNotes string            `json:"guidance_notes"`
-	Error         string            `json:"error"`
+	RunID            string            `json:"run_id"`
+	PredecessorRunID string            `json:"predecessor_run_id"`
+	Repo             string            `json:"repo"`
+	Lead             string            `json:"lead"`
+	Driver           string            `json:"driver"`
+	Mode             string            `json:"mode"`
+	Phase            string            `json:"phase"`
+	Lifecycle        string            `json:"lifecycle"`
+	GateKind         string            `json:"gate_kind"`
+	StepIndex        int               `json:"step_index"`
+	Steps            []json.RawMessage `json:"steps"`
+	MailboxTurn      int               `json:"mailbox_turn"`
+	GateReason       string            `json:"gate_reason"`
+	Error            string            `json:"error"`
 }
 
 // Inspect parses a legacy state read-only and returns a redacted Report. Every
@@ -105,22 +149,24 @@ func Inspect(raw []byte) (Report, error) {
 		return Report{}, fmt.Errorf("legacy: decode: %w", err)
 	}
 	return Report{
-		RunID:         redact.Text(p.RunID),
-		Repo:          redact.Text(p.Repo),
-		Lead:          redact.Text(p.Lead),
-		Pair:          otherAgent(p.Lead),
-		Driver:        redact.Text(p.Driver),
-		Mode:          redact.Text(p.Mode),
-		Phase:         redact.Text(p.Phase),
-		StepIndex:     p.StepIndex,
-		Steps:         len(p.Steps),
-		MailboxTurn:   p.MailboxTurn,
-		Terminal:      terminalPhases[p.Phase],
-		GateReason:    redact.Text(p.GateReason),
-		GuidanceNotes: redact.Text(p.GuidanceNotes),
-		Error:         redact.Text(p.Error),
-		Resumable:     false,
-		Remediation:   Remediation,
+		RunID:            redact.Text(p.RunID),
+		PredecessorRunID: redact.Text(p.PredecessorRunID),
+		Repo:             redact.Text(p.Repo),
+		Lead:             redact.Text(p.Lead),
+		Pair:             otherAgent(p.Lead),
+		Driver:           redact.Text(p.Driver),
+		Mode:             redact.Text(p.Mode),
+		Phase:            redact.Text(p.Phase),
+		Lifecycle:        redact.Text(p.Lifecycle),
+		GateKind:         redact.Text(p.GateKind),
+		StepIndex:        p.StepIndex,
+		Steps:            len(p.Steps),
+		MailboxTurn:      p.MailboxTurn,
+		Terminal:         terminalPhases[p.Phase],
+		GateReason:       redact.Text(p.GateReason),
+		Error:            redact.Text(p.Error),
+		Resumable:        false,
+		Remediation:      Remediation,
 	}, nil
 }
 
@@ -141,21 +187,23 @@ func otherAgent(lead string) string {
 // followed by the remediation line.
 func (r Report) String() string {
 	fields := map[string]string{
-		"run_id":         r.RunID,
-		"repo":           r.Repo,
-		"lead":           r.Lead,
-		"pair":           r.Pair,
-		"driver":         r.Driver,
-		"mode":           r.Mode,
-		"phase":          r.Phase,
-		"step_index":     fmt.Sprintf("%d", r.StepIndex),
-		"steps":          fmt.Sprintf("%d", r.Steps),
-		"mailbox_turn":   fmt.Sprintf("%d", r.MailboxTurn),
-		"terminal":       fmt.Sprintf("%t", r.Terminal),
-		"gate_reason":    r.GateReason,
-		"guidance_notes": r.GuidanceNotes,
-		"error":          r.Error,
-		"resumable":      fmt.Sprintf("%t", r.Resumable),
+		"run_id":       r.RunID,
+		"predecessor":  r.PredecessorRunID,
+		"repo":         r.Repo,
+		"lead":         r.Lead,
+		"pair":         r.Pair,
+		"driver":       r.Driver,
+		"mode":         r.Mode,
+		"phase":        r.Phase,
+		"lifecycle":    r.Lifecycle,
+		"gate_kind":    r.GateKind,
+		"step_index":   fmt.Sprintf("%d", r.StepIndex),
+		"steps":        fmt.Sprintf("%d", r.Steps),
+		"mailbox_turn": fmt.Sprintf("%d", r.MailboxTurn),
+		"terminal":     fmt.Sprintf("%t", r.Terminal),
+		"gate_reason":  r.GateReason,
+		"error":        r.Error,
+		"resumable":    fmt.Sprintf("%t", r.Resumable),
 	}
 	keys := make([]string, 0, len(fields))
 	for k := range fields {
@@ -165,7 +213,7 @@ func (r Report) String() string {
 	var b strings.Builder
 	b.WriteString("legacy pre-pivot claudex run (read-only)\n")
 	for _, k := range keys {
-		fmt.Fprintf(&b, "  %-15s %s\n", k, fields[k])
+		fmt.Fprintf(&b, "  %-13s %s\n", k, fields[k])
 	}
 	b.WriteString("\n" + Remediation)
 	return b.String()
