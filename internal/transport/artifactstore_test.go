@@ -27,6 +27,59 @@ func (s *syncFailSink) Put(turnID, digest string, _ []byte) error {
 	return &atomicfile.PostCommitSyncError{Path: turnID + "/" + digest, Err: errors.New("dir sync failed")}
 }
 
+// countingSink records how many times Put was called and always succeeds.
+type countingSink struct{ calls int }
+
+func (s *countingSink) Put(_, _ string, _ []byte) error { s.calls++; return nil }
+
+// A run that is not live (terminal, or recovering) refuses a submit BEFORE the
+// sink is touched, so terminal/recovery state never writes an orphan artifact.
+func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
+	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		next.Phase = state.PhaseCheckpoint
+		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		return nil
+	}
+
+	t.Run("cancelled", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		rc, err := store.Mutate(rev, func(_ uint64, next *state.RunState) error {
+			next.Lifecycle = state.LifecycleCancelled // assignment lingers; run is not live
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		sink := &countingSink{}
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		if !errors.Is(err, ErrNotAccepting) {
+			t.Fatalf("cancelled submit err = %v, want ErrNotAccepting", err)
+		}
+		if sink.calls != 0 {
+			t.Fatalf("sink was called %d times on a cancelled run", sink.calls)
+		}
+	})
+
+	t.Run("recovering", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		rr, err := store.Mutate(rev, func(gen uint64, next *state.RunState) error {
+			next.Recovery = &state.Projection{Code: "resync", Reason: "reattached", NextAction: "await", AtRevision: gen}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("recovery: %v", err)
+		}
+		sink := &countingSink{}
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rr.Revision, "x"), ownerAuth("sess-1"), adv)
+		if !errors.Is(err, ErrNotAccepting) {
+			t.Fatalf("recovering submit err = %v, want ErrNotAccepting", err)
+		}
+		if sink.calls != 0 {
+			t.Fatalf("sink was called %d times on a recovering run", sink.calls)
+		}
+	})
+}
+
 // A sink that cannot durably persist the artifact must block acceptance: Submit
 // surfaces the post-commit sync error and does NOT advance the run, so a later
 // retry (against a healthy sink) re-confirms durability before accepting.

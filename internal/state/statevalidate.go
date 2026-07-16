@@ -200,10 +200,17 @@ func validateTransition(old, next *RunState) error {
 			if v.Receipt.Revision != next.Revision {
 				return fmt.Errorf("newly accepted turn %q must bind to revision %d, got %d", k, next.Revision, v.Receipt.Revision)
 			}
-			// A newly accepted turn must correspond to a real outstanding turn: the
-			// run had exactly this turn assigned, in an actionable agent phase, and
-			// the accepted phase is that phase. So acceptance can never record a
-			// turn the run never issued (e.g. in INIT or with no/other assignment).
+			// A newly accepted turn must correspond to a real outstanding turn on a
+			// LIVE run: running lifecycle, not recovering or gated, in an actionable
+			// agent phase, with exactly this turn assigned. So acceptance can never
+			// record a turn the run never issued (INIT, no/other assignment) or
+			// resurrect a terminal/paused/recovering run.
+			if old.Lifecycle != LifecycleRunning {
+				return fmt.Errorf("newly accepted turn %q requires a running run, lifecycle is %q", k, old.Lifecycle)
+			}
+			if old.Recovery != nil || old.Gate != nil {
+				return fmt.Errorf("newly accepted turn %q cannot be accepted while the run is recovering or gated", k)
+			}
 			if old.Assignment == nil || old.Assignment.ID != k {
 				return fmt.Errorf("newly accepted turn %q was not the pre-transition assigned turn", k)
 			}

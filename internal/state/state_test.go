@@ -323,15 +323,55 @@ func TestValidateRejectsUnknownSchemaVersion(t *testing.T) {
 	}
 }
 
-// A generation written by an older schema (v1, which carried role/message_type on
-// accepted turns) fails on decode with clear version remediation, not a vague
-// unknown-field corruption error.
+// A generation written by the older v1 schema (accepted turns recorded only the
+// artifact digest and receipt, with no authoritative phase) fails on decode with
+// clear version remediation, not a vague missing-field corruption error.
 func TestDecodeRejectsOlderSchemaVersion(t *testing.T) {
-	// A v1-shaped accepted turn carries role/message_type that v2 does not know.
-	old := []byte(`{"schema_version":1,"run_id":"r","revision":2,"accepted_turns":{"t1":{"artifact_digest":"` + hex64("c") + `","role":"lead","message_type":"implementation_report"}}}`)
+	old := []byte(`{"schema_version":1,"run_id":"r","revision":2,"accepted_turns":{"t1":{"artifact_digest":"` + hex64("c") + `","receipt":{"turn_id":"t1","revision":2,"artifact_digest":"` + hex64("c") + `"}}}}`)
 	if _, err := decodeRunState(genstore.Record{Generation: 2, Payload: old}); !errors.Is(err, ErrUnsupportedSchema) {
 		t.Fatalf("older schema decode err = %v, want ErrUnsupportedSchema", err)
 	}
+}
+
+// Acceptance requires a live run: a cancelled/failed/paused or recovering run
+// cannot accept a turn even if it still names an assigned agent turn.
+func TestAcceptRequiresLiveRun(t *testing.T) {
+	acceptT1 := func(rev uint64, next *RunState) error {
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		return nil
+	}
+
+	t.Run("cancelled", func(t *testing.T) {
+		s := newStore(t)
+		r1b := assignAgentTurn(t, s, mustInit(t, s), "t1")
+		// Force a non-running lifecycle while the assignment lingers (state allows
+		// it; the transport owner check would not).
+		rc, err := s.Mutate(r1b.Revision, func(_ uint64, next *RunState) error {
+			next.Lifecycle = LifecycleCancelled
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		if _, err := s.Mutate(rc.Revision, acceptT1); err == nil {
+			t.Fatalf("accepting on a cancelled run should be rejected")
+		}
+	})
+
+	t.Run("recovering", func(t *testing.T) {
+		s := newStore(t)
+		r1b := assignAgentTurn(t, s, mustInit(t, s), "t1")
+		rr, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
+			next.Recovery = &Projection{Code: "resync", Reason: "reattached", NextAction: "await", AtRevision: rev}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("set recovery: %v", err)
+		}
+		if _, err := s.Mutate(rr.Revision, acceptT1); err == nil {
+			t.Fatalf("accepting on a recovering run should be rejected")
+		}
+	})
 }
 
 // Acceptance can only record a real outstanding turn: never in INIT (no

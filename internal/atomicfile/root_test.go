@@ -116,7 +116,7 @@ func TestSyncInRootReconfirms(t *testing.T) {
 // healthy call re-confirms durability and succeeds.
 func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 	errInject := errors.New("injected dir sync failure")
-	bad := rootOps{syncDir: func(*os.Root, string) error { return errInject }}
+	bad := rootOps{syncDir: func(*os.Root, string) error { return errInject }, openRW: defaultRootOps.openRW}
 	asCommitted := func(t *testing.T, err error) {
 		t.Helper()
 		var pce *PostCommitSyncError
@@ -172,6 +172,29 @@ func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 			t.Fatalf("healthy re-confirm: %v", err)
 		}
 	})
+}
+
+// Re-confirming an already-visible file whose writable open fails for any reason
+// other than genuine absence is a committed *PostCommitSyncError; a genuinely
+// absent file is a raw not-exist error.
+func TestSyncInRootOpenFailuresAreCommitted(t *testing.T) {
+	r, _ := openRoot(t)
+	if err := InstallInRoot(r, "a.json", []byte("x"), 0o600); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	errOpen := errors.New("injected non-transient open failure")
+	bad := rootOps{syncDir: syncRootDir, openRW: func(*os.Root, string) (*os.File, error) { return nil, errOpen }}
+	err := syncInRoot(r, "a.json", bad)
+	var pce *PostCommitSyncError
+	if !errors.As(err, &pce) || !errors.Is(err, errOpen) {
+		t.Fatalf("open-failure re-confirm err = %v, want a committed error wrapping the open failure", err)
+	}
+
+	absent := rootOps{syncDir: syncRootDir, openRW: func(*os.Root, string) (*os.File, error) { return nil, fs.ErrNotExist }}
+	err = syncInRoot(r, "a.json", absent)
+	if errors.As(err, &pce) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("absent re-confirm err = %v, want a raw not-exist error", err)
+	}
 }
 
 // MkdirInRoot re-confirming a path that exists as a non-directory is refused.

@@ -26,14 +26,18 @@ var (
 	ErrNotDirectory = errors.New("atomicfile: existing path is not a directory")
 )
 
-// rootOps is the injectable seam over the durability-sync operation for rooted
-// publication, so tests can force a post-visibility sync failure and prove the
-// committed-error and re-confirm semantics.
+// rootOps is the injectable seam over the durability operations for rooted
+// publication, so tests can force a post-visibility sync/open failure and prove
+// the committed-error and re-confirm semantics.
 type rootOps struct {
 	syncDir func(root *os.Root, name string) error
+	openRW  func(root *os.Root, name string) (*os.File, error)
 }
 
-var defaultRootOps = rootOps{syncDir: syncRootDir}
+var defaultRootOps = rootOps{
+	syncDir: syncRootDir,
+	openRW:  func(root *os.Root, name string) (*os.File, error) { return root.OpenFile(name, os.O_RDWR, 0) },
+}
 
 // randName returns a unique temp name in dir. It fails closed if the OS RNG
 // fails: identity generation must not silently become all-zero.
@@ -137,10 +141,13 @@ func SyncInRoot(root *os.Root, name string) error {
 
 func syncInRoot(root *os.Root, name string, o rootOps) error {
 	// A writable handle is required: on Windows FlushFileBuffers needs write
-	// access, so a read-only handle's Sync fails with "Access is denied".
+	// access, so a read-only handle's Sync fails with "Access is denied". The file
+	// is meant to already be visible, so every non-absent failure to re-confirm it
+	// (open exhaustion, a non-transient open error, or a sync error) is a committed
+	// *PostCommitSyncError; only a genuinely absent file is a raw not-exist error.
 	var f *os.File
 	for i := 0; ; i++ {
-		ff, err := root.OpenFile(name, os.O_RDWR, 0)
+		ff, err := o.openRW(root, name)
 		if err == nil {
 			f = ff
 			break
@@ -149,7 +156,7 @@ func syncInRoot(root *os.Root, name string, o rootOps) error {
 			return err
 		}
 		if i >= maxRootAttempts-1 || !isTransientOpen(err) {
-			return err
+			return &PostCommitSyncError{Path: name, Err: err}
 		}
 		sleepBackoff()
 	}
@@ -182,7 +189,9 @@ func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error 
 		if !errors.Is(err, fs.ErrExist) {
 			return err
 		}
-		info, serr := root.Stat(name)
+		// Lstat, not Stat: an in-root symlink to a directory must not be accepted
+		// as a canonical turn/session directory.
+		info, serr := root.Lstat(name)
 		if serr != nil {
 			return serr
 		}
@@ -218,14 +227,15 @@ func ReadInRoot(root *os.Root, name string, maxBytes int64) ([]byte, error) {
 }
 
 func readRegularInRoot(root *os.Root, name string, maxBytes int64) ([]byte, error) {
-	// Reject a symlink before opening. On POSIX O_NOFOLLOW also enforces this at
-	// open; on Windows os.Root refuses reparse points during traversal. Lstat is
-	// the portable pre-check.
+	// Reject EVERY non-regular type before opening (symlink, FIFO, device,
+	// directory): opening a device can itself have side effects, so the type is
+	// decided by Lstat first. O_NOFOLLOW|O_NONBLOCK and the post-open Stat then
+	// guard against a race that swaps the entry after this check.
 	li, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
-	if li.Mode()&fs.ModeSymlink != 0 {
+	if !li.Mode().IsRegular() {
 		return nil, ErrNotRegular
 	}
 	f, err := root.OpenFile(name, os.O_RDONLY|readOpenExtraFlags, 0)

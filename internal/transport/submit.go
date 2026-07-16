@@ -33,6 +33,10 @@ var (
 	// ErrTransitionInvalid means the transition left the run in a stranded shape
 	// (an un-consumed turn, or a phase/assignment mismatch).
 	ErrTransitionInvalid = errors.New("transport: transition left the run stranded")
+	// ErrNotAccepting means the run is not in a state that can accept a submit
+	// (not running, recovering, gated, or not in an actionable agent phase), so no
+	// artifact is persisted.
+	ErrNotAccepting = errors.New("transport: run is not accepting submissions")
 )
 
 const (
@@ -112,6 +116,8 @@ type statusSnapshot struct {
 	phase        state.Phase
 	assignedTurn string
 	assignedRev  uint64
+	recovering   bool
+	gated        bool
 }
 
 func (s statusSnapshot) staleError(submitted uint64) *StaleError {
@@ -165,7 +171,13 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 		// Capture every authority fact before the authorizer runs, so it cannot
 		// influence classification by mutating the shared state value it receives.
 		acceptedEntry, acceptedSeen := rs.AcceptedTurns[env.TurnID]
-		snap := statusSnapshot{revision: rs.Revision, lifecycle: rs.Lifecycle, phase: rs.Phase}
+		snap := statusSnapshot{
+			revision:   rs.Revision,
+			lifecycle:  rs.Lifecycle,
+			phase:      rs.Phase,
+			recovering: rs.Recovery != nil,
+			gated:      rs.Gate != nil,
+		}
 		if rs.Assignment != nil {
 			snap.assignedTurn, snap.assignedRev = rs.Assignment.ID, rs.Assignment.IssuedRevision
 		}
@@ -196,6 +208,13 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 		spec, ok := TurnSpec(snap.phase)
 		if !ok {
 			return SubmitResult{}, fmt.Errorf("%w: %s", ErrPhaseNotActionable, snap.phase)
+		}
+		// Refuse before persisting anything if the run is not live: a terminal,
+		// paused, recovering, or gated run must never write an artifact (state would
+		// reject the acceptance, but only after the sink already stored orphan
+		// bytes). This mirrors the state-level live-run acceptance invariant.
+		if snap.lifecycle != state.LifecycleRunning || snap.recovering || snap.gated {
+			return SubmitResult{}, ErrNotAccepting
 		}
 		// protocol.Validate is value-free by contract, so its errors need no
 		// redaction. Validate the original raw first, then the redacted bytes.

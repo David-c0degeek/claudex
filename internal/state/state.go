@@ -25,8 +25,10 @@ import (
 )
 
 // RunStateVersion is the on-disk schema version; an unknown version fails closed.
-// v2 dropped the redundant role/message_type on accepted turns in favour of the
-// single authoritative phase (see AcceptedTurn).
+// v2 added the authoritative accepted Phase to each accepted turn (v1 recorded
+// only the artifact digest and receipt). A v1 generation is incompatible because
+// the required phase is absent, so it fails with version remediation, not a vague
+// missing-field error (see AcceptedTurn and checkSchemaVersion).
 const RunStateVersion = 2
 
 // ErrRevisionConflict is returned when a mutation's expected revision does not

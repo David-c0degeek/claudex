@@ -296,3 +296,26 @@ func TestMailboxStoreWriteRead(t *testing.T) {
 		t.Fatalf("mailbox bytes = %q, want %q", got, want)
 	}
 }
+
+// The writer refuses a transcript larger than its bound, so it never persists a
+// file its own Read would reject.
+func TestMailboxStoreRejectsOversize(t *testing.T) {
+	dir := t.TempDir()
+	ms, err := NewMailboxStore(dir)
+	if err != nil {
+		t.Fatalf("new mailbox store: %v", err)
+	}
+	defer ms.Close()
+	ms.maxWrite = 4 // force the bound below any real transcript
+
+	plan, pd := planArtifact(t, "turn-1")
+	ledger := []state.LedgerEntry{{Revision: 2, TurnID: "turn-1", ArtifactDigest: pd, Phase: state.PhasePlanDraft}}
+	load := func(string, string) ([]byte, error) { return plan, nil }
+	if err := ms.Write(ledger, load); !errors.Is(err, ErrMailboxTooLarge) {
+		t.Fatalf("oversize write err = %v, want ErrMailboxTooLarge", err)
+	}
+	// Nothing was persisted.
+	if _, rerr := ms.Read(); !errors.Is(rerr, os.ErrNotExist) {
+		t.Fatalf("read after refused write err = %v, want not-exist", rerr)
+	}
+}

@@ -114,7 +114,8 @@ func (s *SessionStore) ReadAssignment(sessionID string) (Assignment, error) {
 
 // MailboxStore writes the single human-readable transcript under a confined root.
 type MailboxStore struct {
-	root *os.Root
+	root     *os.Root
+	maxWrite int64 // the size bound Write enforces; defaults to maxMailboxSize
 }
 
 // NewMailboxStore roots the mailbox at dir (e.g. .claudex).
@@ -126,7 +127,7 @@ func NewMailboxStore(dir string) (*MailboxStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MailboxStore{root: r}, nil
+	return &MailboxStore{root: r, maxWrite: maxMailboxSize}, nil
 }
 
 // Close releases the root handle.
@@ -140,7 +141,7 @@ func (m *MailboxStore) Write(ledger []state.LedgerEntry, load func(turnID, diges
 		return err
 	}
 	// Never persist a transcript the reader would refuse as over-limit.
-	if int64(len(md)) > maxMailboxSize {
+	if int64(len(md)) > m.maxWrite {
 		return ErrMailboxTooLarge
 	}
 	return atomicfile.ReplaceInRoot(m.root, "mailbox.md", []byte(md), inboxPerm)
