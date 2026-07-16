@@ -80,7 +80,7 @@ func (s *SessionStore) WriteAssignment(sessionID string, a Assignment) error {
 // regular file whose canonical, schema-valid, semantically-valid assignment is
 // addressed to sessionID. It never returns torn or tampered bytes.
 func (s *SessionStore) ReadAssignment(sessionID string) (Assignment, error) {
-	if !state.IsRunID(sessionID) {
+	if !state.IsSessionID(sessionID) {
 		return Assignment{}, fmt.Errorf("%w: session id", ErrBadSession)
 	}
 	raw, err := atomicfile.ReadInRoot(s.root, sessionID+"/assignment.json", maxInboxBytes)

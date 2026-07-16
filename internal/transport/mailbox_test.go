@@ -173,10 +173,13 @@ func TestSessionStoreInbox(t *testing.T) {
 		t.Fatalf("mismatched session err = %v, want ErrBadSession", err)
 	}
 	// Traversal, non-canonical, and non-minted (mixed-case / near-shape) session
-	// ids are all rejected as directory names.
+	// ids are all rejected as directory names by BOTH the write and read boundary.
 	for _, bad := range []string{"../escape", "a/b", "..", "sess-1", "sess-" + strings.Repeat("A", 32), "sess-" + strings.Repeat("a", 31)} {
 		if err := ss.WriteAssignment(bad, a); !errors.Is(err, ErrBadSession) {
-			t.Fatalf("session id %q err = %v, want ErrBadSession", bad, err)
+			t.Fatalf("write session id %q err = %v, want ErrBadSession", bad, err)
+		}
+		if _, err := ss.ReadAssignment(bad); !errors.Is(err, ErrBadSession) {
+			t.Fatalf("read session id %q err = %v, want ErrBadSession", bad, err)
 		}
 	}
 }

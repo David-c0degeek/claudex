@@ -244,6 +244,9 @@ func TestMutateAfterBuildRejected(t *testing.T) {
 		"wrong role":    func(a *Assignment) { a.Role = RolePair },
 		"wrong type":    func(a *Assignment) { a.ArtifactMessageType = "verification" },
 		"drop worktree": func(a *Assignment) { a.Worktree = nil },
+		// A 37-byte but non-minted (mixed-case) session id is length-valid for the
+		// schema yet must be rejected by semantic validation at the wire boundary.
+		"mixed-case session": func(a *Assignment) { a.SessionID = "sess-" + strings.Repeat("A", 32) },
 	}
 	for name, mut := range mutations {
 		t.Run(name, func(t *testing.T) {
