@@ -20,6 +20,7 @@ from claudex.cli import (
 from claudex.config import Config
 from claudex.events import AgentEvent, EventJournal
 from claudex import gitops
+from claudex.agents import AgentError
 from claudex.lifecycle import Lifecycle
 from claudex.state import Phase, RunState
 from claudex.terminal import next_action, render_event, render_state, watch_run
@@ -286,6 +287,39 @@ class TerminalLauncherTests(unittest.TestCase):
                 )
             self.assertEqual(1, code)
             self.assertIn("task contract missing", stderr.getvalue())
+            launch.assert_not_called()
+            self.assertFalse((repo / ".claudex" / "current").exists())
+            self.assertFalse((repo / ".claudex" / "runs").exists())
+
+    def test_failed_provider_probe_does_not_create_run_or_open_terminals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            gitops.git(repo, "init")
+            gitops.git(repo, "config", "user.email", "tests@example.invalid")
+            gitops.git(repo, "config", "user.name", "Claudex Tests")
+            (repo / ".gitignore").write_text(".claudex/\n", encoding="utf-8")
+            task = repo / ".claudex" / "task.md"
+            task.parent.mkdir()
+            task.write_text(
+                "# Goal\n\n[CHANGE] Exercise provider startup preflight.\n",
+                encoding="utf-8",
+            )
+            gitops.git(repo, "add", ".gitignore")
+            gitops.git(repo, "commit", "-m", "base")
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "claudex.cli.build_agents",
+                    side_effect=AgentError("provider capability probe failed"),
+                ),
+                patch("claudex.cli.open_watch_terminals") as launch,
+                redirect_stderr(stderr),
+            ):
+                code = main(
+                    ["run", "--open-terminals", "--repo", str(repo)]
+                )
+            self.assertEqual(1, code)
+            self.assertIn("provider capability probe failed", stderr.getvalue())
             launch.assert_not_called()
             self.assertFalse((repo / ".claudex" / "current").exists())
             self.assertFalse((repo / ".claudex" / "runs").exists())

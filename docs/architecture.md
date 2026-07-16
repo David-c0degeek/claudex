@@ -24,8 +24,9 @@ they do not choose phase transitions. A human gate exists only for explicit
 
 Before minting a new run identity, Claudex performs a read-only repository
 preflight: substantive task, Git repository, ignored and untracked runtime
-paths, and a clean exact base. A failed preflight cannot create state, move the
-current pointer, resolve providers, or launch terminal views.
+paths, a clean exact base, and non-billable provider capability discovery. A
+failed preflight cannot create state, move the current pointer, or launch
+terminal views.
 
 ## Process and event boundary
 

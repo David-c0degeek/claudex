@@ -3,8 +3,9 @@
 ## 0.5.1 — 2026-07-16
 
 - Validate the task contract, Git repository, runtime ignore coverage, tracked
-  runtime artifacts, and exact starting tree before creating a run ID, state
-  directory, current pointer, provider process, or watcher window.
+  runtime artifacts, exact starting tree, and non-billable provider capability
+  discovery before creating a run ID, state directory, current pointer,
+  provider process, or watcher window.
 - Fail with non-destructive repair guidance when `.claudex/current` or
   `.claudex/runs` were accidentally committed, or `.claudex/` ignore coverage
   is missing.

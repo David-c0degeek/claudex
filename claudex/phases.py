@@ -322,11 +322,11 @@ def verification_findings(verdict: dict) -> list[dict]:
 
 
 class Orchestrator:
-    def __init__(self, cfg: Config, state: RunState):
+    def __init__(self, cfg: Config, state: RunState, *, agents: dict | None = None):
         self.cfg = cfg
         self.state = state
         self.run_dir = run_dir_for(cfg.repo, state.run_id)
-        self.agents = build_agents(cfg)
+        self.agents = agents if agents is not None else build_agents(cfg)
         self._save_lock = threading.Lock()
         self._live_text_attempts: set[str] = set()
 

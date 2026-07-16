@@ -44,6 +44,7 @@ from .terminal import next_action, terminal_reason, watch_run
 from .phases import (
     Orchestrator,
     OrchestratorError,
+    build_agents,
     draft_task,
     task_has_content,
     validate_run_start,
@@ -238,13 +239,15 @@ def _print_economic_summary(cfg: Config, state: RunState) -> None:
     print(f"nested provider agents: {'disabled' if nested else 'ENABLED (explicit opt-in)'}")
 
 
-def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunState, bool]:
-    """Returns (state, is_new). A terminal previous run rolls off."""
+def _load_or_new_run(
+    cfg: Config, driver: str, lead: str | None
+) -> tuple[RunState, bool, dict | None]:
+    """Return state/newness/prebuilt agents. A terminal previous run rolls off."""
     rid = get_current_run(cfg.repo)
     if rid:
         state = RunState.load(run_dir_for(cfg.repo, rid))
         if not state.is_terminal():
-            return state, False
+            return state, False, None
     lead = lead or cfg.lead
     if lead not in AGENTS:
         raise OrchestratorError(f"lead must be one of {AGENTS}, got {lead!r}")
@@ -252,6 +255,10 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
     # pointer, create state, launch watchers, or probe providers until the
     # repository can produce an exact base snapshot.
     validate_run_start(cfg)
+    # Provider discovery/capability probing is bounded and non-billable. Do it
+    # before allocating state so a missing/incompatible CLI cannot strand an
+    # empty RUNNING identity or empty watcher windows.
+    agents = build_agents(cfg)
     state = RunState(
         run_id=new_run_id(),
         repo=str(cfg.repo),
@@ -264,7 +271,7 @@ def _load_or_new_run(cfg: Config, driver: str, lead: str | None) -> tuple[RunSta
     state.record_lifecycle_start()
     set_current_run(cfg.repo, state.run_id)
     state.save(run_dir_for(cfg.repo, state.run_id))
-    return state, True
+    return state, True, agents
 
 
 def _replacement_state(
@@ -275,7 +282,9 @@ def _replacement_state(
 
 def cmd_run(args) -> int:
     cfg = _cfg(args)
-    state, is_new = _load_or_new_run(cfg, "headless", getattr(args, "lead", None))
+    state, is_new, agents = _load_or_new_run(
+        cfg, "headless", getattr(args, "lead", None)
+    )
     if not is_new and state.driver == "live":
         print(
             f"run {state.run_id} is a live run (your session is the lead) — "
@@ -290,9 +299,9 @@ def cmd_run(args) -> int:
         _print_economic_summary(cfg, state)
     else:
         print(f"resuming run {state.run_id} (phase: {state.phase})")
+    orch = Orchestrator(cfg, state, agents=agents)
     if getattr(args, "open_terminals", False):
         open_watch_terminals(cfg.repo, state.run_id)
-    orch = Orchestrator(cfg, state)
     return _drive_headless(cfg, orch)
 
 
@@ -381,8 +390,8 @@ def cmd_pair_start(args) -> int:
             return 1
     # In live mode YOU are the lead; --lead names which agent you are so the
     # remaining one becomes the pair.
-    state, _ = _load_or_new_run(cfg, "live", getattr(args, "lead", None))
-    orch = Orchestrator(cfg, state)
+    state, _, agents = _load_or_new_run(cfg, "live", getattr(args, "lead", None))
+    orch = Orchestrator(cfg, state, agents=agents)
 
     def go() -> int:
         orch.phase_init()

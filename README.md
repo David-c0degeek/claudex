@@ -86,10 +86,11 @@ git merge claudex/<run_id>         # DONE prints the exact command
 claudex clean
 ```
 
-New-run startup is side-effect-free until the task and exact Git base are
-valid. Claudex checks that `.claudex/current` and `.claudex/runs` are ignored
-and untracked before it creates state or opens watcher windows. If runtime files
-were accidentally committed, restore `.claudex/` ignore coverage and run
+New-run allocation waits until the task and exact Git base are valid and both
+provider CLIs pass non-billable capability discovery. Claudex checks that
+`.claudex/current` and `.claudex/runs` are ignored and untracked before it
+creates state or opens watcher windows. If runtime files were accidentally
+committed, restore `.claudex/` ignore coverage and run
 `git rm --cached -r .claudex`; this removes them only from Git's index and keeps
 the local task and recovery files.
 

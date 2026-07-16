@@ -38,7 +38,7 @@
 - A paid compatibility smoke is subordinate to enforceable native caps. Missing
   native spend enforcement is a safe preflight refusal, not permission to call
   a provider and inspect cost afterward.
-- Startup validation must precede identity allocation and every observable side
-  effect. Otherwise the coordinator can create ignored-state requirements,
-  dirty its own repository, open empty watcher windows, and then reject the
-  condition it caused.
+- Startup validation and non-billable provider discovery must precede new-run
+  identity, state, and terminal allocation. Otherwise the coordinator can dirty
+  its own repository or open empty watcher windows before rejecting a condition
+  it caused or could have detected safely.
