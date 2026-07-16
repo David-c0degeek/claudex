@@ -372,6 +372,23 @@ func TestAcceptRequiresLiveRun(t *testing.T) {
 			t.Fatalf("accepting on a recovering run should be rejected")
 		}
 	})
+
+	t.Run("stale assignment", func(t *testing.T) {
+		s := newStore(t)
+		r1b := assignAgentTurn(t, s, mustInit(t, s), "t1") // t1 issued at r1b.Revision
+		// Advance the revision with an unrelated change, leaving t1 assigned but now
+		// issued at a stale revision — no valid pull could have produced this.
+		r2, err := s.Mutate(r1b.Revision, func(_ uint64, next *RunState) error {
+			next.Counters.PlanRevisions++
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		if _, err := s.Mutate(r2.Revision, acceptT1); err == nil {
+			t.Fatalf("accepting a stale (old-revision) assignment should be rejected")
+		}
+	})
 }
 
 // Acceptance can only record a real outstanding turn: never in INIT (no

@@ -199,22 +199,30 @@ func Submit(ctx context.Context, store *state.Store, sink ArtifactSink, sessionI
 		if env.StateRevision != snap.revision {
 			return SubmitResult{}, snap.staleError(env.StateRevision)
 		}
+		// Refuse a not-live run before any turn/phase reasoning: a terminal, paused,
+		// recovering, or gated run must never write an artifact, and in a valid such
+		// shape the assignment is cleared and the phase has no turn spec, so this
+		// must win over ErrNoActiveTurn/ErrPhaseNotActionable to keep the stable
+		// ErrNotAccepting contract. The accepted-entry replay above still lets an
+		// already-accepted artifact re-confirm and return its receipt after a stop.
+		if snap.lifecycle != state.LifecycleRunning || snap.recovering || snap.gated {
+			return SubmitResult{}, ErrNotAccepting
+		}
 		if snap.assignedTurn == "" {
 			return SubmitResult{}, ErrNoActiveTurn
 		}
 		if env.TurnID != snap.assignedTurn {
 			return SubmitResult{}, ErrWrongTurn
 		}
+		// The assignment must be the one a valid pull could have issued: bound to the
+		// current revision. A stale assignment left in place by an unrelated mutation
+		// cannot be turned into an acceptance (mirrors the state invariant).
+		if snap.assignedRev != snap.revision {
+			return SubmitResult{}, ErrNotAccepting
+		}
 		spec, ok := TurnSpec(snap.phase)
 		if !ok {
 			return SubmitResult{}, fmt.Errorf("%w: %s", ErrPhaseNotActionable, snap.phase)
-		}
-		// Refuse before persisting anything if the run is not live: a terminal,
-		// paused, recovering, or gated run must never write an artifact (state would
-		// reject the acceptance, but only after the sink already stored orphan
-		// bytes). This mirrors the state-level live-run acceptance invariant.
-		if snap.lifecycle != state.LifecycleRunning || snap.recovering || snap.gated {
-			return SubmitResult{}, ErrNotAccepting
 		}
 		// protocol.Validate is value-free by contract, so its errors need no
 		// redaction. Validate the original raw first, then the redacted bytes.

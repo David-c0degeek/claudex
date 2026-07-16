@@ -78,6 +78,73 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("sink was called %d times on a recovering run", sink.calls)
 		}
 	})
+
+	// A stale assignment (still present, but issued at an older revision after an
+	// unrelated advance) cannot be turned into an acceptance.
+	t.Run("stale assignment", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		r2, err := store.Mutate(rev, func(_ uint64, next *state.RunState) error {
+			next.Counters.PlanRevisions++ // advance, leaving turn-1 assigned but stale
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		sink := &countingSink{}
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", r2.Revision, "x"), ownerAuth("sess-1"), adv)
+		if !errors.Is(err, ErrNotAccepting) {
+			t.Fatalf("stale-assignment submit err = %v, want ErrNotAccepting", err)
+		}
+		if sink.calls != 0 {
+			t.Fatalf("sink was called %d times on a stale assignment", sink.calls)
+		}
+	})
+
+	// A valid cancelled shape clears the assignment; ErrNotAccepting must still win
+	// over ErrNoActiveTurn (the moved-up order), and the sink stays untouched.
+	t.Run("cancelled with cleared assignment", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		rc, err := store.Mutate(rev, func(_ uint64, next *state.RunState) error {
+			next.Lifecycle = state.LifecycleCancelled
+			next.Assignment = nil
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		sink := &countingSink{}
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		if !errors.Is(err, ErrNotAccepting) {
+			t.Fatalf("cancelled-cleared submit err = %v, want ErrNotAccepting", err)
+		}
+		if sink.calls != 0 {
+			t.Fatalf("sink was called %d times on a cancelled run", sink.calls)
+		}
+	})
+
+	// A proper paused human gate (AWAIT_GUIDANCE, assignment cleared) also returns
+	// ErrNotAccepting before the phase's absent turn spec could surface.
+	t.Run("paused gate", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		rg, err := store.Mutate(rev, func(gen uint64, next *state.RunState) error {
+			next.Lifecycle = state.LifecyclePaused
+			next.Phase = state.PhaseAwaitGuidance
+			next.Assignment = nil
+			next.Gate = &state.Ref{ID: "gate-1", IssuedRevision: gen}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("gate: %v", err)
+		}
+		sink := &countingSink{}
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rg.Revision, "x"), ownerAuth("sess-1"), adv)
+		if !errors.Is(err, ErrNotAccepting) {
+			t.Fatalf("paused-gate submit err = %v, want ErrNotAccepting", err)
+		}
+		if sink.calls != 0 {
+			t.Fatalf("sink was called %d times on a paused gate", sink.calls)
+		}
+	})
 }
 
 // A sink that cannot durably persist the artifact must block acceptance: Submit

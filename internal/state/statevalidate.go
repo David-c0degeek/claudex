@@ -214,6 +214,12 @@ func validateTransition(old, next *RunState) error {
 			if old.Assignment == nil || old.Assignment.ID != k {
 				return fmt.Errorf("newly accepted turn %q was not the pre-transition assigned turn", k)
 			}
+			// The assignment must be the one a valid pull could have issued: bound to
+			// the current revision. An unrelated mutation that advanced the run while
+			// leaving a stale assignment in place cannot be turned into an acceptance.
+			if old.Assignment.IssuedRevision != old.Revision {
+				return fmt.Errorf("newly accepted turn %q binds a stale assignment issued at revision %d, not the current %d", k, old.Assignment.IssuedRevision, old.Revision)
+			}
 			if !IsAgentPhase(old.Phase) {
 				return fmt.Errorf("newly accepted turn %q accepted in non-agent phase %q", k, old.Phase)
 			}
