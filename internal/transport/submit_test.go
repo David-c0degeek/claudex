@@ -353,8 +353,91 @@ func TestTransitionReceivesPreparedSubmit(t *testing.T) {
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), capture); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if got.MessageType != "implementation_report" || got.TurnID != "turn-1" || got.Revision != rev || len(got.Canonical) == 0 {
+	if got.MessageType != "implementation_report" || got.TurnID != "turn-1" || got.Revision != rev || got.CanonicalJSON == "" {
 		t.Fatalf("prepared submit not populated: %+v", got)
+	}
+	// The immutable canonical string matches the digest handed to the callback.
+	sum := sha256.Sum256([]byte(got.CanonicalJSON))
+	if hex.EncodeToString(sum[:]) != got.Digest {
+		t.Fatalf("prepared canonical/digest mismatch")
+	}
+}
+
+// Clearing the assignment without leaving an agent phase strands the run and
+// must be rejected.
+func TestClearWithoutAdvanceRejected(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	clearOnly := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+		next.Assignment = nil // phase stays IMPLEMENT_STEP (actionable)
+		return nil
+	}
+	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), clearOnly); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
+	}
+}
+
+// Clearing the assignment while moving to a non-agent phase (a gate) is valid.
+func TestClearToNonActionablePhaseAccepted(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	toGate := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+		next.Phase = state.PhaseAwaitGuidance
+		next.Assignment = nil
+		return nil
+	}
+	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toGate); err != nil {
+		t.Fatalf("clear to a gate phase should be accepted: %v", err)
+	}
+	loaded, _, _ := store.Load()
+	if loaded.Phase != state.PhaseAwaitGuidance || loaded.Assignment != nil {
+		t.Fatalf("run not parked at the gate: %s / %+v", loaded.Phase, loaded.Assignment)
+	}
+}
+
+// An assignment issued in a non-agent phase is inconsistent and rejected.
+func TestAssignmentInNonActionablePhaseRejected(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	bad := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		next.Phase = state.PhaseDone
+		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		return nil
+	}
+	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), bad); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
+	}
+}
+
+// A raw parse error must not echo a secret-shaped duplicate key.
+func TestSubmitRawParseErrorRedacted(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	secretKey := "sk-ant-abcdefghijklmnopqrstuvwx"
+	// A duplicate key (canonjson rejects it) whose name is a secret.
+	dup := fmt.Sprintf(`{"%s":1,"%s":2,"turn_id":"turn-1","state_revision":%d}`, secretKey, secretKey, rev)
+	_, err := submit(store, newMemSink(), "sess-1", []byte(dup), ownerAuth("sess-1"), (&advancer{}).fn)
+	if err == nil {
+		t.Fatalf("a duplicate-key submission should be rejected")
+	}
+	if strings.Contains(err.Error(), "sk-ant-") {
+		t.Fatalf("raw parse error leaked a secret: %v", err)
+	}
+}
+
+// A trusted-but-fallible authorizer that mutates the state value it receives
+// cannot fabricate an idempotent acceptance: authority is captured first.
+func TestAuthorizerCannotInjectAcceptance(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	inject := func(rs state.RunState, _ string, turnID string) error {
+		rs.AcceptedTurns[turnID] = state.AcceptedTurn{
+			ArtifactDigest: "fabricated",
+			Receipt:        state.Receipt{TurnID: turnID, Revision: 999, ArtifactDigest: "fabricated"},
+		}
+		return nil
+	}
+	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), inject, (&advancer{}).fn)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if res.Idempotent || res.Receipt.Revision != rev+1 || res.Receipt.ArtifactDigest == "fabricated" {
+		t.Fatalf("authorizer injection influenced classification: %+v", res)
 	}
 }
 
