@@ -70,6 +70,25 @@ Role-addressed file mailbox under `.claudex/session/`. Four verbs:
 - `status` — lock-free projection of lifecycle, current turn/gate, whose turn,
   caps remaining, and honesty labels.
 
+Durable writes sit on rooted, capability-split atomic-file primitives
+(`internal/atomicfile` over `os.Root` confinement, with the Windows sharing/access
+retry and a committed-but-unsynced `PostCommitSyncError`). Artifacts are immutable
+content-addressed `<turn_id>/<digest>.json` published **no-clobber** (hard-link,
+fails if present) so two racing publishers cannot overwrite and a reader sees
+complete-or-nothing; the store admits only the allowlisted submit artifact types
+and only already-redacted canonical bytes. Session inboxes are role-addressed and
+re-validated on read (canonical + schema + full assignment validation + session
+identity). The single human-readable `.claudex/mailbox.md` mirror is a rebuildable
+projection: it is re-derived from the accepted-artifact ledger and independently
+re-validates every artifact (recomputed digest, canonical + redacted bytes,
+schema) before rendering typed, injection-safe summaries — role and artifact type
+come solely from the turn's authoritative accepted phase, the one fact state
+persists per turn. Acceptance is bound, symmetrically in state and in `submit`, to
+the exact live, current-revision assigned turn, and a stopped/gated/recovering run
+refuses before any artifact is written. A required-field state-shape change is an
+on-disk schema-version bump, gated on a loose version probe before strict decode
+so an older generation fails with clear remediation.
+
 ## Git transaction (D006)
 
 On an implementation `submit` the coordinator, via native `git` plumbing (shell
@@ -114,11 +133,12 @@ Created per-slice as each subject lands (not all up front):
 | `internal/txn` | generic prepared-transaction journal + reconciliation | 01 |
 | `internal/config` | task-contract + run-policy parse/default/validate/freeze | 01 |
 | `internal/redact` | credential redaction at every persist/display boundary | 00/01 |
-| `internal/oslock`, `internal/atomicfile` | build-tagged OS primitives | 01 |
+| `internal/oslock` | build-tagged OS advisory locks | 01 |
+| `internal/atomicfile` | build-tagged atomic writes + rooted no-clobber/replace/read/sync primitives over `os.Root` | 01/02 |
 | `internal/fsclass` | local-filesystem classifier | 01 |
-| `internal/protocol` | embedded versioned JSON schema bytes | 02 |
+| `internal/protocol` | embedded versioned JSON schema registry, keyword-strict compiler, value-free validation | 02 |
 | `internal/canonjson` | restricted canonical JSON (JCS escaping/key order, safe integer-only numbers) + digest | 02 |
-| `internal/transport` | role-addressed mailbox, receipts | 02 |
+| `internal/transport` | `pull`/`submit`/`wait`/`status`, content-addressed artifact store, role-addressed inboxes, mailbox mirror | 02 |
 | `internal/engine` | phase-transition table + convergence | 03 |
 | `internal/gitx` | native-git shell-out plumbing | 04 |
 | `internal/evidence` | committed-object review packet | 04 |

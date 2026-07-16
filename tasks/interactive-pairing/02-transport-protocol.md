@@ -27,14 +27,65 @@ idempotent receipts, and a protocol/schema version on every message.
 - [x] **02.3** (agent) `submit --file result.json`: validate against the assignment's schema, accept-once under the lock via 01 CAS, return a durable receipt (`turn_id` + resulting `state_revision`). Duplicate identity is defined by **canonical artifact digest** (via `internal/canonjson`, 02.1): persist digest + receipt; same `turn_id` + same digest → return the receipt (idempotent); same `turn_id` + different digest → conflict; stale revision → rejected with current status. Test all three paths.
 - [x] **02.4** (agent) `wait --timeout N`: bounded long-poll that returns `unchanged` on timeout, else the next actionable event for this session. It wakes on **any relevant revision** — an actionable assignment (my turn), a gate opening, cancellation, terminal/failure, or session replacement — not only "my turn," so a waiting terminal cannot sleep through STOP/DONE/guidance. Holds no lock; Ctrl-C-safe and idempotent. Test: wakes on turn arrival, on a gate, on cancellation, and returns `unchanged` on timeout.
 - [x] **02.5** (agent) `status`: lock-free read projecting lifecycle, current turn/gate, whose turn, caps remaining, and honesty labels (`protocol-only`/`managed`/capability tags). Test: reflects state after a submit without acquiring the mutation lock.
-- [ ] **02.6** (agent) Atomic artifact + mailbox writes: temp→fsync→rename (`internal/atomicfile`, 01); role-addressed inboxes under `.claudex/session/`; append-only human-readable mailbox mirror derived from accepted artifacts (per 01.3). Windows file-sharing bounded retry. Test: concurrent readers never see a torn artifact.
+- [x] **02.6** (agent) Atomic artifact + mailbox writes: temp→fsync→rename (`internal/atomicfile`, 01); role-addressed inboxes under `.claudex/session/`; append-only human-readable mailbox mirror derived from accepted artifacts (per 01.3). Windows file-sharing bounded retry. Test: concurrent readers never see a torn artifact.
 
 ## Hindsight checkpoint
-- [ ] Captain Hindsight review recorded
-- [ ] Verdict is `CLOSE`
+- [x] Captain Hindsight review recorded
+- [x] Verdict is `CLOSE`
+
+### Captain Hindsight — subject 02 (recorded 2026-07-16)
+
+**Keep**
+- One canonicalizer + one embedded schema registry serving BOTH provider
+  instruction and coordinator validation (02.1) — no divergent validators, and
+  digests are whitespace/order-independent by construction.
+- Injected-seam design across the client verbs (`ArtifactSink`/`Authorizer`/
+  `Transition` for submit; `SessionViewer` for wait; `HonestySource` for status)
+  — every seam fail-closed with value-free sentinel errors, so authority and
+  durability are testable and never fabricated by a callback.
+- Durability primitives consolidated in `internal/atomicfile` as rooted,
+  capability-split operations (no-clobber `InstallInRoot`, atomic `ReplaceInRoot`,
+  regular-only non-blocking `ReadInRoot`, idempotent `MkdirInRoot`, committed-typed
+  `SyncInRoot`) over `os.Root` confinement — one atomic writer, reused by the
+  artifact store, session inbox, and mailbox mirror; no transport-local OS code.
+- Acceptance symmetrically bound on both the state and submit sides to the exact
+  live, current-revision assigned turn; stopped/gated/recovering runs refuse
+  before any sink write, while the accepted-artifact replay path still
+  re-confirms and returns its receipt after a stop.
+- Phase-derived ledger/mirror metadata (persist only the authoritative accepted
+  `Phase`; derive role + artifact type from the single `TurnSpec`) — no redundant
+  facts that can disagree; the renderer independently re-validates every artifact
+  (digest, canonical, redacted, schema, order) before summarizing.
+- Injection-safe typed summaries (structural counts + allowlisted enums only) and
+  value-free persistence/display errors throughout.
+
+**Fix before closing** — none outstanding. Every gap Codex raised across the
+subject was closed in-round (see the per-slice CX AGREE citations in the progress
+log; 02.6 alone took 5 adversarial rounds, TURN 64→68).
+
+**Record (lessons)**
+- On Windows, `os.Rename` is not atomic and `FlushFileBuffers` needs a writable
+  handle — no-clobber hard-link publication avoids reader-side sharing retries,
+  and re-confirm must open O_RDWR. Captured in `lessons.md`.
+- A required-field schema change is an on-disk schema-version bump: gate the
+  version on a loose probe BEFORE strict decoding so an older generation fails
+  with clear remediation, not a vague unknown/missing-field error.
+- Reject every non-regular file type by `Lstat` before opening a confined read
+  (a device open can have side effects); keep `O_NOFOLLOW|O_NONBLOCK` + a
+  post-open `Stat` for the race.
+
+**Risk** — Low. The subject is fail-closed, race-clean (`-race` green on
+state/transport/atomicfile), and cross-compiles (linux amd64/arm64, darwin
+arm64). Residual risk is Windows power-loss durability of the mutable mirror
+(documented: crash-consistency relies on the generation protocol, not the
+best-effort replace), which is acceptable for a rebuildable projection.
+
+**Verdict — CLOSE**
 
 ## Progress log
 > One line per slice.
+
+- 2026-07-16 · slice 6 · atomic artifact + mailbox writes (02.6) · Consolidated the durable file layer in `internal/atomicfile` as rooted, capability-split ops over `os.Root` (`InstallInRoot` no-clobber hard-link publish, `ReplaceInRoot` atomic replace, `ReadInRoot` regular-only + non-blocking + bounded, `MkdirInRoot` idempotent, `SyncInRoot` committed-typed re-confirm), all carrying the Windows sharing/access retry + directory/root fsync + `PostCommitSyncError`; deleted the transport-local OS sync files. `ArtifactStore` persists immutable `<turn>/<digest>.json` under a confined root (allowlisted submit types only, already-redacted-canonical required, real collision path), `SessionStore` writes/validates role-addressed inboxes (canonical + schema + full `Assignment.Validate` + session identity), and `MailboxStore` renders + atomically replaces the single `.claudex/mailbox.md` mirror, independently re-validating every artifact (digest/canonical/redacted/schema/order) and deriving role+type from the single `TurnSpec(phase)`. State now persists only the authoritative accepted `Phase` (schema v2), binds acceptance to the exact live current-revision assigned turn, and Submit mirrors that refusal before any sink write. Concurrent readers never see a torn artifact; injected sync/fault + FIFO/symlink/device + Windows-retry tests; `-race` green. CX AGREE (`326cfa2`→`67e1d4f`, TURN 64→68, 5 rounds — caught the missing mailbox writer, duplicated OS primitives, artifact dir durability, read/type/redaction holes, non-authoritative accepted metadata, non-independent renderer, unvalidated inbox reader, non-blocking/symlink read gaps, committed re-confirm typing, non-live acceptance, and the stale-assignment snapshot binding + ordering).
 
 - 2026-07-16 · slice 5 · status (02.5) · `internal/transport.Status(store, honesty)` — a single lock-free read projecting a `StatusReport` protocol message (`status.v1.json`). Shares wait's fact capture + gate/pause coherence. `whose_turn`/`turn_id` only for a live assignment under a running agent phase (a terminal run keeps its phase but reports no owner; a required recovery dominates and suppresses the owner); a discriminated `stop{kind:failure|recovery, code, redacted reason, next_action, at_revision}`; `run_id`-bound. Nested typed caps (`run_turns`/`plan`/`test`/`verify` = `used/limit/remaining/exceeded_by/mechanism`, clamped; per-step checkpoint budget; wall/bytes deferred to caps). Honesty via a required fail-closed `HonestySource` seam over a value-only input: value-free sentinel errors, `tier` bound to a stable `tier_mechanism` constant, `{name,status,mechanism}` canonical capability records sorted deterministically — never a caller-asserted `managed`. `Marshal` runs a full `semanticValidate` (ownership/gate/stop/cap-arithmetic/redaction) so a mutated public report can't reach the wire. CX AGREE (`5eac1b3`,`6a2d840`,`6f5f347`, 3 rounds — caught bare fields vs nested caps, honesty-value leakage, unbacked tier, recovery-with-owner, and unredacted stop fields).
 - 2026-07-16 · slice 4 · wait (02.4) · `internal/transport.Wait(ctx, store, session, since, timeout, view)` — a bounded, lock-free long-poll. `WaitEvent` is a versioned protocol message (`wait_event.v1.json`, canonical `Marshal`) with per-kind discriminants + a kind↔phase/lifecycle wire contract. A `SessionViewer` seam returns only facts over an immutable `SessionInput`, run on every poll (fail-closed on an unknown/corrupt session; value-free sentinel error) before event selection; `Wait` applies the wake priority from durable state: terminal/failure (dominates a concurrent replacement at a new revision) → registration-driven session_replaced (wakes at the same revision) → gate (AWAIT_GUIDANCE + gate + paused, coherence-checked) → budget/rate pause → recovery_required (with the projection) → own assignment. Client-ahead cursor → typed error; missing state → error; timeout does a final boundary read; injectable clock (no test sleeps) + 25→250ms backoff. CX AGREE (`21db4ff`,`892a702`,`3aa8243`,`c0ef739`, 4 rounds — caught event-not-a-protocol-message, seam-forms-events, seam-skipped-at-same-revision, redaction≠sanitization, gate/pause incoherence, and the inverted priority).

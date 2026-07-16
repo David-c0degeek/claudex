@@ -29,6 +29,20 @@ yet; the sections below track work toward the first tagged binary.
 - `claudex inspect-legacy <path>` — a read-only, redacted inspector for a
   pre-pivot Python run (`internal/legacy`); a pre-pivot `state.json` is refused,
   never resumed, as an attach run.
+- Transport protocol: the client-facing coordination layer over a role-addressed
+  file mailbox. Restricted canonical JSON with a safe-integer domain and a strict
+  parser backing whitespace/order-independent sha256 digests (`internal/canonjson`);
+  a keyword-strict, version-keyed embedded JSON-schema registry serving both
+  provider instruction and coordinator validation (`internal/protocol`); and the
+  `pull`/`submit`/`wait`/`status` verbs (`internal/transport`) — a read-only,
+  snapshot-bound assignment projection; accept-once submit under the state CAS
+  with idempotent receipts and stale/conflict typing; a bounded lock-free
+  long-poll; and a lock-free status projection with honest two-tier capability
+  labels. Durable writes are content-addressed immutable artifacts published
+  no-clobber under an `os.Root`, role-addressed session inboxes validated on read,
+  and a single append-only human-readable mailbox mirror re-derived and
+  re-validated from the accepted-artifact ledger — all over rooted,
+  capability-split, Windows-retrying atomic-file primitives (`internal/atomicfile`).
 - Project documentation: architecture, decision log, and the harvested
   test-vector inventory (`docs/`).
 

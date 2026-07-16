@@ -197,3 +197,44 @@ prove deterministic recovery — the last valid generation always wins, a torn n
 generation or pointer never wins, and an empty/all-invalid set fails closed. This
 is subject 01's state/recovery acceptance matrix; `internal/atomicfile` writes the
 individual generation files but provides none of this protocol itself.
+
+## D018 — Transport durability and canonicalization posture
+The client-facing transport (subject 02) commits to four durable rules, each
+chosen to make an unsafe state unrepresentable rather than merely validated:
+
+- **Restricted canonical JSON, not full RFC 8785.** Digests are taken over
+  canonical bytes using JCS string escaping and UTF-16 key ordering, but the
+  numeric domain is deliberately narrowed to safe integers (±(2^53−1)) with a
+  strict parser (rejects duplicate keys, lone surrogates, invalid UTF-8, leading
+  zeros, trailing content, oversize, over-nesting). Protocol messages carry only
+  integer counters/revisions, so floats buy nothing and cost cross-language
+  digest-stability risk. The same embedded schema bytes serve BOTH provider
+  instruction and coordinator validation — one source, no divergent validators.
+- **Immutable, content-addressed artifacts published no-clobber.** A submit
+  artifact is `<turn_id>/<digest>.json`, written to a temp within an `os.Root`,
+  fsynced, then **hard-linked** into place (fails if the target exists). Because
+  publication is never a replace, two racing publishers cannot overwrite each
+  other and a reader sees complete-or-nothing with no sharing-retry — which the
+  non-atomic Windows rename (D015) would otherwise require. The store admits only
+  the allowlisted submit artifact types and only already-redacted canonical bytes
+  (a secret in a control/free-text field is rejected, never rewritten, since a
+  rewrite would change the digest).
+- **One authoritative acceptance fact.** State persists only the accepted
+  `Phase` per turn; role and artifact type are derived from the single
+  `TurnSpec(phase)` source, so no redundant facts can disagree or be injected
+  through the mirror. Acceptance is bound — symmetrically in state and in the
+  submit path — to the exact live, current-revision assigned turn, and a
+  stopped/gated/recovering run refuses before any artifact is written.
+- **The human-readable mailbox is a rebuildable projection.** The single
+  `.claudex/mailbox.md` mirror is re-derived from the accepted-artifact ledger and
+  independently re-validates every artifact (recomputed digest, canonical +
+  redacted bytes, schema, strictly increasing order) before rendering typed,
+  injection-safe summaries. It is atomically replaced, never appended, so it can
+  always be reconstructed from durable state.
+
+**Acceptance:** subject 02's transport suite — digest stability across
+whitespace/key-order permutations; concurrent publishers/readers never observe a
+torn or overwritten artifact (`-race`); non-regular/symlink/oversize reads and
+non-canonical/tampered inboxes are refused; a not-live or stale-assignment submit
+is rejected before the sink; and a required-field state-shape change bumps the
+on-disk schema version (v2) so an older generation fails with clear remediation.
