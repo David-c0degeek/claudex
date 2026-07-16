@@ -132,9 +132,10 @@
     "honesty": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tier", "capabilities"],
+      "required": ["tier", "tier_mechanism", "capabilities"],
       "properties": {
         "tier": { "type": "string", "enum": ["protocol-only", "managed"] },
+        "tier_mechanism": { "type": "string", "minLength": 1, "maxLength": 64 },
         "capabilities": {
           "type": "array",
           "maxItems": 64,

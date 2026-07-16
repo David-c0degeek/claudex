@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -16,8 +17,9 @@ import (
 func byoHonesty() HonestySource {
 	return func(StatusInput) (HonestyLabels, error) {
 		return HonestyLabels{
-			Tier:         TierProtocolOnly,
-			Capabilities: []Capability{{Name: "repo-read-only", Status: "unavailable", Mechanism: "byo-attach"}},
+			Tier:          TierProtocolOnly,
+			TierMechanism: "durable-byo-registration",
+			Capabilities:  []Capability{{Name: "repo-read-only", Status: "unavailable", Mechanism: "byo-attach"}},
 		}, nil
 	}
 }
@@ -140,10 +142,75 @@ func TestStatusHonestyFailsClosed(t *testing.T) {
 		t.Fatalf("bad tier want ErrHonestySource, got %v", err)
 	}
 	badCap := func(StatusInput) (HonestyLabels, error) {
-		return HonestyLabels{Tier: TierProtocolOnly, Capabilities: []Capability{{Name: "x", Status: "totally-enforced", Mechanism: "m"}}}, nil
+		return HonestyLabels{Tier: TierProtocolOnly, TierMechanism: "durable-byo-registration", Capabilities: []Capability{{Name: "x", Status: "totally-enforced", Mechanism: "m"}}}, nil
 	}
 	if _, err := Status(store, badCap); !errors.Is(err, ErrHonestySource) {
 		t.Fatalf("bad capability status want ErrHonestySource, got %v", err)
+	}
+}
+
+// Arbitrary non-secret-pattern text in tier/name must not cross the boundary.
+func TestStatusHonestyValueFree(t *testing.T) {
+	store, _ := newRunWithActiveTurn(t)
+	leaky := func(StatusInput) (HonestyLabels, error) {
+		return HonestyLabels{Tier: "user@example.com /home/dave", TierMechanism: "durable-byo-registration"}, nil
+	}
+	_, err := Status(store, leaky)
+	if !errors.Is(err, ErrHonestySource) || strings.Contains(err.Error(), "example.com") || strings.Contains(err.Error(), "/home/") {
+		t.Fatalf("honesty value leaked: %v", err)
+	}
+}
+
+// Status reflects a real Submit: the resulting revision and newly issued owner.
+func TestStatusAfterSubmit(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t) // IMPLEMENT_STEP, lead turn-1
+	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		next.Phase = state.PhaseCheckpoint
+		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		return nil
+	}
+	res, err := Submit(context.Background(), store, newMemSink(), "sess-1", report("turn-1", rev, "done"), ownerAuth("sess-1"), adv)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	s, err := Status(store, byoHonesty())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if s.Revision != res.Receipt.Revision {
+		t.Fatalf("status revision %d != receipt revision %d", s.Revision, res.Receipt.Revision)
+	}
+	if s.Phase != state.PhaseCheckpoint || s.WhoseTurn == nil || *s.WhoseTurn != RolePair || s.TurnID == nil || *s.TurnID != "turn-2" {
+		t.Fatalf("status did not reflect the submit's transition: %+v", s)
+	}
+}
+
+// A mutated public report cannot marshal contradictory wire data.
+func TestStatusMarshalRejectsContradictions(t *testing.T) {
+	store, _ := newRunWithActiveTurn(t)
+	good, err := Status(store, byoHonesty())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	mutations := map[string]func(s *StatusReport){
+		"cap arithmetic":     func(s *StatusReport) { s.Caps.PlanRounds.Remaining = 99 },
+		"whose without turn": func(s *StatusReport) { s.TurnID = nil },
+		"gate outside gate":  func(s *StatusReport) { gid := "g"; s.GateID = &gid },
+		"failure under running": func(s *StatusReport) {
+			s.Stop = &StopProjection{Kind: "failure", Code: "c", Reason: "r", NextAction: "a", AtRevision: 1}
+		},
+		"step out of order": func(s *StatusReport) {
+			s.Caps.CheckpointRounds.Steps = []StepCap{{StepIndex: 5, Used: 0, Remaining: 0, ExceededBy: 0}}
+		},
+	}
+	for name, mut := range mutations {
+		t.Run(name, func(t *testing.T) {
+			s := good
+			mut(&s)
+			if _, err := s.Marshal(); err == nil {
+				t.Fatalf("%s should be rejected by Marshal", name)
+			}
+		})
 	}
 }
 
