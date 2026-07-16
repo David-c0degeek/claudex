@@ -65,11 +65,14 @@ func nearestExisting(path string) (string, error) {
 	for {
 		_, err := os.Lstat(p)
 		if err == nil {
-			// Resolve reparse points/symlinks and classify the real target.
-			if resolved, rerr := filepath.EvalSymlinks(p); rerr == nil {
-				return resolved, nil
+			// Resolve reparse points/symlinks and classify the real target. A
+			// resolve failure is returned, not swallowed — otherwise a junction
+			// could hide a remote target behind the unresolved lexical path.
+			resolved, rerr := filepath.EvalSymlinks(p)
+			if rerr != nil {
+				return "", rerr
 			}
-			return p, nil
+			return resolved, nil
 		}
 		if !os.IsNotExist(err) {
 			return "", err

@@ -1,22 +1,42 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
-const validTask = `{
-	"schema_version": 1,
-	"goal": "Build the attach protocol",
-	"current_behavior": "headless subprocess driver",
-	"desired_behavior": "two terminals converge by agreement",
-	"scope": "coordinator core",
-	"acceptance_criteria": ["pull returns an assignment", "submit advances state"]
-}`
+// fullTask returns a complete task contract with every field present.
+func fullTask() map[string]any {
+	return map[string]any{
+		"schema_version":      1,
+		"goal":                "Build the attach protocol",
+		"current_behavior":    "headless subprocess driver",
+		"desired_behavior":    "two terminals converge by agreement",
+		"scope":               "coordinator core",
+		"non_goals":           []string{},
+		"constraints":         []string{},
+		"acceptance_criteria": []string{"pull returns an assignment", "submit advances state"},
+		"required_tests":      []string{},
+		"relevant_files":      []string{},
+		"open_questions":      []string{},
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
 
 func validPolicy() string {
 	return `{"schema_version":1,"test_gate":{"command":"go test ./..."},"base_branch":"main"}`
 }
 
 func TestParseTaskContractValid(t *testing.T) {
-	tc, err := ParseTaskContract([]byte(validTask))
+	tc, err := ParseTaskContract(mustJSON(t, fullTask()))
 	if err != nil {
 		t.Fatalf("ParseTaskContract: %v", err)
 	}
@@ -25,25 +45,44 @@ func TestParseTaskContractValid(t *testing.T) {
 	}
 }
 
+func TestParseTaskContractRequiresFullShape(t *testing.T) {
+	for _, missing := range []string{"non_goals", "constraints", "required_tests", "relevant_files", "open_questions", "current_behavior", "scope"} {
+		t.Run("missing_"+missing, func(t *testing.T) {
+			m := fullTask()
+			delete(m, missing)
+			if _, err := ParseTaskContract(mustJSON(t, m)); err == nil {
+				t.Fatalf("expected rejection for missing %q", missing)
+			}
+		})
+	}
+}
+
 func TestParseTaskContractRejections(t *testing.T) {
-	cases := map[string]string{
-		"missing version":  `{"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
-		"bad version":      `{"schema_version":99,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
-		"missing goal":     `{"schema_version":1,"current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
-		"missing scope":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","acceptance_criteria":["a"]}`,
-		"no acceptance":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":[]}`,
-		"blank acceptance": `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["  "]}`,
-		"blank req test":   `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"],"required_tests":[""]}`,
-		"unknown field":    `{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"],"typo":1}`,
-		"duplicate key":    `{"schema_version":1,"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
-		"explicit null":    `{"schema_version":1,"goal":null,"current_behavior":"c","desired_behavior":"d","scope":"s","acceptance_criteria":["a"]}`,
-		"trailing content": validTask + ` garbage`,
-		"stray delimiter":  validTask + `}`,
-		"not json":         `not json`,
+	full := fullTask()
+	badVersion := fullTask()
+	badVersion["schema_version"] = 99
+	blankAccept := fullTask()
+	blankAccept["acceptance_criteria"] = []string{"   "}
+	blankReq := fullTask()
+	blankReq["required_tests"] = []string{""}
+	emptyAccept := fullTask()
+	emptyAccept["acceptance_criteria"] = []string{}
+
+	cases := map[string][]byte{
+		"bad version":      mustJSON(t, badVersion),
+		"blank acceptance": mustJSON(t, blankAccept),
+		"blank required":   mustJSON(t, blankReq),
+		"no acceptance":    mustJSON(t, emptyAccept),
+		"unknown field":    append(mustJSON(t, full)[:len(mustJSON(t, full))-1], []byte(`,"typo":1}`)...),
+		"case variant":     []byte(`{"Schema_Version":1}`),
+		"explicit null":    []byte(`{"schema_version":1,"goal":null}`),
+		"duplicate key":    []byte(`{"schema_version":1,"schema_version":1}`),
+		"trailing content": append(mustJSON(t, full), []byte(` garbage`)...),
+		"not json":         []byte(`not json`),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := ParseTaskContract([]byte(body)); err == nil {
+			if _, err := ParseTaskContract(body); err == nil {
 				t.Fatalf("expected rejection for %q", name)
 			}
 		})
@@ -61,7 +100,6 @@ func TestParseRunPolicyValidKeepsNestedDefaults(t *testing.T) {
 	if rp.Limits.MaxWallSeconds != 600 {
 		t.Fatalf("max_wall_seconds override lost: %d", rp.Limits.MaxWallSeconds)
 	}
-	// A sibling limit not in the doc keeps its default.
 	if rp.Limits.EvidenceMaxRequests != DefaultRunPolicy().Limits.EvidenceMaxRequests {
 		t.Fatalf("nested default lost: %d", rp.Limits.EvidenceMaxRequests)
 	}
@@ -78,6 +116,7 @@ func TestParseRunPolicyRejections(t *testing.T) {
 		"blank base":       `{"schema_version":1,"base_branch":"   "}`,
 		"file>total":       `{"schema_version":1,"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`,
 		"null value":       `{"schema_version":1,"base_branch":null}`,
+		"case variant":     `{"Schema_Version":1}`,
 		"duplicate key":    `{"schema_version":1,"schema_version":1}`,
 		"trailing content": `{"schema_version":1} x`,
 	}
@@ -100,24 +139,37 @@ func TestParseRunPolicyBudgetZeroAllowed(t *testing.T) {
 	}
 }
 
-func TestValidateEffective(t *testing.T) {
-	tc, err := ParseTaskContract([]byte(validTask))
+func TestValidateEffectiveRunsStructural(t *testing.T) {
+	tc, err := ParseTaskContract(mustJSON(t, fullTask()))
+	if err != nil {
+		t.Fatalf("seed contract: %v", err)
+	}
+	// An override that zeroes a limit must be caught by the final gate even
+	// though it never went through ParseRunPolicy.
+	rp := DefaultRunPolicy()
+	rp.TestGate = TestGate{Command: "go test ./..."}
+	rp.Limits.MaxWallSeconds = 0
+	if err := ValidateEffective(tc, rp); err == nil {
+		t.Fatalf("ValidateEffective should reject a zero limit from an override")
+	}
+}
+
+func TestValidateEffectiveTestGate(t *testing.T) {
+	tc, err := ParseTaskContract(mustJSON(t, fullTask()))
 	if err != nil {
 		t.Fatalf("seed contract: %v", err)
 	}
 	tcReq := tc
 	tcReq.RequiredTests = []string{"unit tests"}
 
-	cmd := DefaultRunPolicy()
+	base := DefaultRunPolicy()
+	cmd := base
 	cmd.TestGate = TestGate{Command: "go test ./..."}
-
-	disabled := DefaultRunPolicy()
+	disabled := base
 	disabled.TestGate = TestGate{Disabled: true}
-
-	both := DefaultRunPolicy()
+	both := base
 	both.TestGate = TestGate{Command: "x", Disabled: true}
-
-	neither := DefaultRunPolicy()
+	neither := base
 	neither.TestGate = TestGate{}
 
 	if err := ValidateEffective(tc, cmd); err != nil {
@@ -148,3 +200,5 @@ func TestHashStableAndSensitive(t *testing.T) {
 		t.Fatalf("Hash length wrong")
 	}
 }
+
+var _ = validPolicy

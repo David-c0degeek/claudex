@@ -111,11 +111,29 @@ func DefaultRunPolicy() RunPolicy {
 	}
 }
 
+// taskContractKeys is the full harvested shape: every field must be present
+// (arrays may be explicitly empty), matching the strict source schema.
+var taskContractKeys = []string{
+	"schema_version", "goal", "current_behavior", "desired_behavior", "scope",
+	"non_goals", "constraints", "acceptance_criteria", "required_tests",
+	"relevant_files", "open_questions",
+}
+
 // ParseTaskContract decodes and validates a task-contract document.
 func ParseTaskContract(data []byte) (TaskContract, error) {
 	var tc TaskContract
 	if err := strictDecode(data, &tc); err != nil {
 		return TaskContract{}, fmt.Errorf("task contract: %w", err)
+	}
+	// Require the full shape: every key present (arrays may be empty).
+	present := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &present); err != nil {
+		return TaskContract{}, fmt.Errorf("task contract: %w", err)
+	}
+	for _, k := range taskContractKeys {
+		if _, ok := present[k]; !ok {
+			return TaskContract{}, fmt.Errorf("task contract: %s is required (present the full shape; arrays may be empty)", k)
+		}
 	}
 	if tc.SchemaVersion != TaskContractVersion {
 		return TaskContract{}, fmt.Errorf("task contract: schema_version must be %d (got %d)", TaskContractVersion, tc.SchemaVersion)
@@ -131,17 +149,25 @@ func ParseTaskContract(data []byte) (TaskContract, error) {
 			return TaskContract{}, fmt.Errorf("task contract: %s is required", s.name)
 		}
 	}
-	if err := noBlankElements("acceptance_criteria", tc.AcceptanceCriteria); err != nil {
-		return TaskContract{}, err
+	// Every string array must have no blank elements.
+	arrays := []struct {
+		name string
+		v    []string
+	}{
+		{"non_goals", tc.NonGoals},
+		{"constraints", tc.Constraints},
+		{"acceptance_criteria", tc.AcceptanceCriteria},
+		{"required_tests", tc.RequiredTests},
+		{"relevant_files", tc.RelevantFiles},
+		{"open_questions", tc.OpenQuestions},
+	}
+	for _, a := range arrays {
+		if err := noBlankElements(a.name, a.v); err != nil {
+			return TaskContract{}, err
+		}
 	}
 	if len(tc.AcceptanceCriteria) == 0 {
 		return TaskContract{}, fmt.Errorf("task contract: at least one acceptance_criteria is required")
-	}
-	if err := noBlankElements("required_tests", tc.RequiredTests); err != nil {
-		return TaskContract{}, err
-	}
-	if err := noBlankElements("relevant_files", tc.RelevantFiles); err != nil {
-		return TaskContract{}, err
 	}
 	return tc, nil
 }
@@ -173,13 +199,18 @@ func ParseRunPolicy(data []byte) (RunPolicy, error) {
 	if rp.SchemaVersion != RunPolicyVersion {
 		return RunPolicy{}, fmt.Errorf("run policy: schema_version must be %d (got %d)", RunPolicyVersion, rp.SchemaVersion)
 	}
-	if err := rp.validateStructural(); err != nil {
+	if err := rp.Validate(); err != nil {
 		return RunPolicy{}, fmt.Errorf("run policy: %w", err)
 	}
 	return rp, nil
 }
 
-func (rp RunPolicy) validateStructural() error {
+// Validate checks the run policy's structural invariants (positive ceilings,
+// non-negative budgets, a valid filesystem policy, a base branch). It is
+// exported so CLI-override wiring can re-run it on the effective policy before
+// freezing. It does NOT check the test-gate/task relationship — that needs the
+// task contract; see ValidateEffective.
+func (rp RunPolicy) Validate() error {
 	if strings.TrimSpace(rp.BaseBranch) == "" {
 		return fmt.Errorf("base_branch is required")
 	}
@@ -227,11 +258,16 @@ func (rp RunPolicy) validateStructural() error {
 	return nil
 }
 
-// ValidateEffective cross-validates the resolved policy against the task
-// contract. It is the final gate before freezing: the test gate must be an
-// explicit command or an explicit disable, and disabling the gate is refused
-// when the task declares required tests.
+// ValidateEffective is the final gate before freezing: it runs the structural
+// policy validation (so CLI overrides applied after parsing cannot smuggle in an
+// invalid limit, filesystem policy, or blank base) and then cross-validates the
+// test gate against the task contract. The test gate must be an explicit command
+// or an explicit disable, and disabling it is refused when the task declares
+// required tests.
 func ValidateEffective(tc TaskContract, rp RunPolicy) error {
+	if err := rp.Validate(); err != nil {
+		return err
+	}
 	hasCmd := strings.TrimSpace(rp.TestGate.Command) != ""
 	switch {
 	case rp.TestGate.Disabled && hasCmd:
@@ -295,6 +331,12 @@ func walkJSON(dec *json.Decoder) error {
 					return err
 				}
 				key := kt.(string)
+				// Our schema keys are canonical lower-case. Reject any other
+				// spelling so a case variant cannot alias a field (Go's decoder
+				// matches keys case-insensitively) or hide a semantic duplicate.
+				if key != strings.ToLower(key) {
+					return fmt.Errorf("non-canonical key spelling %q (keys must be lower-case)", key)
+				}
 				if seen[key] {
 					return fmt.Errorf("duplicate key %q", key)
 				}
