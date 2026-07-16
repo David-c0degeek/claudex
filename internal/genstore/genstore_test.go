@@ -256,6 +256,21 @@ func TestOversizePayloadRejectedLaterGen(t *testing.T) {
 	}
 }
 
+func TestWritePrecommitFailureOnEmptyStore(t *testing.T) {
+	// Generation 1 is the bootstrap path for the catalog and run state: a clean
+	// precommit failure on an empty store must be the original error, not ambiguous.
+	s := newStore(t)
+	sentinel := errors.New("precommit failure")
+	s.write = func(string, []byte, os.FileMode) error { return sentinel } // no file written
+	_, err := s.Append(Head{}, func(uint64, string) ([]byte, error) { return []byte("one"), nil })
+	if !errors.Is(err, sentinel) || errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("empty-store precommit err = %v, want the original error and not ErrAmbiguous", err)
+	}
+	if _, ok, _ := s.Latest(); ok {
+		t.Fatalf("store is not empty after a clean precommit failure")
+	}
+}
+
 func TestReconcileCorruptAncestorIsAmbiguous(t *testing.T) {
 	s := newStore(t)
 	r1 := appendConst(t, s, Head{}, "one")

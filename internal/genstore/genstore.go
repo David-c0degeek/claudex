@@ -282,14 +282,18 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, error) {
 	valid, _, present, eerr := s.enumerate()
 	if eerr == nil {
-		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil && hasHead {
-			switch headRec.Digest {
-			case candidate.Digest:
+		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil {
+			var head Head
+			if hasHead {
+				head = headRec.Head()
+			}
+			switch {
+			case hasHead && head.Digest == candidate.Digest:
 				return candidate, nil // committed: candidate is the validated head
-			case oldHead.Digest:
-				if headRec.Generation == oldHead.Generation {
-					return Record{}, werr // old head intact: write did not commit
-				}
+			case head == oldHead:
+				// Old head intact (including an empty store, where both are the
+				// zero Head): the write did not commit — return the original error.
+				return Record{}, werr
 			}
 		}
 	}
