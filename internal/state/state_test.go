@@ -517,3 +517,41 @@ func TestFirstTurnIssuanceRejections(t *testing.T) {
 		})
 	}
 }
+
+// FirstTurn may only be issued from a pristine, unassigned, running INIT — a
+// pre-set clock, a pre-existing assignment, or a non-running INIT is rejected.
+func TestFirstTurnRequiresPristineInit(t *testing.T) {
+	issue := func(gen uint64, next *RunState) {
+		next.Phase = PhasePlanDraft
+		next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.StartedUnix = 2000
+		next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
+	}
+	cases := map[string]func(rev uint64, next *RunState){
+		"pre-set clock": func(rev uint64, next *RunState) {
+			next.StartedUnix = 2000
+			next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
+		},
+		"pre-existing assignment": func(rev uint64, next *RunState) {
+			next.Assignment = &Ref{ID: "turn-early", IssuedRevision: rev}
+		},
+		"non-running init": func(_ uint64, next *RunState) {
+			next.Lifecycle = LifecyclePaused
+		},
+	}
+	for name, taint := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			r1 := mustInit(t, s)
+			// Taint the INIT state (staying INIT), then attempt the issuance.
+			rt, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error { taint(rev, next); return nil })
+			if err != nil {
+				t.Fatalf("taint: %v", err)
+			}
+			if _, err := s.Mutate(rt.Revision, func(gen uint64, next *RunState) error { issue(gen, next); return nil }); err == nil {
+				t.Fatalf("first_turn issuance from a %s should be rejected", name)
+			}
+		})
+	}
+}

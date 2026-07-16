@@ -261,11 +261,21 @@ func validateTransition(old, next *RunState) error {
 			return fmt.Errorf("first_turn is immutable once issued")
 		}
 	} else if next.FirstTurn != nil {
+		// nil->present is the exact "first turn issued" transition: a live, pristine,
+		// unassigned INIT advancing to PLAN_DRAFT, issuing the same Ref as the
+		// assignment (both bound to the resulting revision) and setting the run clock
+		// in this same generation. So the FirstTurn record is an exclusive fact.
+		if old.Lifecycle != LifecycleRunning || next.Lifecycle != LifecycleRunning {
+			return fmt.Errorf("first_turn may only be issued while the run is running")
+		}
 		if old.Phase != PhaseInit || next.Phase != PhasePlanDraft {
 			return fmt.Errorf("first_turn may only be issued on an INIT->PLAN_DRAFT transition")
 		}
-		if next.Assignment == nil || next.Assignment.ID != next.FirstTurn.ID {
-			return fmt.Errorf("first_turn must equal the issued assignment")
+		if old.Assignment != nil || old.StartedUnix != 0 || old.DeadlineUnix != 0 {
+			return fmt.Errorf("first_turn may only be issued from a pristine unassigned INIT")
+		}
+		if next.Assignment == nil || *next.FirstTurn != *next.Assignment {
+			return fmt.Errorf("first_turn must be the same Ref as the issued assignment")
 		}
 		if next.FirstTurn.IssuedRevision != next.Revision {
 			return fmt.Errorf("first_turn must be issued at the resulting revision")

@@ -233,8 +233,8 @@ func isBaseline(rs state.RunState, in PairAttachIntent) (bool, error) {
 // through every downstream RunState transition.
 func planDraftApplied(rs state.RunState, in PairAttachIntent) (bool, error) {
 	if rs.FirstTurn == nil || rs.FirstTurn.ID != in.FirstTurnID ||
-		rs.FirstTurn.IssuedRevision == 0 || rs.FirstTurn.IssuedRevision > rs.Revision {
-		return false, nil
+		rs.FirstTurn.IssuedRevision <= in.ExpectedStateRevision || rs.FirstTurn.IssuedRevision > rs.Revision {
+		return false, nil // issuance is after the frozen baseline and at/before now
 	}
 	if rs.StartedUnix != in.StartedUnix || rs.DeadlineUnix != in.DeadlineUnix {
 		return false, nil
