@@ -1,20 +1,23 @@
-// Package genstore is the immutable-generation store that is the coordinator's
-// root of trust (D017). State is an append-only sequence of self-validating
-// generation records; a record is never modified once written.
+// Package genstore is the coordinator's root of trust (D017): an append-only
+// sequence of self-validating immutable generation records. A record is never
+// modified once written, so writing a new generation cannot corrupt a valid one
+// and no atomic in-place replace is required (Windows does not provide one, D015).
 //
-// Each generation is a file NNNNNNNNNNNN.gen whose bytes are
-// len(header)|header-json|payload|sha256(everything-before). A crash mid-write
-// leaves a torn file that fails its checksum and is ignored; because a new
-// generation is always a NEW file, writing it can never corrupt an existing
-// valid generation — so the store does not rely on an atomic in-place replace
-// (which Windows does not provide, D015).
+// Each generation is a file NNNNNNNNNNNN.gen (exactly 12 canonical digits) whose
+// bytes are uint64(len(header)) | header-json | payload | sha256(all-preceding).
+// A crash mid-write leaves a torn file that fails its checksum and is ignored.
 //
 // Recovery enumerates the generation files, keeps the self-intact ones, and
-// verifies they form a consistent prev-digest chain. The highest record of that
-// chain is the head; a torn newest generation is simply skipped, leaving the
-// previous valid head. Records present but none valid — or a broken chain — is a
-// fail-closed corruption error. There is no `current` pointer: enumeration at the
-// coordinator's scale is cheap and removes a failure surface.
+// verifies they form a chain rooted at generation 1 (empty prev-digest) with each
+// later record linking to the previous by digest (gaps from quarantined slots are
+// allowed). A torn newest generation is skipped, leaving the previous head.
+// Records present with no valid rooted chain — a missing/torn root, an orphaned
+// suffix, a broken link, or a non-canonical/irregular generation file — is a
+// fail-closed corruption error.
+//
+// Locking is composable: a Guard holds one per-run mutation lock that can span
+// several stores' appends (the transaction the journal and state share). Open is
+// side-effect-free; the store directory is created lazily under the guard.
 package genstore
 
 import (
@@ -25,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,15 +43,49 @@ const (
 	formatVersion = 1
 	genFileExt    = ".gen"
 	genFileDigits = 12
+	maxGeneration = 999999999999 // the 12-digit filename ceiling
 	trailerLen    = sha256.Size
+	maxHeaderSize = 4096     // header JSON cap
+	maxRecordSize = 16 << 20 // per-file cap, guards read-allocation from a corrupt file
+	dirPerm       = os.FileMode(0o700)
+	filePerm      = os.FileMode(0o600)
 )
 
 // Sentinel errors (wrap with %w).
 var (
-	ErrConflict = errors.New("genstore: head changed (CAS conflict)")
-	ErrBusy     = errors.New("genstore: store is locked by another process")
-	ErrCorrupt  = errors.New("genstore: no valid generation chain")
+	ErrConflict  = errors.New("genstore: head changed (CAS conflict)")
+	ErrBusy      = errors.New("genstore: store is locked by another process")
+	ErrCorrupt   = errors.New("genstore: no valid generation chain")
+	ErrWrongLock = errors.New("genstore: guard is for a different lock")
+	ErrAmbiguous = errors.New("genstore: write outcome could not be reconciled")
 )
+
+// Guard is a held per-run mutation lock. One guard can serialize appends across
+// several stores that share the same lock path (the run's transaction).
+type Guard struct {
+	lock     *oslock.Lock
+	lockPath string
+}
+
+// Acquire takes the mutation lock non-blockingly. ok=false means another process
+// holds it.
+func Acquire(lockPath string) (g *Guard, ok bool, err error) {
+	l, ok, err := oslock.TryAcquire(lockPath)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return &Guard{lock: l, lockPath: lockPath}, true, nil
+}
+
+// Release releases the guard's lock.
+func (g *Guard) Release() error {
+	if g == nil || g.lock == nil {
+		return nil
+	}
+	err := g.lock.Release()
+	g.lock = nil
+	return err
+}
 
 // Head identifies the current tip of the chain for compare-and-swap.
 type Head struct {
@@ -72,87 +110,104 @@ type header struct {
 	Generation    uint64 `json:"generation"`
 	PrevDigest    string `json:"prev_digest"`
 	PayloadDigest string `json:"payload_digest"`
-	PayloadLen    int    `json:"payload_len"`
+	PayloadLen    uint64 `json:"payload_len"`
 }
 
-// Store persists generations under dir, serializing mutations with an OS lock.
+// Store persists generations under dir, guarded by the lock at lockPath.
 type Store struct {
 	dir      string
 	lockPath string
+	write    func(path string, data []byte, perm os.FileMode) error
 }
 
-// Open ensures dir exists and returns a store whose mutations are guarded by the
-// advisory lock at lockPath.
-func Open(dir, lockPath string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	return &Store{dir: dir, lockPath: lockPath}, nil
+// Open returns a store handle. It performs no I/O: the directory is created
+// lazily under the guard by the first append, so a read-only Latest never
+// mutates disk.
+func Open(dir, lockPath string) *Store {
+	return &Store{dir: dir, lockPath: lockPath, write: atomicfile.Write}
 }
+
+// LockPath is the mutation lock this store's guard must hold.
+func (s *Store) LockPath() string { return s.lockPath }
 
 func (s *Store) genPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%0*d%s", genFileDigits, gen, genFileExt))
 }
 
-func (s *Store) exists(gen uint64) bool {
-	_, err := os.Stat(s.genPath(gen))
-	return err == nil
+func (s *Store) checkGuard(g *Guard) error {
+	if g == nil || g.lock == nil {
+		return errors.New("genstore: nil or released guard")
+	}
+	if g.lockPath != s.lockPath {
+		return fmt.Errorf("%w: guard=%q store=%q", ErrWrongLock, g.lockPath, s.lockPath)
+	}
+	return nil
 }
 
 // Latest returns the head record. It is lock-free: records are immutable, so a
-// concurrent Append either has produced a complete new file or not. Returns
-// (_, false, nil) for a truly empty store, and a wrapped ErrCorrupt when records
-// are present but no valid chain can be formed.
+// concurrent append either produced a complete new file or not. (_, false, nil)
+// is a truly empty (or absent) store; a wrapped ErrCorrupt means records are
+// present but no valid rooted chain exists.
 func (s *Store) Latest() (Record, bool, error) {
-	valid, present, err := s.enumerate()
+	valid, _, present, err := s.enumerate()
 	if err != nil {
 		return Record{}, false, err
 	}
-	if !present {
-		return Record{}, false, nil
-	}
-	head, err := headOf(valid)
-	if err != nil {
-		return Record{}, false, err
-	}
-	return head, true, nil
+	return chainHead(valid, present)
 }
 
-// Append writes the next generation. It is the store-owned compare-and-swap:
-// under the lock it enumerates and validates the chain, requires the current head
-// to equal expected, selects the next unused generation number (skipping any
-// slot already occupied by an invalid/quarantined file, which leaves a
-// documented gap), then invokes build with that number and the previous digest so
-// the payload's own revision agrees with the filename and envelope generation.
+// Append is the convenience form: it acquires the guard, appends, and releases.
 func (s *Store) Append(expected Head, build func(next uint64, prevDigest string) ([]byte, error)) (Record, error) {
-	lock, ok, err := oslock.TryAcquire(s.lockPath)
+	g, ok, err := Acquire(s.lockPath)
 	if err != nil {
 		return Record{}, err
 	}
 	if !ok {
 		return Record{}, ErrBusy
 	}
-	defer lock.Release()
+	rec, aerr := s.AppendLocked(g, expected, build)
+	rerr := g.Release()
+	if aerr == nil && rerr != nil {
+		// The record is committed, but the lock release failed: report both.
+		return rec, fmt.Errorf("committed generation %d but lock release failed: %w", rec.Generation, rerr)
+	}
+	return rec, aerr
+}
 
-	valid, present, err := s.enumerate()
+// AppendLocked appends the next generation under an already-held guard, so a
+// caller can compose several stores' appends into one critical section. The guard
+// must hold this store's lock.
+func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, prevDigest string) ([]byte, error)) (Record, error) {
+	if err := s.checkGuard(g); err != nil {
+		return Record{}, err
+	}
+	if err := os.MkdirAll(s.dir, dirPerm); err != nil { // init under the lock
+		return Record{}, err
+	}
+
+	valid, occupied, present, err := s.enumerate()
+	if err != nil {
+		return Record{}, err
+	}
+	headRec, hasHead, err := chainHead(valid, present)
 	if err != nil {
 		return Record{}, err
 	}
 	var head Head
-	if present {
-		h, herr := headOf(valid)
-		if herr != nil {
-			return Record{}, herr
-		}
-		head = h.Head()
+	if hasHead {
+		head = headRec.Head()
 	}
 	if expected != head {
-		return Record{}, fmt.Errorf("%w: expected {gen:%d}, have {gen:%d}", ErrConflict, expected.Generation, head.Generation)
+		return Record{}, fmt.Errorf("%w: expected {gen:%d,digest:%s}, have {gen:%d,digest:%s}",
+			ErrConflict, expected.Generation, shortDigest(expected.Digest), head.Generation, shortDigest(head.Digest))
 	}
 
 	next := head.Generation + 1
-	for s.exists(next) {
-		next++ // skip a slot occupied by a quarantined/invalid file
+	for occupied[next] { // skip a slot already holding a (possibly quarantined) file
+		next++
+	}
+	if next > maxGeneration {
+		return Record{}, fmt.Errorf("genstore: generation ceiling %d reached", uint64(maxGeneration))
 	}
 
 	payload, err := build(next, head.Digest)
@@ -161,73 +216,133 @@ func (s *Store) Append(expected Head, build func(next uint64, prevDigest string)
 	}
 	rec, file := encode(next, head.Digest, payload)
 
-	if werr := atomicfile.Write(s.genPath(next), file, 0o644); werr != nil {
-		var pce *atomicfile.PostCommitSyncError
-		if errors.As(werr, &pce) {
-			return rec, nil // committed and visible; only the durability sync failed
-		}
-		return Record{}, werr
+	if werr := s.write(s.genPath(next), file, filePerm); werr != nil {
+		return s.reconcile(rec, head, werr)
 	}
 	return rec, nil
 }
 
-// enumerate lists the generation files, returning the self-intact records in
-// ascending generation order and whether any generation files were present.
-func (s *Store) enumerate() ([]Record, bool, error) {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil, false, err
-	}
-	type gf struct {
-		gen  uint64
-		name string
-	}
-	var gfs []gf
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), genFileExt) {
-			continue
+// reconcile interprets an ambiguous write outcome by re-reading disk exactly
+// once. It never re-invokes the builder. If the exact candidate is now the
+// validated head, the write committed; if the old head still stands, the write
+// did not commit and the original error is returned; otherwise the state is
+// ambiguous/corrupt.
+func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, error) {
+	if data, rerr := os.ReadFile(s.genPath(candidate.Generation)); rerr == nil {
+		if got, ok := decode(candidate.Generation, data); ok && got.Digest == candidate.Digest {
+			return candidate, nil // committed and visible despite the write error
 		}
-		base := strings.TrimSuffix(e.Name(), genFileExt)
-		g, perr := strconv.ParseUint(base, 10, 64)
-		if perr != nil {
-			continue
-		}
-		gfs = append(gfs, gf{gen: g, name: e.Name()})
 	}
-	if len(gfs) == 0 {
-		return nil, false, nil
-	}
-	sort.Slice(gfs, func(i, j int) bool { return gfs[i].gen < gfs[j].gen })
-
-	var valid []Record
-	for _, g := range gfs {
-		data, rerr := os.ReadFile(filepath.Join(s.dir, g.name))
-		if rerr != nil {
-			return nil, true, rerr // a present file we cannot read is an error, not "invalid"
+	valid, _, present, eerr := s.enumerate()
+	if eerr == nil {
+		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil {
+			var head Head
+			if hasHead {
+				head = headRec.Head()
+			}
+			if head == oldHead {
+				return Record{}, werr // old head intact: write did not commit
+			}
 		}
-		if rec, okDecode := decode(g.gen, data); okDecode {
-			valid = append(valid, rec)
-		}
-		// torn/invalid files are quarantined (skipped).
 	}
-	return valid, true, nil
+	return Record{}, fmt.Errorf("%w: after write error: %v", ErrAmbiguous, werr)
 }
 
-// headOf verifies the valid records form a consistent prev-digest chain and
-// returns the head (highest) record.
-func headOf(valid []Record) (Record, error) {
+// enumerate lists the generation files, returning the self-intact records
+// (ascending), the set of occupied generation numbers, and whether any canonical
+// generation files were present. A non-canonical, irregular, or unreadable
+// generation file is a corruption error, not a silent empty store.
+func (s *Store) enumerate() (valid []Record, occupied map[uint64]bool, present bool, err error) {
+	entries, e := os.ReadDir(s.dir)
+	if e != nil {
+		if os.IsNotExist(e) {
+			return nil, map[uint64]bool{}, false, nil // absent store == empty
+		}
+		return nil, nil, false, e
+	}
+
+	occupied = map[uint64]bool{}
+	var gens []uint64
+	for _, ent := range entries {
+		name := ent.Name()
+		if !strings.HasSuffix(name, genFileExt) {
+			continue // e.g. a stale atomicfile temp; outside our namespace
+		}
+		g, ok := parseCanonicalGen(name)
+		if !ok {
+			return nil, nil, true, fmt.Errorf("non-canonical generation file %q: %w", name, ErrCorrupt)
+		}
+		if ent.Type()&os.ModeSymlink != 0 || !ent.Type().IsRegular() {
+			return nil, nil, true, fmt.Errorf("generation file %q is not a regular file: %w", name, ErrCorrupt)
+		}
+		info, ierr := ent.Info()
+		if ierr != nil {
+			return nil, nil, true, ierr
+		}
+		occupied[g] = true
+		if info.Size() <= int64(maxRecordSize) {
+			gens = append(gens, g)
+		}
+		// An over-size file stays occupied (blocks the slot) but is never read.
+	}
+	if len(occupied) == 0 {
+		return nil, occupied, false, nil
+	}
+
+	sort.Slice(gens, func(i, j int) bool { return gens[i] < gens[j] })
+	for _, g := range gens {
+		data, rerr := os.ReadFile(s.genPath(g))
+		if rerr != nil {
+			return nil, nil, true, rerr
+		}
+		if rec, ok := decode(g, data); ok {
+			valid = append(valid, rec)
+		}
+		// torn/invalid files are quarantined (skipped) but remain occupied.
+	}
+	return valid, occupied, true, nil
+}
+
+// chainHead validates that valid forms a chain rooted at generation 1 with an
+// empty prev-digest and returns its head record.
+func chainHead(valid []Record, present bool) (Record, bool, error) {
+	if !present {
+		return Record{}, false, nil
+	}
 	if len(valid) == 0 {
-		return Record{}, fmt.Errorf("records present but none valid: %w", ErrCorrupt)
+		return Record{}, false, fmt.Errorf("records present but none valid: %w", ErrCorrupt)
+	}
+	if valid[0].Generation != 1 || valid[0].PrevDigest != "" {
+		return Record{}, false, fmt.Errorf("chain root is generation %d with prev %q (want generation 1, empty prev): %w",
+			valid[0].Generation, shortDigest(valid[0].PrevDigest), ErrCorrupt)
 	}
 	for i := 1; i < len(valid); i++ {
 		if valid[i].PrevDigest != valid[i-1].Digest {
-			return Record{}, fmt.Errorf("broken chain at generation %d: %w", valid[i].Generation, ErrCorrupt)
+			return Record{}, false, fmt.Errorf("broken chain at generation %d: %w", valid[i].Generation, ErrCorrupt)
 		}
 	}
-	return valid[len(valid)-1], nil
+	return valid[len(valid)-1], true, nil
 }
 
-// encode builds the on-disk bytes and the Record for payload at gen.
+// parseCanonicalGen accepts exactly a 12-digit generation name that round-trips.
+func parseCanonicalGen(name string) (uint64, bool) {
+	base := strings.TrimSuffix(name, genFileExt)
+	if len(base) != genFileDigits {
+		return 0, false
+	}
+	g, err := strconv.ParseUint(base, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if fmt.Sprintf("%0*d%s", genFileDigits, g, genFileExt) != name {
+		return 0, false // e.g. leading '+', overflowed, or wrong width
+	}
+	return g, true
+}
+
+// encode builds the on-disk bytes and the Record for payload at gen. The Record's
+// Payload is a copy so a caller mutating the input cannot desync it from the
+// digest.
 func encode(gen uint64, prevDigest string, payload []byte) (Record, []byte) {
 	pd := sha256.Sum256(payload)
 	h := header{
@@ -235,7 +350,7 @@ func encode(gen uint64, prevDigest string, payload []byte) (Record, []byte) {
 		Generation:    gen,
 		PrevDigest:    prevDigest,
 		PayloadDigest: hex.EncodeToString(pd[:]),
-		PayloadLen:    len(payload),
+		PayloadLen:    uint64(len(payload)),
 	}
 	hb, _ := json.Marshal(h)
 
@@ -254,38 +369,39 @@ func encode(gen uint64, prevDigest string, payload []byte) (Record, []byte) {
 		PrevDigest:    prevDigest,
 		PayloadDigest: h.PayloadDigest,
 		Digest:        hex.EncodeToString(trailer[:]),
-		Payload:       payload,
+		Payload:       append([]byte(nil), payload...),
 	}
 	return rec, file
 }
 
-// decode validates a record file's bytes against the generation implied by its
-// filename, returning ok=false for any torn/inconsistent record.
+// decode validates a record file against the generation implied by its filename.
+// It is overflow- and resource-safe: the header length is bounds-checked without
+// unsigned wraparound and capped.
 func decode(expectGen uint64, file []byte) (Record, bool) {
 	if len(file) < 8+trailerLen {
 		return Record{}, false
 	}
 	body := file[:len(file)-trailerLen]
 	trailer := file[len(file)-trailerLen:]
-	sum := sha256.Sum256(body)
-	if !bytes.Equal(sum[:], trailer) {
+	if sum := sha256.Sum256(body); !bytes.Equal(sum[:], trailer) {
 		return Record{}, false
 	}
 	lenH := binary.BigEndian.Uint64(body[:8])
-	if 8+lenH > uint64(len(body)) {
+	// body has at least 8 bytes; compare before adding to avoid wraparound.
+	if lenH > uint64(len(body)-8) || lenH > maxHeaderSize {
 		return Record{}, false
 	}
 	hb := body[8 : 8+lenH]
 	payload := body[8+lenH:]
+
 	var h header
-	if err := json.Unmarshal(hb, &h); err != nil {
+	if !strictHeader(hb, &h) {
 		return Record{}, false
 	}
-	if h.Format != formatVersion || h.Generation != expectGen || h.PayloadLen != len(payload) {
+	if h.Format != formatVersion || h.Generation != expectGen || h.PayloadLen != uint64(len(payload)) {
 		return Record{}, false
 	}
-	pd := sha256.Sum256(payload)
-	if hex.EncodeToString(pd[:]) != h.PayloadDigest {
+	if pd := sha256.Sum256(payload); hex.EncodeToString(pd[:]) != h.PayloadDigest {
 		return Record{}, false
 	}
 	return Record{
@@ -293,6 +409,25 @@ func decode(expectGen uint64, file []byte) (Record, bool) {
 		PrevDigest:    h.PrevDigest,
 		PayloadDigest: h.PayloadDigest,
 		Digest:        hex.EncodeToString(trailer),
-		Payload:       payload,
+		Payload:       append([]byte(nil), payload...),
 	}, true
+}
+
+// strictHeader decodes a single JSON header, rejecting unknown fields and
+// trailing content.
+func strictHeader(hb []byte, h *header) bool {
+	dec := json.NewDecoder(bytes.NewReader(hb))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(h); err != nil {
+		return false
+	}
+	_, err := dec.Token()
+	return err == io.EOF
+}
+
+func shortDigest(d string) string {
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
 }
