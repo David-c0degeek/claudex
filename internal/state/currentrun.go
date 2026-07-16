@@ -18,11 +18,15 @@ const CurrentRunVersion = 1
 // version this build does not support.
 var ErrUnsupportedCurrentRunSchema = errors.New("state: unsupported active-run schema version")
 
-// CurrentRun is the repository's authoritative active-run pointer. The catalog is
-// the full allocation history; this names the single run currently accepting
-// attaches, plus the caller-stable operation id that bootstrapped it (so a lost
-// response after a completed bootstrap returns the same run, never a forced
-// replacement). It is a separate immutable-generation store under the repo lock.
+// ErrCurrentRunMismatch means a Clear did not name the actual active run.
+var ErrCurrentRunMismatch = errors.New("state: active-run clear does not match the active run")
+
+// CurrentRun is the repository's authoritative active-run pointer: the single run
+// currently accepting attaches, plus the caller-stable operation id that
+// bootstrapped it. It holds ONLY run/locator/operation activation identity —
+// never a session or agent, which are the Registry's sole truth (a copied session
+// here would go stale on a same-role replacement). It is a separate
+// immutable-generation store under the repo lock.
 type CurrentRun struct {
 	SchemaVersion int    `json:"schema_version"`
 	Revision      uint64 `json:"revision"`
@@ -30,8 +34,6 @@ type CurrentRun struct {
 	RunID         string `json:"run_id"`
 	RelDir        string `json:"rel_dir"`
 	OperationID   string `json:"operation_id"`
-	LeadSessionID string `json:"lead_session_id"`
-	LeadAgent     Agent  `json:"lead_agent"`
 }
 
 // CurrentRunStore persists the active-run pointer over a genstore. It shares the
@@ -61,13 +63,43 @@ func (s *CurrentRunStore) Load() (CurrentRun, bool, error) {
 	return cr, true, nil
 }
 
-// MutateLocked appends the next generation under an already-held guard.
-func (s *CurrentRunStore) MutateLocked(g *genstore.Guard, expectedRevision uint64, fn func(next *CurrentRun) error) (CurrentRun, error) {
+// Activate sets the active-run pointer to a NEW run under a held guard, CASing
+// against the expected pointer revision so a later run activates only after a
+// prior one was cleared.
+func (s *CurrentRunStore) Activate(g *genstore.Guard, expectedRevision uint64, runID, relDir, operationID string) (CurrentRun, error) {
+	return s.mutate(g, expectedRevision, func(next *CurrentRun) error {
+		next.Active = true
+		next.RunID = runID
+		next.RelDir = relDir
+		next.OperationID = operationID
+		return nil
+	})
+}
+
+// Clear deactivates the pointer, binding the expected active run id AND revision,
+// so only the actual active run can be cleared (the caller must have confirmed
+// its RunState is terminal first).
+func (s *CurrentRunStore) Clear(g *genstore.Guard, expectedRevision uint64, expectedRunID string) (CurrentRun, error) {
+	cur, ok, err := s.Load()
+	if err != nil {
+		return CurrentRun{}, err
+	}
+	if !ok || !cur.Active || cur.RunID != expectedRunID {
+		return CurrentRun{}, fmt.Errorf("%w: %s", ErrCurrentRunMismatch, expectedRunID)
+	}
+	return s.mutate(g, expectedRevision, func(next *CurrentRun) error {
+		next.Active = false
+		return nil
+	})
+}
+
+func (s *CurrentRunStore) mutate(g *genstore.Guard, expectedRevision uint64, fn func(next *CurrentRun) error) (CurrentRun, error) {
 	rec, ok, err := s.gs.Latest()
 	if err != nil {
 		return CurrentRun{}, err
 	}
 	var head genstore.Head
+	var prev *CurrentRun
 	if ok {
 		p, derr := decodeCurrentRun(rec)
 		if derr != nil {
@@ -77,15 +109,11 @@ func (s *CurrentRunStore) MutateLocked(g *genstore.Guard, expectedRevision uint6
 			return CurrentRun{}, fmt.Errorf("%w: expected %d, have %d", ErrRevisionConflict, expectedRevision, p.Revision)
 		}
 		head = rec.Head()
+		prev = &p
 	} else if expectedRevision != 0 {
 		return CurrentRun{}, fmt.Errorf("%w: expected %d on an empty active-run store", ErrRevisionConflict, expectedRevision)
 	}
 
-	var prev *CurrentRun
-	if ok {
-		p, _ := decodeCurrentRun(rec)
-		prev = &p
-	}
 	built, err := s.gs.AppendLocked(g, head, func(gen uint64, _ string) ([]byte, error) {
 		next := &CurrentRun{}
 		if err := fn(next); err != nil {
@@ -148,8 +176,7 @@ func validateCurrentRun(cr *CurrentRun) error {
 		return fmt.Errorf("active-run revision must be > 0")
 	}
 	if !cr.Active {
-		// A cleared pointer carries no run identity.
-		if cr.RunID != "" || cr.RelDir != "" || cr.OperationID != "" || cr.LeadSessionID != "" || cr.LeadAgent != "" {
+		if cr.RunID != "" || cr.RelDir != "" || cr.OperationID != "" {
 			return fmt.Errorf("an inactive active-run pointer must carry no run identity")
 		}
 		return nil
@@ -162,12 +189,6 @@ func validateCurrentRun(cr *CurrentRun) error {
 	}
 	if !isOperationID(cr.OperationID) {
 		return fmt.Errorf("active-run operation_id is not a minted operation id")
-	}
-	if !isSessionID(cr.LeadSessionID) {
-		return fmt.Errorf("active-run lead_session_id is not a minted session id")
-	}
-	if cr.LeadAgent != AgentClaude && cr.LeadAgent != AgentCodex {
-		return fmt.Errorf("active-run lead_agent is unknown")
 	}
 	return nil
 }
@@ -183,20 +204,15 @@ func validateCurrentRunTransition(old, next *CurrentRun) error {
 		}
 		return fmt.Errorf("the active-run pointer is already inactive")
 	}
-	if next.Active && old.Active {
-		return fmt.Errorf("cannot activate over an active run")
-	}
 	return nil
 }
 
 // currentRunGuard rejects a secret in any active-run control field.
 func currentRunGuard(cr *CurrentRun) error {
 	for field, v := range map[string]string{
-		"run_id":          cr.RunID,
-		"rel_dir":         cr.RelDir,
-		"operation_id":    cr.OperationID,
-		"lead_session_id": cr.LeadSessionID,
-		"lead_agent":      string(cr.LeadAgent),
+		"run_id":       cr.RunID,
+		"rel_dir":      cr.RelDir,
+		"operation_id": cr.OperationID,
 	} {
 		if redact.Text(v) != v {
 			return fmt.Errorf("state: a secret was detected in active-run field %s", field)

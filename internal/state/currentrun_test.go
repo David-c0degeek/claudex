@@ -9,8 +9,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/genstore"
 )
 
-func opid(c string) string   { return "op-" + strings.Repeat(c, 32) }
-func sessid(c string) string { return "sess-" + strings.Repeat(c, 32) }
+func opid(c string) string { return "op-" + strings.Repeat(c, 32) }
 
 func newCurrentRun(t *testing.T) (*CurrentRunStore, string) {
 	t.Helper()
@@ -28,19 +27,10 @@ func withGuard(t *testing.T, lock string, fn func(g *genstore.Guard)) {
 	fn(g)
 }
 
-func activate(next *CurrentRun, runID, op, sess string) {
-	next.Active = true
-	next.RunID = runID
-	next.RelDir = RunDirRelFor(runID)
-	next.OperationID = op
-	next.LeadSessionID = sess
-	next.LeadAgent = AgentClaude
-}
-
 func TestCurrentRunActivateLoad(t *testing.T) {
 	s, lock := newCurrentRun(t)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		if _, err := s.MutateLocked(g, 0, func(n *CurrentRun) error { activate(n, "run-a", opid("a"), sessid("a")); return nil }); err != nil {
+		if _, err := s.Activate(g, 0, "run-a", RunDirRelFor("run-a"), opid("a")); err != nil {
 			t.Fatalf("activate: %v", err)
 		}
 	})
@@ -51,53 +41,51 @@ func TestCurrentRunActivateLoad(t *testing.T) {
 }
 
 // active -> inactive (clear) then inactive -> active (a new run) is legal; a
-// double-set or double-clear is rejected.
+// double-set (activate over active) and a mismatched/absent clear are rejected.
 func TestCurrentRunTransitions(t *testing.T) {
 	s, lock := newCurrentRun(t)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		r1, err := s.MutateLocked(g, 0, func(n *CurrentRun) error { activate(n, "run-a", opid("a"), sessid("a")); return nil })
+		r1, err := s.Activate(g, 0, "run-a", RunDirRelFor("run-a"), opid("a"))
 		if err != nil {
 			t.Fatalf("activate A: %v", err)
 		}
 		// Activating over an active run is rejected.
-		if _, err := s.MutateLocked(g, r1.Revision, func(n *CurrentRun) error { activate(n, "run-b", opid("b"), sessid("b")); return nil }); err == nil {
+		if _, err := s.Activate(g, r1.Revision, "run-b", RunDirRelFor("run-b"), opid("b")); err == nil {
 			t.Fatalf("activating over an active run should be rejected")
 		}
-		// Clear is legal.
-		r2, err := s.MutateLocked(g, r1.Revision, func(n *CurrentRun) error { n.Active = false; return nil })
+		// Clearing a run other than the active one is rejected.
+		if _, err := s.Clear(g, r1.Revision, "run-b"); !errors.Is(err, ErrCurrentRunMismatch) {
+			t.Fatalf("mismatched clear err = %v, want ErrCurrentRunMismatch", err)
+		}
+		// Clear the active run.
+		r2, err := s.Clear(g, r1.Revision, "run-a")
 		if err != nil {
 			t.Fatalf("clear: %v", err)
 		}
-		// Double clear is rejected.
-		if _, err := s.MutateLocked(g, r2.Revision, func(n *CurrentRun) error { n.Active = false; return nil }); err == nil {
-			t.Fatalf("double clear should be rejected")
+		// Clearing an already-inactive pointer is rejected.
+		if _, err := s.Clear(g, r2.Revision, "run-a"); !errors.Is(err, ErrCurrentRunMismatch) {
+			t.Fatalf("double clear err = %v, want ErrCurrentRunMismatch", err)
 		}
 		// A new run activates after the clear.
-		if _, err := s.MutateLocked(g, r2.Revision, func(n *CurrentRun) error { activate(n, "run-b", opid("b"), sessid("b")); return nil }); err != nil {
+		if _, err := s.Activate(g, r2.Revision, "run-b", RunDirRelFor("run-b"), opid("b")); err != nil {
 			t.Fatalf("activate B after clear: %v", err)
 		}
 	})
 }
 
-func TestCurrentRunRejects(t *testing.T) {
-	cases := map[string]func(n *CurrentRun){
-		"non-derived rel dir":  func(n *CurrentRun) { activate(n, "run-a", opid("a"), sessid("a")); n.RelDir = ".claudex/runs/other" },
-		"non-minted operation": func(n *CurrentRun) { activate(n, "run-a", "op-short", sessid("a")) },
-		"non-minted session":   func(n *CurrentRun) { activate(n, "run-a", opid("a"), "sess-UPPER") },
-		"secret run id": func(n *CurrentRun) {
-			activate(n, "run-a", opid("a"), sessid("a"))
-			n.RunID = "sk-ant-abcdefghijklmnopqrstuvwx"
-		},
-		"inactive with identity": func(n *CurrentRun) {
-			n.Active = false
-			n.RunID = "run-a"
-		},
+func TestCurrentRunActivateRejects(t *testing.T) {
+	cases := map[string]struct {
+		runID, relDir, op string
+	}{
+		"non-derived rel dir":  {"run-a", ".claudex/runs/other", opid("a")},
+		"non-minted operation": {"run-a", RunDirRelFor("run-a"), "op-short"},
+		"secret run id":        {"sk-ant-abcdefghijklmnopqrstuvwx", RunDirRelFor("sk-ant-abcdefghijklmnopqrstuvwx"), opid("a")},
 	}
-	for name, mut := range cases {
+	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			s, lock := newCurrentRun(t)
 			withGuard(t, lock, func(g *genstore.Guard) {
-				if _, err := s.MutateLocked(g, 0, func(n *CurrentRun) error { mut(n); return nil }); err == nil {
+				if _, err := s.Activate(g, 0, c.runID, c.relDir, c.op); err == nil {
 					t.Fatalf("%s should be rejected", name)
 				}
 			})
@@ -109,19 +97,24 @@ func TestCurrentRunRejects(t *testing.T) {
 func TestCurrentRunCAS(t *testing.T) {
 	s, lock := newCurrentRun(t)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		if _, err := s.MutateLocked(g, 0, func(n *CurrentRun) error { activate(n, "run-a", opid("a"), sessid("a")); return nil }); err != nil {
+		if _, err := s.Activate(g, 0, "run-a", RunDirRelFor("run-a"), opid("a")); err != nil {
 			t.Fatalf("activate: %v", err)
 		}
-		if _, err := s.MutateLocked(g, 0, func(n *CurrentRun) error { n.Active = false; return nil }); !errors.Is(err, ErrRevisionConflict) {
+		if _, err := s.Clear(g, 0, "run-a"); !errors.Is(err, ErrRevisionConflict) {
 			t.Fatalf("stale CAS err = %v, want ErrRevisionConflict", err)
 		}
 	})
 }
 
-// An older/unknown schema fails decode with version remediation.
-func TestCurrentRunRejectsOlderSchema(t *testing.T) {
+// An older/unknown schema fails decode with version remediation, and an inactive
+// pointer carrying run identity is rejected at decode.
+func TestCurrentRunDecodeRejects(t *testing.T) {
 	old := []byte(`{"schema_version":0,"revision":1,"active":false}`)
 	if _, err := decodeCurrentRun(genstore.Record{Generation: 1, Payload: old}); !errors.Is(err, ErrUnsupportedCurrentRunSchema) {
 		t.Fatalf("older schema err = %v, want ErrUnsupportedCurrentRunSchema", err)
+	}
+	inactiveWithID := []byte(`{"schema_version":1,"revision":1,"active":false,"run_id":"run-a","rel_dir":"","operation_id":""}`)
+	if _, err := decodeCurrentRun(genstore.Record{Generation: 1, Payload: inactiveWithID}); err == nil {
+		t.Fatalf("an inactive pointer with run identity should be rejected")
 	}
 }

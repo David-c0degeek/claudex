@@ -261,8 +261,9 @@ func TestFirstAttachRefusesKnownUnsupportedFS(t *testing.T) {
 		t.Fatalf("git seams were called: base=%d worktree=%d", base.calls, wt.applyCalls)
 	}
 	// No .claudex allocation state was created.
-	if _, err := os.Stat(filepath.Join(repo, ".claudex", "catalog")); !os.IsNotExist(err) {
-		t.Fatalf("catalog dir created despite refusal: %v", err)
+	// No mutation at all: .claudex itself was never created.
+	if _, err := os.Stat(filepath.Join(repo, ".claudex")); !os.IsNotExist(err) {
+		t.Fatalf(".claudex created despite pre-lock filesystem refusal: %v", err)
 	}
 }
 
@@ -374,16 +375,6 @@ func TestSnapshotConflictIsIndeterminate(t *testing.T) {
 	}
 }
 
-func withRepoGuard(t *testing.T, lock string, fn func(g *genstore.Guard)) {
-	t.Helper()
-	g, ok, err := genstore.Acquire(lock)
-	if err != nil || !ok {
-		t.Fatalf("acquire repo guard: %v", err)
-	}
-	defer g.Release()
-	fn(g)
-}
-
 // A different operation that arrives while a bootstrap is pending completes the
 // recovery but is told the run exists — it never receives the incumbent session.
 func TestFirstAttachDifferentOpDoesNotGetSession(t *testing.T) {
@@ -404,8 +395,9 @@ func TestFirstAttachDifferentOpDoesNotGetSession(t *testing.T) {
 	}
 }
 
-// A completed run can be cleared and a second run bootstrapped; both catalog refs
-// are retained and the second run is current.
+// A run that has actually reached terminal is reconciled and a second run
+// bootstrapped; a still-running run is never displaced. Both catalog refs are
+// retained and the second run is current.
 func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 	repo := t.TempDir()
 	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
@@ -413,15 +405,23 @@ func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 		t.Fatalf("run A: %v", err)
 	}
 	lay := layoutFor(repo)
-	// Simulate run A reaching terminal: clear the active-run pointer.
-	withRepoGuard(t, lay.repoLock, func(g *genstore.Guard) {
-		store := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock)
-		cur, _, _ := store.Load()
-		if _, err := store.MutateLocked(g, cur.Revision, func(n *state.CurrentRun) error { n.Active = false; return nil }); err != nil {
-			t.Fatalf("clear: %v", err)
-		}
-	})
+	aStore := state.Open(filepath.Join(lay.runDir(state.RunDirRelFor(a.RunID)), "state"), lay.repoLock)
 
+	// While A is still RUNNING, a different operation must be refused (no split-brain).
+	running := newRequest(t, repo, &fakeWorktree{})
+	running.OperationID = opID("e")
+	running.RNG = bytes.NewReader(bytes.Repeat([]byte{0x01, 0x02, 0x03, 0x04}, 64))
+	if _, err := FirstAttach(running); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("attach over a running run err = %v, want ErrRunExists", err)
+	}
+
+	// Drive A to a terminal lifecycle (as a real completion/cancellation would).
+	rsA, _, _ := aStore.Load()
+	if _, err := aStore.Mutate(rsA.Revision, func(_ uint64, n *state.RunState) error { n.Lifecycle = state.LifecycleCancelled; return nil }); err != nil {
+		t.Fatalf("terminate A: %v", err)
+	}
+
+	// Now a different operation reconciles the terminal A and bootstraps B.
 	reqB := newRequest(t, repo, &fakeWorktree{})
 	reqB.OperationID = opID("b")
 	reqB.RNG = bytes.NewReader(bytes.Repeat([]byte{0x77, 0x11, 0x88, 0x22}, 64)) // distinct ids from run A
@@ -450,7 +450,7 @@ func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 // A crash after each durable step (effect applied, progress not recorded) is
 // recovered forward on retry to a fully bootstrapped run.
 func TestBootstrapCutRecovers(t *testing.T) {
-	for _, step := range []string{"registry-init", "state-init", "catalog-allocate", "current-run-set"} {
+	for _, step := range []string{"snapshot-task", "snapshot-policy", "worktree", "registry-init", "state-init", "catalog-allocate", "current-run-set"} {
 		t.Run(step, func(t *testing.T) {
 			repo := t.TempDir()
 			fired := false
@@ -484,34 +484,48 @@ func TestBootstrapCutRecovers(t *testing.T) {
 }
 
 // Concurrent first attaches serialize on the repo lock: exactly one bootstraps a
-// run; the other is busy or told the run exists, and only one run is allocated.
+// run, and the losing operation, retried, CONVERGES to ErrRunExists — only one
+// run is ever allocated.
 func TestFirstAttachConcurrent(t *testing.T) {
 	repo := t.TempDir()
+	ops := []string{opID("a"), opID("b")}
+	seeds := [][]byte{{0x11, 0x22, 0x33, 0x44}, {0x55, 0x66, 0x77, 0x88}}
 	type outcome struct {
-		res FirstAttachResult
+		op  string
 		err error
 	}
 	results := make(chan outcome, 2)
-	for _, op := range []string{opID("a"), opID("b")} {
-		op := op
+	for i, op := range ops {
+		i, op := i, op
 		go func() {
 			req := newRequest(t, repo, &fakeWorktree{})
 			req.OperationID = op
-			res, err := FirstAttach(req)
-			results <- outcome{res, err}
+			req.RNG = bytes.NewReader(bytes.Repeat(seeds[i], 64))
+			_, err := FirstAttach(req)
+			results <- outcome{op, err}
 		}()
 	}
 	got := []outcome{<-results, <-results}
-	successes := 0
+	successes, loser := 0, ""
 	for _, o := range got {
-		if o.err == nil {
+		switch {
+		case o.err == nil:
 			successes++
-		} else if !errors.Is(o.err, ErrRunExists) && !errors.Is(o.err, genstore.ErrBusy) {
+		case errors.Is(o.err, ErrRunExists) || errors.Is(o.err, genstore.ErrBusy):
+			loser = o.op
+		default:
 			t.Fatalf("unexpected concurrent error: %v", o.err)
 		}
 	}
 	if successes != 1 {
 		t.Fatalf("concurrent successes = %d, want exactly 1", successes)
+	}
+	// The loser retried converges to ErrRunExists (never a second run).
+	retry := newRequest(t, repo, &fakeWorktree{})
+	retry.OperationID = loser
+	retry.RNG = bytes.NewReader(bytes.Repeat([]byte{0x9a, 0xbc, 0xde, 0xf0}, 64))
+	if _, err := FirstAttach(retry); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("loser retry err = %v, want ErrRunExists", err)
 	}
 	lay := layoutFor(repo)
 	cat, _, _ := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()

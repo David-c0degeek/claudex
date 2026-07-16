@@ -305,22 +305,13 @@ func currentRunStep(store *state.CurrentRunStore, g *genstore.Guard, in Bootstra
 			if !ok || !cur.Active {
 				return txn.StatusNotApplied, nil
 			}
-			if cur.RunID == in.RunID && cur.OperationID == in.OperationID && cur.RelDir == in.RelDir &&
-				cur.LeadSessionID == in.SessionID && cur.LeadAgent == in.Agent {
+			if cur.RunID == in.RunID && cur.OperationID == in.OperationID && cur.RelDir == in.RelDir {
 				return txn.StatusApplied, nil
 			}
 			return txn.StatusIndeterminate, nil
 		},
 		Apply: func() error {
-			_, err := store.MutateLocked(g, in.CurrentRunExpectedRevision, func(next *state.CurrentRun) error {
-				next.Active = true
-				next.RunID = in.RunID
-				next.RelDir = in.RelDir
-				next.OperationID = in.OperationID
-				next.LeadSessionID = in.SessionID
-				next.LeadAgent = in.Agent
-				return nil
-			})
+			_, err := store.Activate(g, in.CurrentRunExpectedRevision, in.RunID, in.RelDir, in.OperationID)
 			return err
 		},
 	}

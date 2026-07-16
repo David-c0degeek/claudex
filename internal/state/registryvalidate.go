@@ -227,8 +227,9 @@ func registryGuard(r *Registry) error {
 	return nil
 }
 
-// ErrSessionIDExhausted means fresh session-id minting could not find an unused id.
-var ErrSessionIDExhausted = errors.New("state: session id minting exhausted attempts")
+// ErrMintExhausted means id minting could not find an unused id after its bounded
+// attempts (neutral across session and operation ids).
+var ErrMintExhausted = errors.New("state: id minting exhausted attempts")
 
 // MintSessionID generates a fresh, canonical, secret-free session id from rng,
 // retrying on a collision reported by taken, and failing closed on an RNG error.
@@ -262,5 +263,5 @@ func mintID(prefix string, rng io.Reader, taken func(string) bool) (string, erro
 		}
 		return id, nil
 	}
-	return "", ErrSessionIDExhausted
+	return "", ErrMintExhausted
 }

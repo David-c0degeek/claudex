@@ -141,11 +141,28 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	}
 	lay := layoutFor(req.RepoDir)
 
-	// Read-only legacy refusal BEFORE creating .claudex or taking the lock: a
-	// pre-pivot Python run is refused before any side effect. (The fs decision
-	// needs a policy and so runs on the new-bootstrap path, under the guard.)
+	// Read-only legacy refusal BEFORE any mutation.
 	if err := legacyRepoRefusal(lay.repoDir); err != nil {
 		return FirstAttachResult{}, err
+	}
+
+	// Lock-free probe: if neither a pending bootstrap nor an active run exists, this
+	// is definitely a new bootstrap, so parse the inputs and classify the filesystem
+	// READ-ONLY and refuse an unsupported one BEFORE creating .claudex or the lock.
+	journal := txn.Open(lay.bootstrapJournal, lay.repoLock)
+	current := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock)
+	recoveryPath, err := hasPendingOrActive(journal, current)
+	if err != nil {
+		return FirstAttachResult{}, err
+	}
+	if !recoveryPath {
+		policy, verr := req.validateForNewBootstrap()
+		if verr != nil {
+			return FirstAttachResult{}, verr
+		}
+		if _, _, _, ferr := decideFS(mustClassify(classifier, lay), policy); ferr != nil {
+			return FirstAttachResult{}, ferr
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(lay.repoLock), 0o700); err != nil {
@@ -161,12 +178,11 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	defer g.Release()
 
 	seams := seams{base: req.Base, worktree: req.Worktree}
-	journal := txn.Open(lay.bootstrapJournal, lay.repoLock)
 
 	// Recover a pending bootstrap forward first (needs only the worktree seam, no
 	// fresh inputs). The recovered run's identity is returned ONLY to the operation
 	// that started it; a different operation completes the recovery but is told the
-	// run exists — it never receives the incumbent lead session.
+	// run exists.
 	rec, recovered, err := journal.Recover(g, func(in txn.Intent) (txn.Plan, error) {
 		return planFor(lay, seams, g, in)
 	})
@@ -181,30 +197,47 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		if bi.OperationID != req.OperationID {
 			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
 		}
-		return resultFor(bi), nil
+		return sameOpResult(lay, bi)
 	}
 
-	// A current active run means join/reattach, not a second bootstrap — except a
-	// lost response after a completed bootstrap: the same operation id returns the
-	// incumbent lead session (never a forced replacement).
-	current := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock)
-	cur, ok, cerr := current.Load()
+	// An active run: the same operation returns the incumbent (verified still
+	// current in the Registry, never a stale/replaced session); a different
+	// operation is told the run exists — unless the active run has reached terminal,
+	// in which case it is reconciled (cleared) under the guard so a new run can start.
+	cur, hasCur, cerr := current.Load()
 	if cerr != nil {
 		return FirstAttachResult{}, cerr
 	}
-	if ok && cur.Active {
+	if hasCur && cur.Active {
 		if cur.OperationID == req.OperationID {
-			return incumbentResult(cur), nil
+			bi, jerr := journalIntent(journal)
+			if jerr != nil {
+				return FirstAttachResult{}, jerr
+			}
+			return sameOpResult(lay, bi)
 		}
-		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
+		terminal, terr := currentRunTerminal(lay, cur)
+		if terr != nil {
+			return FirstAttachResult{}, terr
+		}
+		if !terminal {
+			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
+		}
+		if _, cerr := current.Clear(g, cur.Revision, cur.RunID); cerr != nil {
+			return FirstAttachResult{}, cerr
+		}
+		cur, hasCur, cerr = current.Load()
+		if cerr != nil {
+			return FirstAttachResult{}, cerr
+		}
 	}
 
-	// New bootstrap: full input validation + the fs decision under the guard.
+	// New bootstrap under the guard: full input validation + fs decision (revalidated).
 	policy, err := req.validateForNewBootstrap()
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	intent, err := prepare(lay, req, policy, classifier, curRevision(cur, ok))
+	intent, err := prepare(lay, req, policy, classifier, curRevision(cur, hasCur))
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
@@ -219,6 +252,71 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		return FirstAttachResult{}, err
 	}
 	return resultFor(intent), nil
+}
+
+// hasPendingOrActive lock-free reports whether a pending bootstrap or an active
+// run exists, so a definite new bootstrap can be refused before any mutation.
+func hasPendingOrActive(journal *txn.Journal, current *state.CurrentRunStore) (bool, error) {
+	if rec, ok, err := journal.Latest(); err != nil {
+		return false, err
+	} else if ok && !rec.Terminal() {
+		return true, nil
+	}
+	if cur, ok, err := current.Load(); err != nil {
+		return false, err
+	} else if ok && cur.Active {
+		return true, nil
+	}
+	return false, nil
+}
+
+func mustClassify(classifier Classifier, lay layout) fsclass.Result {
+	res, err := classifier.Classify(filepath.Join(lay.repoDir, ".claudex"))
+	if err != nil {
+		return fsclass.Result{Class: fsclass.KnownUnsupported, Reason: "classification failed"}
+	}
+	return res
+}
+
+// currentRunTerminal loads the active run's authoritative RunState and reports
+// whether it has reached a terminal lifecycle (safe to reconcile/clear).
+func currentRunTerminal(lay layout, cur state.CurrentRun) (bool, error) {
+	rs, ok, err := state.Open(filepath.Join(lay.runDir(cur.RelDir), "state"), lay.repoLock).Load()
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return state.IsTerminalLifecycle(rs.Lifecycle), nil
+}
+
+// sameOpResult returns the incumbent bootstrap result for an idempotent retry,
+// but ONLY after confirming the lead session is still current in the Registry —
+// the Registry is the sole session authority, so a replaced session never comes
+// back as the incumbent.
+func sameOpResult(lay layout, bi BootstrapIntent) (FirstAttachResult, error) {
+	reg, ok, err := state.OpenRegistry(filepath.Join(lay.runDir(bi.RelDir), "registry"), lay.repoLock).Load()
+	if err != nil {
+		return FirstAttachResult{}, err
+	}
+	if !ok || reg.Resolve(bi.SessionID).Status != state.RegCurrent {
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
+	}
+	return resultFor(bi), nil
+}
+
+// journalIntent decodes the intent of the latest (terminal) bootstrap journal
+// record — the exact bootstrap result for the active run.
+func journalIntent(journal *txn.Journal) (BootstrapIntent, error) {
+	rec, ok, err := journal.Latest()
+	if err != nil {
+		return BootstrapIntent{}, err
+	}
+	if !ok {
+		return BootstrapIntent{}, fmt.Errorf("attach: no bootstrap journal for the active run")
+	}
+	return decodeIntent(rec.Intent.Payload)
 }
 
 // curRevision is the active-run pointer's revision to CAS against (0 if the store
@@ -278,16 +376,6 @@ func resultFor(in BootstrapIntent) FirstAttachResult {
 		Role:      state.SlotLead,
 		Agent:     in.Agent,
 		JoinArgv:  joinArgv(in.RunID, in.Agent),
-	}
-}
-
-func incumbentResult(cur state.CurrentRun) FirstAttachResult {
-	return FirstAttachResult{
-		RunID:     cur.RunID,
-		SessionID: cur.LeadSessionID,
-		Role:      state.SlotLead,
-		Agent:     cur.LeadAgent,
-		JoinArgv:  joinArgv(cur.RunID, cur.LeadAgent),
 	}
 }
 

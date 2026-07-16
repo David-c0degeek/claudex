@@ -235,8 +235,8 @@ func TestMintSessionID(t *testing.T) {
 		t.Fatalf("RNG failure should fail closed")
 	}
 	// Every one of the eight draws colliding exhausts with a typed error.
-	if _, err := MintSessionID(bytes.NewReader(bytes.Repeat([]byte{0x5a}, 16*8)), func(string) bool { return true }); !errors.Is(err, ErrSessionIDExhausted) {
-		t.Fatalf("all-collision mint err = %v, want ErrSessionIDExhausted", err)
+	if _, err := MintSessionID(bytes.NewReader(bytes.Repeat([]byte{0x5a}, 16*8)), func(string) bool { return true }); !errors.Is(err, ErrMintExhausted) {
+		t.Fatalf("all-collision mint err = %v, want ErrMintExhausted", err)
 	}
 }
 
@@ -296,5 +296,21 @@ func TestRegistryComposesWithRunStateUnderOneLock(t *testing.T) {
 	}
 	if got, ok, _ := reg.Load(); !ok || got.Resolve(sid("1")).Status != RegCurrent || got.RunID != "run-a" {
 		t.Fatalf("registry not persisted/resolvable")
+	}
+}
+
+func TestMintOperationID(t *testing.T) {
+	id, err := MintOperationID(bytes.NewReader(bytes.Repeat([]byte{0xab}, 16)))
+	if err != nil || !isOperationID(id) {
+		t.Fatalf("mint operation id = %q err=%v", id, err)
+	}
+	if id == sid("a") {
+		t.Fatalf("operation id collided with a session id shape")
+	}
+	if _, err := MintOperationID(nil); err == nil {
+		t.Fatalf("nil RNG should fail closed")
+	}
+	if _, err := MintOperationID(bytes.NewReader(nil)); err == nil {
+		t.Fatalf("RNG failure should fail closed")
 	}
 }
