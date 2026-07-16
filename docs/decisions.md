@@ -137,18 +137,18 @@ subject 01 shapes state.
   because D015 requires local filesystems. **Windows: `LockFileEx` on a handle**
   (`golang.org/x/sys/windows`), released when the handle/process closes. Both the
   repo-level allocation lock and the per-run mutation lock use this.
-- **Atomic rename — guarantee is process-crash atomicity, not power-loss
-  durability (scope narrowed deliberately).** `os.Rename` is an atomic *replace*
-  within a directory (POSIX `rename(2)`; Windows `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`),
-  so a crash never exposes a torn file — a reader sees either the old or new bytes.
-  For durability across a power loss, subject 01 additionally fsyncs the temp file
-  before rename and fsyncs the containing directory after (POSIX). On **Windows**,
-  Go's `os.Rename` does NOT pass `MOVEFILE_WRITE_THROUGH`, so the metadata flush is
-  not guaranteed on power loss; subject 01 either (a) narrows the documented Windows
-  guarantee to process-crash atomicity, or (b) implements a `MoveFileEx` wrapper
-  with `MOVEFILE_WRITE_THROUGH` and tests it. Default is (a); (b) is a hardening
-  decision recorded if pursued. Ref: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa
-  Sharing-violation bounded retry on Windows.
+- **File replace — POSIX atomic, Windows NOT atomic (see D017 for the state
+  root of trust).** `os.Rename` is an atomic replace on **POSIX** (`rename(2)`): a
+  reader sees old or new bytes, never torn; a directory fsync adds power-loss
+  durability. On **Windows**, `os.Rename` uses `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`,
+  which **Go's own contract explicitly does NOT guarantee to be atomic**
+  (https://pkg.go.dev/os#Rename), and it does not pass `MOVEFILE_WRITE_THROUGH`, so
+  neither torn-write safety nor power-loss durability can be assumed. `internal/atomicfile`
+  therefore makes no old-or-new promise on Windows and implements no recovery; it is a
+  low-level write primitive only. Windows crash-consistency of the authoritative state
+  is provided by the immutable-generation protocol (D017), not by overwrite-in-place.
+  Windows rename retries only transient sharing/access errors (`ERROR_SHARING_VIOLATION`/
+  `ERROR_ACCESS_DENIED`), bounded, with an injectable backoff.
 - **Process-tree kill** — Windows: create-suspended → `AssignProcessToJobObject`
   → resume, then terminate the job (race-free). POSIX: `Setpgid` + `kill(-pgid)`.
 - **Filesystem classification** — Windows: `GetDriveType`/volume info to spot
@@ -158,3 +158,33 @@ subject 01 shapes state.
 - **Canonical JSON** — RFC 8785 (JCS) for digest/idempotency so receipts are
   whitespace/key-order/platform independent; `json.Decoder.UseNumber()` to preserve
   number semantics. Library-vs-vendored decision is finalised in subject 02.
+
+## D017 — Immutable-generation persistence (state root of trust)
+Because file replace is not atomic on Windows (D015), the authoritative run state
+is **never overwritten in place**. Instead it is an append-only sequence of
+**immutable, self-validating generation records**:
+
+- Each state mutation writes a NEW generation file (e.g. `state/000042.json`)
+  containing a version, the payload, and a checksum/framing over the exact bytes.
+  A generation file, once written, is never modified.
+- A partial or torn new generation (crash mid-write) is **invalid by checksum** and
+  ignored; the previous valid generation remains the state. Writing a brand-new
+  file cannot corrupt an existing one, so the non-atomic Windows replace problem
+  does not touch the root of trust.
+- Recovery **enumerates** the generation files and selects the highest-numbered one
+  whose checksum validates. A `current` pointer file may be written as an
+  optimization, but recovery MUST be able to work without trusting it (a torn
+  pointer falls back to enumeration). If no valid generation exists, recovery
+  fails closed with remediation.
+- The prepared-transaction journal (D006/01.5) is itself persisted as such a
+  generation/immutable record, so it never depends on the single replace whose
+  failure it is meant to diagnose. Its reconciliation defines every observable
+  target/temp/pointer/generation state after a crash cut.
+- Old generations are pruned only under the exclusive run lock, keeping at least the
+  last known-valid one; pruning never removes the generation recovery would select.
+
+**Acceptance:** inject crash cuts at write / flush / replace / pointer-update and
+prove deterministic recovery — the last valid generation always wins, a torn new
+generation or pointer never wins, and an empty/all-invalid set fails closed. This
+is subject 01's state/recovery acceptance matrix; `internal/atomicfile` writes the
+individual generation files but provides none of this protocol itself.

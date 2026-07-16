@@ -8,9 +8,19 @@
 //     fsync makes the replacement durable across power loss.
 //   - Windows: os.Rename uses MoveFileEx(REPLACE_EXISTING), which Go's own
 //     contract explicitly does NOT guarantee to be atomic. This package therefore
-//     does not promise old-or-new semantics on Windows. Crash-consistency of
-//     Windows state is provided by the caller's transaction journal + checksum
-//     reconciliation on recovery (subject 01), not by this leaf.
+//     makes NO old-or-new promise on Windows and does NOT implement recovery. A
+//     caller that needs crash-consistency on Windows must NOT overwrite its root
+//     of trust through Write; it must use the immutable-generation protocol
+//     (docs/decisions.md D017): write each new state as a fresh, checksummed
+//     generation file (never overwriting the last valid one) and, on recovery,
+//     enumerate and select the highest valid generation. A torn new generation is
+//     detected by its checksum and ignored, leaving the previous one intact.
+//
+// So this is a low-level write primitive, not a crash-safe store: it is safe to
+// use directly for POSIX-atomic replaces and for writing new immutable
+// generation files (whose torn-write case the generation protocol handles). It
+// must not be used to overwrite the single authoritative state/journal file on
+// Windows.
 //
 // Neither platform's default path guarantees power-loss durability on Windows
 // (that would need MOVEFILE_WRITE_THROUGH). Local filesystems only.
@@ -74,10 +84,12 @@ var defaultOps = ops{
 	remove:     os.Remove,
 }
 
-// Write atomically (POSIX) or recoverably (Windows) writes data to path with the
-// given permissions, replacing any existing file. A failure before the internal
-// rename leaves any existing file untouched. If the data is committed but the
-// final directory sync fails, Write returns a *PostCommitSyncError.
+// Write writes data to path with the given permissions, replacing any existing
+// file. The replace is atomic on POSIX and best-effort on Windows (see the
+// package doc — Windows callers needing crash-consistency use the generation
+// protocol, D017). A failure before the internal rename leaves any existing file
+// untouched. If the data is committed but the final directory sync fails, Write
+// returns a *PostCommitSyncError.
 func Write(path string, data []byte, perm os.FileMode) error {
 	return write(path, data, perm, defaultOps)
 }

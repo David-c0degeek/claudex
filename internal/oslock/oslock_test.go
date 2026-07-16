@@ -117,9 +117,10 @@ func TestCrashStaleReclaim(t *testing.T) {
 	}
 
 	// While the child holds the lock, the parent must observe contention.
-	if _, ok, err := TryAcquire(lockPath); err != nil {
+	if l, ok, err := TryAcquire(lockPath); err != nil {
 		t.Fatalf("parent TryAcquire errored: %v", err)
 	} else if ok {
+		l.Release() // don't leak a live handle out of the failing assertion
 		t.Fatalf("parent acquired the lock while the child held it; child output:\n%s", childOut.String())
 	}
 

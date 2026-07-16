@@ -30,9 +30,14 @@ Every `claudex` invocation is short-lived. State lives under `.claudex/` on a
 
 Both are OS-held advisory locks, so a crashed CLI's lock is reclaimed by the
 kernel — no PID-guessing. Every state mutation is an atomic CAS on the expected
-`state_revision`; artifacts are written temp → fsync → rename before the state
-and ledger advance. The human-readable ledger is a projection of accepted
-artifacts, never an independent source of truth.
+`state_revision`. Because file replace is not atomic on Windows (D015),
+authoritative state is persisted as **immutable, checksummed generations that are
+never overwritten** (D017): a torn new generation is invalid-by-checksum and
+ignored, recovery enumerates and picks the highest valid generation (an
+untrusted `current` pointer is only an optimization), and the journal is itself
+such a record so it never depends on the replace it repairs. The human-readable
+ledger is a projection of accepted artifacts, never an independent source of
+truth.
 
 ## Run input and policy (D016)
 
