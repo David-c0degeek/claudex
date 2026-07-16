@@ -20,7 +20,8 @@ const (
 	ReattachReplaced ReattachStatus = "replaced"
 	// ReattachUnknown: the session was never registered for this run.
 	ReattachUnknown ReattachStatus = "unknown"
-	// ReattachMismatch: the session is current but the agent/role disagree.
+	// ReattachMismatch: the session is known (current OR replaced) but the presented
+	// agent/role disagree with its slot.
 	ReattachMismatch ReattachStatus = "agent-role-mismatch"
 	// ReattachStale: the run is not the active run, or the snapshot changed under
 	// the read (retry).

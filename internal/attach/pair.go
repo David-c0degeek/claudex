@@ -279,9 +279,6 @@ func bindRunToBootstrap(lay layout, cur state.CurrentRun, runID string) error {
 	if err != nil {
 		return err
 	}
-	if err != nil {
-		return err
-	}
 	if !ok || !rec.Complete || rec.Aborted ||
 		rec.Intent.Version != txn.IntentVersion || rec.Intent.Kind != intentKind || rec.Intent.ExpectedStateRevision != 0 {
 		return fmt.Errorf("%w: bootstrap not complete", ErrJoinUnauthorized)
