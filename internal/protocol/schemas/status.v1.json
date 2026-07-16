@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex status, version 1",
+  "description": "A lock-free projection of run state: lifecycle, current turn/gate, whose turn, caps remaining against frozen budgets, and honestly-labeled capabilities.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "run_id",
+    "revision",
+    "lifecycle",
+    "phase",
+    "whose_turn",
+    "turn_id",
+    "gate_id",
+    "stop",
+    "caps",
+    "honesty"
+  ],
+  "properties": {
+    "protocol_version": { "type": "integer", "const": 1 },
+    "message_type": { "type": "string", "const": "status" },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["running", "paused", "paused_budget", "rate_limited", "cancelled", "failed_retryable", "failed_terminal", "completed"]
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["INIT", "PLAN_DRAFT", "PLAN_CRITIQUE", "PLAN_REVISE", "IMPLEMENT_STEP", "CHECKPOINT", "FIX", "TESTS", "VERIFY", "AWAIT_GUIDANCE", "DONE"]
+    },
+    "whose_turn": {
+      "description": "The role that owns the live turn, or null when there is no owner.",
+      "type": ["string", "null"],
+      "enum": ["lead", "pair", null]
+    },
+    "turn_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "gate_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "stop": {
+      "description": "The discriminated stop reason, present when failed or a recovery is required; null otherwise.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "code", "reason", "next_action", "at_revision"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["failure", "recovery"] },
+        "code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "next_action": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "at_revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_turns", "plan_rounds", "test_rounds", "verify_rounds", "checkpoint_rounds"],
+      "properties": {
+        "run_turns": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["used", "limit", "remaining", "exceeded_by", "mechanism"],
+          "properties": {
+            "used": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 },
+            "exceeded_by": { "type": "integer", "minimum": 0 },
+            "mechanism": { "type": "string", "enum": ["durable-state-counter"] }
+          }
+        },
+        "plan_rounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["used", "limit", "remaining", "exceeded_by", "mechanism"],
+          "properties": {
+            "used": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 },
+            "exceeded_by": { "type": "integer", "minimum": 0 },
+            "mechanism": { "type": "string", "enum": ["durable-state-counter"] }
+          }
+        },
+        "test_rounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["used", "limit", "remaining", "exceeded_by", "mechanism"],
+          "properties": {
+            "used": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 },
+            "exceeded_by": { "type": "integer", "minimum": 0 },
+            "mechanism": { "type": "string", "enum": ["durable-state-counter"] }
+          }
+        },
+        "verify_rounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["used", "limit", "remaining", "exceeded_by", "mechanism"],
+          "properties": {
+            "used": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 },
+            "exceeded_by": { "type": "integer", "minimum": 0 },
+            "mechanism": { "type": "string", "enum": ["durable-state-counter"] }
+          }
+        },
+        "checkpoint_rounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["limit_per_step", "steps", "mechanism"],
+          "properties": {
+            "limit_per_step": { "type": "integer", "minimum": 0 },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["step_index", "used", "remaining", "exceeded_by"],
+                "properties": {
+                  "step_index": { "type": "integer", "minimum": 0 },
+                  "used": { "type": "integer", "minimum": 0 },
+                  "remaining": { "type": "integer", "minimum": 0 },
+                  "exceeded_by": { "type": "integer", "minimum": 0 }
+                }
+              }
+            },
+            "mechanism": { "type": "string", "enum": ["durable-state-counter"] }
+          }
+        }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tier", "capabilities"],
+      "properties": {
+        "tier": { "type": "string", "enum": ["protocol-only", "managed"] },
+        "capabilities": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "status", "mechanism"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "status": { "type": "string", "enum": ["enforced", "unavailable", "requires-telemetry"] },
+              "mechanism": { "type": "string", "minLength": 1, "maxLength": 128 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

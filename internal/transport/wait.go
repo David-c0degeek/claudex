@@ -206,7 +206,10 @@ type runFacts struct {
 	failure      *projFacts
 }
 
-type projFacts struct{ code, reason, nextAction string }
+type projFacts struct {
+	code, reason, nextAction string
+	atRevision               uint64
+}
 
 func captureFacts(rs state.RunState) runFacts {
 	f := runFacts{revision: rs.Revision, phase: rs.Phase, lifecycle: rs.Lifecycle}
@@ -217,10 +220,10 @@ func captureFacts(rs state.RunState) runFacts {
 		f.gateID = rs.Gate.ID
 	}
 	if rs.Recovery != nil {
-		f.recovery = &projFacts{rs.Recovery.Code, redact.Text(rs.Recovery.Reason), rs.Recovery.NextAction}
+		f.recovery = &projFacts{rs.Recovery.Code, redact.Text(rs.Recovery.Reason), rs.Recovery.NextAction, rs.Recovery.AtRevision}
 	}
 	if rs.Failure != nil {
-		f.failure = &projFacts{rs.Failure.Code, redact.Text(rs.Failure.Reason), rs.Failure.NextAction}
+		f.failure = &projFacts{rs.Failure.Code, redact.Text(rs.Failure.Reason), rs.Failure.NextAction, rs.Failure.AtRevision}
 	}
 	return f
 }
