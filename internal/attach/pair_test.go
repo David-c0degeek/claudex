@@ -2,11 +2,15 @@ package attach
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
+	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
 // bootstrapRun bootstraps a lead-claude run and returns its id.
@@ -142,5 +146,136 @@ func TestJoinAttachRecoversMidTransaction(t *testing.T) {
 	rs, _, _ := state.Open(filepath.Join(runDir, "state"), runLock(runDir)).Load()
 	if rs.Phase != state.PhasePlanDraft || rs.Assignment == nil || rs.Assignment.ID != res.FirstTurnID {
 		t.Fatalf("run not at PLAN_DRAFT after recovery: %+v", rs)
+	}
+}
+
+func minimalJoinRequest(repo, runID, op string) JoinAttachRequest {
+	return JoinAttachRequest{RepoDir: repo, RunID: runID, OperationID: op}
+}
+
+// A completed pair retry needs only {repo, run, operation}; agent/role/now/rng
+// are validated only for a new fill.
+func TestJoinAttachMinimalRetry(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	first, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	got, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b")))
+	if err != nil {
+		t.Fatalf("minimal retry: %v", err)
+	}
+	if got.SessionID != first.SessionID {
+		t.Fatalf("minimal retry returned a different session")
+	}
+}
+
+// A run that went terminal while still INIT is not joinable (no split-brain).
+func TestJoinAttachRefusesCancelledInit(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	st := state.Open(filepath.Join(runDir, "state"), runLock(runDir))
+	rs, _, _ := st.Load()
+	if _, err := st.Mutate(rs.Revision, func(_ uint64, n *state.RunState) error { n.Lifecycle = state.LifecycleCancelled; return nil }); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); !errors.Is(err, ErrJoinUnauthorized) {
+		t.Fatalf("join a cancelled-INIT run err = %v, want ErrJoinUnauthorized", err)
+	}
+}
+
+// A crash after the plan-draft effect, followed by a downstream Submit accepting
+// the first turn, still recovers the pending pair journal (monotonic observation)
+// rather than bricking it.
+func TestJoinAttachRecoversAfterDownstreamAccept(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+
+	fired := false
+	stepFailpoint = func(s string) error {
+		if s == "state-plan-draft" && !fired {
+			fired = true
+			return errors.New("crash after plan-draft effect")
+		}
+		return nil
+	}
+	defer func() { stepFailpoint = nil }()
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+		t.Fatalf("expected a crash after plan-draft")
+	}
+	stepFailpoint = nil
+
+	journal := txn.Open(lay.attachJournalDir(runDir), runLock(runDir))
+	rec, _, _ := journal.Latest()
+	var pin PairAttachIntent
+	if err := json.Unmarshal(rec.Intent.Payload, &pin); err != nil {
+		t.Fatalf("decode pending pair intent: %v", err)
+	}
+
+	// A downstream Submit accepts the first (PLAN_DRAFT) turn, advancing the run.
+	st := state.Open(filepath.Join(runDir, "state"), runLock(runDir))
+	rs, _, _ := st.Load()
+	dg := strings.Repeat("a", 64)
+	if _, err := st.Mutate(rs.Revision, func(gen uint64, n *state.RunState) error {
+		n.Phase = state.PhasePlanCritique
+		n.AcceptedTurns[pin.FirstTurnID] = state.AcceptedTurn{
+			ArtifactDigest: dg,
+			Receipt:        state.Receipt{TurnID: pin.FirstTurnID, Revision: gen, ArtifactDigest: dg},
+			Phase:          state.PhasePlanDraft,
+		}
+		n.Assignment = &state.Ref{ID: "turn-critique", IssuedRevision: gen}
+		return nil
+	}); err != nil {
+		t.Fatalf("downstream accept: %v", err)
+	}
+
+	// Recovery must complete (monotonic Applied via the accepted-turn proof).
+	res, err := JoinAttach(minimalJoinRequest(repo, a.RunID, opID("b")))
+	if err != nil {
+		t.Fatalf("recovery after downstream accept: %v", err)
+	}
+	if res.FirstTurnID != pin.FirstTurnID {
+		t.Fatalf("recovery returned a different first turn")
+	}
+	if rec2, _, _ := journal.Latest(); !rec2.Complete {
+		t.Fatalf("attach journal not completed after recovery")
+	}
+}
+
+// A forged pair intent whose frozen lead digest does not match the run is refused
+// before any effect.
+func TestPairPlanForRejectsForgedLeadDigest(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	lay := layoutFor(repo)
+	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	reg, _, _ := state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load()
+	rs, _, _ := state.Open(filepath.Join(runDir, "state"), runLock(runDir)).Load()
+	baseDigest, _ := canonDigest(rs)
+
+	in := PairAttachIntent{
+		RunID: a.RunID, TxnID: "pair-forged", OperationID: opID("b"),
+		PairSessionID: "sess-" + strings.Repeat("f", 32), PairAgent: state.AgentCodex, FirstTurnID: "turn-forged",
+		ExpectedRegistryRevision: reg.Revision, ExpectedStateRevision: rs.Revision,
+		StartedUnix: 2000, DeadlineUnix: 2000 + rs.EffectivePolicy.Limits.MaxWallSeconds,
+		LeadDigest: strings.Repeat("0", 64), BaseStateDigest: baseDigest, // wrong lead digest
+	}
+	payload, _ := in.marshal()
+
+	g, ok, err := genstore.Acquire(runLock(runDir))
+	if err != nil || !ok {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer g.Release()
+	_, perr := pairPlanFor(lay, g, a.RunID, txn.Intent{
+		Version: txn.IntentVersion, Kind: pairIntentKind, TxnID: in.TxnID, ExpectedStateRevision: rs.Revision, Payload: payload,
+	})
+	if perr == nil {
+		t.Fatalf("pairPlanFor accepted a forged lead digest")
 	}
 }
