@@ -25,13 +25,46 @@ const (
 	cloudIndeterminate                   // query failed for an ambiguous reason
 )
 
-// HRESULTs of interest from CfGetSyncRootInfoByPath.
+// Win32 error codes (decimal) of interest, named rather than hand-copied as
+// HRESULT literals. They are converted with hresultFromWin32 to compare against
+// CfGetSyncRootInfoByPath's HRESULT return.
 const (
-	hrOK               = 0
-	hrNotUnderSyncRoot = 0x8007018C // HRESULT_FROM_WIN32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)
-	hrInvalidFunction  = 0x80070001 // ERROR_INVALID_FUNCTION: volume has no Cloud Filter — reliable negative
-	hrNotSupported     = 0x80070032 // ERROR_NOT_SUPPORTED
+	errInvalidFunction           = 1   // ERROR_INVALID_FUNCTION
+	errNotSupported              = 50  // ERROR_NOT_SUPPORTED
+	errCloudFileNotUnderSyncRoot = 390 // ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT
 )
+
+const hrOK = 0 // S_OK
+
+var (
+	hrNotUnderSyncRoot = hresultFromWin32(errCloudFileNotUnderSyncRoot)
+	hrInvalidFunction  = hresultFromWin32(errInvalidFunction)
+	hrNotSupported     = hresultFromWin32(errNotSupported)
+)
+
+// hresultFromWin32 mirrors the Win32 HRESULT_FROM_WIN32 macro.
+func hresultFromWin32(code uint32) uint32 {
+	if code == 0 {
+		return 0
+	}
+	return 0x80070000 | (code & 0xFFFF)
+}
+
+// classifyHRESULT maps a CfGetSyncRootInfoByPath HRESULT to the tri-state.
+// S_OK proves under-root; the documented not-under result and the "no Cloud
+// Filter on this volume" errors are accepted negatives (no CfAPI-managed sync
+// root detected — not proof that no third-party sync product exists, per D015);
+// every other HRESULT is indeterminate.
+func classifyHRESULT(hr uint32) cloudState {
+	switch hr {
+	case hrOK:
+		return cloudUnder
+	case hrNotUnderSyncRoot, hrInvalidFunction, hrNotSupported:
+		return cloudNotUnder
+	default:
+		return cloudIndeterminate
+	}
+}
 
 // cloudQuery is overridable in tests.
 var cloudQuery = queryCloudSyncRoot
@@ -147,14 +180,7 @@ func queryCloudSyncRoot(path string) (cloudState, uintptr) {
 		uintptr(len(buf)),
 		uintptr(unsafe.Pointer(&returned)),
 	)
-	switch uint32(hr) {
-	case hrOK:
-		return cloudUnder, hr
-	case hrNotUnderSyncRoot, hrInvalidFunction, hrNotSupported:
-		return cloudNotUnder, hr
-	default:
-		return cloudIndeterminate, hr
-	}
+	return classifyHRESULT(uint32(hr)), hr
 }
 
 const hexdigits = "0123456789abcdef"

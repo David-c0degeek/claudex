@@ -211,6 +211,9 @@ func ParseRunPolicy(data []byte) (RunPolicy, error) {
 // freezing. It does NOT check the test-gate/task relationship — that needs the
 // task contract; see ValidateEffective.
 func (rp RunPolicy) Validate() error {
+	if rp.SchemaVersion != RunPolicyVersion {
+		return fmt.Errorf("schema_version must be %d (got %d)", RunPolicyVersion, rp.SchemaVersion)
+	}
 	if strings.TrimSpace(rp.BaseBranch) == "" {
 		return fmt.Errorf("base_branch is required")
 	}

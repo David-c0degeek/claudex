@@ -25,7 +25,7 @@ func TestClassifyCloudTriState(t *testing.T) {
 		t.Fatalf("cloudIndeterminate -> %s, want unknown", res.Class)
 	}
 
-	cloudQuery = func(string) (cloudState, uintptr) { return cloudNotUnder, hrInvalidFunction }
+	cloudQuery = func(string) (cloudState, uintptr) { return cloudNotUnder, uintptr(hrInvalidFunction) }
 	if res, _ := Classify(dir); res.Class != SupportedLocal {
 		t.Fatalf("cloudNotUnder on a fixed drive -> %s (%s), want supported-local", res.Class, res.Reason)
 	}
@@ -54,6 +54,35 @@ func TestClassifyEnvSyncRootWins(t *testing.T) {
 	}
 	if res.Class != KnownUnsupported {
 		t.Fatalf("path under OneDrive env root -> %s, want known-unsupported", res.Class)
+	}
+}
+
+func TestClassifyHRESULT(t *testing.T) {
+	cases := []struct {
+		name string
+		hr   uint32
+		want cloudState
+	}{
+		{"s_ok", hrOK, cloudUnder},
+		{"not_under_390", hresultFromWin32(390), cloudNotUnder},
+		{"invalid_function_1", hresultFromWin32(1), cloudNotUnder},
+		{"not_supported_50", hresultFromWin32(50), cloudNotUnder},
+		{"incompatible_hardlinks_396", hresultFromWin32(396), cloudIndeterminate}, // must NOT be not-under
+		{"access_denied_5", hresultFromWin32(5), cloudIndeterminate},
+	}
+	for _, c := range cases {
+		if got := classifyHRESULT(c.hr); got != c.want {
+			t.Fatalf("classifyHRESULT(%s=0x%08x) = %d, want %d", c.name, c.hr, got, c.want)
+		}
+	}
+}
+
+func TestHRESULTFromWin32(t *testing.T) {
+	if got := hresultFromWin32(390); got != 0x80070186 {
+		t.Fatalf("hresultFromWin32(390) = 0x%08x, want 0x80070186", got)
+	}
+	if got := hresultFromWin32(0); got != 0 {
+		t.Fatalf("hresultFromWin32(0) = 0x%x, want 0", got)
 	}
 }
 
