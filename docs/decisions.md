@@ -109,15 +109,46 @@ are `known-unsupported`; undetectable third-party sync roots are `unknown` (refu
 by default or explicit acknowledgement). No claim of perfect detection.
 Classification is enforced at attach bootstrap; `doctor` reports it.
 
-### Implementation notes (00.4 research)
+## D016 — Run input and policy contract
+A run's inputs are explicit, versioned, validated, and frozen — never ambient.
+The first `attach` (the sole bootstrap, D003) resolves:
+- a **versioned task-contract file** (the harvested `TASK_CONTRACT` shape: goal,
+  desired behaviour, scope, non-goals, acceptance criteria, required tests,
+  relevant files) — required, with a documented default location/flag;
+- a **config / run-policy** (from a config file + flags): the mechanical
+  `test_command`, the observable caps (turn/fix counts, artifact bytes, wall
+  time), timeouts, evidence limits, and base/repo policy.
+
+`attach` validates both, hashes and copies them into the run directory, and
+persists the **effective run policy** into run state so later config edits cannot
+change a live run (frozen-at-bootstrap). `internal/config` owns parsing,
+defaulting, and validation; `internal/state` persists the frozen policy + the
+task-contract hash. An `init` command that scaffolds a task/config file is
+optional sugar; the input *source* is mandatory. This closes the orphaned
+`TASK_CONTRACT` and gives `test_command`/caps/timeouts a definite owner before
+subject 01 shapes state.
+
+### Implementation notes (00.4 research — decisions locked for subject 01)
 - **Advisory locks with death-semantics** — an OS-held advisory lock is released
   by the kernel when the holding process exits, which *is* the crash-stale reclaim
-  signal (no PID-guessing). Windows: `LockFileEx` on a handle (`golang.org/x/sys/windows`);
-  POSIX: `flock`/`fcntl` (`golang.org/x/sys/unix`). The repo-level allocation lock
-  and per-run mutation lock both use this.
-- **Atomic rename** — `os.Rename` is atomic-replace within a directory (Windows
-  uses `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` under the hood); durability needs an
-  fsync of the containing directory on POSIX. Sharing-violation retry on Windows.
+  signal (no PID-guessing). **POSIX: `flock(LOCK_EX|LOCK_NB)`** (`golang.org/x/sys/unix`),
+  chosen over `fcntl` — `flock` is per-open-file-handle with simple whole-file
+  semantics and clean release on the last close/exit, and the NFS caveat is moot
+  because D015 requires local filesystems. **Windows: `LockFileEx` on a handle**
+  (`golang.org/x/sys/windows`), released when the handle/process closes. Both the
+  repo-level allocation lock and the per-run mutation lock use this.
+- **Atomic rename — guarantee is process-crash atomicity, not power-loss
+  durability (scope narrowed deliberately).** `os.Rename` is an atomic *replace*
+  within a directory (POSIX `rename(2)`; Windows `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`),
+  so a crash never exposes a torn file — a reader sees either the old or new bytes.
+  For durability across a power loss, subject 01 additionally fsyncs the temp file
+  before rename and fsyncs the containing directory after (POSIX). On **Windows**,
+  Go's `os.Rename` does NOT pass `MOVEFILE_WRITE_THROUGH`, so the metadata flush is
+  not guaranteed on power loss; subject 01 either (a) narrows the documented Windows
+  guarantee to process-crash atomicity, or (b) implements a `MoveFileEx` wrapper
+  with `MOVEFILE_WRITE_THROUGH` and tests it. Default is (a); (b) is a hardening
+  decision recorded if pursued. Ref: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa
+  Sharing-violation bounded retry on Windows.
 - **Process-tree kill** — Windows: create-suspended → `AssignProcessToJobObject`
   → resume, then terminate the job (race-free). POSIX: `Setpgid` + `kill(-pgid)`.
 - **Filesystem classification** — Windows: `GetDriveType`/volume info to spot

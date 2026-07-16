@@ -1,10 +1,33 @@
 # Evidence Harvest — Go test vectors from the retired Python suite
 
 > Provenance: harvested (read-only) from branch `reliability-observability-refactor`
-> (`tests/*.py`, `claudex/schemas.py`, `tests/fixtures/**`) during the Go rewrite.
-> These are **executable requirements** for the Go implementation — behaviours to
-> re-satisfy with fresh Go tests, NOT code to port. The Python source is
+> (**10 `test_*.py` modules + 6 fixture executables**; `claudex/schemas.py`;
+> `tests/fixtures/**`) during the Go rewrite. These are candidate requirements —
+> each carries a **disposition** below, because much of the old suite pins the
+> *retired headless engine*, not the attach product. The Python source is
 > reference-only in git history.
+
+## 0. Dispositions — do NOT rebuild the discarded engine
+
+Every harvested behaviour is tagged; 01–06 implement only `ADOPT`/`ADAPT`.
+
+| Behaviour | Disposition | Note |
+|---|---|---|
+| Persistence atomicity, malformed-state rejection, unique attempt evidence, run-lock contention | **ADOPT** | Core to 01 durable state/journal/locks. |
+| Git tree identity (untracked/deleted/conflict/symlink), dirty-start preflight, fast-forward integration, merge-tree conflict-without-mutation | **ADOPT** | Core to 04; add the §5 gaps. |
+| Process cancel/timeout kills descendant tree + retains evidence; injectable/cancellable wait | **ADOPT** | 04 test gate + 01 process primitive. |
+| Redaction across stdout/stderr/events/command/export + retention prunes only raw | **ADOPT** | `internal/redact` leaf, applied at every persist/display boundary. |
+| Canonical-JSON / digest determinism (plan digest, evidence manifest hashing, checkpoint digest) | **ADOPT** | 02 `internal/canonjson` + digest-over-persisted-bytes. |
+| Convergence/stop rules (`is_converged`, actionable findings, inconclusive→retry-reviewer, human-decision→`ProtocolViolation`) | **ADOPT** | 03 engine — the heart of the loop. |
+| Lifecycle transition table, resume/restart identity, checkpoint hash-equivalence, evidence bounding/fail-closed | **ADAPT** | 05 lifecycle; resume/restart semantics change under attach (no headless resume of a session). |
+| Schema contract set (task/plan/critique/revision/checkpoint/verification) | **ADAPT** | Keep the shapes that fit attach; see §2 deltas (drop agent-authored commits/tests_passed authority; add envelope fields). |
+| Usage normalization (subset vs additive tokens, foreign currency, unknowns) | **CONDITIONAL (07 telemetry)** | Only enforceable with a trustworthy telemetry channel (D007); NOT an unconditional 02/05 requirement. |
+| Config schema migration + narrow-tool allowlist policy | **ADAPT** | Becomes the Go run-policy/config boundary (see §6). |
+| Provider CLI command construction, semver provider resolution, capability policy | **ADAPT** | Moves to 07 managed-launch provider table; not a headless invocation builder. |
+| Provider invocation budgets, rate-limit exit-75 + resume, budget admission before a provider call | **RETIRE** | The coordinator no longer invokes providers; caps become observable-only (turn/fix/byte/wall). |
+| Streamed provider adapters / event journal normalization of claude+codex stdout | **RETIRE** | No subprocess provider streams in attach; the mailbox carries typed artifacts. |
+| Watcher terminal windows (2 view-only `watch` launchers) | **RETIRE** | Superseded by managed launch (07) + `status`. |
+| Paid headless live smoke (native spend-cap preflight) | **ADAPT → managed-interactive smoke (07.7)** | Becomes the real-TUI interactivity smoke, NOT a native-budget gate. |
 
 ## 1. Test-file → behaviour → Go-subject map
 
@@ -43,6 +66,14 @@ All are OpenAI strict mode: `additionalProperties:false`, every property `requir
 - `has_actionable_findings(review)` = any `blocking`/`major` finding.
 - `is_inconclusive_review` = withheld AGREE but no actionable defect and no human-decision → retries the **reviewer**, never rewrites the artifact.
 - `requires_human_decision` = true only when explicit flag XOR-consistent with a non-empty question; mismatch **raises `ProtocolViolation`**.
+
+**Attach-protocol schema deltas (ADAPT — the old shapes assume a headless engine):**
+- **Drop `IMPLEMENTATION_REPORT.commits`** — the coordinator owns commits (D006); the agent does not report SHAs. The lead reports *what it changed in the worktree*; the coordinator records the commit/tree it created.
+- **`tests_passed` is not authoritative** — the mechanical gate is the coordinator's subprocess exit code + unchanged tree (D006/04.5); an agent-reported `tests_passed` is advisory context only, never the gate.
+- **Add a common envelope to every submit/receipt** — `protocol_version`, `turn_id`, `state_revision` (expected), `human_context` (disclosed local-dialogue that changed requirements, D005/05.1), `requires_human_decision` + `decision_question` (D004/05.2). Receipts carry `turn_id` + resulting `state_revision` + the canonical artifact digest.
+- **Add assignment + receipt schemas** (new — the old suite had none): assignment = the `pull` contract (role, phase, expected revision, worktree-or-evidence, binding guidance, artifact schema); receipt = accept-once acknowledgement.
+- **`CHECKPOINT_REVIEW` must express missing evidence + a human gate** — extend it with `missing_evidence[]` and the human-decision fields so a reviewer can be inconclusive or escalate, mirroring `PLAN_CRITIQUE` (today it cannot).
+- **Preserve unchanged** — `FINDING`/`PLAN_FINDING` severity+category+key model, `PLAN_REVISION` hash-guarded section replacement (`base_plan_sha256`), and the convergence rules; these fit attach directly.
 
 ## 3. Subtle-behaviour vectors (quoted edge cases)
 

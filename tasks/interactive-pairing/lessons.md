@@ -21,7 +21,7 @@
   It compiles (`python -m compileall claudex` OK) but has **zero tests**
   (`tests/` holds only fixtures). The reliability/observability engine — 12
   modules (budgets, evidence, lifecycle, limits, processes, providers, security,
-  terminal, recovery, events, provider_events, planops) and all 17 test files,
+  terminal, recovery, events, provider_events, planops) and all 10 test modules + 6 fixtures,
   +9.3k lines — exists **only on `reliability-observability-refactor`**, not on
   our base. Any Integration-analysis reference to those modules means "port from
   refactor-branch history," not "already present." §2 test baseline: the suite

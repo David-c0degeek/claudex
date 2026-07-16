@@ -34,6 +34,18 @@ kernel — no PID-guessing. Every state mutation is an atomic CAS on the expecte
 and ledger advance. The human-readable ledger is a projection of accepted
 artifacts, never an independent source of truth.
 
+## Run input and policy (D016)
+
+A run's inputs are explicit and frozen at bootstrap, never ambient. The first
+`attach` resolves a **versioned task-contract file** (goal, desired behaviour,
+scope, non-goals, acceptance criteria, required tests, relevant files) and a
+**config / run-policy** (mechanical `test_command`, observable caps, timeouts,
+evidence limits, base/repo policy) from a config file + flags, validates both,
+hashes and copies them into the run directory, and persists the **effective run
+policy** into run state. Later config edits cannot change a live run.
+`internal/config` owns parse/default/validate; `internal/state` persists the
+frozen policy and the task-contract hash.
+
 ## Transport protocol (D001, D004)
 
 Role-addressed file mailbox under `.claudex/session/`. Four verbs:
@@ -90,8 +102,10 @@ Created per-slice as each subject lands (not all up front):
 |---|---|---|
 | `cmd/claudex` | CLI entry, command dispatch | 00 (skeleton) → grows |
 | `internal/buildinfo` | version/build metadata | 00 |
-| `internal/state` | durable run state, `state_revision`, CAS | 01 |
+| `internal/state` | durable run state, `state_revision`, CAS, frozen run-policy | 01 |
 | `internal/txn` | generic prepared-transaction journal + reconciliation | 01 |
+| `internal/config` | task-contract + run-policy parse/default/validate/freeze | 01 |
+| `internal/redact` | credential redaction at every persist/display boundary | 00/01 |
 | `internal/oslock`, `internal/atomicfile` | build-tagged OS primitives | 01 |
 | `internal/fsclass` | local-filesystem classifier | 01 |
 | `internal/protocol` | embedded versioned JSON schema bytes | 02 |
