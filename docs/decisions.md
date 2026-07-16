@@ -45,3 +45,11 @@ windows do not host provider TUIs, scrape output, acquire run locks, or interpre
 pane closure as cancellation. Observer loads apply legacy config/state defaults
 in memory without persisting them; a control command performs the durable
 migration and retains its rollback backup.
+
+## New-run allocation follows preflight
+
+A new execution identity, current pointer, state directory, and terminal views
+are allocated only after the task, exact Git base, runtime ignore/tracking
+boundary, and non-billable provider capabilities validate. Failed startup
+checks return repair guidance without creating a failed run that dirties or
+obscures the condition being reported.

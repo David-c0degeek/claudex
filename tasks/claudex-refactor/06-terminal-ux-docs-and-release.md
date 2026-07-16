@@ -110,6 +110,12 @@ the full acceptance flow before versioned release.
   watcher lifecycle record and rate-limit exit 75.
 - Fixed recovery export inclusion of exact legacy backups and symlinks, and
   re-redact all exported text. Removed the now-unused full-journal replay helper.
+- Post-acceptance field use exposed that new-run state and watcher windows were
+  allocated before INIT validated the task and Git base. Version 0.5.1 moves
+  task/Git/runtime-boundary validation and non-billable provider discovery ahead
+  of identity, state, provider, and terminal allocation, with exact regressions
+  for missing task, dirty tree, missing ignore, tracked runtime, and failed
+  provider discovery.
 - Cleanup audit triage: `abort` remains only in the release compatibility note;
   `guidance_notes` remains only as an old-state migration input and regression;
   bounded `capture_output` calls are capability/Git/OS probes or test helpers,
@@ -136,10 +142,11 @@ the full acceptance flow before versioned release.
 
 ### 5. Verdict
 
-`CLOSE`. Final evidence: `compileall`, `git diff --check`, version 0.5.0, wheel
-build, doctor, 127 offline tests in 64.716s (one intentional live-smoke skip),
-12 explicit integration tests, and CI run 29459011913 across Windows/Ubuntu and
-Python 3.10/3.13 all passed.
+`CLOSE`. Final evidence after the field correction: `compileall`,
+`git diff --check`, version 0.5.1, wheel/editable build, doctor, 131 offline
+tests in 71.804s (one intentional live-smoke skip), explicit integration and
+real-repository startup reproductions, and CI run 29474993946 across
+Windows/Ubuntu and Python 3.10/3.13 all passed.
 
 ## Progress log
 
@@ -164,3 +171,13 @@ Python 3.10/3.13 all passed.
   live skip); final CI 29459011913: all four Windows/Ubuntu Python 3.10/3.13 jobs
   passed. Docs/ADRs/lessons reconciled; no manual action; closure checkpoint is
   this pushed plan-state commit.
+- 2026-07-16 · 3 · 06.3, 06.5–06.7 · A real `run --open-terminals` attempt after
+  closure revealed self-created runtime files could make INIT reject its own
+  dirty tree when `.claudex/` ignore coverage was missing or runtime files were
+  tracked. Shipped 0.5.1 in `2b2f077` and `540c4e3`: new-run preflight and
+  provider capability discovery now precede state/windows. The affected target
+  checkout was repaired non-destructively with local recovery files retained.
+  Verification: real reproduction created zero additional runs; 131 tests in
+  71.804s, OK (one safe live skip); CI 29474993946 passed all Windows/Ubuntu
+  Python 3.10/3.13 jobs. Durable decision/docs/lesson updated; verdict remains
+  `CLOSE` after the correction.
