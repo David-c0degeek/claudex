@@ -44,3 +44,26 @@ func TestVersionInjectedCommitNotOverriddenByVCS(t *testing.T) {
 		t.Fatalf("Version() = %q, want %q", got, want)
 	}
 }
+
+func TestFormat(t *testing.T) {
+	cases := []struct {
+		name                  string
+		version, commit, date string
+		dirty                 bool
+		want                  string
+	}{
+		{"dev-no-commit", "dev", "", "", false, "claudex dev"},
+		{"commit-only", "1.0.0", "abcdef1234567890", "", false, "claudex 1.0.0 (abcdef123456)"},
+		{"commit-and-date", "1.0.0", "abcdef1234567890", "2026-01-01", false, "claudex 1.0.0 (abcdef123456, 2026-01-01)"},
+		{"dirty-commit", "1.0.0", "abcdef1234567890", "", true, "claudex 1.0.0 (abcdef123456-dirty)"},
+		{"dirty-with-date", "1.0.0", "abcdef1234567890", "2026-01-01", true, "claudex 1.0.0 (abcdef123456-dirty, 2026-01-01)"},
+		{"dirty-without-commit-omits-marker", "dev", "", "", true, "claudex dev"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := format(c.version, c.commit, c.date, c.dirty); got != c.want {
+				t.Fatalf("format(%q,%q,%q,%v) = %q, want %q", c.version, c.commit, c.date, c.dirty, got, c.want)
+			}
+		})
+	}
+}

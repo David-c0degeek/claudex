@@ -28,6 +28,13 @@ func Version() string {
 	if c == "" {
 		c, dirty = vcsInfo()
 	}
+	return format(version, c, date, dirty)
+}
+
+// format is the pure rendering logic, separated from the VCS lookup so the
+// dirty/truncation behaviour is unit-testable without a build stamp.
+func format(version, commit, date string, dirty bool) string {
+	c := commit
 	if len(c) > 12 {
 		c = c[:12]
 	}

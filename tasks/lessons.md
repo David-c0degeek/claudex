@@ -37,6 +37,9 @@ git history.
 - Normalize provider usage only at the terminal result boundary and charge each
   attempt idempotently; overlapping token categories differ per provider (some are
   subsets, some additive), and missing usage/cost must stay unknown, not estimated.
+  Usage/cost *enforcement* is conditional: it requires a trustworthy provider
+  telemetry channel (managed launch) — without one, usage caps are unenforceable
+  and must be labelled so, never silently treated as enforced.
 
 ## Build / process
 - Rebuild from evidence, not from code: harvest the retired suite's tests,

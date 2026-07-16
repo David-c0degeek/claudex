@@ -13,8 +13,9 @@ yet; the sections below track work toward the first tagged binary.
 ### Added
 - Go module skeleton (`cmd/claudex`, `internal/buildinfo`) on Go 1.25 with a
   `version`/`help` command surface and a green build/vet/test baseline.
-- `internal/redact` — credential redaction applied at every persistence/display
-  boundary.
+- `internal/redact` — credential-redaction leaf (provider API keys, bearer
+  tokens, key/value assignments). Boundary wiring into state/transport persistence
+  lands with subjects 01/02.
 - Project documentation: architecture, decision log (D001–D016), and the
   harvested test-vector inventory (`docs/`).
 
