@@ -56,9 +56,9 @@ type TurnSpecEntry struct {
 }
 
 // turnSpecs is the single transport-owned source of which role acts and which
-// artifact a submit produces for each actionable phase. The engine (03) consumes
-// this rather than duplicating it. INIT, AWAIT_GUIDANCE, DONE, and TESTS issue
-// no assignment and are absent here.
+// artifact a submit produces for each actionable phase. The phase engine
+// consumes this rather than duplicating it. INIT, AWAIT_GUIDANCE, DONE, and
+// TESTS issue no assignment and are absent here.
 var turnSpecs = map[state.Phase]TurnSpecEntry{
 	state.PhasePlanDraft:     {RoleLead, "plan"},
 	state.PhasePlanCritique:  {RolePair, "plan_critique"},
@@ -76,16 +76,17 @@ func TurnSpec(p state.Phase) (TurnSpecEntry, bool) {
 	return e, ok
 }
 
-// editPhases are the phases in which the lead may mutate the repository. This
-// must stay aligned with the repo-edit policy enforced at submit time (03.7).
+// editPhases are the phases in which the lead may mutate the repository. This is
+// the single source for the repo-edit policy, shared with the submit-time edit
+// check so the two never drift.
 var editPhases = map[state.Phase]bool{
 	state.PhaseImplementStep: true,
 	state.PhaseFix:           true,
 }
 
 // EditableTurn reports whether an assignment for this role and phase carries a
-// mutable worktree: only a lead turn in an edit phase does. 03.7 calls this to
-// enforce the same predicate at submit time.
+// mutable worktree: only a lead turn in an edit phase does. The submit path
+// calls this to enforce the same predicate when accepting a repo mutation.
 func EditableTurn(role Role, p state.Phase) bool {
 	return role == RoleLead && editPhases[p]
 }
@@ -98,11 +99,12 @@ type EvidenceRef struct {
 	RootDigest      string `json:"root_digest"`
 }
 
-// PullInputs are the assignment fields the engine resolves around run state.
+// PullInputs are the assignment fields the caller resolves around run state.
 // Every value MUST be read from persisted state/artifacts at the same revision
 // as rs — never from ambient config or the current filesystem — so the
-// projection stays deterministic (this obligation is the engine's, subjects
-// 03/05). Exactly one of Worktree or Evidence is set, per EditableTurn.
+// projection stays deterministic. That obligation belongs to the caller that
+// drives phase transitions and human gates. Exactly one of Worktree or Evidence
+// is set, per EditableTurn.
 type PullInputs struct {
 	SessionID       string
 	Role            Role
@@ -181,6 +183,8 @@ func BuildAssignment(rs state.RunState, in PullInputs) (Assignment, error) {
 		a.Evidence = &ev
 	}
 
+	// Full validation (semantic invariants AND the structural/bounds schema), so a
+	// nil error here guarantees Marshal succeeds.
 	if err := a.Validate(); err != nil {
 		return Assignment{}, err
 	}
@@ -197,12 +201,11 @@ func redactGuidance(g []string) []string {
 	return out
 }
 
-// Validate enforces the semantic invariants the JSON schema cannot express, so a
-// mutated or hand-built assignment cannot slip past Marshal. It re-fetches the
-// registry schema and requires exact bytes + digest, enforces the phase turn
-// spec (role and artifact type), enforces the workspace XOR by EditableTurn, and
-// validates the evidence/worktree grammar.
-func (a Assignment) Validate() error {
+// validateSemantics enforces the invariants the JSON schema cannot express: it
+// re-fetches the registry schema and requires exact bytes + digest, enforces the
+// phase turn spec (role and artifact type), enforces the workspace XOR by
+// EditableTurn, and validates the evidence/worktree grammar.
+func (a Assignment) validateSemantics() error {
 	if a.ProtocolVersion != protocol.SupportedVersion {
 		return fmt.Errorf("%w: wrong protocol_version", ErrAssignmentInvalid)
 	}
@@ -270,8 +273,8 @@ func validateEvidence(e EvidenceRef) error {
 }
 
 // validateWorktree requires a clean absolute platform path free of NUL, control
-// characters, and secret-bearing values. Subject 03 later verifies it belongs to
-// the allocated run.
+// characters, and secret-bearing values. The bootstrap path later verifies it
+// belongs to the allocated run.
 func validateWorktree(p string) error {
 	if p == "" || !filepath.IsAbs(p) {
 		return fmt.Errorf("%w: worktree must be a clean absolute path", ErrWorkspaceMismatch)
@@ -290,10 +293,11 @@ func validateWorktree(p string) error {
 	return nil
 }
 
-// Marshal validates the assignment (semantic invariants) and its schema, and
-// returns the canonical wire bytes so two pulls are byte-identical.
+// Marshal fully validates the assignment — the semantic invariants AND the
+// structural/bounds schema — and returns the canonical wire bytes, so two pulls
+// are byte-identical.
 func (a Assignment) Marshal() ([]byte, error) {
-	if err := a.Validate(); err != nil {
+	if err := a.validateSemantics(); err != nil {
 		return nil, err
 	}
 	raw, err := json.Marshal(a)
@@ -305,4 +309,11 @@ func (a Assignment) Marshal() ([]byte, error) {
 		return nil, fmt.Errorf("transport: assignment fails its schema: %w", err)
 	}
 	return canon, nil
+}
+
+// Validate fully checks the assignment: the semantic invariants plus the
+// structural/bounds schema. A nil result guarantees Marshal succeeds.
+func (a Assignment) Validate() error {
+	_, err := a.Marshal()
+	return err
 }

@@ -42,7 +42,7 @@
       "minimum": 1
     },
     "human_context": {
-      "description": "Optional free-text context for the human; null when none.",
+      "description": "Disclosed local human/agent dialogue that changed requirements this turn; null when none.",
       "type": ["string", "null"],
       "maxLength": 16384
     },

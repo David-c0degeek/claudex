@@ -12,7 +12,7 @@
 // exact persisted bytes, so it never diverges from durable state.
 //
 // State holds only typed identities, digests, and relative references — never the
-// protocol artifacts themselves (those arrive with subject 02).
+// protocol artifacts themselves (those arrive with the transport layer).
 package state
 
 import (
@@ -46,7 +46,7 @@ const (
 )
 
 // Phase is the current phase of the pairing loop. State owns the known values;
-// the engine (subject 03) owns the allowed transitions between them.
+// the phase engine owns the allowed transitions between them.
 type Phase string
 
 const (

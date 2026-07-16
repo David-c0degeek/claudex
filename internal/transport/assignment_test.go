@@ -280,6 +280,66 @@ func TestEvidenceGrammarEnforced(t *testing.T) {
 	}
 }
 
+// BuildAssignment must fully validate, so structural bound violations fail at
+// build time, not only later at Marshal.
+func TestOverBoundInputsRejectedAtBuild(t *testing.T) {
+	// Session id beyond the schema's 128-char bound.
+	in := editInputs()
+	in.SessionID = strings.Repeat("s", 129)
+	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in); err == nil {
+		t.Fatalf("an over-long session id should be rejected at build")
+	}
+	// Guidance beyond the 4096-char bound.
+	in2 := editInputs()
+	in2.BindingGuidance = []string{strings.Repeat("g", 5000)}
+	if _, err := BuildAssignment(runStateAt(state.PhaseImplementStep), in2); err == nil {
+		t.Fatalf("over-long binding guidance should be rejected at build")
+	}
+	// Evidence manifest path valid grammar but beyond the 4096-char bound.
+	in3 := evidenceInputs(RolePair)
+	in3.Evidence = &EvidenceRef{ManifestRelPath: "evidence/" + strings.Repeat("a", 5000) + ".json", RootDigest: hex64()}
+	if _, err := BuildAssignment(runStateAt(state.PhaseCheckpoint), in3); err == nil {
+		t.Fatalf("an over-long manifest path should be rejected at build")
+	}
+}
+
+// The TurnSpec table is the contract the phase engine consumes: exact role,
+// exact artifact type, an embedded schema for it, and the workspace mode.
+func TestTurnSpecTableIsTheContract(t *testing.T) {
+	type want struct {
+		role     Role
+		artifact string
+		editable bool
+	}
+	table := map[state.Phase]want{
+		state.PhasePlanDraft:     {RoleLead, "plan", false},
+		state.PhasePlanCritique:  {RolePair, "plan_critique", false},
+		state.PhasePlanRevise:    {RoleLead, "plan_revision", false},
+		state.PhaseImplementStep: {RoleLead, "implementation_report", true},
+		state.PhaseCheckpoint:    {RolePair, "checkpoint_review", false},
+		state.PhaseFix:           {RoleLead, "implementation_report", true},
+		state.PhaseVerify:        {RolePair, "verification", false},
+	}
+	if len(table) != len(turnSpecs) {
+		t.Fatalf("turn spec table drift: %d expected vs %d in turnSpecs", len(table), len(turnSpecs))
+	}
+	for phase, w := range table {
+		spec, ok := TurnSpec(phase)
+		if !ok {
+			t.Fatalf("%s has no turn spec", phase)
+		}
+		if spec.Role != w.role || spec.ArtifactMessageType != w.artifact {
+			t.Fatalf("%s spec = %+v, want role %s artifact %s", phase, spec, w.role, w.artifact)
+		}
+		if _, err := protocol.Schema(spec.ArtifactMessageType, protocol.SupportedVersion); err != nil {
+			t.Fatalf("%s references a missing schema %q: %v", phase, spec.ArtifactMessageType, err)
+		}
+		if EditableTurn(spec.Role, phase) != w.editable {
+			t.Fatalf("%s editable = %v, want %v", phase, EditableTurn(spec.Role, phase), w.editable)
+		}
+	}
+}
+
 func TestWorktreeGrammarEnforced(t *testing.T) {
 	bad := []string{
 		"relative/path",

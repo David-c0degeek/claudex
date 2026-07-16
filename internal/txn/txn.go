@@ -1,7 +1,7 @@
 // Package txn is the prepared-transaction journal. It bridges the
 // several ordered, durable cuts of a coordinator transaction that cannot commit
-// atomically together (subject 04 supplies the git ref move, index reconcile, and
-// state CAS as concrete steps).
+// atomically together (the git participant supplies the git ref move, index
+// reconcile, and state CAS as concrete steps).
 //
 // It is a durable PROGRESS machine, not a two-phase flag: the journal records the
 // ordered step ids and how many have durably completed. A transaction is COMPLETE
@@ -14,8 +14,9 @@
 // genstore generation sequence, so it never depends on the replace it
 // diagnoses, and it composes under the run's shared guard with the state store.
 //
-// The steps and the intent payload codec are the caller's (subject 04 for git).
-// This package is the generic engine, tested against fake steps.
+// The steps and the intent payload codec are the caller's (the git participant
+// for a git transaction). This package is the generic engine, tested against
+// fake steps.
 package txn
 
 import (
@@ -63,7 +64,8 @@ type Step struct {
 }
 
 // Intent is the typed, versioned transaction envelope. The payload is a bounded,
-// kind-specific JSON blob whose codec belongs to the caller (subject 04 for git).
+// kind-specific JSON blob whose codec belongs to the caller (the git participant
+// for a git transaction).
 type Intent struct {
 	Version               int             `json:"version"`
 	Kind                  string          `json:"kind"`

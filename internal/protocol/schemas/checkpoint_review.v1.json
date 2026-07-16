@@ -14,6 +14,7 @@
     "decision_question",
     "verdict",
     "findings",
+    "missing_evidence",
     "tests_adequate",
     "tests_critique"
   ],
@@ -40,7 +41,7 @@
       "minimum": 1
     },
     "human_context": {
-      "description": "Optional free-text context for the human; null when none.",
+      "description": "Disclosed local human/agent dialogue that changed requirements this turn; null when none.",
       "type": ["string", "null"],
       "maxLength": 16384
     },
@@ -99,6 +100,15 @@
             "maxLength": 8192
           }
         }
+      }
+    },
+    "missing_evidence": {
+      "description": "Existing repository-relative paths omitted from the evidence manifest that the review needs; empty when the review is conclusive.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
       }
     },
     "tests_adequate": {

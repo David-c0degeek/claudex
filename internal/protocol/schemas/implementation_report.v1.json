@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "claudex implementation report artifact, version 1",
-  "description": "The lead's report after implementing a step: the commits made, files changed, the test command and its result, deviations from the plan, and notes. Submitted for an implement-step phase.",
+  "description": "The lead's report after an IMPLEMENT_STEP or FIX turn: the files it changed, where it diverged from the agreed plan, and notes. The coordinator owns commit and tree creation and runs the authoritative test gate, so this report carries no agent-authored commit SHAs or test verdicts; that evidence is recorded separately.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,11 +12,7 @@
     "human_context",
     "requires_human_decision",
     "decision_question",
-    "commits",
     "files_changed",
-    "tests_command",
-    "tests_passed",
-    "test_output_summary",
     "deviations_from_plan",
     "notes"
   ],
@@ -43,7 +39,7 @@
       "minimum": 1
     },
     "human_context": {
-      "description": "Optional free-text context for the human; null when none.",
+      "description": "Disclosed local human/agent dialogue that changed requirements this turn; null when none.",
       "type": ["string", "null"],
       "maxLength": 16384
     },
@@ -56,53 +52,14 @@
       "type": ["string", "null"],
       "maxLength": 4096
     },
-    "commits": {
-      "description": "Commits produced by this step.",
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["sha", "message"],
-        "properties": {
-          "sha": {
-            "description": "Commit hash.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64
-          },
-          "message": {
-            "description": "Commit message.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 8192
-          }
-        }
-      }
-    },
     "files_changed": {
-      "description": "Repository-relative paths changed by this step.",
+      "description": "Repository-relative paths the lead changed this turn (advisory; the coordinator's tree diff is authoritative).",
       "type": "array",
       "items": {
         "type": "string",
         "minLength": 1,
         "maxLength": 4096
       }
-    },
-    "tests_command": {
-      "description": "The exact command run to exercise the change.",
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 4096
-    },
-    "tests_passed": {
-      "description": "Whether the test command succeeded.",
-      "type": "boolean"
-    },
-    "test_output_summary": {
-      "description": "Summary of the test output.",
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 8192
     },
     "deviations_from_plan": {
       "description": "Where the implementation diverged from the agreed plan and why.",
