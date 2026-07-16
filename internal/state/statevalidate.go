@@ -82,11 +82,12 @@ func validate(rs *RunState) error {
 	if !isGitOID(rs.BaseCommit) {
 		return fmt.Errorf("base_commit is not a git object id (40 or 64 lower-hex)")
 	}
-	if !isLocalRelPath(rs.WorktreeRelPath) {
-		return fmt.Errorf("worktree_rel_path is not a canonical local path")
+	// Workspace identity is DERIVED from the run id, never a caller claim.
+	if rs.WorktreeRelPath != WorktreeRelPathFor(rs.RunID) {
+		return fmt.Errorf("worktree_rel_path must be the derived %q", WorktreeRelPathFor(rs.RunID))
 	}
-	if strings.TrimSpace(rs.RunBranch) == "" || len(rs.RunBranch) > 256 {
-		return fmt.Errorf("run_branch is required and bounded")
+	if rs.RunBranch != RunBranchFor(rs.RunID) {
+		return fmt.Errorf("run_branch must be the derived %q", RunBranchFor(rs.RunID))
 	}
 	if rs.Base != rs.EffectivePolicy.BaseBranch {
 		return fmt.Errorf("base %q must equal effective_policy.base_branch %q", rs.Base, rs.EffectivePolicy.BaseBranch)

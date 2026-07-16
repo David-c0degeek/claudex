@@ -13,6 +13,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/fsclass"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/legacy"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
@@ -131,8 +132,7 @@ func (l layout) runDir(relDir string) string {
 // identities), then — only when no run exists — prepares a deterministic intent
 // read-only and journals the bootstrap to completion.
 func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
-	policy, err := req.validate()
-	if err != nil {
+	if err := req.validateMinimal(); err != nil {
 		return FirstAttachResult{}, err
 	}
 	classifier := req.Classifier
@@ -141,9 +141,10 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	}
 	lay := layoutFor(req.RepoDir)
 
-	// Read-only repo preflight BEFORE creating .claudex or taking the lock: refuse
-	// a pre-pivot legacy run and an unsupported filesystem before any side effect.
-	if err := repoPreflight(lay, classifier, policy); err != nil {
+	// Read-only legacy refusal BEFORE creating .claudex or taking the lock: a
+	// pre-pivot Python run is refused before any side effect. (The fs decision
+	// needs a policy and so runs on the new-bootstrap path, under the guard.)
+	if err := legacyRepoRefusal(lay.repoDir); err != nil {
 		return FirstAttachResult{}, err
 	}
 
@@ -162,8 +163,10 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	seams := seams{base: req.Base, worktree: req.Worktree}
 	journal := txn.Open(lay.bootstrapJournal, lay.repoLock)
 
-	// Recover a pending bootstrap forward first: a crash between an applied effect
-	// and recorded progress is repaired, and the same session id is returned.
+	// Recover a pending bootstrap forward first (needs only the worktree seam, no
+	// fresh inputs). The recovered run's identity is returned ONLY to the operation
+	// that started it; a different operation completes the recovery but is told the
+	// run exists — it never receives the incumbent lead session.
 	rec, recovered, err := journal.Recover(g, func(in txn.Intent) (txn.Plan, error) {
 		return planFor(lay, seams, g, in)
 	})
@@ -175,13 +178,17 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		if derr != nil {
 			return FirstAttachResult{}, derr
 		}
+		if bi.OperationID != req.OperationID {
+			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
+		}
 		return resultFor(bi), nil
 	}
 
 	// A current active run means join/reattach, not a second bootstrap — except a
 	// lost response after a completed bootstrap: the same operation id returns the
 	// incumbent lead session (never a forced replacement).
-	cur, ok, cerr := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	current := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock)
+	cur, ok, cerr := current.Load()
 	if cerr != nil {
 		return FirstAttachResult{}, cerr
 	}
@@ -192,7 +199,12 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 	}
 
-	intent, err := prepare(lay, req, policy, classifier)
+	// New bootstrap: full input validation + the fs decision under the guard.
+	policy, err := req.validateForNewBootstrap()
+	if err != nil {
+		return FirstAttachResult{}, err
+	}
+	intent, err := prepare(lay, req, policy, classifier, curRevision(cur, ok))
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
@@ -209,18 +221,13 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	return resultFor(intent), nil
 }
 
-// repoPreflight runs the read-only refusals before any mutation: a pre-pivot
-// legacy run named by .claudex/current, and an unsupported filesystem.
-func repoPreflight(lay layout, classifier Classifier, policy config.RunPolicy) error {
-	if err := legacyRepoRefusal(lay.repoDir); err != nil {
-		return err
+// curRevision is the active-run pointer's revision to CAS against (0 if the store
+// is empty), so a later run activates after a prior one was cleared.
+func curRevision(cur state.CurrentRun, ok bool) uint64 {
+	if !ok {
+		return 0
 	}
-	res, err := classifier.Classify(filepath.Join(lay.repoDir, ".claudex"))
-	if err != nil {
-		return err
-	}
-	_, _, _, err = decideFS(res, policy)
-	return err
+	return cur.Revision
 }
 
 // legacyRepoRefusal refuses a pre-pivot Python run: the repo-level
@@ -248,16 +255,19 @@ func legacyRepoRefusal(repoDir string) error {
 // a typed UnsupportedFSError for a known-unsupported filesystem or an unknown one
 // without the acknowledge policy.
 func decideFS(res fsclass.Result, pol config.RunPolicy) (class, reason string, ack bool, err error) {
+	// The classifier reason is external free text; redact it before it reaches a
+	// typed error or the frozen intent (which persists in the journal).
+	r := redact.Text(res.Reason)
 	switch res.Class {
 	case fsclass.SupportedLocal:
-		return "supported-local", nonEmpty(res.Reason, "local fixed drive"), false, nil
+		return "supported-local", nonEmpty(r, "local fixed drive"), false, nil
 	case fsclass.Unknown:
 		if pol.UnknownFSPolicy != config.UnknownFSAcknowledge {
-			return "", "", false, &UnsupportedFSError{Class: "unknown", Reason: nonEmpty(res.Reason, "unclassified filesystem"), AckRequired: true}
+			return "", "", false, &UnsupportedFSError{Class: "unknown", Reason: nonEmpty(r, "unclassified filesystem"), AckRequired: true}
 		}
-		return "unknown", nonEmpty(res.Reason, "unknown filesystem, acknowledged"), true, nil
+		return "unknown", nonEmpty(r, "unknown filesystem, acknowledged"), true, nil
 	default:
-		return "", "", false, &UnsupportedFSError{Class: res.Class.String(), Reason: nonEmpty(res.Reason, "network/remote filesystem"), AckRequired: false}
+		return "", "", false, &UnsupportedFSError{Class: res.Class.String(), Reason: nonEmpty(r, "network/remote filesystem"), AckRequired: false}
 	}
 }
 
@@ -294,15 +304,29 @@ func complementaryAgent(a state.Agent) state.Agent {
 	return state.AgentClaude
 }
 
-func (req FirstAttachRequest) validate() (config.RunPolicy, error) {
+// validateMinimal is the authority a RECOVERY needs: just the repo, the
+// operation id, and the worktree participant — never fresh task/policy bytes,
+// RNG, or base resolver, so a lost response is recoverable even if the source
+// files changed or vanished.
+func (req FirstAttachRequest) validateMinimal() error {
 	if req.RepoDir == "" {
-		return config.RunPolicy{}, fmt.Errorf("attach: repo dir is required")
+		return fmt.Errorf("attach: repo dir is required")
 	}
+	if !state.IsOperationID(req.OperationID) {
+		return fmt.Errorf("attach: a minted operation_id is required")
+	}
+	if req.Worktree == nil {
+		return fmt.Errorf("attach: a worktree provisioner is required")
+	}
+	return nil
+}
+
+// validateForNewBootstrap is the full authority a NEW bootstrap needs: it parses
+// the exact source bytes and validates the task and policy together (the effective
+// policy is DERIVED from the snapshot bytes, never a separate claim).
+func (req FirstAttachRequest) validateForNewBootstrap() (config.RunPolicy, error) {
 	if req.Agent != state.AgentClaude && req.Agent != state.AgentCodex {
 		return config.RunPolicy{}, fmt.Errorf("attach: agent must be claude or codex")
-	}
-	if !state.IsRunID(req.OperationID) {
-		return config.RunPolicy{}, fmt.Errorf("attach: a canonical operation_id is required")
 	}
 	if req.CreatedUnix <= 0 {
 		return config.RunPolicy{}, fmt.Errorf("attach: created_unix must be positive")
@@ -310,12 +334,9 @@ func (req FirstAttachRequest) validate() (config.RunPolicy, error) {
 	if req.RNG == nil {
 		return config.RunPolicy{}, fmt.Errorf("attach: an RNG is required")
 	}
-	if req.Base == nil || req.Worktree == nil {
-		return config.RunPolicy{}, fmt.Errorf("attach: base resolver and worktree provisioner are required")
+	if req.Base == nil {
+		return config.RunPolicy{}, fmt.Errorf("attach: a base resolver is required")
 	}
-	// Parse the exact source bytes and validate the task and policy together, so a
-	// run is never bootstrapped against an invalid contract, and the effective
-	// policy is DERIVED from the snapshot bytes (never a separate claim).
 	task, err := config.ParseTaskContract(req.TaskCanonical)
 	if err != nil {
 		return config.RunPolicy{}, fmt.Errorf("attach: %w", err)
@@ -335,7 +356,7 @@ func (req FirstAttachRequest) validate() (config.RunPolicy, error) {
 // identity, classifies the run location, and resolves the base commit from a
 // frozen OID — so every downstream Apply and any recovery works from exactly
 // these values.
-func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier) (BootstrapIntent, error) {
+func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier, currentExpectedRev uint64) (BootstrapIntent, error) {
 	if err := legacyRepoRefusal(lay.repoDir); err != nil {
 		return BootstrapIntent{}, err
 	}
@@ -373,28 +394,29 @@ func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classi
 	}
 
 	in := BootstrapIntent{
-		RunID:                   runID,
-		TxnID:                   txnID,
-		OperationID:             req.OperationID,
-		SessionID:               sessionID,
-		Agent:                   req.Agent,
-		CreatedUnix:             req.CreatedUnix,
-		RelDir:                  relDir,
-		TaskRelPath:             "inputs/task.json",
-		TaskDigest:              config.Hash(req.TaskCanonical),
-		TaskCanonical:           req.TaskCanonical,
-		PolicyRelPath:           "inputs/policy.json",
-		PolicyDigest:            config.Hash(req.PolicyCanonical),
-		PolicyCanonical:         req.PolicyCanonical,
-		EffectivePolicy:         policy,
-		Base:                    policy.BaseBranch,
-		BaseCommit:              baseCommit,
-		WorktreeRelPath:         relDir + "/worktree",
-		RunBranch:               wantRunBranch(runID),
-		FSClass:                 fsClass,
-		FSReason:                fsReason,
-		FSAck:                   fsAck,
-		CatalogExpectedRevision: 0,
+		RunID:                      runID,
+		TxnID:                      txnID,
+		OperationID:                req.OperationID,
+		SessionID:                  sessionID,
+		Agent:                      req.Agent,
+		CreatedUnix:                req.CreatedUnix,
+		RelDir:                     relDir,
+		TaskRelPath:                "inputs/task.json",
+		TaskDigest:                 config.Hash(req.TaskCanonical),
+		TaskCanonical:              req.TaskCanonical,
+		PolicyRelPath:              "inputs/policy.json",
+		PolicyDigest:               config.Hash(req.PolicyCanonical),
+		PolicyCanonical:            req.PolicyCanonical,
+		EffectivePolicy:            policy,
+		Base:                       policy.BaseBranch,
+		BaseCommit:                 baseCommit,
+		WorktreeRelPath:            relDir + "/worktree",
+		RunBranch:                  wantRunBranch(runID),
+		FSClass:                    fsClass,
+		FSReason:                   fsReason,
+		FSAck:                      fsAck,
+		CatalogExpectedRevision:    0,
+		CurrentRunExpectedRevision: currentExpectedRev,
 	}
 	if cat, ok, cerr := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load(); cerr != nil {
 		return BootstrapIntent{}, cerr

@@ -18,6 +18,20 @@ func IsRunID(s string) bool { return validRunID(s) }
 // assignment boundary uses this, not IsRunID.
 func IsSessionID(s string) bool { return isSessionID(s) }
 
+// IsOperationID reports whether s is a canonical minted operation id ("op-" + 32
+// lowercase hex) — the caller-stable idempotency key whose equality releases the
+// incumbent lead session, so it must be unguessable.
+func IsOperationID(s string) bool { return isOperationID(s) }
+
+// RunDirRelFor is the canonical run directory (relative to the repo root) for a
+// run id. It is the single source of the run's on-disk locator.
+func RunDirRelFor(runID string) string { return ".claudex/runs/" + runID }
+
+// WorktreeRelPathFor and RunBranchFor are the canonical, derived workspace
+// identities for a run id — never a caller claim. State enforces exactly these.
+func WorktreeRelPathFor(runID string) string { return RunDirRelFor(runID) + "/worktree" }
+func RunBranchFor(runID string) string       { return "claudex/" + runID }
+
 // IsLocalRelPath reports whether p is a canonical, forward-slash, relative,
 // traversal-free, platform-local path — the same rule the state store applies to
 // stored locators. It rejects absolute, volume-qualified, backslash, colon, NUL,

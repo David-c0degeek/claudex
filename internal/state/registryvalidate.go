@@ -12,27 +12,33 @@ import (
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
-const sessionIDPrefix = "sess-"
+const (
+	sessionIDPrefix   = "sess-"
+	operationIDPrefix = "op-"
+)
 
-// isSessionID enforces the EXACT coordinator-minted grammar: "sess-" + 32
-// lowercase hex. Session ids become directory names, so the general mixed-case id
-// grammar is too loose — on a case-insensitive filesystem `Sess-X` and `sess-x`
-// would alias one directory while the registry treated them as distinct. The
-// lowercase-only rule makes global uniqueness case-safe.
-func isSessionID(s string) bool {
-	if len(s) != len(sessionIDPrefix)+32 {
+// isMintedID enforces an EXACT coordinator-minted grammar: a fixed prefix + 32
+// lowercase hex. These ids become directory names and gate authority, so the
+// general mixed-case id grammar is too loose — on a case-insensitive filesystem
+// `Sess-X`/`sess-x` would alias, and a guessable id could release an incumbent
+// session. Lowercase-only makes equality and uniqueness case-safe.
+func isMintedID(prefix, s string) bool {
+	if len(s) != len(prefix)+32 {
 		return false
 	}
-	if s[:len(sessionIDPrefix)] != sessionIDPrefix {
+	if s[:len(prefix)] != prefix {
 		return false
 	}
-	for _, c := range s[len(sessionIDPrefix):] {
+	for _, c := range s[len(prefix):] {
 		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
 			return false
 		}
 	}
 	return true
 }
+
+func isSessionID(s string) bool   { return isMintedID(sessionIDPrefix, s) }
+func isOperationID(s string) bool { return isMintedID(operationIDPrefix, s) }
 
 // strictDecodeRegistry decodes exactly one JSON value with no unknown fields and
 // no trailing content.
@@ -228,16 +234,27 @@ var ErrSessionIDExhausted = errors.New("state: session id minting exhausted atte
 // retrying on a collision reported by taken, and failing closed on an RNG error.
 // taken should report whether an id already exists in either slot history.
 func MintSessionID(rng io.Reader, taken func(string) bool) (string, error) {
+	return mintID(sessionIDPrefix, rng, taken)
+}
+
+// MintOperationID mints a caller-stable idempotency key ("op-" + 32 lower-hex).
+// The CLI mints one per attach invocation and reuses it across retries; equality
+// releases the incumbent lead session, so it must be unguessable.
+func MintOperationID(rng io.Reader) (string, error) {
+	return mintID(operationIDPrefix, rng, nil)
+}
+
+func mintID(prefix string, rng io.Reader, taken func(string) bool) (string, error) {
 	if rng == nil {
-		return "", errors.New("state: mint session id: nil RNG")
+		return "", fmt.Errorf("state: mint %sid: nil RNG", prefix)
 	}
 	for attempt := 0; attempt < 8; attempt++ {
 		var b [16]byte
 		if _, err := io.ReadFull(rng, b[:]); err != nil {
-			return "", fmt.Errorf("state: mint session id: %w", err)
+			return "", fmt.Errorf("state: mint %sid: %w", prefix, err)
 		}
-		id := sessionIDPrefix + hex.EncodeToString(b[:])
-		if !isSessionID(id) || redact.Text(id) != id {
+		id := prefix + hex.EncodeToString(b[:])
+		if !isMintedID(prefix, id) || redact.Text(id) != id {
 			continue // grammar/secret guard (asserted; unreachable for lower-hex)
 		}
 		if taken != nil && taken(id) {

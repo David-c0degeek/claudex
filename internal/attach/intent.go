@@ -73,8 +73,10 @@ type BootstrapIntent struct {
 	FSAck    bool   `json:"fs_acknowledged"`
 
 	// Catalog allocation target: the expected catalog revision and the immutable
-	// run ref committed last (the discoverability commit).
-	CatalogExpectedRevision uint64 `json:"catalog_expected_revision"`
+	// run ref. The active-run pointer's expected revision lets a later run
+	// activate after a prior one is cleared (the repo is not single-run).
+	CatalogExpectedRevision    uint64 `json:"catalog_expected_revision"`
+	CurrentRunExpectedRevision uint64 `json:"current_run_expected_revision"`
 }
 
 // runRef is the immutable catalog allocation this intent commits.
@@ -119,8 +121,11 @@ func (in BootstrapIntent) validate() error {
 	if !state.IsRunID(in.RunID) {
 		return fmt.Errorf("attach: intent run_id is not canonical")
 	}
-	if !state.IsRunID(in.TxnID) || !state.IsRunID(in.OperationID) {
-		return fmt.Errorf("attach: intent txn_id/operation_id is not canonical")
+	if !state.IsRunID(in.TxnID) {
+		return fmt.Errorf("attach: intent txn_id is not canonical")
+	}
+	if !state.IsOperationID(in.OperationID) {
+		return fmt.Errorf("attach: intent operation_id is not a minted operation id")
 	}
 	if !state.IsSessionID(in.SessionID) {
 		return fmt.Errorf("attach: intent session_id is not a canonical minted id")

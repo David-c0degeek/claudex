@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
+	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
 // CurrentRunVersion is the on-disk schema version of the active-run pointer.
@@ -80,6 +81,11 @@ func (s *CurrentRunStore) MutateLocked(g *genstore.Guard, expectedRevision uint6
 		return CurrentRun{}, fmt.Errorf("%w: expected %d on an empty active-run store", ErrRevisionConflict, expectedRevision)
 	}
 
+	var prev *CurrentRun
+	if ok {
+		p, _ := decodeCurrentRun(rec)
+		prev = &p
+	}
 	built, err := s.gs.AppendLocked(g, head, func(gen uint64, _ string) ([]byte, error) {
 		next := &CurrentRun{}
 		if err := fn(next); err != nil {
@@ -87,8 +93,16 @@ func (s *CurrentRunStore) MutateLocked(g *genstore.Guard, expectedRevision uint6
 		}
 		next.Revision = gen
 		next.SchemaVersion = CurrentRunVersion
+		if err := currentRunGuard(next); err != nil {
+			return nil, err
+		}
 		if err := validateCurrentRun(next); err != nil {
 			return nil, err
+		}
+		if prev != nil {
+			if err := validateCurrentRunTransition(prev, next); err != nil {
+				return nil, err
+			}
 		}
 		return json.Marshal(next)
 	})
@@ -143,17 +157,50 @@ func validateCurrentRun(cr *CurrentRun) error {
 	if !validRunID(cr.RunID) {
 		return fmt.Errorf("active-run run_id is not canonical")
 	}
-	if !isLocalRelPath(cr.RelDir) {
-		return fmt.Errorf("active-run rel_dir is not a canonical local path")
+	if cr.RelDir != RunDirRelFor(cr.RunID) {
+		return fmt.Errorf("active-run rel_dir must be the derived %q", RunDirRelFor(cr.RunID))
 	}
-	if !validRunID(cr.OperationID) {
-		return fmt.Errorf("active-run operation_id is not canonical")
+	if !isOperationID(cr.OperationID) {
+		return fmt.Errorf("active-run operation_id is not a minted operation id")
 	}
 	if !isSessionID(cr.LeadSessionID) {
 		return fmt.Errorf("active-run lead_session_id is not a minted session id")
 	}
 	if cr.LeadAgent != AgentClaude && cr.LeadAgent != AgentCodex {
 		return fmt.Errorf("active-run lead_agent is unknown")
+	}
+	return nil
+}
+
+// validateCurrentRunTransition enforces that a mutation flips Active: an active
+// run may be cleared (its RunState reached terminal), and an inactive/absent
+// pointer may activate a NEW run. A double-set or double-clear is a no-op
+// generation and rejected.
+func validateCurrentRunTransition(old, next *CurrentRun) error {
+	if old.Active == next.Active {
+		if old.Active {
+			return fmt.Errorf("an active run must be cleared before another is activated")
+		}
+		return fmt.Errorf("the active-run pointer is already inactive")
+	}
+	if next.Active && old.Active {
+		return fmt.Errorf("cannot activate over an active run")
+	}
+	return nil
+}
+
+// currentRunGuard rejects a secret in any active-run control field.
+func currentRunGuard(cr *CurrentRun) error {
+	for field, v := range map[string]string{
+		"run_id":          cr.RunID,
+		"rel_dir":         cr.RelDir,
+		"operation_id":    cr.OperationID,
+		"lead_session_id": cr.LeadSessionID,
+		"lead_agent":      string(cr.LeadAgent),
+	} {
+		if redact.Text(v) != v {
+			return fmt.Errorf("state: a secret was detected in active-run field %s", field)
+		}
 	}
 	return nil
 }

@@ -17,12 +17,15 @@ import (
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
+// opID builds a valid minted operation id ("op-" + 32 hex of the given digit).
+func opID(c string) string { return "op-" + strings.Repeat(c, 32) }
+
 // validIntent builds a coherent intent whose derived layout validates.
 func validIntent() BootstrapIntent {
 	runID := "run-" + strings.Repeat("a", 32)
 	pol, _ := config.ParseRunPolicy(policyBytes())
 	return BootstrapIntent{
-		RunID: runID, TxnID: "boot-x1", OperationID: "op-x1",
+		RunID: runID, TxnID: "boot-x1", OperationID: opID("c"),
 		SessionID: "sess-" + strings.Repeat("b", 32), Agent: state.AgentClaude, CreatedUnix: 1000,
 		RelDir: ".claudex/runs/" + runID, TaskRelPath: "inputs/task.json",
 		TaskDigest: config.Hash(taskBytes()), TaskCanonical: taskBytes(),
@@ -103,7 +106,7 @@ func newRequest(t *testing.T, repoDir string, wt WorktreeProvisioner) FirstAttac
 	return FirstAttachRequest{
 		RepoDir:         repoDir,
 		Agent:           state.AgentClaude,
-		OperationID:     "op-abc123",
+		OperationID:     opID("a"),
 		TaskCanonical:   taskBytes(),
 		PolicyCanonical: policyBytes(),
 		CreatedUnix:     1000,
@@ -176,7 +179,7 @@ func TestFirstAttachActiveRunSemantics(t *testing.T) {
 
 	// A genuinely different operation refuses.
 	other := newRequest(t, repo, &fakeWorktree{})
-	other.OperationID = "op-different"
+	other.OperationID = opID("d")
 	if _, err := FirstAttach(other); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("different-op attach err = %v, want ErrRunExists", err)
 	}
@@ -184,7 +187,7 @@ func TestFirstAttachActiveRunSemantics(t *testing.T) {
 	// The same operation id (a retry after a lost response) returns the incumbent
 	// run and lead session — never a forced replacement — even though the journal
 	// is already terminal.
-	retry := newRequest(t, repo, &fakeWorktree{}) // same OperationID "op-abc123"
+	retry := newRequest(t, repo, &fakeWorktree{}) // same OperationID opID("a")
 	got, err := FirstAttach(retry)
 	if err != nil {
 		t.Fatalf("idempotent retry: %v", err)
@@ -368,5 +371,151 @@ func TestSnapshotConflictIsIndeterminate(t *testing.T) {
 	st, err := step.Status()
 	if err != nil || st != txn.StatusIndeterminate {
 		t.Fatalf("conflicting snapshot status = %q err=%v, want indeterminate", st, err)
+	}
+}
+
+func withRepoGuard(t *testing.T, lock string, fn func(g *genstore.Guard)) {
+	t.Helper()
+	g, ok, err := genstore.Acquire(lock)
+	if err != nil || !ok {
+		t.Fatalf("acquire repo guard: %v", err)
+	}
+	defer g.Release()
+	fn(g)
+}
+
+// A different operation that arrives while a bootstrap is pending completes the
+// recovery but is told the run exists — it never receives the incumbent session.
+func TestFirstAttachDifferentOpDoesNotGetSession(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := FirstAttach(newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
+		t.Fatalf("first attach should fail at the worktree step")
+	}
+	other := newRequest(t, repo, &fakeWorktree{}) // healthy worktree drives recovery
+	other.OperationID = opID("d")
+	if _, err := FirstAttach(other); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("different-op pending recovery err = %v, want ErrRunExists", err)
+	}
+	// Recovery still completed: an active run now exists.
+	lay := layoutFor(repo)
+	cur, ok, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if !ok || !cur.Active {
+		t.Fatalf("recovery did not complete the run")
+	}
+}
+
+// A completed run can be cleared and a second run bootstrapped; both catalog refs
+// are retained and the second run is current.
+func TestFirstAttachSecondRunAfterClear(t *testing.T) {
+	repo := t.TempDir()
+	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	if err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	lay := layoutFor(repo)
+	// Simulate run A reaching terminal: clear the active-run pointer.
+	withRepoGuard(t, lay.repoLock, func(g *genstore.Guard) {
+		store := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock)
+		cur, _, _ := store.Load()
+		if _, err := store.MutateLocked(g, cur.Revision, func(n *state.CurrentRun) error { n.Active = false; return nil }); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+	})
+
+	reqB := newRequest(t, repo, &fakeWorktree{})
+	reqB.OperationID = opID("b")
+	reqB.RNG = bytes.NewReader(bytes.Repeat([]byte{0x77, 0x11, 0x88, 0x22}, 64)) // distinct ids from run A
+	b, err := FirstAttach(reqB)
+	if err != nil {
+		t.Fatalf("run B: %v", err)
+	}
+	if b.RunID == a.RunID {
+		t.Fatalf("run B reused run A's id")
+	}
+	// Both catalog refs retained.
+	cat, _, _ := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()
+	if _, okA := cat.Lookup(a.RunID); !okA {
+		t.Fatalf("run A dropped from catalog")
+	}
+	if _, okB := cat.Lookup(b.RunID); !okB {
+		t.Fatalf("run B missing from catalog")
+	}
+	// B is current.
+	cur, _, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if !cur.Active || cur.RunID != b.RunID {
+		t.Fatalf("current run = %+v, want B active", cur)
+	}
+}
+
+// A crash after each durable step (effect applied, progress not recorded) is
+// recovered forward on retry to a fully bootstrapped run.
+func TestBootstrapCutRecovers(t *testing.T) {
+	for _, step := range []string{"registry-init", "state-init", "catalog-allocate", "current-run-set"} {
+		t.Run(step, func(t *testing.T) {
+			repo := t.TempDir()
+			fired := false
+			stepFailpoint = func(s string) error {
+				if s == step && !fired {
+					fired = true
+					return errors.New("injected crash after " + s)
+				}
+				return nil
+			}
+			defer func() { stepFailpoint = nil }()
+
+			// One worktree instance across both calls, so it reports its provisioned
+			// state on recovery (a real provisioner observes the on-disk worktree).
+			wt := &fakeWorktree{}
+			if _, err := FirstAttach(newRequest(t, repo, wt)); err == nil {
+				t.Fatalf("expected a crash after %s", step)
+			}
+			stepFailpoint = nil // healthy retry
+			got, err := FirstAttach(newRequest(t, repo, wt))
+			if err != nil {
+				t.Fatalf("recovery after %s cut: %v", step, err)
+			}
+			lay := layoutFor(repo)
+			cur, ok, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+			if !ok || !cur.Active || cur.RunID != got.RunID {
+				t.Fatalf("run not fully bootstrapped after recovering the %s cut", step)
+			}
+		})
+	}
+}
+
+// Concurrent first attaches serialize on the repo lock: exactly one bootstraps a
+// run; the other is busy or told the run exists, and only one run is allocated.
+func TestFirstAttachConcurrent(t *testing.T) {
+	repo := t.TempDir()
+	type outcome struct {
+		res FirstAttachResult
+		err error
+	}
+	results := make(chan outcome, 2)
+	for _, op := range []string{opID("a"), opID("b")} {
+		op := op
+		go func() {
+			req := newRequest(t, repo, &fakeWorktree{})
+			req.OperationID = op
+			res, err := FirstAttach(req)
+			results <- outcome{res, err}
+		}()
+	}
+	got := []outcome{<-results, <-results}
+	successes := 0
+	for _, o := range got {
+		if o.err == nil {
+			successes++
+		} else if !errors.Is(o.err, ErrRunExists) && !errors.Is(o.err, genstore.ErrBusy) {
+			t.Fatalf("unexpected concurrent error: %v", o.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent successes = %d, want exactly 1", successes)
+	}
+	lay := layoutFor(repo)
+	cat, _, _ := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()
+	if len(cat.Runs) != 1 {
+		t.Fatalf("catalog has %d runs, want exactly 1", len(cat.Runs))
 	}
 }
