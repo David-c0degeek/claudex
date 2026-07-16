@@ -48,11 +48,30 @@ func (e *LegacyRunError) Error() string {
 	return fmt.Sprintf("%s is a pre-pivot Python claudex run: %s", e.StatePath, Remediation)
 }
 
-// CheckRunDir reports a pre-pivot legacy run in dir WITHOUT mutating anything.
-// If <dir>/state.json is a legacy Python state it returns a *LegacyRunError so a
-// bootstrap/resume path can fail closed with remediation instead of seeing an
-// empty attach store and allocating over the legacy run. A missing or
-// non-legacy state.json returns nil; an unreadable one returns the read error.
+// UnknownStateError signals a directory that holds an existing state.json which
+// is neither a recognized pre-pivot legacy state nor part of the attach store.
+// Attach state lives in immutable generation directories, never in
+// <run>/state.json, so any state.json here is unexplained — malformed, from an
+// unrelated tool, or a future/unknown schema — and the directory must not be
+// allocated over. Fail closed rather than trust it.
+type UnknownStateError struct {
+	StatePath string
+}
+
+func (e *UnknownStateError) Error() string {
+	return fmt.Sprintf("%s holds an unrecognized state.json (not a legacy run, not an attach generation); "+
+		"refusing to allocate over it — inspect, upgrade, or move it aside before starting a run here", e.StatePath)
+}
+
+// CheckRunDir inspects dir for an existing state.json WITHOUT mutating anything,
+// so a bootstrap/resume path can fail closed before any allocation. Because
+// attach state lives in immutable generation directories (never in
+// <dir>/state.json), any existing state.json is unexplained and blocks:
+//
+//   - missing state.json           -> nil (safe to allocate)
+//   - a detected pivot Python run  -> *LegacyRunError (with Remediation)
+//   - any other existing state.json -> *UnknownStateError (fail closed)
+//   - an unreadable state.json     -> the read error
 func CheckRunDir(dir string) error {
 	p := filepath.Join(dir, LegacyStateFile)
 	raw, err := os.ReadFile(p)
@@ -65,7 +84,7 @@ func CheckRunDir(dir string) error {
 	if Detect(raw) {
 		return &LegacyRunError{StatePath: p}
 	}
-	return nil
+	return &UnknownStateError{StatePath: p}
 }
 
 // Detect reports whether raw is a pre-pivot Python state. It is conservative: a

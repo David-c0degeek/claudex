@@ -105,14 +105,20 @@ func TestInspectRejectsNonLegacy(t *testing.T) {
 	}
 }
 
-// CheckRunDir is the actual bootstrap/resume refusal seam: a legacy run
-// directory (state.json + state.v1.bak.json + current) must be refused with a
-// typed error carrying Remediation, and nothing on disk may change.
+// CheckRunDir is the actual bootstrap/resume refusal seam. A legacy run in the
+// real harvested layout (.claudex/runs/<run_id>/state.json + sibling backup,
+// with the repo-level .claudex/current pointer) must be refused with a typed
+// error carrying Remediation, and nothing on disk may change.
 func TestCheckRunDirRefusesLegacyAndPreservesBytes(t *testing.T) {
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "state.json")
-	bakPath := filepath.Join(dir, "state.v1.bak.json")
-	curPath := filepath.Join(dir, "current")
+	repo := t.TempDir()
+	claudex := filepath.Join(repo, ".claudex")
+	runDir := filepath.Join(claudex, "runs", "20260714-abc123")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
+	statePath := filepath.Join(runDir, "state.json")
+	bakPath := filepath.Join(runDir, "state.v1.bak.json")
+	curPath := filepath.Join(claudex, "current") // repo-level pointer
 
 	stateBytes := readFixture(t)
 	bakBytes := append([]byte(nil), stateBytes...) // an existing legacy backup
@@ -121,7 +127,7 @@ func TestCheckRunDirRefusesLegacyAndPreservesBytes(t *testing.T) {
 	mustWrite(t, bakPath, bakBytes)
 	mustWrite(t, curPath, curBytes)
 
-	err := CheckRunDir(dir)
+	err := CheckRunDir(runDir)
 	var lre *LegacyRunError
 	if !errors.As(err, &lre) {
 		t.Fatalf("CheckRunDir err = %v, want *LegacyRunError", err)
@@ -133,21 +139,44 @@ func TestCheckRunDirRefusesLegacyAndPreservesBytes(t *testing.T) {
 		t.Fatalf("refusal missing remediation: %v", lre)
 	}
 
-	// .bak and pointer preservation: the read-only guard changed nothing.
+	// .bak and repo-level pointer preservation: the read-only guard changed nothing.
 	assertBytes(t, statePath, stateBytes)
 	assertBytes(t, bakPath, bakBytes)
 	assertBytes(t, curPath, curBytes)
 }
 
-func TestCheckRunDirIgnoresMissingAndAttach(t *testing.T) {
-	empty := t.TempDir()
-	if err := CheckRunDir(empty); err != nil {
-		t.Fatalf("empty dir CheckRunDir = %v, want nil", err)
+func TestCheckRunDirMissingIsSafe(t *testing.T) {
+	if err := CheckRunDir(t.TempDir()); err != nil {
+		t.Fatalf("missing state.json CheckRunDir = %v, want nil", err)
 	}
-	attach := t.TempDir()
-	mustWrite(t, filepath.Join(attach, "state.json"), []byte(`{"schema_version":1,"revision":1,"run_id":"r"}`))
-	if err := CheckRunDir(attach); err != nil {
-		t.Fatalf("attach state.json CheckRunDir = %v, want nil (not legacy)", err)
+}
+
+// Any existing state.json that is not a recognized legacy run fails closed:
+// attach state never lives at <dir>/state.json, so an unrecognized one is
+// unexplained and must block allocation, never return nil.
+func TestCheckRunDirFailsClosedOnUnrecognizedState(t *testing.T) {
+	cases := map[string]string{
+		"malformed":      `{not json`,
+		"unrelated":      `{"hello":"world"}`,
+		"attach-like":    `{"schema_version":1,"revision":1,"run_id":"r"}`,
+		"future-schema":  `{"schema_version":999,"revision":1,"run_id":"r"}`,
+		"legacy-partial": `{"lead":"claude"}`, // lacks phase+markers: not legacy, still unexplained
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "state.json")
+			mustWrite(t, path, []byte(body))
+			err := CheckRunDir(dir)
+			var use *UnknownStateError
+			if !errors.As(err, &use) {
+				t.Fatalf("CheckRunDir(%s) err = %v, want *UnknownStateError", name, err)
+			}
+			if use.StatePath != path {
+				t.Fatalf("UnknownStateError.StatePath = %q, want %q", use.StatePath, path)
+			}
+			assertBytes(t, path, []byte(body)) // never mutated
+		})
 	}
 }
 
