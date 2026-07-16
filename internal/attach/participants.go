@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 
 	"github.com/David-c0degeek/claudex/internal/atomicfile"
@@ -48,6 +49,21 @@ func planFor(lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan,
 	}
 	if raw.TxnID != in.TxnID {
 		return txn.Plan{}, fmt.Errorf("attach: envelope txn id disagrees with the payload")
+	}
+	// A clear-prior is authority-bound BEFORE any participant runs: the named prior
+	// run's persisted state must be identity-matching and ABSORBING-terminal, so a
+	// validly-shaped but forged intent can never evict a live run. This is stable
+	// after the pointer is cleared (an absorbing lifecycle can't be resurrected), so
+	// recovery revalidates it identically.
+	if in.ClearPriorRunID != "" {
+		priorState := state.Open(filepath.Join(lay.runDir(state.RunDirRelFor(in.ClearPriorRunID)), "state"), lay.repoLock)
+		rs, ok, serr := priorState.Load()
+		if serr != nil {
+			return txn.Plan{}, serr
+		}
+		if !ok || rs.RunID != in.ClearPriorRunID || !state.IsAbsorbingLifecycle(rs.Lifecycle) {
+			return txn.Plan{}, fmt.Errorf("attach: clear_prior %q is not an absorbing-terminal run", in.ClearPriorRunID)
+		}
 	}
 	runDir := lay.runDir(in.RelDir)
 	registry := state.OpenRegistry(path.Join(runDir, "registry"), lay.repoLock)
@@ -295,10 +311,12 @@ func catalogStep(store *state.CatalogStore, g *genstore.Guard, in BootstrapInten
 	}
 }
 
-// currentClearStep clears a terminal predecessor inside this bootstrap's journal.
-// Observe is MONOTONIC: the pointer being inactive, or already advanced to this
-// run, both count as Applied, so the later current-set does not invalidate the
-// prefix observation on recovery.
+// currentClearStep clears the FROZEN terminal predecessor inside this bootstrap's
+// journal. The pre-effect pointer must be the exact prior run at the exact frozen
+// revision — a same-id but newer activation is Indeterminate, never clearable, so
+// recovering an old journal can't evict a fresh run. Observe is MONOTONIC: the
+// pointer being inactive, or already advanced to exactly this run, both count as
+// Applied, so the later current-set does not invalidate the prefix on recovery.
 func currentClearStep(store *state.CurrentRunStore, g *genstore.Guard, in BootstrapIntent) txn.Step {
 	return txn.Step{
 		Name: "current-clear",
@@ -308,25 +326,23 @@ func currentClearStep(store *state.CurrentRunStore, g *genstore.Guard, in Bootst
 				return "", err
 			}
 			if !ok {
-				return txn.StatusIndeterminate, nil // clear was requested but no pointer exists
+				return txn.StatusIndeterminate, nil // clear requested but no pointer exists
 			}
-			if !cur.Active || cur.RunID == in.RunID {
-				return txn.StatusApplied, nil // cleared, or already advanced to this run
+			if !cur.Active {
+				return txn.StatusApplied, nil // cleared
 			}
-			if cur.RunID == in.ClearPriorRunID {
-				return txn.StatusNotApplied, nil
+			if cur.RunID == in.RunID && cur.RelDir == in.RelDir && cur.OperationID == in.OperationID {
+				return txn.StatusApplied, nil // already advanced to exactly this run
 			}
-			return txn.StatusIndeterminate, nil
+			if cur.RunID == in.ClearPriorRunID && cur.Revision == in.ClearPriorRevision {
+				return txn.StatusNotApplied, nil // the exact frozen prior, clearable
+			}
+			return txn.StatusIndeterminate, nil // newer activation or a different run
 		},
 		Apply: func() error {
-			cur, ok, err := store.Load()
-			if err != nil {
-				return err
-			}
-			if !ok || !cur.Active || cur.RunID != in.ClearPriorRunID {
-				return nil // idempotent: already cleared/advanced
-			}
-			_, err = store.Clear(g, cur.Revision, in.ClearPriorRunID)
+			// Clear binds the frozen revision AND the prior run id, so a moved pointer
+			// fails the CAS rather than clearing a newer activation.
+			_, err := store.Clear(g, in.ClearPriorRevision, in.ClearPriorRunID)
 			return err
 		},
 	}

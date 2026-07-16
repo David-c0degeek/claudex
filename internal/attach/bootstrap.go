@@ -310,7 +310,10 @@ func sameOpResult(lay layout, journal *txn.Journal, cur state.CurrentRun) (First
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	if !ok || !rec.Terminal() || rec.Intent.Kind != intentKind {
+	// A COMPLETED (never aborted) bootstrap with a fully-bound envelope — an aborted
+	// transaction must never yield a session even if other stores were cross-wired.
+	if !ok || !rec.Complete || rec.Aborted ||
+		rec.Intent.Version != txn.IntentVersion || rec.Intent.Kind != intentKind || rec.Intent.ExpectedStateRevision != 0 {
 		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 	}
 	bi, err := decodeIntent(rec.Intent.Payload)

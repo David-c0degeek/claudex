@@ -600,7 +600,9 @@ func TestSameOpRefusesReplacedSession(t *testing.T) {
 		t.Fatalf("first attach: %v", err)
 	}
 	lay := layoutFor(repo)
-	regStore := state.OpenRegistry(filepath.Join(lay.runDir(state.RunDirRelFor(a.RunID)), "registry"), lay.repoLock)
+	// A same-role replacement happens through the run's own lock, not the repo lock.
+	aRunDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	regStore := state.OpenRegistry(filepath.Join(aRunDir, "registry"), filepath.Join(aRunDir, "run.lock"))
 	reg, _, _ := regStore.Load()
 	newSess := "sess-" + strings.Repeat("f", 32)
 	if _, err := regStore.Mutate(reg.Revision, func(gen uint64, next *state.Registry) error {
@@ -612,5 +614,142 @@ func TestSameOpRefusesReplacedSession(t *testing.T) {
 	}
 	if _, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{})); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("retry after replacement err = %v, want ErrRunExists (never the stale session)", err)
+	}
+}
+
+// A crash after current-clear or B's current-run-set recovers forward: A and B
+// both stay in catalog history and B ends exactly current.
+func TestSecondRunCutRecovers(t *testing.T) {
+	for _, step := range []string{"current-clear", "current-run-set"} {
+		t.Run(step, func(t *testing.T) {
+			repo := t.TempDir()
+			a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+			if err != nil {
+				t.Fatalf("run A: %v", err)
+			}
+			lay := layoutFor(repo)
+			aRunDir := lay.runDir(state.RunDirRelFor(a.RunID))
+			aStore := state.Open(filepath.Join(aRunDir, "state"), filepath.Join(aRunDir, "run.lock"))
+			rsA, _, _ := aStore.Load()
+			if _, err := aStore.Mutate(rsA.Revision, func(_ uint64, n *state.RunState) error { n.Lifecycle = state.LifecycleCancelled; return nil }); err != nil {
+				t.Fatalf("terminate A: %v", err)
+			}
+
+			fired := false
+			stepFailpoint = func(s string) error {
+				if s == step && !fired {
+					fired = true
+					return errors.New("injected crash after " + s)
+				}
+				return nil
+			}
+			defer func() { stepFailpoint = nil }()
+
+			wtB := &fakeWorktree{}
+			reqB := newRequest(t, repo, wtB)
+			reqB.OperationID = opID("b")
+			reqB.RNG = bytes.NewReader(bytes.Repeat([]byte{0x77, 0x11, 0x88, 0x22}, 64))
+			if _, err := FirstAttach(reqB); err == nil {
+				t.Fatalf("expected a crash after %s", step)
+			}
+			stepFailpoint = nil
+
+			gotB, err := FirstAttach(minimalRequest(repo, opID("b"), wtB))
+			if err != nil {
+				t.Fatalf("recover B after %s cut: %v", step, err)
+			}
+			cat, _, _ := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()
+			if _, okA := cat.Lookup(a.RunID); !okA {
+				t.Fatalf("run A dropped from catalog")
+			}
+			if _, okB := cat.Lookup(gotB.RunID); !okB {
+				t.Fatalf("run B missing from catalog")
+			}
+			cur, ok, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+			if !ok || !cur.Active || cur.RunID != gotB.RunID {
+				t.Fatalf("B is not exactly current after the %s cut", step)
+			}
+		})
+	}
+}
+
+// The combined same-op read fails closed on any journal<->pointer<->registry
+// mismatch (hand-built pointer) and a missing registry.
+func TestSameOpResultRejectsMismatch(t *testing.T) {
+	repo := t.TempDir()
+	FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	lay := layoutFor(repo)
+	journal := txn.Open(lay.bootstrapJournal, lay.repoLock)
+	good, _, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if _, err := sameOpResult(lay, journal, good); err != nil {
+		t.Fatalf("baseline combined read: %v", err)
+	}
+	other := "run-" + strings.Repeat("e", 32)
+	mismatches := map[string]state.CurrentRun{
+		"run id":    {SchemaVersion: 1, Revision: good.Revision, Active: true, RunID: other, RelDir: state.RunDirRelFor(other), OperationID: good.OperationID},
+		"rel dir":   {SchemaVersion: 1, Revision: good.Revision, Active: true, RunID: good.RunID, RelDir: ".claudex/runs/other", OperationID: good.OperationID},
+		"operation": {SchemaVersion: 1, Revision: good.Revision, Active: true, RunID: good.RunID, RelDir: good.RelDir, OperationID: opID("f")},
+	}
+	for name, bad := range mismatches {
+		if _, err := sameOpResult(lay, journal, bad); !errors.Is(err, ErrRunExists) {
+			t.Fatalf("%s mismatch err = %v, want ErrRunExists", name, err)
+		}
+	}
+	// A missing registry for the journal's run also fails closed.
+	if err := os.RemoveAll(filepath.Join(lay.runDir(good.RelDir), "registry")); err != nil {
+		t.Fatalf("remove registry: %v", err)
+	}
+	if _, err := sameOpResult(lay, journal, good); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("missing registry err = %v, want ErrRunExists", err)
+	}
+}
+
+// planFor refuses a forged clear-prior that names a still-running run, so a
+// tampered journal can never evict a live run.
+func TestPlanForRejectsNonterminalClearPrior(t *testing.T) {
+	repo := t.TempDir()
+	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{})) // A is RUNNING
+	if err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	lay := layoutFor(repo)
+	in := validIntent()
+	in.ClearPriorRunID = a.RunID
+	in.ClearPriorRevision = 1
+	payload, _ := in.marshal()
+
+	g, ok, err := genstore.Acquire(lay.repoLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer g.Release()
+	_, perr := planFor(lay, seams{base: fakeBase{commit: strings.Repeat("a", 40)}, worktree: &fakeWorktree{}}, g,
+		txn.Intent{Version: txn.IntentVersion, Kind: intentKind, TxnID: in.TxnID, Payload: payload})
+	if perr == nil {
+		t.Fatalf("planFor accepted a clear-prior naming a running run")
+	}
+}
+
+// current-clear only clears the EXACT frozen prior revision; a same-id newer
+// activation is Indeterminate, never clearable.
+func TestCurrentClearStepFrozenRevision(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "run.lock")
+	store := state.OpenCurrentRun(filepath.Join(dir, "active-run"), lock)
+	g, ok, err := genstore.Acquire(lock)
+	if err != nil || !ok {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer g.Release()
+	if _, err := store.Activate(g, 0, "run-a", state.RunDirRelFor("run-a"), opID("a")); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	in := BootstrapIntent{
+		RunID: "run-b", RelDir: state.RunDirRelFor("run-b"), OperationID: opID("b"),
+		ClearPriorRunID: "run-a", ClearPriorRevision: 99, // != the pointer's actual revision (1)
+	}
+	st, err := currentClearStep(store, g, in).Status()
+	if err != nil || st != txn.StatusIndeterminate {
+		t.Fatalf("frozen-revision clear status = %q err=%v, want indeterminate", st, err)
 	}
 }
