@@ -56,19 +56,16 @@ func mustInit(t *testing.T, s *Store) RunState {
 	return rs
 }
 
-// assignAgentTurn moves the run into an actionable agent phase (IMPLEMENT_STEP)
-// with turnID assigned, the pre-transition shape a real submit consumes.
-func assignAgentTurn(t *testing.T, s *Store, prev RunState, turnID string) RunState {
+// assignAgentTurn drives a run from its pristine INIT (init) through the real plan
+// negotiation to a 1-step agreed plan at IMPLEMENT_STEP, then assigns turnID there
+// — the pre-transition shape a real submit consumes. The v5 shape requires an
+// agreed plan to be at any implementation phase, so this is no longer a single
+// generation; callers that care about the resulting revision read it from the
+// returned state, not a hardcoded number.
+func assignAgentTurn(t *testing.T, s *Store, init RunState, turnID string) RunState {
 	t.Helper()
-	rs, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error {
-		next.Phase = PhaseImplementStep
-		next.Assignment = &Ref{ID: turnID, IssuedRevision: rev}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("assign %s: %v", turnID, err)
-	}
-	return rs
+	impl := driveToAgreedImplement(t, s, init)
+	return assignAt(t, s, impl, turnID)
 }
 
 func TestInitAndLoad(t *testing.T) {
@@ -274,7 +271,6 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
 		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
 		next.Assignment = nil
-		next.Phase = PhaseTests
 		return nil
 	})
 	if err != nil {
@@ -291,9 +287,11 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	s, stateDir := newStoreDir(t)
 	r1 := mustInit(t, s)
-	r1b := assignAgentTurn(t, s, r1, "t1") // gen 2: IMPLEMENT_STEP, t1 assigned
-	// Occupy generation 3 with a torn file so the next append skips to 4.
-	if err := os.WriteFile(filepath.Join(stateDir, fmt.Sprintf("%012d.gen", 3)), []byte("garbage"), 0o600); err != nil {
+	r1b := assignAgentTurn(t, s, r1, "t1") // IMPLEMENT_STEP, t1 assigned
+	// Occupy the next generation with a torn file so the append skips over it.
+	torn := r1b.Revision + 1
+	skippedTo := r1b.Revision + 2
+	if err := os.WriteFile(filepath.Join(stateDir, fmt.Sprintf("%012d.gen", torn)), []byte("garbage"), 0o600); err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}
 	r4, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
@@ -304,11 +302,11 @@ func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mutate across gap: %v", err)
 	}
-	if r4.Revision != 4 || r4.Assignment == nil || r4.Assignment.IssuedRevision != 4 {
-		t.Fatalf("gap issuance = rev %d assignment %+v, want rev 4 / issued 4", r4.Revision, r4.Assignment)
+	if r4.Revision != skippedTo || r4.Assignment == nil || r4.Assignment.IssuedRevision != skippedTo {
+		t.Fatalf("gap issuance = rev %d assignment %+v, want rev %d / issued %d", r4.Revision, r4.Assignment, skippedTo, skippedTo)
 	}
-	if r4.AcceptedTurns["t1"].Receipt.Revision != 4 {
-		t.Fatalf("accepted-turn receipt revision = %d, want the skipped-to generation 4", r4.AcceptedTurns["t1"].Receipt.Revision)
+	if r4.AcceptedTurns["t1"].Receipt.Revision != skippedTo {
+		t.Fatalf("accepted-turn receipt revision = %d, want the skipped-to generation %d", r4.AcceptedTurns["t1"].Receipt.Revision, skippedTo)
 	}
 }
 
@@ -537,7 +535,7 @@ func TestFirstTurnRequiresPristineInit(t *testing.T) {
 			next.Assignment = &Ref{ID: "turn-early", IssuedRevision: rev}
 		},
 		"non-running init": func(_ uint64, next *RunState) {
-			next.Lifecycle = LifecyclePaused
+			next.Lifecycle = LifecycleCancelled
 		},
 	}
 	for name, taint := range cases {

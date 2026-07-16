@@ -263,5 +263,16 @@ func normalizeToBaseline(rs state.RunState, in PairAttachIntent) state.RunState 
 	rs.PendingTxnID = ""
 	rs.Counters = state.Counters{StepFixes: []int{}}
 	rs.AcceptedTurns = map[string]state.AcceptedTurn{}
+	// The v5 phase-engine working set is empty at the pristine baseline; a
+	// downstream transition (plan negotiation onward) introduces it, so strip it
+	// before comparing the immutable remainder.
+	rs.CandidatePlan = nil
+	rs.CandidateChecks = nil
+	rs.PendingFindings = nil
+	rs.AgreedPlan = nil
+	rs.StepIndex = nil
+	rs.FixReturn = ""
+	rs.Verify = nil
+	rs.Pause = nil
 	return rs
 }

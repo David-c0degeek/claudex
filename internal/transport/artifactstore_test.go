@@ -127,17 +127,16 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 	t.Run("paused gate", func(t *testing.T) {
 		store, rev := newRunWithActiveTurn(t)
 		rg, err := store.Mutate(rev, func(gen uint64, next *state.RunState) error {
-			next.Lifecycle = state.LifecyclePaused
-			next.Phase = state.PhaseAwaitGuidance
-			next.Assignment = nil
-			next.Gate = &state.Ref{ID: "gate-1", IssuedRevision: gen}
+			acceptAndHumanGate(next, gen, state.PhaseImplementStep, "turn-1", dig("7"), "gate-1")
 			return nil
 		})
 		if err != nil {
 			t.Fatalf("gate: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rg.Revision, "x"), ownerAuth("sess-1"), adv)
+		// turn-1 is the accepted gate source; submit a fresh turn so the not-accepting
+		// refusal (not an already-accepted replay) is what surfaces.
+		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-2", rg.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("paused-gate submit err = %v, want ErrNotAccepting", err)
 		}

@@ -228,6 +228,13 @@ func TestJoinAttachRecoversAfterDownstreamAccept(t *testing.T) {
 			Receipt:        state.Receipt{TurnID: pin.FirstTurnID, Revision: gen, ArtifactDigest: dg},
 			Phase:          state.PhasePlanDraft,
 		}
+		// PLAN_CRITIQUE carries the candidate plan the accepted draft produced.
+		n.CandidatePlan = &state.PlanRef{
+			Source:    state.EventRef{Digest: dg, TurnID: pin.FirstTurnID},
+			Digest:    strings.Repeat("b", 64),
+			StepCount: 1,
+		}
+		n.CandidateChecks = &state.CheckSetRef{Keys: []string{"chk-a"}, Digest: strings.Repeat("c", 64)}
 		n.Assignment = &state.Ref{ID: "turn-critique", IssuedRevision: gen}
 		return nil
 	}); err != nil {

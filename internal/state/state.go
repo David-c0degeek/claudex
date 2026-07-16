@@ -31,9 +31,13 @@ import (
 // completed bootstrap journal for it. v4 added the write-once FirstTurn issuance
 // record — append-only assignment history that durably proves which first turn
 // was issued at INIT->PLAN_DRAFT even after the mutable Assignment has moved on.
-// An older generation is missing a required field, so it fails with version
-// remediation, not a vague error (see checkSchemaVersion).
-const RunStateVersion = 4
+// v5 added the phase-engine working set: the plan-negotiation staging
+// (CandidatePlan/CandidateChecks/PendingFindings), the frozen immutable AgreedPlan,
+// the implementation cursor (StepIndex) and per-phase FIX/VERIFY context, and the
+// durable human-gate resume record (Pause) unifying human-decision and
+// quality-budget gates. An older generation is missing a required field, so it
+// fails with version remediation, not a vague error (see checkSchemaVersion).
+const RunStateVersion = 5
 
 // ErrRevisionConflict is returned when a mutation's expected revision does not
 // match the current head.
@@ -128,6 +132,101 @@ type Projection struct {
 	AtRevision uint64 `json:"at_revision"`
 }
 
+// EventRef is the provenance of one accepted artifact (an agent turn) or a
+// coordinator test result. TurnID is a non-empty accepted agent turn id, or empty
+// for the single coordinator TESTS source. EventRef carries no redundant kind: the
+// authoritative artifact type is AcceptedTurns[TurnID].Phase, and the containing
+// field supplies the expected source phase. Digest is the raw accepted canonical
+// artifact digest (agent) or the coordinator test-result digest (TESTS).
+type EventRef struct {
+	Digest string `json:"digest"`
+	TurnID string `json:"turn_id"`
+}
+
+// PlanRef points at one proposed plan. Digest is the MATERIALIZED canonical
+// plan-document digest — distinct from Source.Digest, which is the accepted
+// plan/plan_revision submit artifact (an envelope, and for a revision a patch).
+// StepCount is the frozen step count (1..protocol.MaxPlanSteps) that bounds the
+// implementation cursor and per-step fix vector without holding the steps.
+type PlanRef struct {
+	Source    EventRef `json:"source"`
+	Digest    string   `json:"digest"`
+	StepCount int      `json:"step_count"`
+}
+
+// CheckSetRef is the materialized implementation-check obligation set: strictly
+// sorted canonical keys plus the digest of the canonical full materialized check
+// array. An empty key set carries the canonical digest of the empty array.
+type CheckSetRef struct {
+	Keys   []string `json:"keys"`
+	Digest string   `json:"digest"`
+}
+
+// FindingObligations are the actionable critique findings a plan revision must
+// answer: the raising plan_critique event plus a non-empty, strictly sorted key set.
+type FindingObligations struct {
+	Source EventRef `json:"source"`
+	Keys   []string `json:"keys"`
+}
+
+// PlanAgreement is the frozen, immutable outcome of plan negotiation. Once set it
+// never changes; it carries the agreed plan, the agreeing critique, the frozen
+// implementation-check obligations, and the promotion revision.
+type PlanAgreement struct {
+	Plan           PlanRef     `json:"plan"`
+	Critique       EventRef    `json:"critique"`
+	Checks         CheckSetRef `json:"checks"`
+	AgreedRevision uint64      `json:"agreed_revision"`
+}
+
+// VerifyRequirement owns the ownerless-VERIFY threshold: the pair generation that
+// must be reached before a verification turn issues (VERIFY enters ownerless, with
+// no assignment, until the reviewer is replaced). The attempt is DERIVED as
+// Counters.VerifyFixes+1 (range 1..config.MaxBudget+1) and never stored.
+type VerifyRequirement struct {
+	RequiredGeneration uint64 `json:"required_generation"`
+}
+
+// PauseKind discriminates the two durable human-gated pauses. Both use
+// AWAIT_GUIDANCE + LifecyclePaused + Gate; neither is the D019 usage-window pause
+// (LifecyclePausedBudget), which carries no gate.
+type PauseKind string
+
+const (
+	PauseHumanDecision PauseKind = "human_decision"
+	PauseQualityBudget PauseKind = "quality_budget"
+)
+
+// BudgetKind names the exhausted quality budget of a quality_budget pause.
+type BudgetKind string
+
+const (
+	BudgetPlan       BudgetKind = "plan"
+	BudgetCheckpoint BudgetKind = "checkpoint"
+	BudgetTest       BudgetKind = "test"
+	BudgetVerify     BudgetKind = "verify"
+)
+
+// BudgetPause is the quality-budget detail of a PauseContext.
+type BudgetPause struct {
+	Kind BudgetKind `json:"kind"`
+}
+
+// PauseContext is the durable resume record for a human-gated pause. It records
+// where the run paused out of and resumes into, the accepted (or coordinator)
+// event that raised the gate, and — moved in from the live state for the duration
+// of the pause — the FIX return target and/or VERIFY requirement that must be
+// restored on resume.
+type PauseContext struct {
+	Kind        PauseKind          `json:"kind"`
+	OriginPhase Phase              `json:"origin_phase"`
+	ResumePhase Phase              `json:"resume_phase"`
+	FixReturn   Phase              `json:"fix_return,omitempty"`
+	Source      EventRef           `json:"source"`
+	Budget      *BudgetPause       `json:"budget,omitempty"`
+	Verify      *VerifyRequirement `json:"verify,omitempty"`
+}
+
 // RunState is the authoritative typed state of a run. Absent refs/projections are
 // nil (distinct from a present all-zero record).
 type RunState struct {
@@ -151,6 +250,14 @@ type RunState struct {
 	Assignment      *Ref                    `json:"assignment,omitempty"`
 	FirstTurn       *Ref                    `json:"first_turn,omitempty"`
 	Gate            *Ref                    `json:"gate,omitempty"`
+	CandidatePlan   *PlanRef                `json:"candidate_plan,omitempty"`
+	CandidateChecks *CheckSetRef            `json:"candidate_checks,omitempty"`
+	PendingFindings *FindingObligations     `json:"pending_findings,omitempty"`
+	AgreedPlan      *PlanAgreement          `json:"agreed_plan,omitempty"`
+	StepIndex       *int                    `json:"step_index,omitempty"`
+	FixReturn       Phase                   `json:"fix_return,omitempty"`
+	Verify          *VerifyRequirement      `json:"verify,omitempty"`
+	Pause           *PauseContext           `json:"pause,omitempty"`
 	AcceptedTurns   map[string]AcceptedTurn `json:"accepted_turns"`
 	PendingTxnID    string                  `json:"pending_txn_id"`
 	Recovery        *Projection             `json:"recovery,omitempty"`
@@ -295,6 +402,45 @@ func cloneForNext(prev *RunState) *RunState {
 	if prev.Gate != nil {
 		g := *prev.Gate
 		n.Gate = &g
+	}
+	if prev.CandidatePlan != nil {
+		cp := *prev.CandidatePlan
+		n.CandidatePlan = &cp
+	}
+	if prev.CandidateChecks != nil {
+		cc := *prev.CandidateChecks
+		cc.Keys = append([]string(nil), prev.CandidateChecks.Keys...)
+		n.CandidateChecks = &cc
+	}
+	if prev.PendingFindings != nil {
+		pf := *prev.PendingFindings
+		pf.Keys = append([]string(nil), prev.PendingFindings.Keys...)
+		n.PendingFindings = &pf
+	}
+	if prev.AgreedPlan != nil {
+		ap := *prev.AgreedPlan
+		ap.Checks.Keys = append([]string(nil), prev.AgreedPlan.Checks.Keys...)
+		n.AgreedPlan = &ap
+	}
+	if prev.StepIndex != nil {
+		si := *prev.StepIndex
+		n.StepIndex = &si
+	}
+	if prev.Verify != nil {
+		v := *prev.Verify
+		n.Verify = &v
+	}
+	if prev.Pause != nil {
+		pc := *prev.Pause
+		if prev.Pause.Budget != nil {
+			b := *prev.Pause.Budget
+			pc.Budget = &b
+		}
+		if prev.Pause.Verify != nil {
+			v := *prev.Pause.Verify
+			pc.Verify = &v
+		}
+		n.Pause = &pc
 	}
 	if prev.Recovery != nil {
 		r := *prev.Recovery

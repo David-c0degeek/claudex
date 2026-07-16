@@ -40,7 +40,8 @@ func TestStatusProjectsLiveTurn(t *testing.T) {
 		t.Fatalf("honesty wrong: %+v", s.Honesty)
 	}
 	pol := config.DefaultRunPolicy()
-	if s.Caps.RunTurns.Used != 0 || s.Caps.RunTurns.Limit != pol.Limits.MaxRunTurns {
+	// Two turns (plan, critique) were accepted reaching the agreed plan.
+	if s.Caps.RunTurns.Used != 2 || s.Caps.RunTurns.Limit != pol.Limits.MaxRunTurns {
 		t.Fatalf("run_turns cap wrong: %+v", s.Caps.RunTurns)
 	}
 	if s.Caps.PlanRounds.Remaining != pol.Budgets.PlanRounds || s.Caps.RunTurns.Mechanism != "durable-state-counter" {
@@ -281,10 +282,7 @@ func TestStatusMarshalsAndRoundTrips(t *testing.T) {
 	}
 }
 
-func TestStatusCoherenceFailsClosed(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t)
-	mutate(t, store, rev, func(gen uint64, n *state.RunState) { n.Gate = &state.Ref{ID: "g", IssuedRevision: gen} }) // gate outside AWAIT_GUIDANCE
-	if _, err := Status(store, byoHonesty()); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("err = %v, want ErrCorruptState", err)
-	}
-}
+// The gate-coherence corruption Status formerly guarded against (a gate outside
+// AWAIT_GUIDANCE) is now unrepresentable: the state layer enforces the four-way
+// gate equivalence, so such a generation can never be persisted. See state's
+// gate-coherence tests.

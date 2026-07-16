@@ -129,6 +129,15 @@ func validate(rs *RunState) error {
 	if err := validateProjection("failure", rs.Failure, rs.Revision); err != nil {
 		return err
 	}
+	if err := validateV5Shape(rs); err != nil {
+		return err
+	}
+	if err := validateV5Refs(rs); err != nil {
+		return err
+	}
+	if err := validateBudgetHonesty(rs); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -154,6 +163,9 @@ func validateInit(rs *RunState) error {
 	}
 	if rs.PendingTxnID != "" {
 		return fmt.Errorf("initial state must have no pending transaction")
+	}
+	if err := validateV5Init(rs); err != nil {
+		return err
 	}
 	return nil
 }
@@ -298,6 +310,9 @@ func validateTransition(old, next *RunState) error {
 	if err := projBindsToRevision("failure", old.Failure, next.Failure, next.Revision); err != nil {
 		return err
 	}
+	if err := validateV5Transition(old, next); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -353,7 +368,7 @@ func validateCounters(c Counters) error {
 			return fmt.Errorf("step fix %d is negative", i)
 		}
 	}
-	return nil
+	return v5CounterCeiling(c)
 }
 
 func validateAcceptedTurns(rs *RunState) error {
@@ -448,6 +463,34 @@ func redactAndGuard(rs *RunState) error {
 	}
 	if rs.Gate != nil {
 		control["gate.id"] = rs.Gate.ID
+	}
+	if rs.CandidatePlan != nil {
+		addEventRefControls(control, "candidate_plan.source", rs.CandidatePlan.Source)
+		control["candidate_plan.digest"] = rs.CandidatePlan.Digest
+	}
+	if rs.CandidateChecks != nil {
+		control["candidate_checks.digest"] = rs.CandidateChecks.Digest
+		for i, k := range rs.CandidateChecks.Keys {
+			control[fmt.Sprintf("candidate_checks.keys.%d", i)] = k
+		}
+	}
+	if rs.PendingFindings != nil {
+		addEventRefControls(control, "pending_findings.source", rs.PendingFindings.Source)
+		for i, k := range rs.PendingFindings.Keys {
+			control[fmt.Sprintf("pending_findings.keys.%d", i)] = k
+		}
+	}
+	if rs.AgreedPlan != nil {
+		addEventRefControls(control, "agreed_plan.plan.source", rs.AgreedPlan.Plan.Source)
+		control["agreed_plan.plan.digest"] = rs.AgreedPlan.Plan.Digest
+		addEventRefControls(control, "agreed_plan.critique", rs.AgreedPlan.Critique)
+		control["agreed_plan.checks.digest"] = rs.AgreedPlan.Checks.Digest
+		for i, k := range rs.AgreedPlan.Checks.Keys {
+			control[fmt.Sprintf("agreed_plan.checks.keys.%d", i)] = k
+		}
+	}
+	if rs.Pause != nil {
+		addEventRefControls(control, "pause.source", rs.Pause.Source)
 	}
 	if rs.Recovery != nil {
 		control["recovery.code"] = rs.Recovery.Code

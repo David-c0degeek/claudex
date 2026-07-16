@@ -10,62 +10,58 @@ import (
 // every other state field.
 func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	s := newStore(t)
-	r1 := mustInit(t, s)
 
-	// An accepted turn must correspond to a real assigned agent turn, so move into
-	// IMPLEMENT_STEP and assign t1 before accepting it.
-	r1b, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.Phase = PhaseImplementStep
-		next.Assignment = &Ref{ID: "t1", IssuedRevision: rev}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("assign t1: %v", err)
-	}
-	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{
-			ArtifactDigest: hex64("c"),
-			Receipt:        Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")},
-			Phase:          PhaseImplementStep,
-		}
+	// Drive the real negotiation (which accepts the plan and critique turns) to an
+	// agreed 1-step plan, then implement and test — each accepted turn joins the
+	// ledger in receipt-revision order regardless of the phase it advanced into.
+	final := driveToAgreedImplement(t, s, mustInit(t, s))
+	final = assignAt(t, s, final, "t1")
+	final = acceptTurnAdvance(t, s, final, "t1", hex64("c"), func(rev uint64, next *RunState) {
 		next.Assignment = &Ref{ID: "t2", IssuedRevision: rev} // issue the next agent turn
-		return nil
 	})
-	if err != nil {
-		t.Fatalf("accept t1: %v", err)
-	}
-	r3, err := s.Mutate(r2.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t2"] = AcceptedTurn{
-			ArtifactDigest: hex64("d"),
-			Receipt:        Receipt{TurnID: "t2", Revision: rev, ArtifactDigest: hex64("d")},
-			Phase:          PhaseImplementStep, // == the pre-transition phase (r2)
-		}
+	final = acceptTurnAdvance(t, s, final, "t2", hex64("d"), func(_ uint64, next *RunState) {
+		idx := 1
+		next.StepIndex = &idx   // the single step is done
 		next.Phase = PhaseTests // the resulting phase must not affect the ledger
-		next.Assignment = nil
-		return nil
 	})
-	if err != nil {
-		t.Fatalf("accept t2: %v", err)
+
+	// The ledger is the full accepted history, in strict receipt-revision order.
+	wantOrder := []struct {
+		turn  string
+		phase Phase
+	}{
+		{planTurnID, PhasePlanDraft},
+		{critTurnID, PhasePlanCritique},
+		{"t1", PhaseImplementStep},
+		{"t2", PhaseImplementStep},
+	}
+	assertLedger := func(label string, led []LedgerEntry) {
+		if len(led) != len(wantOrder) {
+			t.Fatalf("%s ledger has %d entries, want %d: %+v", label, len(led), len(wantOrder), led)
+		}
+		for i, w := range wantOrder {
+			if led[i].TurnID != w.turn || led[i].Phase != w.phase {
+				t.Fatalf("%s ledger[%d] = %+v, want turn %q phase %s", label, i, led[i], w.turn, w.phase)
+			}
+			if i > 0 && led[i-1].Revision >= led[i].Revision {
+				t.Fatalf("%s ledger is not revision-ordered at %d: %+v", label, i, led)
+			}
+		}
 	}
 
-	want := []LedgerEntry{
-		{Revision: 3, TurnID: "t1", ArtifactDigest: hex64("c"), Phase: PhaseImplementStep},
-		{Revision: 4, TurnID: "t2", ArtifactDigest: hex64("d"), Phase: PhaseImplementStep},
-	}
-	if got := Ledger(r3); !reflect.DeepEqual(got, want) {
-		t.Fatalf("ledger = %+v, want %+v", got, want)
-	}
+	led := Ledger(final)
+	assertLedger("direct", led)
 
 	// Reconstruct from the persisted state: same accepted artifacts -> same ledger.
 	loaded, _, _ := s.Load()
-	if got := Ledger(loaded); !reflect.DeepEqual(got, want) {
-		t.Fatalf("reconstructed ledger = %+v, want %+v", got, want)
+	if got := Ledger(loaded); !reflect.DeepEqual(got, led) {
+		t.Fatalf("reconstructed ledger = %+v, want %+v", got, led)
 	}
 
 	// Purity: a state carrying only the accepted turns yields the same ledger as
 	// the full run state, proving no other field contributes.
-	bare := RunState{AcceptedTurns: r3.AcceptedTurns}
-	if got := Ledger(bare); !reflect.DeepEqual(got, want) {
+	bare := RunState{AcceptedTurns: final.AcceptedTurns}
+	if got := Ledger(bare); !reflect.DeepEqual(got, led) {
 		t.Fatalf("ledger is not a pure projection of AcceptedTurns: %+v", got)
 	}
 }

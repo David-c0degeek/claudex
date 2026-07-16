@@ -87,13 +87,12 @@ func TestWaitStopPriority(t *testing.T) {
 		{"completed", func(_ uint64, n *state.RunState) {
 			n.Lifecycle = state.LifecycleCompleted
 			n.Phase = state.PhaseDone
+			idx := 1 // the single step is done
+			n.StepIndex = &idx
 			n.Assignment = nil
 		}, WaitCompleted},
 		{"gate", func(gen uint64, n *state.RunState) {
-			n.Phase = state.PhaseAwaitGuidance
-			n.Lifecycle = state.LifecyclePaused
-			n.Assignment = nil
-			n.Gate = &state.Ref{ID: "gate-1", IssuedRevision: gen}
+			acceptAndHumanGate(n, gen, state.PhaseImplementStep, "turn-1", dig("7"), "gate-1")
 		}, WaitGate},
 		{"paused_budget", func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecyclePausedBudget }, WaitPausedBudget},
 		{"rate_limited", func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecycleRateLimited }, WaitRateLimited},
@@ -212,17 +211,10 @@ func TestWaitViewerInvalidReplacement(t *testing.T) {
 	}
 }
 
-func TestWaitGatelessAwaitGuidanceFailsClosed(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t)
-	mutate(t, store, rev, func(_ uint64, n *state.RunState) {
-		n.Phase = state.PhaseAwaitGuidance
-		n.Lifecycle = state.LifecyclePaused
-		n.Assignment = nil // no gate
-	})
-	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("err = %v, want ErrCorruptState", err)
-	}
-}
+// Note: the gate-coherence corruption cases that formerly lived here
+// (gateless AWAIT_GUIDANCE, paused-without-gate, gate-outside-AWAIT) are now
+// unrepresentable — the state layer enforces the four-way gate equivalence, so such
+// a generation can never be persisted or loaded. See state's gate-coherence tests.
 
 // The seam runs on every poll, so an unknown session fails immediately even at
 // the caller's current revision, and a registration-only replacement wakes.
@@ -265,6 +257,8 @@ func TestWaitSeamContradictions(t *testing.T) {
 	// "owns with no turn" needs a state with no active turn; use a coherent TESTS phase.
 	mutate(t, store, next, func(_ uint64, n *state.RunState) {
 		n.Phase = state.PhaseTests
+		idx := 1 // TESTS sits at the plan end
+		n.StepIndex = &idx
 		n.Assignment = nil
 	})
 	after, _, _ := store.Load()
@@ -272,22 +266,6 @@ func TestWaitSeamContradictions(t *testing.T) {
 		if _, err := Wait(context.Background(), store, "pair", after.Revision-1, time.Second, view); !errors.Is(err, ErrSessionView) {
 			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
 		}
-	}
-}
-
-// A gate outside AWAIT_GUIDANCE and a paused lifecycle outside a gate both fail.
-func TestWaitInverseCorruption(t *testing.T) {
-	// Paused lifecycle without AWAIT_GUIDANCE.
-	store, rev := newRunWithActiveTurn(t)
-	mutate(t, store, rev, func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecyclePaused })
-	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("paused outside gate err = %v, want ErrCorruptState", err)
-	}
-	// Gate ref outside AWAIT_GUIDANCE.
-	store2, rev2 := newRunWithActiveTurn(t)
-	mutate(t, store2, rev2, func(gen uint64, n *state.RunState) { n.Gate = &state.Ref{ID: "g", IssuedRevision: gen} })
-	if _, err := Wait(context.Background(), store2, "pair", rev2, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("gate outside AWAIT_GUIDANCE err = %v, want ErrCorruptState", err)
 	}
 }
 
@@ -327,7 +305,7 @@ func TestWaitCatchesEventAtBoundary(t *testing.T) {
 func TestWaitIgnoresOtherRoleTurn(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	mutate(t, store, rev, func(gen uint64, n *state.RunState) {
-		n.Phase = state.PhasePlanDraft // a lead turn
+		// IMPLEMENT_STEP is already a lead turn; reissue turn-2 there.
 		n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 	})
 	clk := newFakeClock()

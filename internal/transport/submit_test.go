@@ -100,13 +100,13 @@ func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	r2, err := store.Mutate(r1.Revision, func(gen uint64, n *state.RunState) error {
-		n.Phase = state.PhaseImplementStep
+	implRev := driveAgreedImplement(t, store, r1.Revision)
+	r2, err := store.Mutate(implRev, func(gen uint64, n *state.RunState) error {
 		n.Assignment = &state.Ref{ID: "turn-1", IssuedRevision: gen}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("advance: %v", err)
+		t.Fatalf("assign turn-1: %v", err)
 	}
 	return store, r2.Revision
 }
@@ -223,9 +223,8 @@ func TestSubmitStaleCarriesCurrentStatus(t *testing.T) {
 // over the turn-identity check, so the caller still gets typed current status.
 func TestStaleBeatsWrongTurnOnReissue(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	// Reissue turn-2 at rev+1 without accepting turn-1.
+	// Reissue turn-2 at rev+1 without accepting turn-1 (staying at IMPLEMENT_STEP).
 	if _, err := store.Mutate(rev, func(gen uint64, n *state.RunState) error {
-		n.Phase = state.PhasePlanRevise
 		n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 		return nil
 	}); err != nil {
@@ -381,11 +380,10 @@ func TestClearWithoutAdvanceRejected(t *testing.T) {
 // Parking at a human gate requires a paused lifecycle and a gate issued now.
 func TestClearToHumanGateAccepted(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	toGate := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-		next.Phase = state.PhaseAwaitGuidance
-		next.Lifecycle = state.LifecyclePaused
-		next.Assignment = nil
-		next.Gate = &state.Ref{ID: "gate-1", IssuedRevision: gen}
+	toGate := func(p PreparedSubmit, gen uint64, next *state.RunState) error {
+		// The just-accepted turn-1 is the event that requested the decision; Submit
+		// records it after this callback, so the source references it by digest.
+		humanGate(next, gen, state.PhaseImplementStep, p.TurnID, p.Digest, "gate-1")
 		return nil
 	}
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toGate); err != nil {
@@ -403,6 +401,8 @@ func TestClearToTerminalAccepted(t *testing.T) {
 	toDone := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
 		next.Phase = state.PhaseDone
 		next.Lifecycle = state.LifecycleCompleted
+		idx := 1 // the single step is done
+		next.StepIndex = &idx
 		next.Assignment = nil
 		return nil
 	}
