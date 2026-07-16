@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "claudex pull assignment, version 1",
-  "description": "The complete authoritative assignment returned by pull: what this session must do this turn. Phase/role-specific — an edit phase carries a mutable worktree; every other phase carries an immutable evidence root.",
+  "description": "The complete authoritative assignment returned by pull: what this session must do this turn, including the exact schema its submission must satisfy. Phase/role-specific — a lead edit phase carries a mutable worktree; every other phase carries an immutable evidence root.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,8 +15,10 @@
     "expected_state_revision",
     "binding_guidance",
     "artifact_message_type",
+    "artifact_schema_json",
+    "artifact_schema_sha256",
     "worktree",
-    "evidence_root"
+    "evidence"
   ],
   "properties": {
     "protocol_version": {
@@ -85,17 +87,43 @@
       "minLength": 1,
       "maxLength": 64
     },
+    "artifact_schema_json": {
+      "description": "The exact embedded schema bytes a submit must satisfy, so pull is a complete provider instruction.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536
+    },
+    "artifact_schema_sha256": {
+      "description": "Lower-hex sha256 over artifact_schema_json, binding it to the registry entry.",
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
     "worktree": {
       "description": "The mutable worktree path, present only for a lead edit phase (IMPLEMENT_STEP/FIX); null otherwise.",
       "type": ["string", "null"],
       "minLength": 1,
       "maxLength": 4096
     },
-    "evidence_root": {
-      "description": "The immutable evidence-root digest, present for every non-edit phase; null for an edit phase.",
-      "type": ["string", "null"],
-      "minLength": 1,
-      "maxLength": 128
+    "evidence": {
+      "description": "The immutable, hash-bound evidence root a read-only phase reviews from; null for a lead edit phase.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["manifest_rel_path", "root_digest"],
+      "properties": {
+        "manifest_rel_path": {
+          "description": "Canonical run-relative path of the evidence manifest.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "root_digest": {
+          "description": "Lower-hex sha256 binding the evidence content.",
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
     }
   }
 }

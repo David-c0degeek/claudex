@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex plan artifact, version 1",
+  "description": "An agreed implementation plan: the ordered steps a run will execute. Submitted for the planning phases.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "message_type", "turn_id", "steps"],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "plan"
+    },
+    "turn_id": {
+      "description": "The turn this plan is submitted for.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "steps": {
+      "description": "The ordered plan steps.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "description"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        }
+      }
+    }
+  }
+}
