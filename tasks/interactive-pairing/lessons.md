@@ -15,6 +15,7 @@
   turn/fix counts, artifact bytes, and wall time are enforceable without a
   managed launch + real telemetry channel. Never label a capability "enforced"
   without the mechanism that backs it.
+- (design close, 2026-07-16) CX's top-3 Go implementation watch-items (both agents AGREE): (1) **Canonical protocol bytes** — one embedded schema source, exact version negotiation, `json.Decoder.UseNumber()`/number semantics, digest stable across whitespace/key-order/platforms; (2) **Crash consistency** — same-directory atomic writes + fsync durability, the git ref/index/state/receipt journal cut-points, idempotent recovery with read-only commands never mutating; (3) **Real OS behaviour** — process-death locks + race-free process-tree ownership tested on native Windows AND Linux; keep inherited-stdio launch separate from the optional PTY telemetry path.
 - (00.3, 2026-07-16) `main` is the lean v2 baseline: `claudex/` = agents,
   artifacts, cli, config, gitops, phases, prompts, schemas, state (+templates).
   It compiles (`python -m compileall claudex` OK) but has **zero tests**
