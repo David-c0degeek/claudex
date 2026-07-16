@@ -200,6 +200,16 @@ func validateTransition(old, next *RunState) error {
 			if v.Receipt.Revision != next.Revision {
 				return fmt.Errorf("newly accepted turn %q must bind to revision %d, got %d", k, next.Revision, v.Receipt.Revision)
 			}
+			// A newly accepted turn must correspond to a real outstanding turn: the
+			// run had exactly this turn assigned, in an actionable agent phase, and
+			// the accepted phase is that phase. So acceptance can never record a
+			// turn the run never issued (e.g. in INIT or with no/other assignment).
+			if old.Assignment == nil || old.Assignment.ID != k {
+				return fmt.Errorf("newly accepted turn %q was not the pre-transition assigned turn", k)
+			}
+			if !IsAgentPhase(old.Phase) {
+				return fmt.Errorf("newly accepted turn %q accepted in non-agent phase %q", k, old.Phase)
+			}
 			// The accepted phase is authoritative: it is the phase the turn was in
 			// (the phase before this transition advanced it), never a caller claim.
 			if v.Phase != old.Phase {

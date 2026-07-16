@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -203,6 +204,71 @@ func TestReadAssignmentRejectsTamperedInbox(t *testing.T) {
 	}
 	if _, err := ss.ReadAssignment("sess-1"); !errors.Is(err, ErrBadSession) {
 		t.Fatalf("read tampered inbox err = %v, want ErrBadSession", err)
+	}
+}
+
+// The state-level actionable-phase grammar and the transport turn-spec registry
+// are the same set: every phase agrees on both sides.
+func TestAgentPhaseParityWithTurnSpec(t *testing.T) {
+	phases := []state.Phase{
+		state.PhaseInit, state.PhasePlanDraft, state.PhasePlanCritique, state.PhasePlanRevise,
+		state.PhaseImplementStep, state.PhaseCheckpoint, state.PhaseFix, state.PhaseTests,
+		state.PhaseVerify, state.PhaseAwaitGuidance, state.PhaseDone,
+	}
+	for _, p := range phases {
+		_, ok := TurnSpec(p)
+		if ok != state.IsAgentPhase(p) {
+			t.Fatalf("phase %s: TurnSpec ok=%v but state.IsAgentPhase=%v", p, ok, state.IsAgentPhase(p))
+		}
+	}
+}
+
+// RenderMailbox rejects a revision-0 entry and a nil loader for a non-empty
+// ledger rather than trusting them.
+func TestRenderMailboxRejectsDegenerateInputs(t *testing.T) {
+	plan, pd := planArtifact(t, "turn-1")
+	load := func(string, string) ([]byte, error) { return plan, nil }
+	rev0 := []state.LedgerEntry{{Revision: 0, TurnID: "turn-1", ArtifactDigest: pd, Phase: state.PhasePlanDraft}}
+	if _, err := RenderMailbox(rev0, load); !errors.Is(err, ErrMailboxMismatch) {
+		t.Fatalf("revision 0 err = %v, want ErrMailboxMismatch", err)
+	}
+	nonEmpty := []state.LedgerEntry{{Revision: 2, TurnID: "turn-1", ArtifactDigest: pd, Phase: state.PhasePlanDraft}}
+	if _, err := RenderMailbox(nonEmpty, nil); !errors.Is(err, ErrMailboxMismatch) {
+		t.Fatalf("nil loader err = %v, want ErrMailboxMismatch", err)
+	}
+	// An empty ledger with a nil loader is fine (nothing to load).
+	if md, err := RenderMailbox(nil, nil); err != nil || md != "" {
+		t.Fatalf("empty render = %q err=%v", md, err)
+	}
+}
+
+// A schema-valid but non-canonical (whitespace-reformatted) inbox is refused:
+// tampering that preserves JSON semantics still changes the bytes.
+func TestReadAssignmentRejectsNonCanonical(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewSessionStore(dir)
+	if err != nil {
+		t.Fatalf("new session store: %v", err)
+	}
+	defer ss.Close()
+
+	a, err := BuildAssignment(runStateAt(state.PhaseImplementStep), editInputs())
+	if err != nil {
+		t.Fatalf("build assignment: %v", err)
+	}
+	canon, _ := a.Marshal()
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, canon, "", "  "); err != nil { // valid JSON, non-canonical bytes
+		t.Fatalf("indent: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sess-1"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sess-1", "assignment.json"), pretty.Bytes(), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := ss.ReadAssignment("sess-1"); !errors.Is(err, ErrBadSession) {
+		t.Fatalf("non-canonical inbox err = %v, want ErrBadSession", err)
 	}
 }
 

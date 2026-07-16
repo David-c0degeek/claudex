@@ -12,14 +12,15 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
 
-	// The accepted phase is bound to the pre-transition phase, so move into
-	// IMPLEMENT_STEP before accepting.
-	r1b, err := s.Mutate(r1.Revision, func(_ uint64, next *RunState) error {
+	// An accepted turn must correspond to a real assigned agent turn, so move into
+	// IMPLEMENT_STEP and assign t1 before accepting it.
+	r1b, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
 		next.Phase = PhaseImplementStep
+		next.Assignment = &Ref{ID: "t1", IssuedRevision: rev}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("to implement: %v", err)
+		t.Fatalf("assign t1: %v", err)
 	}
 	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
 		next.AcceptedTurns["t1"] = AcceptedTurn{
@@ -27,18 +28,20 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 			Receipt:        Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")},
 			Phase:          PhaseImplementStep,
 		}
+		next.Assignment = &Ref{ID: "t2", IssuedRevision: rev} // issue the next agent turn
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("accept t1: %v", err)
 	}
 	r3, err := s.Mutate(r2.Revision, func(rev uint64, next *RunState) error {
-		next.Phase = PhasePlanDraft // the resulting phase must not affect the ledger
 		next.AcceptedTurns["t2"] = AcceptedTurn{
 			ArtifactDigest: hex64("d"),
 			Receipt:        Receipt{TurnID: "t2", Revision: rev, ArtifactDigest: hex64("d")},
 			Phase:          PhaseImplementStep, // == the pre-transition phase (r2)
 		}
+		next.Phase = PhaseTests // the resulting phase must not affect the ledger
+		next.Assignment = nil
 		return nil
 	})
 	if err != nil {

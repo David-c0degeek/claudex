@@ -54,6 +54,21 @@ func mustInit(t *testing.T, s *Store) RunState {
 	return rs
 }
 
+// assignAgentTurn moves the run into an actionable agent phase (IMPLEMENT_STEP)
+// with turnID assigned, the pre-transition shape a real submit consumes.
+func assignAgentTurn(t *testing.T, s *Store, prev RunState, turnID string) RunState {
+	t.Helper()
+	rs, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error {
+		next.Phase = PhaseImplementStep
+		next.Assignment = &Ref{ID: turnID, IssuedRevision: rev}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("assign %s: %v", turnID, err)
+	}
+	return rs
+}
+
 func TestInitAndLoad(t *testing.T) {
 	s := newStore(t)
 	rs := mustInit(t, s)
@@ -237,15 +252,18 @@ func TestCountersMustNotDecrease(t *testing.T) {
 func TestAcceptedTurnImmutable(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
-	r2, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
+	r1b := assignAgentTurn(t, s, r1, "t1")
+	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		next.Assignment = nil
+		next.Phase = PhaseTests
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("add turn: %v", err)
 	}
 	if _, err := s.Mutate(r2.Revision, func(_ uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Phase: PhaseInit}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Phase: PhaseImplementStep}
 		return nil
 	}); err == nil {
 		t.Fatalf("changing an accepted turn should be rejected")
@@ -255,23 +273,24 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	s, stateDir := newStoreDir(t)
 	r1 := mustInit(t, s)
-	// Occupy generation 2 with a torn file so the next append skips to 3.
-	if err := os.WriteFile(filepath.Join(stateDir, fmt.Sprintf("%012d.gen", 2)), []byte("garbage"), 0o600); err != nil {
+	r1b := assignAgentTurn(t, s, r1, "t1") // gen 2: IMPLEMENT_STEP, t1 assigned
+	// Occupy generation 3 with a torn file so the next append skips to 4.
+	if err := os.WriteFile(filepath.Join(stateDir, fmt.Sprintf("%012d.gen", 3)), []byte("garbage"), 0o600); err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}
-	r3, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
-		next.Assignment = &Ref{ID: "assign-1", IssuedRevision: rev}
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
+	r4, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
+		next.Assignment = &Ref{ID: "assign-1", IssuedRevision: rev} // issued in the skipped-to gen
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("mutate across gap: %v", err)
 	}
-	if r3.Revision != 3 || r3.Assignment == nil || r3.Assignment.IssuedRevision != 3 {
-		t.Fatalf("gap issuance = rev %d assignment %+v, want rev 3 / issued 3", r3.Revision, r3.Assignment)
+	if r4.Revision != 4 || r4.Assignment == nil || r4.Assignment.IssuedRevision != 4 {
+		t.Fatalf("gap issuance = rev %d assignment %+v, want rev 4 / issued 4", r4.Revision, r4.Assignment)
 	}
-	if r3.AcceptedTurns["t1"].Receipt.Revision != 3 {
-		t.Fatalf("accepted-turn receipt revision = %d, want the skipped-to generation 3", r3.AcceptedTurns["t1"].Receipt.Revision)
+	if r4.AcceptedTurns["t1"].Receipt.Revision != 4 {
+		t.Fatalf("accepted-turn receipt revision = %d, want the skipped-to generation 4", r4.AcceptedTurns["t1"].Receipt.Revision)
 	}
 }
 
@@ -301,6 +320,39 @@ func TestValidateRejectsUnknownSchemaVersion(t *testing.T) {
 	rs.SchemaVersion = RunStateVersion + 1
 	if err := validate(&rs); err == nil || !strings.Contains(err.Error(), "schema_version") {
 		t.Fatalf("unknown schema_version err = %v, want a schema_version rejection", err)
+	}
+}
+
+// A generation written by an older schema (v1, which carried role/message_type on
+// accepted turns) fails on decode with clear version remediation, not a vague
+// unknown-field corruption error.
+func TestDecodeRejectsOlderSchemaVersion(t *testing.T) {
+	// A v1-shaped accepted turn carries role/message_type that v2 does not know.
+	old := []byte(`{"schema_version":1,"run_id":"r","revision":2,"accepted_turns":{"t1":{"artifact_digest":"` + hex64("c") + `","role":"lead","message_type":"implementation_report"}}}`)
+	if _, err := decodeRunState(genstore.Record{Generation: 2, Payload: old}); !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("older schema decode err = %v, want ErrUnsupportedSchema", err)
+	}
+}
+
+// Acceptance can only record a real outstanding turn: never in INIT (no
+// assignment), never a turn other than the assigned one.
+func TestAcceptRequiresAssignedAgentTurn(t *testing.T) {
+	s := newStore(t)
+	r1 := mustInit(t, s)
+	// INIT with no assignment: acceptance is rejected.
+	if _, err := s.Mutate(r1.Revision, func(rev uint64, next *RunState) error {
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseInit}
+		return nil
+	}); err == nil {
+		t.Fatalf("accepting a turn in INIT with no assignment should be rejected")
+	}
+	// A different turn than the one assigned: rejected.
+	r1b := assignAgentTurn(t, s, r1, "t1")
+	if _, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
+		next.AcceptedTurns["other"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "other", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		return nil
+	}); err == nil {
+		t.Fatalf("accepting a turn other than the assigned one should be rejected")
 	}
 }
 

@@ -30,6 +30,9 @@ var (
 	// ErrMailboxMismatch means an accepted-turn ledger entry disagrees with its
 	// stored artifact, or the ledger is out of order.
 	ErrMailboxMismatch = errors.New("transport: mailbox entry disagrees with its artifact")
+	// ErrMailboxTooLarge means the rendered transcript exceeds the readable bound,
+	// so the writer refuses to persist a file its own reader would reject.
+	ErrMailboxTooLarge = errors.New("transport: rendered transcript exceeds the mailbox size limit")
 )
 
 // SessionStore writes and reads role-addressed assignment inboxes under a
@@ -84,15 +87,24 @@ func (s *SessionStore) ReadAssignment(sessionID string) (Assignment, error) {
 	if err != nil {
 		return Assignment{}, err
 	}
-	if _, err := protocol.Validate(assignmentType, raw); err != nil {
+	// Validate against the schema and require the bytes are already canonical
+	// (protocol.Validate returns the canonical form): a whitespace-reformatted but
+	// otherwise valid tampering is refused, not silently accepted.
+	canonical, err := protocol.Validate(assignmentType, raw)
+	if err != nil {
 		return Assignment{}, fmt.Errorf("%w: inbox schema", ErrBadSession)
 	}
+	if !bytes.Equal(canonical, raw) {
+		return Assignment{}, fmt.Errorf("%w: inbox not canonical", ErrBadSession)
+	}
 	var a Assignment
-	if err := json.Unmarshal(raw, &a); err != nil {
+	if err := json.Unmarshal(canonical, &a); err != nil {
 		return Assignment{}, fmt.Errorf("%w: inbox decode", ErrBadSession)
 	}
+	// Collapse semantic-validation failures to the stable, value-free inbox error
+	// so no arbitrary validation text crosses the display boundary.
 	if err := a.Validate(); err != nil {
-		return Assignment{}, fmt.Errorf("%w: %v", ErrBadSession, err)
+		return Assignment{}, fmt.Errorf("%w: inbox invalid", ErrBadSession)
 	}
 	if a.SessionID != sessionID {
 		return Assignment{}, fmt.Errorf("%w: inbox session id disagrees", ErrBadSession)
@@ -127,6 +139,10 @@ func (m *MailboxStore) Write(ledger []state.LedgerEntry, load func(turnID, diges
 	if err != nil {
 		return err
 	}
+	// Never persist a transcript the reader would refuse as over-limit.
+	if int64(len(md)) > maxMailboxSize {
+		return ErrMailboxTooLarge
+	}
 	return atomicfile.ReplaceInRoot(m.root, "mailbox.md", []byte(md), inboxPerm)
 }
 
@@ -144,10 +160,16 @@ func (m *MailboxStore) Read() ([]byte, error) {
 // typed counts and allowlisted enums. A longer ledger's render has a shorter
 // one's as an exact prefix.
 func RenderMailbox(ledger []state.LedgerEntry, load func(turnID, digest string) ([]byte, error)) (string, error) {
+	if len(ledger) > 0 && load == nil {
+		return "", fmt.Errorf("%w: nil artifact loader", ErrMailboxMismatch)
+	}
 	var b strings.Builder
 	var prevRevision uint64
 	seen := make(map[string]bool)
 	for i, e := range ledger {
+		if e.Revision == 0 {
+			return "", fmt.Errorf("%w: ledger entry has revision 0", ErrMailboxMismatch)
+		}
 		if i > 0 && e.Revision <= prevRevision {
 			return "", fmt.Errorf("%w: ledger revisions are not strictly increasing", ErrMailboxMismatch)
 		}
@@ -162,7 +184,7 @@ func RenderMailbox(ledger []state.LedgerEntry, load func(turnID, digest string) 
 		}
 		spec, ok := TurnSpec(e.Phase)
 		if !ok {
-			return "", fmt.Errorf("%w: ledger phase %s is not actionable", ErrMailboxMismatch, e.Phase)
+			return "", fmt.Errorf("%w: ledger phase is not actionable", ErrMailboxMismatch)
 		}
 
 		artifact, err := load(e.TurnID, e.ArtifactDigest)

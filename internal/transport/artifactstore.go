@@ -88,7 +88,7 @@ func (s *ArtifactStore) Put(turnID, digest string, canonical []byte) error {
 			return rerr
 		}
 		if !bytes.Equal(existing, canonical) {
-			return fmt.Errorf("%w: %s", ErrArtifactCollision, rel)
+			return ErrArtifactCollision
 		}
 		return atomicfile.SyncInRoot(s.root, rel) // durably re-confirm the existing file
 	}
@@ -149,7 +149,7 @@ func (s *ArtifactStore) verify(turnID, digest string, canonical []byte) error {
 		return fmt.Errorf("%w: envelope", ErrArtifactMismatch)
 	}
 	if !artifactMessageTypes[env.MessageType] {
-		return fmt.Errorf("%w: %q is not a submit artifact type", ErrArtifactMismatch, env.MessageType)
+		return fmt.Errorf("%w: not a submit artifact type", ErrArtifactMismatch)
 	}
 	if env.TurnID != turnID {
 		return fmt.Errorf("%w: envelope turn id", ErrArtifactMismatch)

@@ -111,6 +111,80 @@ func TestSyncInRootReconfirms(t *testing.T) {
 	}
 }
 
+// A failed durability sync after the bytes are already visible is a committed
+// *PostCommitSyncError for install, replace, mkdir, and re-confirm; a later
+// healthy call re-confirms durability and succeeds.
+func TestRootedSyncFaultsAreCommitted(t *testing.T) {
+	errInject := errors.New("injected dir sync failure")
+	bad := rootOps{syncDir: func(*os.Root, string) error { return errInject }}
+	asCommitted := func(t *testing.T, err error) {
+		t.Helper()
+		var pce *PostCommitSyncError
+		if !errors.As(err, &pce) {
+			t.Fatalf("err = %v, want *PostCommitSyncError", err)
+		}
+		if !pce.Committed() {
+			t.Fatalf("PostCommitSyncError must report committed")
+		}
+	}
+
+	t.Run("install", func(t *testing.T) {
+		r, dir := openRoot(t)
+		err := publishInRoot(r, "a.json", []byte("x"), 0o600, r.Link, false, bad)
+		asCommitted(t, err)
+		if got, _ := os.ReadFile(filepath.Join(dir, "a.json")); string(got) != "x" {
+			t.Fatalf("install bytes not visible after committed sync failure: %q", got)
+		}
+		if err := SyncInRoot(r, "a.json"); err != nil { // healthy re-confirm
+			t.Fatalf("re-confirm: %v", err)
+		}
+	})
+
+	t.Run("replace", func(t *testing.T) {
+		r, dir := openRoot(t)
+		err := publishInRoot(r, "a.json", []byte("y"), 0o600, r.Rename, true, bad)
+		asCommitted(t, err)
+		if got, _ := os.ReadFile(filepath.Join(dir, "a.json")); string(got) != "y" {
+			t.Fatalf("replace bytes not visible after committed sync failure: %q", got)
+		}
+	})
+
+	t.Run("mkdir", func(t *testing.T) {
+		r, dir := openRoot(t)
+		err := mkdirInRoot(r, "d", 0o700, bad)
+		asCommitted(t, err)
+		if info, serr := os.Stat(filepath.Join(dir, "d")); serr != nil || !info.IsDir() {
+			t.Fatalf("dir not visible after committed sync failure: %v", serr)
+		}
+		if err := MkdirInRoot(r, "d", 0o700); err != nil { // healthy re-confirm
+			t.Fatalf("re-confirm mkdir: %v", err)
+		}
+	})
+
+	t.Run("reconfirm", func(t *testing.T) {
+		r, _ := openRoot(t)
+		if err := InstallInRoot(r, "a.json", []byte("z"), 0o600); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+		err := syncInRoot(r, "a.json", bad)
+		asCommitted(t, err)
+		if err := SyncInRoot(r, "a.json"); err != nil { // healthy re-confirm
+			t.Fatalf("healthy re-confirm: %v", err)
+		}
+	})
+}
+
+// MkdirInRoot re-confirming a path that exists as a non-directory is refused.
+func TestMkdirInRootRejectsNonDir(t *testing.T) {
+	r, _ := openRoot(t)
+	if err := InstallInRoot(r, "a", []byte("file"), 0o600); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := MkdirInRoot(r, "a", 0o700); !errors.Is(err, ErrNotDirectory) {
+		t.Fatalf("mkdir over a file err = %v, want ErrNotDirectory", err)
+	}
+}
+
 func TestInstallInRootNested(t *testing.T) {
 	r, dir := openRoot(t)
 	if err := MkdirInRoot(r, "turn-1", 0o700); err != nil {

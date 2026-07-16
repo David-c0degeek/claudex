@@ -25,11 +25,17 @@ import (
 )
 
 // RunStateVersion is the on-disk schema version; an unknown version fails closed.
-const RunStateVersion = 1
+// v2 dropped the redundant role/message_type on accepted turns in favour of the
+// single authoritative phase (see AcceptedTurn).
+const RunStateVersion = 2
 
 // ErrRevisionConflict is returned when a mutation's expected revision does not
 // match the current head.
 var ErrRevisionConflict = errors.New("state: revision conflict")
+
+// ErrUnsupportedSchema means a persisted generation carries a schema version this
+// build does not support (it was written by a different claudex version).
+var ErrUnsupportedSchema = errors.New("state: unsupported on-disk schema version")
 
 // Lifecycle is the durable macro lifecycle of a run.
 type Lifecycle string
@@ -281,6 +287,12 @@ func cloneForNext(prev *RunState) *RunState {
 
 // decodeRunState strictly decodes and fully validates a persisted record.
 func decodeRunState(rec genstore.Record) (RunState, error) {
+	// Check the on-disk schema version FIRST, on a loose probe, so an older/newer
+	// generation fails with clear version remediation rather than a vague
+	// unknown-field or missing-field corruption error from strict decoding.
+	if err := checkSchemaVersion(rec.Payload); err != nil {
+		return RunState{}, fmt.Errorf("state: generation %d: %w", rec.Generation, err)
+	}
 	rs, err := strictDecodeRunState(rec.Payload)
 	if err != nil {
 		return RunState{}, fmt.Errorf("state: decode generation %d: %w", rec.Generation, err)
@@ -293,6 +305,22 @@ func decodeRunState(rec genstore.Record) (RunState, error) {
 		return RunState{}, fmt.Errorf("state: generation %d invalid: %w", rec.Generation, err)
 	}
 	return rs, nil
+}
+
+// checkSchemaVersion loosely reads only the schema_version field and rejects a
+// generation this build does not support, before any strict shape decoding.
+func checkSchemaVersion(payload []byte) error {
+	var probe struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return fmt.Errorf("%w: schema_version is unreadable", ErrUnsupportedSchema)
+	}
+	if probe.SchemaVersion != RunStateVersion {
+		return fmt.Errorf("%w: on-disk schema_version %d, this build expects %d — the run was written by a different claudex version",
+			ErrUnsupportedSchema, probe.SchemaVersion, RunStateVersion)
+	}
+	return nil
 }
 
 // normalize ensures nil-vs-empty collections do not create accidental variants.

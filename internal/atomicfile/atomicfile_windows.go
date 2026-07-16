@@ -53,6 +53,15 @@ func isTransientOpen(err error) bool { return isTransientRename(err) }
 // syncRootDir is a no-op on Windows: there is no directory fsync (see syncDir).
 func syncRootDir(*os.Root, string) error { return nil }
 
+// readOpenExtraFlags adds nothing on Windows: O_NOFOLLOW/O_NONBLOCK are not
+// meaningful, and os.Root already refuses reparse points (symlinks) during
+// traversal. Type is confirmed regular via Lstat/Stat.
+const readOpenExtraFlags = 0
+
+// isSymlinkOpenErr is always false on Windows; symlink rejection happens in
+// os.Root traversal and the pre-open Lstat check.
+func isSymlinkOpenErr(error) bool { return false }
+
 // syncDir is a no-op on Windows: there is no directory fsync. Power-loss
 // durability would additionally require MOVEFILE_WRITE_THROUGH, which the
 // default os.Rename does not request.

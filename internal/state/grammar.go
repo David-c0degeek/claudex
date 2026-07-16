@@ -42,3 +42,17 @@ func IsPausedLifecycle(l Lifecycle) bool {
 	}
 	return false
 }
+
+// agentPhases are the phases in which an assigned agent turn is outstanding; a
+// submit accepts exactly one such turn. This is the authoritative set the
+// transport turn-spec registry must equal (a parity test enforces it), kept in
+// state so acceptance can be validated without importing transport.
+var agentPhases = map[Phase]bool{
+	PhasePlanDraft: true, PhasePlanCritique: true, PhasePlanRevise: true,
+	PhaseImplementStep: true, PhaseCheckpoint: true, PhaseFix: true, PhaseVerify: true,
+}
+
+// IsAgentPhase reports whether phase p has an outstanding agent turn that a
+// submit consumes. It is the single actionable-phase grammar; the transport
+// turn-spec registry mirrors exactly this set.
+func IsAgentPhase(p Phase) bool { return agentPhases[p] }
