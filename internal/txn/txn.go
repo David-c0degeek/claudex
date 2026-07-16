@@ -138,6 +138,9 @@ func (j *Journal) latestGS() (genstore.Record, Record, bool, error) {
 
 // Run drives a NEW transaction to completion under a held guard.
 func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
+	if err := j.gs.CheckGuard(g); err != nil {
+		return Record{}, err
+	}
 	names, err := validatePlan(plan)
 	if err != nil {
 		return Record{}, err
@@ -164,6 +167,13 @@ func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
 // plan, requires it to match the journalled step ids, re-observes the durable
 // prefix, then drives the remaining steps.
 func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error)) (Record, bool, error) {
+	// Validate the guard BEFORE any step callback can perform an external effect.
+	if err := j.gs.CheckGuard(g); err != nil {
+		return Record{}, false, err
+	}
+	if planFor == nil {
+		return Record{}, false, fmt.Errorf("txn: planFor is required")
+	}
 	_, cur, ok, err := j.latestGS()
 	if err != nil {
 		return Record{}, false, err
@@ -201,6 +211,9 @@ func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error))
 // definitively NotApplied first step permits abort; Applied must recover forward
 // and Indeterminate fails closed.
 func (j *Journal) Abort(g *genstore.Guard, plan Plan) (Record, error) {
+	if err := j.gs.CheckGuard(g); err != nil {
+		return Record{}, err
+	}
 	names, err := validatePlan(plan)
 	if err != nil {
 		return Record{}, err
@@ -212,7 +225,10 @@ func (j *Journal) Abort(g *genstore.Guard, plan Plan) (Record, error) {
 	if !ok || cur.Terminal() || cur.TxnID() != plan.Intent.TxnID {
 		return Record{}, fmt.Errorf("%w: %s", ErrNoPending, plan.Intent.TxnID)
 	}
-	if !slicesEqual(names, cur.StepIDs) {
+	// Bind the supplied intent to the journalled one, so a same-id/same-steps plan
+	// with a different payload cannot observe a different target and terminalize
+	// the original transaction.
+	if !reflect.DeepEqual(plan.Intent, cur.Intent) || !slicesEqual(names, cur.StepIDs) {
 		return Record{}, ErrPlanMismatch
 	}
 	if cur.StepsDone != 0 {
@@ -383,6 +399,9 @@ func validatePlan(plan Plan) ([]string, error) {
 	}
 	names := make([]string, len(plan.Steps))
 	for i, s := range plan.Steps {
+		if s.Status == nil || s.Apply == nil {
+			return nil, fmt.Errorf("txn: step %d (%q) has a nil Status or Apply", i, s.Name)
+		}
 		names[i] = s.Name
 	}
 	if err := validateStepIDs(names); err != nil {

@@ -179,6 +179,11 @@ func (s *Store) genPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%0*d%s", genFileDigits, gen, genFileExt))
 }
 
+// CheckGuard reports whether g is a valid guard for this store's lock, without
+// performing any I/O — so a caller can validate the guard before running any
+// side-effecting work under it.
+func (s *Store) CheckGuard(g *Guard) error { return s.checkGuard(g) }
+
 func (s *Store) checkGuard(g *Guard) error {
 	if g == nil || g.lock == nil {
 		return errors.New("genstore: nil or released guard")

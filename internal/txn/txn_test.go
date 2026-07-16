@@ -305,6 +305,88 @@ func TestRestartRecovery(t *testing.T) {
 	})
 }
 
+func TestAbortIntentMismatchStaysPending(t *testing.T) {
+	j, lock := newJournal(t)
+	s := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", s)) })
+
+	// Same txn id and step names, but a different payload.
+	badIntent := intent("t1")
+	badIntent.Payload = json.RawMessage(`{"ref":"refs/DIFFERENT"}`)
+	badPlan := Plan{Intent: badIntent, Steps: []Step{(&fakeStep{name: "a"}).toStep()}}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Abort(g, badPlan); !errors.Is(err, ErrPlanMismatch) {
+			t.Fatalf("abort with changed payload err = %v, want ErrPlanMismatch", err)
+		}
+	})
+	if cur, _, _ := j.Latest(); cur.Terminal() {
+		t.Fatalf("the transaction was terminalized by a mismatched abort")
+	}
+}
+
+func TestGuardValidatedBeforeAnyEffect(t *testing.T) {
+	poison := func() Step {
+		return Step{
+			Name:   "p",
+			Status: func() (StepStatus, error) { t.Fatal("Status called under an invalid guard"); return "", nil },
+			Apply:  func() error { t.Fatal("Apply called under an invalid guard"); return nil },
+		}
+	}
+
+	// nil guard.
+	j, _ := newJournal(t)
+	if _, err := j.Run(nil, Plan{Intent: intent("t1"), Steps: []Step{poison()}}); err == nil {
+		t.Fatalf("Run with a nil guard should error")
+	}
+
+	// released guard.
+	j2, lock2 := newJournal(t)
+	g, ok, _ := genstore.Acquire(lock2)
+	if !ok {
+		t.Fatalf("acquire")
+	}
+	g.Release()
+	if _, err := j2.Run(g, Plan{Intent: intent("t1"), Steps: []Step{poison()}}); err == nil {
+		t.Fatalf("Run with a released guard should error")
+	}
+
+	// wrong-lock guard on Recover (which reaches step callbacks).
+	j3, lock3 := newJournal(t)
+	s := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
+	withGuard(t, lock3, func(gg *genstore.Guard) { _, _ = j3.Run(gg, planFrom("t1", s)) })
+	other, ok, _ := genstore.Acquire(filepath.Join(t.TempDir(), "other.lock"))
+	if !ok {
+		t.Fatalf("acquire other")
+	}
+	defer other.Release()
+	if _, _, err := j3.Recover(other, func(Intent) (Plan, error) {
+		return Plan{Intent: intent("t1"), Steps: []Step{poison()}}, nil
+	}); err == nil {
+		t.Fatalf("Recover with a wrong-lock guard should error")
+	}
+}
+
+func TestNilCallbackRejected(t *testing.T) {
+	j, lock := newJournal(t)
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, Plan{Intent: intent("t1"), Steps: []Step{{Name: "a"}}}); err == nil {
+			t.Fatalf("nil Status/Apply should be rejected")
+		}
+	})
+	if _, ok, _ := j.Latest(); ok {
+		t.Fatalf("a journal record was written for a nil-callback plan")
+	}
+
+	j2, lock2 := newJournal(t)
+	s := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
+	withGuard(t, lock2, func(g *genstore.Guard) { _, _ = j2.Run(g, planFrom("t1", s)) })
+	withGuard(t, lock2, func(g *genstore.Guard) {
+		if _, _, err := j2.Recover(g, nil); err == nil {
+			t.Fatalf("a nil planFor should be rejected")
+		}
+	})
+}
+
 func TestSecretInPayloadRejected(t *testing.T) {
 	j, lock := newJournal(t)
 	in := intent("t1")
