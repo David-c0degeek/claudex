@@ -88,6 +88,8 @@ func initValid(n *state.RunState) {
 	n.FS = state.FSResult{Class: "supported-local", Reason: "local fixed drive"}
 	n.Base = pol.BaseBranch
 	n.BaseCommit = strings.Repeat("a", 40)
+	n.WorktreeRelPath = ".claudex/runs/run-a/worktree"
+	n.RunBranch = "claudex/run-a"
 }
 
 func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {

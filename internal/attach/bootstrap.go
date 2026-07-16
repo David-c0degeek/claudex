@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/fsclass"
@@ -39,19 +40,54 @@ type WorktreeProvisioner interface {
 	ApplyWorktree(repoDir string, in BootstrapIntent) error
 }
 
-// FirstAttachRequest is a first-attach invocation. The caller supplies the
-// canonical task bytes and the validated effective policy (its canonical
-// serialization must equal PolicyCanonical); clock and RNG are injected.
+// Classifier classifies the durability-support class of the run location. The
+// default wraps fsclass.Classify; tests inject a fake to exercise the refusal
+// paths deterministically.
+type Classifier interface {
+	Classify(path string) (fsclass.Result, error)
+}
+
+type realClassifier struct{}
+
+func (realClassifier) Classify(path string) (fsclass.Result, error) { return fsclass.Classify(path) }
+
+// UnsupportedFSError is the structured filesystem refusal the CLI messages from:
+// the class, the reason, and whether an acknowledge policy would have allowed it.
+// It unwraps to the single ErrUnsupportedFS sentinel.
+type UnsupportedFSError struct {
+	Class       string
+	Reason      string
+	AckRequired bool
+}
+
+func (e *UnsupportedFSError) Error() string {
+	if e.AckRequired {
+		return fmt.Sprintf("attach: %s filesystem needs unknown_fs_policy=acknowledge (%s)", e.Class, e.Reason)
+	}
+	return fmt.Sprintf("attach: %s filesystem is unsupported for a run (%s)", e.Class, e.Reason)
+}
+
+func (e *UnsupportedFSError) Unwrap() error { return ErrUnsupportedFS }
+
+// FirstAttachRequest is a first-attach invocation. The caller supplies the exact
+// task-contract and effective-policy source bytes; the effective policy is
+// DERIVED from PolicyCanonical (so the persisted snapshot and the run's policy
+// can never disagree), and the two are checked together via ValidateEffective.
+// OperationID is a caller-stable idempotency key so a lost response after a
+// completed bootstrap returns the same run rather than forcing a new one. Clock,
+// RNG, base resolver, worktree provisioner, and filesystem classifier are
+// injected.
 type FirstAttachRequest struct {
 	RepoDir         string
 	Agent           state.Agent
+	OperationID     string
 	TaskCanonical   []byte
 	PolicyCanonical []byte
-	EffectivePolicy config.RunPolicy
 	CreatedUnix     int64
 	RNG             io.Reader
 	Base            BaseResolver
 	Worktree        WorktreeProvisioner
+	Classifier      Classifier
 }
 
 // FirstAttachResult is the outcome the initiator receives: the run and its lead
@@ -71,6 +107,7 @@ type layout struct {
 	repoDir          string
 	repoLock         string
 	catalogDir       string
+	currentRunDir    string
 	bootstrapJournal string
 }
 
@@ -80,6 +117,7 @@ func layoutFor(repoDir string) layout {
 		repoDir:          repoDir,
 		repoLock:         filepath.Join(base, "repo.lock"),
 		catalogDir:       filepath.Join(base, "catalog"),
+		currentRunDir:    filepath.Join(base, "active-run"),
 		bootstrapJournal: filepath.Join(base, "bootstrap"),
 	}
 }
@@ -93,14 +131,25 @@ func (l layout) runDir(relDir string) string {
 // identities), then — only when no run exists — prepares a deterministic intent
 // read-only and journals the bootstrap to completion.
 func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
-	if err := req.validate(); err != nil {
+	policy, err := req.validate()
+	if err != nil {
 		return FirstAttachResult{}, err
 	}
+	classifier := req.Classifier
+	if classifier == nil {
+		classifier = realClassifier{}
+	}
 	lay := layoutFor(req.RepoDir)
-	if err := os.MkdirAll(filepath.Dir(lay.repoLock), 0o700); err != nil {
+
+	// Read-only repo preflight BEFORE creating .claudex or taking the lock: refuse
+	// a pre-pivot legacy run and an unsupported filesystem before any side effect.
+	if err := repoPreflight(lay, classifier, policy); err != nil {
 		return FirstAttachResult{}, err
 	}
 
+	if err := os.MkdirAll(filepath.Dir(lay.repoLock), 0o700); err != nil {
+		return FirstAttachResult{}, err
+	}
 	g, ok, err := genstore.Acquire(lay.repoLock)
 	if err != nil {
 		return FirstAttachResult{}, err
@@ -129,15 +178,21 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		return resultFor(bi), nil
 	}
 
-	// No pending bootstrap: a run already allocated means "join/reattach", not a
-	// second bootstrap.
-	if cat, ok, cerr := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load(); cerr != nil {
+	// A current active run means join/reattach, not a second bootstrap — except a
+	// lost response after a completed bootstrap: the same operation id returns the
+	// incumbent lead session (never a forced replacement).
+	cur, ok, cerr := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if cerr != nil {
 		return FirstAttachResult{}, cerr
-	} else if ok && len(cat.Runs) > 0 {
-		return FirstAttachResult{}, ErrRunExists
+	}
+	if ok && cur.Active {
+		if cur.OperationID == req.OperationID {
+			return incumbentResult(cur), nil
+		}
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 	}
 
-	intent, err := prepare(lay, req)
+	intent, err := prepare(lay, req, policy, classifier)
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
@@ -154,14 +209,82 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	return resultFor(intent), nil
 }
 
+// repoPreflight runs the read-only refusals before any mutation: a pre-pivot
+// legacy run named by .claudex/current, and an unsupported filesystem.
+func repoPreflight(lay layout, classifier Classifier, policy config.RunPolicy) error {
+	if err := legacyRepoRefusal(lay.repoDir); err != nil {
+		return err
+	}
+	res, err := classifier.Classify(filepath.Join(lay.repoDir, ".claudex"))
+	if err != nil {
+		return err
+	}
+	_, _, _, err = decideFS(res, policy)
+	return err
+}
+
+// legacyRepoRefusal refuses a pre-pivot Python run: the repo-level
+// .claudex/current pointer names a run directory whose state.json the legacy
+// guard recognizes. Absent pointer is safe.
+func legacyRepoRefusal(repoDir string) error {
+	data, err := os.ReadFile(filepath.Join(repoDir, ".claudex", "current"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	name := strings.TrimSpace(string(data))
+	if name == "" {
+		return nil
+	}
+	if !state.IsRunID(name) {
+		return fmt.Errorf("attach: legacy current pointer is not a safe run name")
+	}
+	return legacy.CheckRunDir(filepath.Join(repoDir, ".claudex", "runs", name))
+}
+
+// decideFS maps a filesystem classification to the frozen fs decision, returning
+// a typed UnsupportedFSError for a known-unsupported filesystem or an unknown one
+// without the acknowledge policy.
+func decideFS(res fsclass.Result, pol config.RunPolicy) (class, reason string, ack bool, err error) {
+	switch res.Class {
+	case fsclass.SupportedLocal:
+		return "supported-local", nonEmpty(res.Reason, "local fixed drive"), false, nil
+	case fsclass.Unknown:
+		if pol.UnknownFSPolicy != config.UnknownFSAcknowledge {
+			return "", "", false, &UnsupportedFSError{Class: "unknown", Reason: nonEmpty(res.Reason, "unclassified filesystem"), AckRequired: true}
+		}
+		return "unknown", nonEmpty(res.Reason, "unknown filesystem, acknowledged"), true, nil
+	default:
+		return "", "", false, &UnsupportedFSError{Class: res.Class.String(), Reason: nonEmpty(res.Reason, "network/remote filesystem"), AckRequired: false}
+	}
+}
+
 func resultFor(in BootstrapIntent) FirstAttachResult {
 	return FirstAttachResult{
 		RunID:     in.RunID,
 		SessionID: in.SessionID,
 		Role:      state.SlotLead,
 		Agent:     in.Agent,
-		JoinArgv:  []string{"attach", "--repo", ".", "--agent", string(complementaryAgent(in.Agent)), "--role", "pair"},
+		JoinArgv:  joinArgv(in.RunID, in.Agent),
 	}
+}
+
+func incumbentResult(cur state.CurrentRun) FirstAttachResult {
+	return FirstAttachResult{
+		RunID:     cur.RunID,
+		SessionID: cur.LeadSessionID,
+		Role:      state.SlotLead,
+		Agent:     cur.LeadAgent,
+		JoinArgv:  joinArgv(cur.RunID, cur.LeadAgent),
+	}
+}
+
+// joinArgv names the EXACT run so the pair joins the right one even once the
+// catalog holds history.
+func joinArgv(runID string, leadAgent state.Agent) []string {
+	return []string{"attach", "--repo", ".", "--run", runID, "--agent", string(complementaryAgent(leadAgent)), "--role", "pair"}
 }
 
 func complementaryAgent(a state.Agent) state.Agent {
@@ -171,32 +294,51 @@ func complementaryAgent(a state.Agent) state.Agent {
 	return state.AgentClaude
 }
 
-func (req FirstAttachRequest) validate() error {
+func (req FirstAttachRequest) validate() (config.RunPolicy, error) {
 	if req.RepoDir == "" {
-		return fmt.Errorf("attach: repo dir is required")
+		return config.RunPolicy{}, fmt.Errorf("attach: repo dir is required")
 	}
 	if req.Agent != state.AgentClaude && req.Agent != state.AgentCodex {
-		return fmt.Errorf("attach: agent must be claude or codex")
+		return config.RunPolicy{}, fmt.Errorf("attach: agent must be claude or codex")
+	}
+	if !state.IsRunID(req.OperationID) {
+		return config.RunPolicy{}, fmt.Errorf("attach: a canonical operation_id is required")
 	}
 	if req.CreatedUnix <= 0 {
-		return fmt.Errorf("attach: created_unix must be positive")
+		return config.RunPolicy{}, fmt.Errorf("attach: created_unix must be positive")
 	}
 	if req.RNG == nil {
-		return fmt.Errorf("attach: an RNG is required")
+		return config.RunPolicy{}, fmt.Errorf("attach: an RNG is required")
 	}
 	if req.Base == nil || req.Worktree == nil {
-		return fmt.Errorf("attach: base resolver and worktree provisioner are required")
+		return config.RunPolicy{}, fmt.Errorf("attach: base resolver and worktree provisioner are required")
 	}
-	if config.Hash(req.PolicyCanonical) == "" || len(req.TaskCanonical) == 0 {
-		return fmt.Errorf("attach: task and policy bytes are required")
+	// Parse the exact source bytes and validate the task and policy together, so a
+	// run is never bootstrapped against an invalid contract, and the effective
+	// policy is DERIVED from the snapshot bytes (never a separate claim).
+	task, err := config.ParseTaskContract(req.TaskCanonical)
+	if err != nil {
+		return config.RunPolicy{}, fmt.Errorf("attach: %w", err)
 	}
-	return nil
+	policy, err := config.ParseRunPolicy(req.PolicyCanonical)
+	if err != nil {
+		return config.RunPolicy{}, fmt.Errorf("attach: %w", err)
+	}
+	if err := config.ValidateEffective(task, policy); err != nil {
+		return config.RunPolicy{}, fmt.Errorf("attach: %w", err)
+	}
+	return policy, nil
 }
 
-// prepare builds the deterministic intent read-only: it runs the legacy refusal
-// and filesystem classification before any side effect, mints every identity,
-// and resolves the base commit from a frozen OID.
-func prepare(lay layout, req FirstAttachRequest) (BootstrapIntent, error) {
+// prepare builds the deterministic intent under the repo guard. It REVALIDATES
+// the legacy refusal (the read-only preflight ran before the lock), mints every
+// identity, classifies the run location, and resolves the base commit from a
+// frozen OID — so every downstream Apply and any recovery works from exactly
+// these values.
+func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier) (BootstrapIntent, error) {
+	if err := legacyRepoRefusal(lay.repoDir); err != nil {
+		return BootstrapIntent{}, err
+	}
 	runID, err := mintID("run-", req.RNG)
 	if err != nil {
 		return BootstrapIntent{}, err
@@ -210,23 +352,22 @@ func prepare(lay layout, req FirstAttachRequest) (BootstrapIntent, error) {
 		return BootstrapIntent{}, err
 	}
 
-	relDir := ".claudex/runs/" + runID
+	relDir := wantRelDir(runID)
 	runDir := lay.runDir(relDir)
 
-	// Legacy refusal + fs classification BEFORE any mutation.
-	if err := legacy.CheckRunDir(runDir); err != nil {
+	if err := legacy.CheckRunDir(runDir); err != nil { // the candidate target
 		return BootstrapIntent{}, err
 	}
-	fsres, err := fsclass.Classify(filepath.Dir(runDir))
+	res, err := classifier.Classify(filepath.Dir(runDir))
 	if err != nil {
 		return BootstrapIntent{}, err
 	}
-	fsClass, fsReason, fsAck, err := classifyFS(fsres, req.EffectivePolicy)
+	fsClass, fsReason, fsAck, err := decideFS(res, policy)
 	if err != nil {
 		return BootstrapIntent{}, err
 	}
 
-	baseCommit, err := req.Base.ResolveBase(lay.repoDir, req.EffectivePolicy.BaseBranch)
+	baseCommit, err := req.Base.ResolveBase(lay.repoDir, policy.BaseBranch)
 	if err != nil {
 		return BootstrapIntent{}, fmt.Errorf("attach: resolve base: %w", err)
 	}
@@ -234,6 +375,7 @@ func prepare(lay layout, req FirstAttachRequest) (BootstrapIntent, error) {
 	in := BootstrapIntent{
 		RunID:                   runID,
 		TxnID:                   txnID,
+		OperationID:             req.OperationID,
 		SessionID:               sessionID,
 		Agent:                   req.Agent,
 		CreatedUnix:             req.CreatedUnix,
@@ -244,11 +386,11 @@ func prepare(lay layout, req FirstAttachRequest) (BootstrapIntent, error) {
 		PolicyRelPath:           "inputs/policy.json",
 		PolicyDigest:            config.Hash(req.PolicyCanonical),
 		PolicyCanonical:         req.PolicyCanonical,
-		EffectivePolicy:         req.EffectivePolicy,
-		Base:                    req.EffectivePolicy.BaseBranch,
+		EffectivePolicy:         policy,
+		Base:                    policy.BaseBranch,
 		BaseCommit:              baseCommit,
 		WorktreeRelPath:         relDir + "/worktree",
-		RunBranch:               "claudex/" + runID,
+		RunBranch:               wantRunBranch(runID),
 		FSClass:                 fsClass,
 		FSReason:                fsReason,
 		FSAck:                   fsAck,
@@ -263,22 +405,6 @@ func prepare(lay layout, req FirstAttachRequest) (BootstrapIntent, error) {
 		return BootstrapIntent{}, err
 	}
 	return in, nil
-}
-
-// classifyFS maps a filesystem result to the frozen fs decision, refusing a
-// known-unsupported filesystem and requiring the acknowledge policy for unknown.
-func classifyFS(res fsclass.Result, pol config.RunPolicy) (class, reason string, ack bool, err error) {
-	switch res.Class {
-	case fsclass.SupportedLocal:
-		return "supported-local", nonEmpty(res.Reason, "local fixed drive"), false, nil
-	case fsclass.Unknown:
-		if pol.UnknownFSPolicy != config.UnknownFSAcknowledge {
-			return "", "", false, fmt.Errorf("%w: unknown filesystem needs unknown_fs_policy=acknowledge", ErrUnsupportedFS)
-		}
-		return "unknown", nonEmpty(res.Reason, "unknown filesystem, acknowledged"), true, nil
-	default:
-		return "", "", false, fmt.Errorf("%w: %s", ErrUnsupportedFS, res.Class.String())
-	}
 }
 
 func nonEmpty(s, fallback string) string {

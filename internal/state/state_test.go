@@ -43,6 +43,8 @@ func initState(next *RunState) {
 	next.FS = FSResult{Class: "supported-local", Reason: "local fixed drive"}
 	next.Base = pol.BaseBranch // == effective policy base branch
 	next.BaseCommit = hex40()
+	next.WorktreeRelPath = ".claudex/runs/run-a/worktree"
+	next.RunBranch = "claudex/run-a"
 }
 
 func mustInit(t *testing.T, s *Store) RunState {

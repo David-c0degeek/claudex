@@ -120,7 +120,15 @@ var taskContractKeys = []string{
 }
 
 // ParseTaskContract decodes and validates a task-contract document.
+// MaxContractBytes bounds a task-contract or run-policy source document. It is
+// generous for hand-authored inputs, and small enough that a run's frozen input
+// snapshots embed safely inside a bounded prepared-transaction payload.
+const MaxContractBytes = 16 * 1024
+
 func ParseTaskContract(data []byte) (TaskContract, error) {
+	if len(data) > MaxContractBytes {
+		return TaskContract{}, fmt.Errorf("task contract: exceeds %d bytes", MaxContractBytes)
+	}
 	var tc TaskContract
 	if err := strictDecode(data, &tc); err != nil {
 		return TaskContract{}, fmt.Errorf("task contract: %w", err)
@@ -179,6 +187,9 @@ func ParseTaskContract(data []byte) (TaskContract, error) {
 func ParseRunPolicy(data []byte) (RunPolicy, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return RunPolicy{}, fmt.Errorf("run policy: empty document (use DefaultRunPolicy for no-file runs)")
+	}
+	if len(data) > MaxContractBytes {
+		return RunPolicy{}, fmt.Errorf("run policy: exceeds %d bytes", MaxContractBytes)
 	}
 	// Because the document is decoded onto non-zero defaults, an absent
 	// schema_version would be masked by the default. Probe its presence with a

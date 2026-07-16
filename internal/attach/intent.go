@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -24,9 +25,10 @@ import (
 // intentKind is the txn kind for a first-attach bootstrap.
 const intentKind = "bootstrap"
 
-// maxSnapshotBytes bounds an embedded input snapshot so the whole intent stays
-// well under the journal's payload limit.
-const maxSnapshotBytes = 16 * 1024
+// maxSnapshotBytes bounds an embedded input snapshot so both snapshots plus the
+// rest of the intent stay under the journal's payload limit. It equals config's
+// documented source bound.
+const maxSnapshotBytes = config.MaxContractBytes
 
 // BootstrapIntent is the deterministic, bounded target identity of a first
 // attach, prepared read-only before the journal and immutable for the
@@ -35,8 +37,9 @@ const maxSnapshotBytes = 16 * 1024
 type BootstrapIntent struct {
 	RunID       string      `json:"run_id"`
 	TxnID       string      `json:"txn_id"`
-	SessionID   string      `json:"session_id"` // the lead's minted session
-	Agent       state.Agent `json:"agent"`      // the lead agent
+	OperationID string      `json:"operation_id"` // caller-stable idempotency key
+	SessionID   string      `json:"session_id"`   // the lead's minted session
+	Agent       state.Agent `json:"agent"`        // the lead agent
 	CreatedUnix int64       `json:"created_unix"`
 
 	RelDir string `json:"rel_dir"` // run directory, relative to the repo root
@@ -108,11 +111,16 @@ func decodeIntent(payload json.RawMessage) (BootstrapIntent, error) {
 	return in, nil
 }
 
-// validate enforces the intent's internal coherence, so a malformed or tampered
-// journal payload can never drive a bootstrap.
+// validate enforces the intent's internal coherence AND the exact derived layout,
+// so a malformed or forged journal payload can never drive a bootstrap that
+// writes outside the run's own directory. Every path is required to be exactly
+// the value derived from the run id — not merely "some local path".
 func (in BootstrapIntent) validate() error {
 	if !state.IsRunID(in.RunID) {
 		return fmt.Errorf("attach: intent run_id is not canonical")
+	}
+	if !state.IsRunID(in.TxnID) || !state.IsRunID(in.OperationID) {
+		return fmt.Errorf("attach: intent txn_id/operation_id is not canonical")
 	}
 	if !state.IsSessionID(in.SessionID) {
 		return fmt.Errorf("attach: intent session_id is not a canonical minted id")
@@ -123,61 +131,83 @@ func (in BootstrapIntent) validate() error {
 	if in.CreatedUnix <= 0 {
 		return fmt.Errorf("attach: intent created_unix must be positive")
 	}
-	if !state.IsLocalRelPath(in.RelDir) {
-		return fmt.Errorf("attach: intent rel_dir is not a canonical local path")
+	// Derived layout: the run directory, snapshot paths, worktree, and branch are
+	// EXACTLY the values derived from the run id, so a forged intent cannot target
+	// another location in the repo.
+	if in.RelDir != wantRelDir(in.RunID) {
+		return fmt.Errorf("attach: intent rel_dir is not the derived run directory")
 	}
-	if err := validateSnapshotField("task", in.TaskRelPath, in.TaskDigest, in.TaskCanonical); err != nil {
+	if in.TaskRelPath != "inputs/task.json" || in.PolicyRelPath != "inputs/policy.json" {
+		return fmt.Errorf("attach: intent snapshot paths are not the derived paths")
+	}
+	if in.WorktreeRelPath != in.RelDir+"/worktree" {
+		return fmt.Errorf("attach: intent worktree_rel_path is not under the run directory")
+	}
+	if in.RunBranch != wantRunBranch(in.RunID) {
+		return fmt.Errorf("attach: intent run_branch is not the derived branch")
+	}
+	if err := validateSnapshotField("task", in.TaskDigest, in.TaskCanonical); err != nil {
 		return err
 	}
-	if err := validateSnapshotField("policy", in.PolicyRelPath, in.PolicyDigest, in.PolicyCanonical); err != nil {
+	if err := validateSnapshotField("policy", in.PolicyDigest, in.PolicyCanonical); err != nil {
 		return err
 	}
-	if config.Hash(in.PolicyCanonical) != in.PolicyDigest {
-		return fmt.Errorf("attach: intent policy digest disagrees with the policy bytes")
+	// The effective policy is DERIVED from the exact policy snapshot bytes, so the
+	// two can never disagree; the task snapshot parses and is coherent with it.
+	policy, err := config.ParseRunPolicy(in.PolicyCanonical)
+	if err != nil {
+		return fmt.Errorf("attach: intent policy bytes: %w", err)
 	}
-	if config.Hash(in.TaskCanonical) != in.TaskDigest {
-		return fmt.Errorf("attach: intent task digest disagrees with the task bytes")
+	if !reflect.DeepEqual(policy, in.EffectivePolicy) {
+		return fmt.Errorf("attach: intent effective_policy is not the parsed policy snapshot")
 	}
-	if err := in.EffectivePolicy.Validate(); err != nil {
-		return fmt.Errorf("attach: intent effective_policy: %w", err)
+	task, err := config.ParseTaskContract(in.TaskCanonical)
+	if err != nil {
+		return fmt.Errorf("attach: intent task bytes: %w", err)
 	}
-	if in.Base == "" || in.Base != in.EffectivePolicy.BaseBranch {
-		return fmt.Errorf("attach: intent base must equal the effective policy base branch")
+	if err := config.ValidateEffective(task, policy); err != nil {
+		return fmt.Errorf("attach: intent task/policy: %w", err)
+	}
+	if in.Base != policy.BaseBranch {
+		return fmt.Errorf("attach: intent base must equal the policy base branch")
 	}
 	if !isGitOID(in.BaseCommit) {
 		return fmt.Errorf("attach: intent base_commit is not a git object id")
 	}
-	if !state.IsLocalRelPath(in.WorktreeRelPath) {
-		return fmt.Errorf("attach: intent worktree_rel_path is not a canonical local path")
+	// Filesystem coherence: supported-local is never acknowledged; unknown is only
+	// permitted with the acknowledge policy AND the ack flag set.
+	if in.FSReason == "" {
+		return fmt.Errorf("attach: intent fs reason is required")
 	}
-	if in.RunBranch == "" {
-		return fmt.Errorf("attach: intent run_branch is required")
-	}
-	if !knownFSClass(in.FSClass) || in.FSReason == "" {
-		return fmt.Errorf("attach: intent fs classification is incomplete")
+	switch in.FSClass {
+	case "supported-local":
+		if in.FSAck {
+			return fmt.Errorf("attach: supported-local must not be acknowledged")
+		}
+	case "unknown":
+		if !in.FSAck || policy.UnknownFSPolicy != config.UnknownFSAcknowledge {
+			return fmt.Errorf("attach: unknown filesystem requires the acknowledge policy and ack flag")
+		}
+	default:
+		return fmt.Errorf("attach: intent fs class is not runnable")
 	}
 	return nil
 }
 
-func validateSnapshotField(name, rel, digest string, canonical []byte) error {
-	if !state.IsLocalRelPath(rel) {
-		return fmt.Errorf("attach: intent %s snapshot path is not a canonical local path", name)
-	}
+func wantRelDir(runID string) string    { return ".claudex/runs/" + runID }
+func wantRunBranch(runID string) string { return "claudex/" + runID }
+
+func validateSnapshotField(name, digest string, canonical []byte) error {
 	if !state.IsHex64(digest) {
 		return fmt.Errorf("attach: intent %s snapshot digest is not a sha256", name)
 	}
 	if len(canonical) == 0 || len(canonical) > maxSnapshotBytes {
 		return fmt.Errorf("attach: intent %s snapshot bytes out of range", name)
 	}
-	return nil
-}
-
-func knownFSClass(c string) bool {
-	switch c {
-	case "supported-local", "unknown":
-		return true
+	if config.Hash(canonical) != digest {
+		return fmt.Errorf("attach: intent %s snapshot digest disagrees with its bytes", name)
 	}
-	return false
+	return nil
 }
 
 func isGitOID(s string) bool {

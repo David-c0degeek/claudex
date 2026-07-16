@@ -82,6 +82,12 @@ func validate(rs *RunState) error {
 	if !isGitOID(rs.BaseCommit) {
 		return fmt.Errorf("base_commit is not a git object id (40 or 64 lower-hex)")
 	}
+	if !isLocalRelPath(rs.WorktreeRelPath) {
+		return fmt.Errorf("worktree_rel_path is not a canonical local path")
+	}
+	if strings.TrimSpace(rs.RunBranch) == "" || len(rs.RunBranch) > 256 {
+		return fmt.Errorf("run_branch is required and bounded")
+	}
 	if rs.Base != rs.EffectivePolicy.BaseBranch {
 		return fmt.Errorf("base %q must equal effective_policy.base_branch %q", rs.Base, rs.EffectivePolicy.BaseBranch)
 	}
@@ -165,6 +171,9 @@ func validateTransition(old, next *RunState) error {
 	}
 	if old.Base != next.Base || old.BaseCommit != next.BaseCommit {
 		return fmt.Errorf("base identity is immutable")
+	}
+	if old.WorktreeRelPath != next.WorktreeRelPath || old.RunBranch != next.RunBranch {
+		return fmt.Errorf("workspace identity is immutable")
 	}
 	// Started/deadline are write-once.
 	if err := writeOnce("started_unix", old.StartedUnix, next.StartedUnix); err != nil {
@@ -373,6 +382,8 @@ func redactAndGuard(rs *RunState) error {
 		"run_id":                             rs.RunID,
 		"base":                               rs.Base,
 		"base_commit":                        rs.BaseCommit,
+		"worktree_rel_path":                  rs.WorktreeRelPath,
+		"run_branch":                         rs.RunBranch,
 		"phase":                              string(rs.Phase),
 		"lifecycle":                          string(rs.Lifecycle),
 		"task_snapshot.rel_path":             rs.TaskSnapshot.RelPath,

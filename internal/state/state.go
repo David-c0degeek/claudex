@@ -26,10 +26,12 @@ import (
 
 // RunStateVersion is the on-disk schema version; an unknown version fails closed.
 // v2 added the authoritative accepted Phase to each accepted turn (v1 recorded
-// only the artifact digest and receipt). A v1 generation is incompatible because
-// the required phase is absent, so it fails with version remediation, not a vague
-// missing-field error (see AcceptedTurn and checkSchemaVersion).
-const RunStateVersion = 2
+// only the artifact digest and receipt). v3 added the frozen workspace identity
+// (worktree relative locator + run branch) so pull/git work never has to mine a
+// completed bootstrap journal for it. An older generation is missing a required
+// field, so it fails with version remediation, not a vague error (see
+// checkSchemaVersion).
+const RunStateVersion = 3
 
 // ErrRevisionConflict is returned when a mutation's expected revision does not
 // match the current head.
@@ -141,6 +143,8 @@ type RunState struct {
 	FS              FSResult                `json:"fs"`
 	Base            string                  `json:"base"`
 	BaseCommit      string                  `json:"base_commit"`
+	WorktreeRelPath string                  `json:"worktree_rel_path"`
+	RunBranch       string                  `json:"run_branch"`
 	Counters        Counters                `json:"counters"`
 	Assignment      *Ref                    `json:"assignment,omitempty"`
 	Gate            *Ref                    `json:"gate,omitempty"`
