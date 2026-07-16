@@ -176,6 +176,12 @@ func validateTransition(old, next *RunState) error {
 	if old.WorktreeRelPath != next.WorktreeRelPath || old.RunBranch != next.RunBranch {
 		return fmt.Errorf("workspace identity is immutable")
 	}
+	// An absorbing terminal lifecycle (completed/cancelled/failed_terminal) can
+	// never be resurrected, so a terminal observation is stable. failed_retryable
+	// is deliberately excluded — it may return to running for a retry.
+	if IsAbsorbingLifecycle(old.Lifecycle) && next.Lifecycle != old.Lifecycle {
+		return fmt.Errorf("absorbing terminal lifecycle %q cannot be changed to %q", old.Lifecycle, next.Lifecycle)
+	}
 	// Started/deadline are write-once.
 	if err := writeOnce("started_unix", old.StartedUnix, next.StartedUnix); err != nil {
 		return err

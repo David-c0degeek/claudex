@@ -66,8 +66,14 @@ func planFor(lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan,
 		registryInitStep(registry, g, in),
 		stateInitStep(runState, g, in),
 		catalogStep(catalog, g, in),
-		currentRunStep(current, g, in),
 	}
+	// A terminal predecessor is cleared inside THIS journal, immediately before the
+	// active-run pointer is set to this run — so the clear happens only after the
+	// bootstrap is fully prepared, and recovery is monotonic.
+	if in.ClearPriorRunID != "" {
+		steps = append(steps, currentClearStep(current, g, in))
+	}
+	steps = append(steps, currentRunStep(current, g, in))
 	for i := range steps {
 		steps[i] = withFailpoint(steps[i])
 	}
@@ -289,11 +295,47 @@ func catalogStep(store *state.CatalogStore, g *genstore.Guard, in BootstrapInten
 	}
 }
 
+// currentClearStep clears a terminal predecessor inside this bootstrap's journal.
+// Observe is MONOTONIC: the pointer being inactive, or already advanced to this
+// run, both count as Applied, so the later current-set does not invalidate the
+// prefix observation on recovery.
+func currentClearStep(store *state.CurrentRunStore, g *genstore.Guard, in BootstrapIntent) txn.Step {
+	return txn.Step{
+		Name: "current-clear",
+		Status: func() (txn.StepStatus, error) {
+			cur, ok, err := store.Load()
+			if err != nil {
+				return "", err
+			}
+			if !ok {
+				return txn.StatusIndeterminate, nil // clear was requested but no pointer exists
+			}
+			if !cur.Active || cur.RunID == in.RunID {
+				return txn.StatusApplied, nil // cleared, or already advanced to this run
+			}
+			if cur.RunID == in.ClearPriorRunID {
+				return txn.StatusNotApplied, nil
+			}
+			return txn.StatusIndeterminate, nil
+		},
+		Apply: func() error {
+			cur, ok, err := store.Load()
+			if err != nil {
+				return err
+			}
+			if !ok || !cur.Active || cur.RunID != in.ClearPriorRunID {
+				return nil // idempotent: already cleared/advanced
+			}
+			_, err = store.Clear(g, cur.Revision, in.ClearPriorRunID)
+			return err
+		},
+	}
+}
+
 // currentRunStep sets the authoritative active-run pointer (the SOLE activation
-// authority) as the final step: it CASes against the intent's expected pointer
-// revision, so a later run activates after a prior one was cleared. Observe is
-// semantic — the active run must be exactly this one — so it tolerates the
-// generation the CAS actually lands on.
+// authority) as the final step. Its Apply reads the pointer's current revision
+// fresh under the guard (never a baked-in revision that a gap could break) and
+// activates this run; Observe is semantic — the active run must be exactly this one.
 func currentRunStep(store *state.CurrentRunStore, g *genstore.Guard, in BootstrapIntent) txn.Step {
 	return txn.Step{
 		Name: "current-run-set",
@@ -311,7 +353,15 @@ func currentRunStep(store *state.CurrentRunStore, g *genstore.Guard, in Bootstra
 			return txn.StatusIndeterminate, nil
 		},
 		Apply: func() error {
-			_, err := store.Activate(g, in.CurrentRunExpectedRevision, in.RunID, in.RelDir, in.OperationID)
+			cur, ok, err := store.Load()
+			if err != nil {
+				return err
+			}
+			var expRev uint64
+			if ok {
+				expRev = cur.Revision
+			}
+			_, err = store.Activate(g, expRev, in.RunID, in.RelDir, in.OperationID)
 			return err
 		},
 	}

@@ -160,7 +160,11 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		if verr != nil {
 			return FirstAttachResult{}, verr
 		}
-		if _, _, _, ferr := decideFS(mustClassify(classifier, lay), policy); ferr != nil {
+		res, cerr := classifyRunLocation(classifier, lay)
+		if cerr != nil {
+			return FirstAttachResult{}, cerr // an inability to classify is fail-closed, cause preserved
+		}
+		if _, _, _, ferr := decideFS(res, policy); ferr != nil {
 			return FirstAttachResult{}, ferr
 		}
 	}
@@ -197,24 +201,30 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		if bi.OperationID != req.OperationID {
 			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
 		}
-		return sameOpResult(lay, bi)
+		cur, ok, lerr := current.Load()
+		if lerr != nil {
+			return FirstAttachResult{}, lerr
+		}
+		if !ok || !cur.Active {
+			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
+		}
+		return sameOpResult(lay, journal, cur)
 	}
 
-	// An active run: the same operation returns the incumbent (verified still
-	// current in the Registry, never a stale/replaced session); a different
-	// operation is told the run exists — unless the active run has reached terminal,
-	// in which case it is reconciled (cleared) under the guard so a new run can start.
+	// An active run: the same operation returns the incumbent (a combined,
+	// identity-bound read verified still current in the Registry — never a
+	// stale/replaced session); a different operation is told the run exists —
+	// unless the active run has reached an ABSORBING terminal, in which case it is
+	// reconciled by a journaled clear inside the new bootstrap (never cleared
+	// eagerly, so a failed prepare leaves the pointer untouched).
 	cur, hasCur, cerr := current.Load()
 	if cerr != nil {
 		return FirstAttachResult{}, cerr
 	}
+	var clearPrior *state.CurrentRun
 	if hasCur && cur.Active {
 		if cur.OperationID == req.OperationID {
-			bi, jerr := journalIntent(journal)
-			if jerr != nil {
-				return FirstAttachResult{}, jerr
-			}
-			return sameOpResult(lay, bi)
+			return sameOpResult(lay, journal, cur)
 		}
 		terminal, terr := currentRunTerminal(lay, cur)
 		if terr != nil {
@@ -223,13 +233,8 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 		if !terminal {
 			return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 		}
-		if _, cerr := current.Clear(g, cur.Revision, cur.RunID); cerr != nil {
-			return FirstAttachResult{}, cerr
-		}
-		cur, hasCur, cerr = current.Load()
-		if cerr != nil {
-			return FirstAttachResult{}, cerr
-		}
+		c := cur
+		clearPrior = &c
 	}
 
 	// New bootstrap under the guard: full input validation + fs decision (revalidated).
@@ -237,7 +242,7 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	intent, err := prepare(lay, req, policy, classifier, curRevision(cur, hasCur))
+	intent, err := prepare(lay, req, policy, classifier, clearPrior)
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
@@ -270,62 +275,65 @@ func hasPendingOrActive(journal *txn.Journal, current *state.CurrentRunStore) (b
 	return false, nil
 }
 
-func mustClassify(classifier Classifier, lay layout) fsclass.Result {
-	res, err := classifier.Classify(filepath.Join(lay.repoDir, ".claudex"))
-	if err != nil {
-		return fsclass.Result{Class: fsclass.KnownUnsupported, Reason: "classification failed"}
-	}
-	return res
+// classifyRunLocation classifies the filesystem backing the run location and
+// PROPAGATES a classifier error (an inability to classify is fail-closed, but it
+// is never fabricated into a positive known-unsupported classification).
+func classifyRunLocation(classifier Classifier, lay layout) (fsclass.Result, error) {
+	return classifier.Classify(filepath.Join(lay.repoDir, ".claudex"))
 }
 
-// currentRunTerminal loads the active run's authoritative RunState and reports
-// whether it has reached a terminal lifecycle (safe to reconcile/clear).
+// currentRunTerminal reports whether the active run has reached an ABSORBING
+// terminal (safe to reconcile). It is identity-bound: the pointer's locator must
+// be the derived one, and the loaded RunState's run id must equal the pointer's,
+// so a cross-wired or resurrectable run is never treated as clearable.
 func currentRunTerminal(lay layout, cur state.CurrentRun) (bool, error) {
+	if cur.RelDir != state.RunDirRelFor(cur.RunID) {
+		return false, nil
+	}
 	rs, ok, err := state.Open(filepath.Join(lay.runDir(cur.RelDir), "state"), lay.repoLock).Load()
 	if err != nil {
 		return false, err
 	}
-	if !ok {
+	if !ok || rs.RunID != cur.RunID {
 		return false, nil
 	}
-	return state.IsTerminalLifecycle(rs.Lifecycle), nil
+	return state.IsAbsorbingLifecycle(rs.Lifecycle), nil
 }
 
-// sameOpResult returns the incumbent bootstrap result for an idempotent retry,
-// but ONLY after confirming the lead session is still current in the Registry —
-// the Registry is the sole session authority, so a replaced session never comes
-// back as the incumbent.
-func sameOpResult(lay layout, bi BootstrapIntent) (FirstAttachResult, error) {
+// sameOpResult is the single combined-read for an idempotent same-operation
+// return. It binds the terminal bootstrap journal, the active-run pointer, and the
+// Registry to ONE run identity before returning any credential, and fails closed
+// (ErrRunExists) on any mismatch or a replaced session — so cross-wired stores can
+// never hand back the wrong run's session.
+func sameOpResult(lay layout, journal *txn.Journal, cur state.CurrentRun) (FirstAttachResult, error) {
+	rec, ok, err := journal.Latest()
+	if err != nil {
+		return FirstAttachResult{}, err
+	}
+	if !ok || !rec.Terminal() || rec.Intent.Kind != intentKind {
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
+	}
+	bi, err := decodeIntent(rec.Intent.Payload)
+	if err != nil {
+		return FirstAttachResult{}, err
+	}
+	// Envelope <-> payload, and journal <-> active-run pointer identity.
+	if rec.TxnID() != bi.TxnID || bi.RunID != cur.RunID || bi.RelDir != cur.RelDir || bi.OperationID != cur.OperationID {
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
+	}
+	// Journal <-> Registry identity/role/agent, and the session is still current.
 	reg, ok, err := state.OpenRegistry(filepath.Join(lay.runDir(bi.RelDir), "registry"), lay.repoLock).Load()
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	if !ok || reg.Resolve(bi.SessionID).Status != state.RegCurrent {
-		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, bi.RunID)
+	if !ok || reg.RunID != bi.RunID {
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
+	}
+	r := reg.Resolve(bi.SessionID)
+	if r.Status != state.RegCurrent || r.Role != state.SlotLead || r.Agent != bi.Agent {
+		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 	}
 	return resultFor(bi), nil
-}
-
-// journalIntent decodes the intent of the latest (terminal) bootstrap journal
-// record — the exact bootstrap result for the active run.
-func journalIntent(journal *txn.Journal) (BootstrapIntent, error) {
-	rec, ok, err := journal.Latest()
-	if err != nil {
-		return BootstrapIntent{}, err
-	}
-	if !ok {
-		return BootstrapIntent{}, fmt.Errorf("attach: no bootstrap journal for the active run")
-	}
-	return decodeIntent(rec.Intent.Payload)
-}
-
-// curRevision is the active-run pointer's revision to CAS against (0 if the store
-// is empty), so a later run activates after a prior one was cleared.
-func curRevision(cur state.CurrentRun, ok bool) uint64 {
-	if !ok {
-		return 0
-	}
-	return cur.Revision
 }
 
 // legacyRepoRefusal refuses a pre-pivot Python run: the repo-level
@@ -444,7 +452,7 @@ func (req FirstAttachRequest) validateForNewBootstrap() (config.RunPolicy, error
 // identity, classifies the run location, and resolves the base commit from a
 // frozen OID — so every downstream Apply and any recovery works from exactly
 // these values.
-func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier, currentExpectedRev uint64) (BootstrapIntent, error) {
+func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier, clearPrior *state.CurrentRun) (BootstrapIntent, error) {
 	if err := legacyRepoRefusal(lay.repoDir); err != nil {
 		return BootstrapIntent{}, err
 	}
@@ -482,29 +490,32 @@ func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classi
 	}
 
 	in := BootstrapIntent{
-		RunID:                      runID,
-		TxnID:                      txnID,
-		OperationID:                req.OperationID,
-		SessionID:                  sessionID,
-		Agent:                      req.Agent,
-		CreatedUnix:                req.CreatedUnix,
-		RelDir:                     relDir,
-		TaskRelPath:                "inputs/task.json",
-		TaskDigest:                 config.Hash(req.TaskCanonical),
-		TaskCanonical:              req.TaskCanonical,
-		PolicyRelPath:              "inputs/policy.json",
-		PolicyDigest:               config.Hash(req.PolicyCanonical),
-		PolicyCanonical:            req.PolicyCanonical,
-		EffectivePolicy:            policy,
-		Base:                       policy.BaseBranch,
-		BaseCommit:                 baseCommit,
-		WorktreeRelPath:            relDir + "/worktree",
-		RunBranch:                  wantRunBranch(runID),
-		FSClass:                    fsClass,
-		FSReason:                   fsReason,
-		FSAck:                      fsAck,
-		CatalogExpectedRevision:    0,
-		CurrentRunExpectedRevision: currentExpectedRev,
+		RunID:                   runID,
+		TxnID:                   txnID,
+		OperationID:             req.OperationID,
+		SessionID:               sessionID,
+		Agent:                   req.Agent,
+		CreatedUnix:             req.CreatedUnix,
+		RelDir:                  relDir,
+		TaskRelPath:             "inputs/task.json",
+		TaskDigest:              config.Hash(req.TaskCanonical),
+		TaskCanonical:           req.TaskCanonical,
+		PolicyRelPath:           "inputs/policy.json",
+		PolicyDigest:            config.Hash(req.PolicyCanonical),
+		PolicyCanonical:         req.PolicyCanonical,
+		EffectivePolicy:         policy,
+		Base:                    policy.BaseBranch,
+		BaseCommit:              baseCommit,
+		WorktreeRelPath:         relDir + "/worktree",
+		RunBranch:               wantRunBranch(runID),
+		FSClass:                 fsClass,
+		FSReason:                fsReason,
+		FSAck:                   fsAck,
+		CatalogExpectedRevision: 0,
+	}
+	if clearPrior != nil {
+		in.ClearPriorRunID = clearPrior.RunID
+		in.ClearPriorRevision = clearPrior.Revision
 	}
 	if cat, ok, cerr := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load(); cerr != nil {
 		return BootstrapIntent{}, cerr

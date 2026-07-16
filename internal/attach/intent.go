@@ -73,10 +73,15 @@ type BootstrapIntent struct {
 	FSAck    bool   `json:"fs_acknowledged"`
 
 	// Catalog allocation target: the expected catalog revision and the immutable
-	// run ref. The active-run pointer's expected revision lets a later run
-	// activate after a prior one is cleared (the repo is not single-run).
-	CatalogExpectedRevision    uint64 `json:"catalog_expected_revision"`
-	CurrentRunExpectedRevision uint64 `json:"current_run_expected_revision"`
+	// run ref.
+	CatalogExpectedRevision uint64 `json:"catalog_expected_revision"`
+
+	// Prior run to reconcile (clear) inside THIS bootstrap's journal, so a
+	// terminal predecessor is cleared atomically-with-recovery only after this
+	// bootstrap is prepared — a failed prepare never mutates the pointer. Empty
+	// when there is no prior active run.
+	ClearPriorRunID    string `json:"clear_prior_run_id"`
+	ClearPriorRevision uint64 `json:"clear_prior_revision"`
 }
 
 // runRef is the immutable catalog allocation this intent commits.
@@ -195,6 +200,15 @@ func (in BootstrapIntent) validate() error {
 		}
 	default:
 		return fmt.Errorf("attach: intent fs class is not runnable")
+	}
+	// A prior run to clear must be a real run id at a positive revision, and must
+	// not be this run.
+	if in.ClearPriorRunID != "" {
+		if !state.IsRunID(in.ClearPriorRunID) || in.ClearPriorRevision == 0 || in.ClearPriorRunID == in.RunID {
+			return fmt.Errorf("attach: intent clear_prior is not a valid distinct prior run")
+		}
+	} else if in.ClearPriorRevision != 0 {
+		return fmt.Errorf("attach: intent clear_prior revision without a run id")
 	}
 	return nil
 }

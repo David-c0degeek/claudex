@@ -54,6 +54,18 @@ func IsFailureLifecycle(l Lifecycle) bool {
 	return l == LifecycleFailedTerminal || l == LifecycleFailedRetryable
 }
 
+// IsAbsorbingLifecycle reports whether the run has ended in a state it can never
+// leave: completed, cancelled, or failed_terminal. failed_retryable is terminal
+// but NOT absorbing — it may transition back to running for a retry, so it is not
+// safe to reconcile/clear an active-run pointer on failed_retryable alone.
+func IsAbsorbingLifecycle(l Lifecycle) bool {
+	switch l {
+	case LifecycleCompleted, LifecycleCancelled, LifecycleFailedTerminal:
+		return true
+	}
+	return false
+}
+
 // IsPausedLifecycle reports whether the run is paused waiting on a gate (human
 // decision, budget, or rate limit) rather than an agent turn.
 func IsPausedLifecycle(l Lifecycle) bool {

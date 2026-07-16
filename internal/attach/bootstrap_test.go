@@ -405,7 +405,10 @@ func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 		t.Fatalf("run A: %v", err)
 	}
 	lay := layoutFor(repo)
-	aStore := state.Open(filepath.Join(lay.runDir(state.RunDirRelFor(a.RunID)), "state"), lay.repoLock)
+	// Drive A terminal through a PER-RUN lock (the two-tier protocol: after
+	// bootstrap, run-scoped work uses the run's own lock, not the repo lock).
+	aRunDir := lay.runDir(state.RunDirRelFor(a.RunID))
+	aStore := state.Open(filepath.Join(aRunDir, "state"), filepath.Join(aRunDir, "run.lock"))
 
 	// While A is still RUNNING, a different operation must be refused (no split-brain).
 	running := newRequest(t, repo, &fakeWorktree{})
@@ -531,5 +534,83 @@ func TestFirstAttachConcurrent(t *testing.T) {
 	cat, _, _ := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()
 	if len(cat.Runs) != 1 {
 		t.Fatalf("catalog has %d runs, want exactly 1", len(cat.Runs))
+	}
+}
+
+// minimalRequest carries only what a recovery/idempotent return needs: repo,
+// operation id, and a worktree observer — no task/policy/RNG/base/agent/clock.
+func minimalRequest(repo, op string, wt WorktreeProvisioner) FirstAttachRequest {
+	return FirstAttachRequest{RepoDir: repo, OperationID: op, Worktree: wt}
+}
+
+// A classifier I/O error is propagated (fail-closed) BEFORE any mutation — never
+// fabricated into a positive known-unsupported classification.
+func TestFirstAttachClassifierError(t *testing.T) {
+	repo := t.TempDir()
+	req := newRequest(t, repo, &fakeWorktree{})
+	req.Classifier = fakeClassifier{err: errors.New("classify io failure")}
+	_, err := FirstAttach(req)
+	if err == nil || errors.Is(err, ErrUnsupportedFS) {
+		t.Fatalf("classifier error = %v, want the propagated cause (not ErrUnsupportedFS)", err)
+	}
+	if _, e := os.Stat(filepath.Join(repo, ".claudex")); !os.IsNotExist(e) {
+		t.Fatalf(".claudex created despite a classifier error")
+	}
+}
+
+// A recovery and a completed-response retry both work from ONLY {repo, operation
+// id, worktree}, even when the fresh inputs are gone/nil.
+func TestFirstAttachMinimalRecoveryInputs(t *testing.T) {
+	t.Run("pending recovery", func(t *testing.T) {
+		repo := t.TempDir()
+		if _, err := FirstAttach(newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
+			t.Fatalf("first attach should fail at the worktree step")
+		}
+		// Retry with NOTHING but repo + op + a healthy worktree.
+		got, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{}))
+		if err != nil {
+			t.Fatalf("minimal pending recovery: %v", err)
+		}
+		if !state.IsSessionID(got.SessionID) {
+			t.Fatalf("recovery returned no session")
+		}
+	})
+	t.Run("completed response retry", func(t *testing.T) {
+		repo := t.TempDir()
+		a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+		if err != nil {
+			t.Fatalf("first attach: %v", err)
+		}
+		got, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{}))
+		if err != nil {
+			t.Fatalf("minimal completed retry: %v", err)
+		}
+		if got.RunID != a.RunID || got.SessionID != a.SessionID {
+			t.Fatalf("minimal retry identity = %s/%s, want %s/%s", got.RunID, got.SessionID, a.RunID, a.SessionID)
+		}
+	})
+}
+
+// A same-op retry after the lead session was replaced in the Registry returns
+// run-exists, never the stale credential — the Registry is the sole session truth.
+func TestSameOpRefusesReplacedSession(t *testing.T) {
+	repo := t.TempDir()
+	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	if err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	lay := layoutFor(repo)
+	regStore := state.OpenRegistry(filepath.Join(lay.runDir(state.RunDirRelFor(a.RunID)), "registry"), lay.repoLock)
+	reg, _, _ := regStore.Load()
+	newSess := "sess-" + strings.Repeat("f", 32)
+	if _, err := regStore.Mutate(reg.Revision, func(gen uint64, next *state.Registry) error {
+		next.Lead.Sessions = append(next.Lead.Sessions, state.SessionRecord{SessionID: newSess, Generation: 2, IssuedRegistryRevision: gen})
+		next.Lead.CurrentSessionID = newSess
+		return nil
+	}); err != nil {
+		t.Fatalf("replace lead session: %v", err)
+	}
+	if _, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{})); !errors.Is(err, ErrRunExists) {
+		t.Fatalf("retry after replacement err = %v, want ErrRunExists (never the stale session)", err)
 	}
 }
