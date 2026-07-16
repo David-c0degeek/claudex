@@ -7,13 +7,25 @@ import (
 	"sort"
 
 	"github.com/David-c0degeek/claudex/internal/protocol"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
 const (
 	statusType          = "status"
 	capMechanismCounter = "durable-state-counter"
+
+	// tierMechanismBYO / tierMechanismManaged are the stable mechanisms backing
+	// each tier, so the tier label is not a bare assertion.
+	tierMechanismBYO     = "durable-byo-registration"
+	tierMechanismManaged = "managed-launch-record"
 )
+
+// tierMechanisms binds each tier to the one mechanism that may back it.
+var tierMechanisms = map[Tier]string{
+	TierProtocolOnly: tierMechanismBYO,
+	TierManaged:      tierMechanismManaged,
+}
 
 var (
 	// ErrHonestySource means the honesty seam failed or returned invalid labels.
@@ -141,11 +153,15 @@ func Status(store *state.Store, honesty HonestySource) (StatusReport, error) {
 	if err := coherenceCheck(facts); err != nil {
 		return StatusReport{}, err
 	}
-	whose, turnID, err := projectOwner(facts)
+	// Project the stop before ownership: a required recovery dominates the agent
+	// turn (as it does in wait), so it suppresses the owner rather than reporting
+	// two next actors.
+	stop, err := projectStop(facts)
 	if err != nil {
 		return StatusReport{}, err
 	}
-	stop, err := projectStop(facts)
+	recoveryPresent := stop != nil && stop.Kind == "recovery"
+	whose, turnID, err := projectOwner(facts, recoveryPresent)
 	if err != nil {
 		return StatusReport{}, err
 	}
@@ -188,7 +204,7 @@ func Status(store *state.Store, honesty HonestySource) (StatusReport, error) {
 // agent phase. A cancelled/terminal run with a leftover actionable phase but no
 // assignment reports no owner; an assignment under a non-agent or non-running
 // shape, or a running agent phase with no assignment, fails closed.
-func projectOwner(f runFacts) (*Role, *string, error) {
+func projectOwner(f runFacts, recoveryPresent bool) (*Role, *string, error) {
 	spec, agentPhase := TurnSpec(f.phase)
 	hasAssignment := f.assignmentID != ""
 	running := f.lifecycle == state.LifecycleRunning
@@ -196,11 +212,16 @@ func projectOwner(f runFacts) (*Role, *string, error) {
 		if !agentPhase || !running {
 			return nil, nil, fmt.Errorf("%w: an assignment under phase %s / lifecycle %s", ErrCorruptState, f.phase, f.lifecycle)
 		}
+		if recoveryPresent {
+			return nil, nil, nil // a required recovery dominates the agent turn
+		}
 		role := spec.Role
 		id := f.assignmentID
 		return &role, &id, nil
 	}
-	if agentPhase && running {
+	// A running agent phase normally needs an owner; a pending recovery is the
+	// next actor instead.
+	if agentPhase && running && !recoveryPresent {
 		return nil, nil, fmt.Errorf("%w: running agent phase %s with no assignment", ErrCorruptState, f.phase)
 	}
 	return nil, nil, nil
@@ -266,6 +287,9 @@ func validateHonesty(l HonestyLabels) error {
 	if !isCanonicalID(l.TierMechanism) {
 		return fmt.Errorf("%w: tier mechanism is not a canonical identifier", ErrHonestySource)
 	}
+	if tierMechanisms[l.Tier] != l.TierMechanism {
+		return fmt.Errorf("%w: tier mechanism does not back the tier", ErrHonestySource)
+	}
 	if len(l.Capabilities) > 64 {
 		return fmt.Errorf("%w: too many capabilities", ErrHonestySource)
 	}
@@ -318,7 +342,9 @@ func (s StatusReport) semanticValidate() error {
 		return fail("missing run_id or revision")
 	}
 
-	// Ownership.
+	// Ownership. A recovery stop dominates the agent turn, so it excludes an owner
+	// and lets a running agent phase be ownerless.
+	recoveryStop := s.Stop != nil && s.Stop.Kind == "recovery"
 	spec, agentPhase := TurnSpec(s.Phase)
 	running := s.Lifecycle == state.LifecycleRunning
 	hasWhose, hasTurn := s.WhoseTurn != nil, s.TurnID != nil
@@ -326,13 +352,16 @@ func (s StatusReport) semanticValidate() error {
 		return fail("whose_turn and turn_id must appear together")
 	}
 	if hasWhose {
+		if recoveryStop {
+			return fail("a recovery stop excludes an owner")
+		}
 		if !agentPhase || !running {
 			return fail("an owner requires a running agent phase")
 		}
 		if *s.WhoseTurn != spec.Role {
 			return fail("whose_turn disagrees with the phase")
 		}
-	} else if agentPhase && running {
+	} else if agentPhase && running && !recoveryStop {
 		return fail("a running agent phase must have an owner")
 	}
 
@@ -371,6 +400,14 @@ func (s StatusReport) semanticValidate() error {
 		}
 		if s.Stop.Code == "" || s.Stop.Reason == "" || s.Stop.NextAction == "" {
 			return fail("a stop needs code, reason, and next_action")
+		}
+		// Every stop field must already be redacted; a mutated report must not
+		// carry a secret to the wire, and control fields must not be silently
+		// rewritten.
+		for _, f := range []string{s.Stop.Code, s.Stop.Reason, s.Stop.NextAction} {
+			if redact.Text(f) != f {
+				return fail("a stop field is not redacted")
+			}
 		}
 		if s.Stop.AtRevision == 0 || s.Stop.AtRevision > s.Revision {
 			return fail("stop at_revision is out of range")

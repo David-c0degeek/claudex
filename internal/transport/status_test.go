@@ -111,14 +111,21 @@ func TestStatusStopProjection(t *testing.T) {
 	if strings.Contains(s.Stop.Reason, "sk-ant-") {
 		t.Fatalf("stop reason not redacted: %q", s.Stop.Reason)
 	}
-	// recovery projection -> recovery stop.
-	store2, rev2 := newRunWithActiveTurn(t)
+	// A recovery on a running run with an active turn suppresses the owner: the
+	// recovery is the single next actor.
+	store2, rev2 := newRunWithActiveTurn(t) // IMPLEMENT_STEP, lead turn-1, running
 	mutate(t, store2, rev2, func(r uint64, n *state.RunState) {
 		n.Recovery = &state.Projection{Code: "torn", Reason: "torn gen", NextAction: "recover", AtRevision: r}
 	})
-	s2, _ := Status(store2, byoHonesty())
+	s2, err := Status(store2, byoHonesty())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
 	if s2.Stop == nil || s2.Stop.Kind != "recovery" {
 		t.Fatalf("recovery stop wrong: %+v", s2.Stop)
+	}
+	if s2.WhoseTurn != nil || s2.TurnID != nil {
+		t.Fatalf("recovery must suppress the owner: %+v", s2)
 	}
 }
 
@@ -146,6 +153,24 @@ func TestStatusHonestyFailsClosed(t *testing.T) {
 	}
 	if _, err := Status(store, badCap); !errors.Is(err, ErrHonestySource) {
 		t.Fatalf("bad capability status want ErrHonestySource, got %v", err)
+	}
+}
+
+// The tier mechanism must actually back the tier.
+func TestStatusTierMechanismPairing(t *testing.T) {
+	store, _ := newRunWithActiveTurn(t)
+	mismatched := func(StatusInput) (HonestyLabels, error) {
+		return HonestyLabels{Tier: TierManaged, TierMechanism: "durable-byo-registration"}, nil
+	}
+	if _, err := Status(store, mismatched); !errors.Is(err, ErrHonestySource) {
+		t.Fatalf("mismatched tier/mechanism err = %v, want ErrHonestySource", err)
+	}
+	// The correct managed pairing validates (a fake managed source).
+	managed := func(StatusInput) (HonestyLabels, error) {
+		return HonestyLabels{Tier: TierManaged, TierMechanism: "managed-launch-record"}, nil
+	}
+	if _, err := Status(store, managed); err != nil {
+		t.Fatalf("valid managed pairing rejected: %v", err)
 	}
 }
 
@@ -198,6 +223,13 @@ func TestStatusMarshalRejectsContradictions(t *testing.T) {
 		"gate outside gate":  func(s *StatusReport) { gid := "g"; s.GateID = &gid },
 		"failure under running": func(s *StatusReport) {
 			s.Stop = &StopProjection{Kind: "failure", Code: "c", Reason: "r", NextAction: "a", AtRevision: 1}
+		},
+		"recovery with owner": func(s *StatusReport) {
+			s.Stop = &StopProjection{Kind: "recovery", Code: "c", Reason: "r", NextAction: "a", AtRevision: 1}
+		},
+		"secret in stop reason": func(s *StatusReport) {
+			s.WhoseTurn, s.TurnID = nil, nil
+			s.Stop = &StopProjection{Kind: "recovery", Code: "c", Reason: "token=sk-ant-abcdefghijklmnopqrstuvwx", NextAction: "a", AtRevision: 1}
 		},
 		"step out of order": func(s *StatusReport) {
 			s.Caps.CheckpointRounds.Steps = []StepCap{{StepIndex: 5, Used: 0, Remaining: 0, ExceededBy: 0}}
