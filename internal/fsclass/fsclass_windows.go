@@ -53,7 +53,7 @@ func hresultFromWin32(code uint32) uint32 {
 // classifyHRESULT maps a CfGetSyncRootInfoByPath HRESULT to the tri-state.
 // S_OK proves under-root; the documented not-under result and the "no Cloud
 // Filter on this volume" errors are accepted negatives (no CfAPI-managed sync
-// root detected — not proof that no third-party sync product exists, per D015);
+// root detected — not proof that no third-party sync product exists);
 // every other HRESULT is indeterminate.
 func classifyHRESULT(hr uint32) cloudState {
 	switch hr {

@@ -10,7 +10,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/genstore"
 )
 
-// The ordered durable cuts of a git-shaped transaction (01.5).
+// The ordered durable cuts of a git-shaped transaction.
 var canonicalSteps = []string{"result", "commit", "refCAS", "index", "stateCAS", "receipt", "ledger"}
 
 type fakeStep struct {

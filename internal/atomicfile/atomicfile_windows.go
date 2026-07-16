@@ -47,8 +47,8 @@ func isTransientRename(err error) bool {
 }
 
 // syncDir is a no-op on Windows: there is no directory fsync. Power-loss
-// durability would additionally require MOVEFILE_WRITE_THROUGH (docs/decisions.md
-// D015), which the default os.Rename does not request.
+// durability would additionally require MOVEFILE_WRITE_THROUGH, which the
+// default os.Rename does not request.
 func syncDir(string) error {
 	return nil
 }

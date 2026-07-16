@@ -9,10 +9,10 @@ type LedgerEntry struct {
 	ArtifactDigest string `json:"artifact_digest"`
 }
 
-// Ledger derives the append-only ledger purely from the accepted artifacts
-// (01.3/D004). It is a projection, never an independent source of truth: two
-// states with the same accepted turns yield byte-identical ledgers regardless
-// of any other field, and the ledger reconstructs from AcceptedTurns alone.
+// Ledger derives the append-only ledger purely from the accepted artifacts. It
+// is a projection, never an independent source of truth: two states with the
+// same accepted turns yield byte-identical ledgers regardless of any other
+// field, and the ledger reconstructs from AcceptedTurns alone.
 //
 // Entries are ordered by the receipt revision that accepted them, then by
 // turn_id, so the order is deterministic and stable across recovery.

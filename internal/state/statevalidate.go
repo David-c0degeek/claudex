@@ -188,7 +188,7 @@ func validateTransition(old, next *RunState) error {
 		}
 	}
 	// Accepted turns are append-only; existing entries are frozen and a NEW turn
-	// must have been accepted at the resulting revision (D004).
+	// must have been accepted at the resulting revision.
 	for k, v := range old.AcceptedTurns {
 		nv, ok := next.AcceptedTurns[k]
 		if !ok || nv != v {
@@ -413,7 +413,7 @@ func validateTimes(rs *RunState) error {
 	}
 	// The deadline is the frozen run wall cap applied to the start (overflow-safe
 	// via subtraction, since both are positive): an arbitrary deadline must not
-	// silently replace the D016 cap.
+	// silently replace the cap.
 	if rs.DeadlineUnix <= rs.StartedUnix {
 		return fmt.Errorf("deadline_unix must be after started_unix")
 	}

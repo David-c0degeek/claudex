@@ -144,7 +144,7 @@ Before considering a box done:
 | Done | # | File | Status | Owner summary | Human actions mirrored? |
 |---|---|---|---|---|---|
 | [x] | 00 | `tasks/interactive-pairing/00-tooling-research-and-readiness.md` | DONE | agent: 8; product-owner: 1 | yes |
-| [ ] | 01 | `tasks/interactive-pairing/01-durable-state-core.md` | TODO | agent: 10 | n/a |
+| [x] | 01 | `tasks/interactive-pairing/01-durable-state-core.md` | DONE | agent: 10 | n/a |
 | [ ] | 02 | `tasks/interactive-pairing/02-transport-protocol.md` | TODO | agent: 6 | n/a |
 | [ ] | 03 | `tasks/interactive-pairing/03-attach-and-phase-engine.md` | TODO | agent: 9 | n/a |
 | [ ] | 04 | `tasks/interactive-pairing/04-git-transaction-and-review-evidence.md` | TODO | agent: 6 | n/a |

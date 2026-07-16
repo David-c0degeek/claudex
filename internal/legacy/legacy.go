@@ -1,5 +1,5 @@
 // Package legacy reads pre-pivot Python claudex run state read-only. The attach
-// coordinator uses a new, incompatible state major version (D011): a pre-pivot
+// coordinator uses a new, incompatible state major version: a pre-pivot
 // Python run directory is never reinterpreted or resumed as an attach run — it
 // is detected, inspectable in a redacted view, and refused at bootstrap.
 //

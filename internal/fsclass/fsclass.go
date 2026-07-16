@@ -1,6 +1,6 @@
 // Package fsclass classifies a filesystem path so the coordinator only stores
 // durable state where its advisory-lock and file-replace guarantees actually
-// hold: local filesystems (D015).
+// hold: local filesystems.
 //
 // Classification is honest about its limits. Network filesystems (SMB/NFS) and
 // remote-mapped drives are usually detectable and reported as KnownUnsupported.

@@ -1,4 +1,4 @@
-// Package txn is the prepared-transaction journal (D006/01.5). It bridges the
+// Package txn is the prepared-transaction journal. It bridges the
 // several ordered, durable cuts of a coordinator transaction that cannot commit
 // atomically together (subject 04 supplies the git ref move, index reconcile, and
 // state CAS as concrete steps).
@@ -11,7 +11,7 @@
 // NotApplied applies and is re-observed, Indeterminate fails closed. So the
 // classic "external effect done, crash before state" cut is repaired forward, and
 // a transaction is never falsely terminalized. The journal itself is an immutable
-// genstore generation sequence (D017), so it never depends on the replace it
+// genstore generation sequence, so it never depends on the replace it
 // diagnoses, and it composes under the run's shared guard with the state store.
 //
 // The steps and the intent payload codec are the caller's (subject 04 for git).
@@ -96,7 +96,7 @@ func (r Record) Terminal() bool { return r.Complete || r.Aborted }
 func (r Record) TxnID() string { return r.Intent.TxnID }
 
 // NextStep is the id of the next step to run, or "" when none remain. It lets a
-// read-only status project the exact next action (01.6).
+// read-only status project the exact next action.
 func (r Record) NextStep() string {
 	if r.Terminal() || r.StepsDone >= len(r.StepIDs) {
 		return ""

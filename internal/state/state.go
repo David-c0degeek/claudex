@@ -1,10 +1,10 @@
 // Package state is the coordinator's typed, validated run state, persisted as
-// immutable generations (D017) via internal/genstore. State never overwrites in
+// immutable generations via internal/genstore. State never overwrites in
 // place; each mutation is a compare-and-swap that appends the next generation.
 //
 // The mutator runs INSIDE the generation builder, after genstore has chosen the
 // next (possibly gap-skipped) generation number, so identities and receipts bind
-// to the exact resulting revision (D004/01.2). Every mutation is validated for
+// to the exact resulting revision. Every mutation is validated for
 // its own invariants and as a transition from the previous state (bootstrap
 // fields immutable, counters non-decreasing, accepted turns append-only). Free
 // text is redacted before persisting; a secret in an executable/control field is
@@ -85,7 +85,7 @@ type Counters struct {
 	StepFixes     []int `json:"step_fixes"`
 }
 
-// Ref binds an issued identity to the revision that issued it (D004/01.2).
+// Ref binds an issued identity to the revision that issued it.
 type Ref struct {
 	ID             string `json:"id"`
 	IssuedRevision uint64 `json:"issued_revision"`

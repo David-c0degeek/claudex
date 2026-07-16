@@ -1,5 +1,5 @@
 // Package config parses, defaults, validates, and resolves a run's two explicit
-// inputs (D016): the versioned task contract (what the run must achieve) and the
+// inputs: the versioned task contract (what the run must achieve) and the
 // run policy (test gate, observable caps, timeouts, evidence bounds, base/repo
 // and filesystem policy). The first attach resolves the effective policy, hashes
 // the raw sources, and freezes both into run state so later edits cannot change a
@@ -79,7 +79,7 @@ type Limits struct {
 }
 
 // RunPolicy is the operational envelope. There is no agent/turn timeout that
-// could expire a turn_id: D004 rejects lease expiry, so idle turns are bounded
+// could expire a turn_id: lease expiry is rejected, so idle turns are bounded
 // only by the run wall cap, never by silently invalidating an assignment.
 type RunPolicy struct {
 	SchemaVersion   int             `json:"schema_version"`

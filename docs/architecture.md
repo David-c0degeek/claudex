@@ -107,7 +107,9 @@ Created per-slice as each subject lands (not all up front):
 |---|---|---|
 | `cmd/claudex` | CLI entry, command dispatch | 00 (skeleton) → grows |
 | `internal/buildinfo` | version/build metadata | 00 |
-| `internal/state` | durable run state, `state_revision`, CAS, frozen run-policy | 01 |
+| `internal/genstore` | append-only immutable-generation store (root of trust) | 01 |
+| `internal/state` | durable run state, `state_revision`, CAS, run catalog, ledger projection, frozen run-policy | 01 |
+| `internal/legacy` | read-only pre-pivot state inspector + bootstrap refusal guard | 01 |
 | `internal/txn` | generic prepared-transaction journal + reconciliation | 01 |
 | `internal/config` | task-contract + run-policy parse/default/validate/freeze | 01 |
 | `internal/redact` | credential redaction at every persist/display boundary | 00/01 |

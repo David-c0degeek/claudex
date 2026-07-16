@@ -2,7 +2,7 @@
 // rename, so that a failure before the rename leaves the previous file
 // byte-identical and the target is never written in place.
 //
-// Consistency guarantee, stated honestly per platform (D015):
+// Consistency guarantee, stated honestly per platform:
 //   - POSIX: rename(2) is an atomic replace — a concurrent reader sees either the
 //     old bytes or the complete new bytes, never a torn intermediate. A directory
 //     fsync makes the replacement durable across power loss.
@@ -10,8 +10,8 @@
 //     contract explicitly does NOT guarantee to be atomic. This package therefore
 //     makes NO old-or-new promise on Windows and does NOT implement recovery. A
 //     caller that needs crash-consistency on Windows must NOT overwrite its root
-//     of trust through Write; it must use the immutable-generation protocol
-//     (docs/decisions.md D017): write each new state as a fresh, checksummed
+//     of trust through Write; it must use the immutable-generation protocol:
+//     write each new state as a fresh, checksummed
 //     generation file (never overwriting the last valid one) and, on recovery,
 //     enumerate and select the highest valid generation. A torn new generation is
 //     detected by its checksum and ignored, leaving the previous one intact.
@@ -87,7 +87,7 @@ var defaultOps = ops{
 // Write writes data to path with the given permissions, replacing any existing
 // file. The replace is atomic on POSIX and best-effort on Windows (see the
 // package doc — Windows callers needing crash-consistency use the generation
-// protocol, D017). A failure before the internal rename leaves any existing file
+// protocol). A failure before the internal rename leaves any existing file
 // untouched. If the data is committed but the final directory sync fails, Write
 // returns a *PostCommitSyncError.
 func Write(path string, data []byte, perm os.FileMode) error {

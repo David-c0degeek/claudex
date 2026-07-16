@@ -1,7 +1,7 @@
-// Package genstore is the coordinator's root of trust (D017): an append-only
+// Package genstore is the coordinator's root of trust: an append-only
 // sequence of self-validating immutable generation records. A record is never
 // modified once written, so writing a new generation cannot corrupt a valid one
-// and no atomic in-place replace is required (Windows does not provide one, D015).
+// and no atomic in-place replace is required (Windows does not provide one).
 //
 // Each generation is a file NNNNNNNNNNNN.gen (exactly 12 canonical digits) whose
 // bytes are uint64(len(header)) | header-json | payload | sha256(all-preceding).

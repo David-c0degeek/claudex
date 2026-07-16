@@ -3,7 +3,7 @@
 //
 // That automatic release is the crash-stale reclaim mechanism: a lock left by a
 // crashed claudex process is reclaimable by the next one without any PID
-// guessing or timeout heuristics (D015). The lock is advisory and only
+// guessing or timeout heuristics. The lock is advisory and only
 // meaningful on a local filesystem.
 //
 // TryAcquire is non-blocking: it either takes the lock or reports that another

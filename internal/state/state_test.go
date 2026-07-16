@@ -285,7 +285,7 @@ func TestStrictDecodeRejectsUnknownField(t *testing.T) {
 }
 
 // A pre-pivot Python state.json is never reinterpreted as an attach run: its
-// legacy-only fields fail the strict attach decoder (01.7/D011). The friendly
+// legacy-only fields fail the strict attach decoder. The friendly
 // operator-facing refusal lives in internal/legacy.
 func TestStrictDecodeRejectsLegacyPythonState(t *testing.T) {
 	legacy := []byte(`{"run_id":"r","repo":"/p","lead":"claude","driver":"headless","phase":"init"}`)
