@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex pull assignment, version 1",
+  "description": "The complete authoritative assignment returned by pull: what this session must do this turn. Phase/role-specific — an edit phase carries a mutable worktree; every other phase carries an immutable evidence root.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "run_id",
+    "session_id",
+    "turn_id",
+    "role",
+    "phase",
+    "expected_state_revision",
+    "binding_guidance",
+    "artifact_message_type",
+    "worktree",
+    "evidence_root"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "assignment"
+    },
+    "run_id": {
+      "description": "The run this assignment belongs to.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "session_id": {
+      "description": "The session this assignment is addressed to.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "turn_id": {
+      "description": "The turn the preceding transition issued; pull never mints this.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "role": {
+      "description": "Which role must act this turn.",
+      "type": "string",
+      "enum": ["lead", "pair"]
+    },
+    "phase": {
+      "description": "The phase whose work this assignment covers.",
+      "type": "string",
+      "enum": [
+        "PLAN_DRAFT",
+        "PLAN_CRITIQUE",
+        "PLAN_REVISE",
+        "IMPLEMENT_STEP",
+        "CHECKPOINT",
+        "FIX",
+        "VERIFY"
+      ]
+    },
+    "expected_state_revision": {
+      "description": "The run-state revision a submit for this turn must compare-and-swap against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "binding_guidance": {
+      "description": "Human decisions that remain binding for the rest of the run.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      }
+    },
+    "artifact_message_type": {
+      "description": "The message type a submit for this turn must be.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "worktree": {
+      "description": "The mutable worktree path, present only for a lead edit phase (IMPLEMENT_STEP/FIX); null otherwise.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "evidence_root": {
+      "description": "The immutable evidence-root digest, present for every non-edit phase; null for an edit phase.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}
