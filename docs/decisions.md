@@ -155,9 +155,16 @@ subject 01 shapes state.
   network drives; Linux: `statfs` `f_type` magics (NFS `0x6969`, SMB/CIFS
   `0xff534d42`) + `/proc/mounts`. Third-party sync roots (OneDrive-style) are not
   universally detectable → `unknown`.
-- **Canonical JSON** — RFC 8785 (JCS) for digest/idempotency so receipts are
-  whitespace/key-order/platform independent; `json.Decoder.UseNumber()` to preserve
-  number semantics. Library-vs-vendored decision is finalised in subject 02.
+- **Restricted canonical JSON** — a dependency-free canonicalizer (`internal/canonjson`)
+  using RFC 8785 (JCS) string escaping and UTF-16 object-key ordering, but a
+  restricted numeric domain: only integers in the safe range ±(2^53−1) are
+  accepted; non-integer numbers and larger integers are rejected (fractional
+  quantities use integer-scaled minor units, full-width identities/counters use
+  strings). This avoids reproducing ECMAScript shortest-round-trip float
+  formatting and preserves digest identity under JavaScript providers. The parser
+  is strict — it rejects duplicate keys, lone surrogates, invalid UTF-8, leading
+  zeros, trailing content, and oversize/over-nested input — so canonicalization is
+  injective on accepted inputs. Digest is `sha256` over the canonical bytes.
 
 ## D017 — Immutable-generation persistence (state root of trust)
 Because file replace is not atomic on Windows (D015), the authoritative run state

@@ -61,7 +61,8 @@ Role-addressed file mailbox under `.claudex/session/`. Four verbs:
   Read-only and idempotent; never mints identity.
 - `submit` — validates against the assignment schema, accept-once under the lock
   via CAS, returns a durable receipt. Duplicate identity is a **canonical
-  artifact digest** (RFC 8785) match → returns the receipt; different digest →
+  artifact digest** (restricted canonical JSON — JCS escaping/key order, safe
+  integer-only numbers) match → returns the receipt; different digest →
   conflict; stale revision → rejected.
 - `wait --timeout N` — bounded long-poll; wakes on any relevant revision (my
   turn, a gate, cancellation, terminal/failure, session replacement); holds no
@@ -116,7 +117,7 @@ Created per-slice as each subject lands (not all up front):
 | `internal/oslock`, `internal/atomicfile` | build-tagged OS primitives | 01 |
 | `internal/fsclass` | local-filesystem classifier | 01 |
 | `internal/protocol` | embedded versioned JSON schema bytes | 02 |
-| `internal/canonjson` | RFC 8785 canonicalization + digest | 02 |
+| `internal/canonjson` | restricted canonical JSON (JCS escaping/key order, safe integer-only numbers) + digest | 02 |
 | `internal/transport` | role-addressed mailbox, receipts | 02 |
 | `internal/engine` | phase-transition table + convergence | 03 |
 | `internal/gitx` | native-git shell-out plumbing | 04 |
