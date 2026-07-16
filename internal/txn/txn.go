@@ -1,18 +1,20 @@
-// Package txn is the prepared-transaction journal (D006/01.5). It bridges a
-// non-idempotent external operation (subject 04 plugs in the git ref move) and
-// the coordinator state CAS, which cannot commit atomically together.
+// Package txn is the prepared-transaction journal (D006/01.5). It bridges the
+// several ordered, durable cuts of a coordinator transaction that cannot commit
+// atomically together (subject 04 supplies the git ref move, index reconcile, and
+// state CAS as concrete steps).
 //
-// The journal is itself an immutable generation sequence (D017) via genstore, so
-// it never depends on the single replace whose failure it diagnoses. A
-// transaction lifecycle is: Prepare (record the intent) → the participant commits
-// the external operation → MarkCommitted; a failure before commit is resolved by
-// Reconcile, which observes the participant and either replays forward
-// (MarkCommitted) or rolls back (MarkAborted), deterministically and idempotently.
+// It is a durable PROGRESS machine, not a two-phase flag: the journal records how
+// many ordered steps have durably completed. A transaction is COMPLETE only after
+// every step's effect is durable. Recovery resumes from the last recorded step and
+// drives the remaining idempotent step handlers — checking each step's Status
+// (Applied → advance, NotApplied → apply, Indeterminate → fail closed) — so the
+// classic "external effect done, crash before state" cut is repaired forward, not
+// falsely terminalized. The journal itself is an immutable genstore generation
+// sequence (D017), so it never depends on the replace it diagnoses, and it
+// composes under the run's shared guard with the state store.
 //
-// This package is the generic machine, tested against a fake participant. It
-// composes under the run's shared genstore.Guard so the caller can run
-// journal-prepare → participant → state-append → journal-commit in one critical
-// section.
+// The steps and the intent payload codec are the caller's (subject 04 for git).
+// This package is the generic engine, tested against fake steps.
 package txn
 
 import (
@@ -21,52 +23,79 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
-// RecordVersion is the on-disk schema version; an unknown version fails closed.
-const RecordVersion = 1
+const (
+	RecordVersion = 1
+	IntentVersion = 1
+	maxPayload    = 64 * 1024
+)
 
 // Sentinel errors.
 var (
-	ErrRevisionConflict = errors.New("txn: revision conflict")
-	ErrPending          = errors.New("txn: a prepared transaction is already pending")
-	ErrNoPending        = errors.New("txn: no matching prepared transaction")
+	ErrPending          = errors.New("txn: a non-terminal transaction is already pending")
+	ErrNoPending        = errors.New("txn: no matching pending transaction")
+	ErrCannotAbort      = errors.New("txn: cannot abort after a step has been applied")
+	ErrRecoveryRequired = errors.New("txn: transaction is in an indeterminate state; recovery required")
+	ErrPlanMismatch     = errors.New("txn: recovery plan does not match the journalled transaction")
 )
 
-// Phase is the lifecycle phase of a transaction.
-type Phase string
+// StepStatus reports whether a step's durable effect is already present.
+type StepStatus string
 
 const (
-	Prepared  Phase = "prepared"
-	Committed Phase = "committed"
-	Aborted   Phase = "aborted"
+	StatusApplied       StepStatus = "applied"
+	StatusNotApplied    StepStatus = "not-applied"
+	StatusIndeterminate StepStatus = "indeterminate"
 )
 
-// Participant performs and observes the external non-idempotent operation named
-// by a transaction's opaque intent (e.g. a git ref CAS).
-type Participant interface {
-	// Commit performs the operation described by intent.
-	Commit(intent []byte) error
-	// Observe reports whether the operation described by intent has taken effect.
-	Observe(intent []byte) (committed bool, err error)
+// Step is one ordered, idempotent durable effect of a transaction.
+type Step struct {
+	Name   string
+	Status func() (StepStatus, error)
+	Apply  func() error
 }
 
-// Record is one journal generation.
+// Intent is the typed, versioned transaction envelope. The payload is a bounded,
+// kind-specific JSON blob whose codec belongs to the caller (subject 04 for git);
+// the journal validates the envelope and carries the replay-critical bindings.
+type Intent struct {
+	Version               int             `json:"version"`
+	Kind                  string          `json:"kind"`
+	TxnID                 string          `json:"txn_id"`
+	ExpectedStateRevision uint64          `json:"expected_state_revision"`
+	Payload               json.RawMessage `json:"payload"`
+}
+
+// Plan is an intent plus the ordered steps that realize it.
+type Plan struct {
+	Intent Intent
+	Steps  []Step
+}
+
+// Record is one journal generation: the durable progress of a transaction.
 type Record struct {
 	SchemaVersion int    `json:"schema_version"`
 	Revision      uint64 `json:"revision"`
-	TxnID         string `json:"txn_id"`
-	Phase         Phase  `json:"phase"`
-	Intent        []byte `json:"intent"`
+	Intent        Intent `json:"intent"`
+	StepsDone     int    `json:"steps_done"`
+	TotalSteps    int    `json:"total_steps"`
+	Complete      bool   `json:"complete"`
+	Aborted       bool   `json:"aborted"`
 }
 
-// Terminal reports whether the record is a completed transaction.
-func (r Record) Terminal() bool { return r.Phase == Committed || r.Phase == Aborted }
+// Terminal reports whether the transaction is finished (complete or aborted).
+func (r Record) Terminal() bool { return r.Complete || r.Aborted }
 
-// Journal persists transaction records over a genstore under the run lock.
+// TxnID returns the transaction id.
+func (r Record) TxnID() string { return r.Intent.TxnID }
+
+// Journal persists transaction progress over a genstore under the run lock.
 type Journal struct {
 	gs *genstore.Store
 }
@@ -82,12 +111,10 @@ func (j *Journal) LockPath() string { return j.gs.LockPath() }
 
 // Latest returns the newest journal record (lock-free).
 func (j *Journal) Latest() (Record, bool, error) {
-	gsRec, r, ok, err := j.latestGS()
-	_ = gsRec
+	_, r, ok, err := j.latestGS()
 	return r, ok, err
 }
 
-// latestGS returns the raw genstore record (for its head) and the decoded record.
 func (j *Journal) latestGS() (genstore.Record, Record, bool, error) {
 	gsRec, ok, err := j.gs.Latest()
 	if err != nil {
@@ -103,9 +130,13 @@ func (j *Journal) latestGS() (genstore.Record, Record, bool, error) {
 	return gsRec, r, true, nil
 }
 
-// PrepareLocked records a new transaction intent under a held guard. It fails if
-// a prepared (non-terminal) transaction is already pending.
-func (j *Journal) PrepareLocked(g *genstore.Guard, txnID string, intent []byte) (Record, error) {
+// Run drives a NEW transaction to completion under a held guard: it records the
+// intent, then applies and records each step in order, marking complete only after
+// the last step's effect is durable.
+func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
+	if err := validateIntent(plan.Intent); err != nil {
+		return Record{}, err
+	}
 	gsRec, cur, ok, err := j.latestGS()
 	if err != nil {
 		return Record{}, err
@@ -113,70 +144,126 @@ func (j *Journal) PrepareLocked(g *genstore.Guard, txnID string, intent []byte) 
 	var head genstore.Head
 	if ok {
 		if !cur.Terminal() {
-			return Record{}, fmt.Errorf("%w: %s still %s", ErrPending, cur.TxnID, cur.Phase)
+			return Record{}, fmt.Errorf("%w: %s", ErrPending, cur.TxnID())
 		}
 		head = gsRec.Head()
 	}
-	return j.appendPhase(g, head, txnID, Prepared, intent)
+	rec, err := j.append(g, head, Record{Intent: plan.Intent, TotalSteps: len(plan.Steps)})
+	if err != nil {
+		return Record{}, err
+	}
+	return j.drive(g, rec, plan.Steps)
 }
 
-// MarkCommittedLocked records that the pending transaction's participant committed.
-func (j *Journal) MarkCommittedLocked(g *genstore.Guard, txnID string) (Record, error) {
-	return j.markLocked(g, txnID, Committed)
-}
-
-// MarkAbortedLocked records that the pending transaction was rolled back.
-func (j *Journal) MarkAbortedLocked(g *genstore.Guard, txnID string) (Record, error) {
-	return j.markLocked(g, txnID, Aborted)
-}
-
-// ReconcileLocked resolves a pending prepared transaction by observing the
-// participant: committed → MarkCommitted (replay forward), otherwise MarkAborted
-// (roll back). It is idempotent — with no pending transaction it returns the
-// latest record unchanged.
-func (j *Journal) ReconcileLocked(g *genstore.Guard, p Participant) (Record, bool, error) {
+// Recover resumes a pending (non-terminal) transaction under a held guard, driving
+// its remaining steps forward. It is idempotent — with no pending transaction it
+// returns the latest record and recovered=false. planFor reconstructs the ordered
+// steps from the journalled intent (subject 04 maps a git intent to git steps).
+func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error)) (Record, bool, error) {
 	_, cur, ok, err := j.latestGS()
 	if err != nil {
 		return Record{}, false, err
 	}
 	if !ok || cur.Terminal() {
-		return cur, false, nil // nothing pending
+		return cur, false, nil
 	}
-	committed, err := p.Observe(cur.Intent)
+	plan, err := planFor(cur.Intent)
 	if err != nil {
 		return Record{}, false, err
 	}
-	phase := Aborted
-	if committed {
-		phase = Committed
+	if len(plan.Steps) != cur.TotalSteps || !reflect.DeepEqual(plan.Intent, cur.Intent) {
+		return Record{}, false, fmt.Errorf("%w: got %d steps, journal has %d", ErrPlanMismatch, len(plan.Steps), cur.TotalSteps)
 	}
-	out, err := j.markLocked(g, cur.TxnID, phase)
-	if err != nil {
-		return Record{}, false, err
-	}
-	return out, true, nil
+	out, err := j.drive(g, cur, plan.Steps)
+	return out, true, err
 }
 
-func (j *Journal) markLocked(g *genstore.Guard, txnID string, phase Phase) (Record, error) {
+// AbortLocked terminates a pending transaction that has applied no steps yet. It is
+// illegal after any (possibly irreversible) step has been applied.
+func (j *Journal) AbortLocked(g *genstore.Guard, txnID string) (Record, error) {
 	gsRec, cur, ok, err := j.latestGS()
 	if err != nil {
 		return Record{}, err
 	}
-	if !ok || cur.Terminal() || cur.TxnID != txnID {
-		return Record{}, fmt.Errorf("%w: %s -> %s", ErrNoPending, txnID, phase)
+	if !ok || cur.Terminal() || cur.TxnID() != txnID {
+		return Record{}, fmt.Errorf("%w: %s", ErrNoPending, txnID)
 	}
-	return j.appendPhase(g, gsRec.Head(), txnID, phase, cur.Intent)
+	if cur.StepsDone != 0 {
+		return Record{}, fmt.Errorf("%w: %d steps applied", ErrCannotAbort, cur.StepsDone)
+	}
+	return j.append(g, gsRec.Head(), Record{Intent: cur.Intent, TotalSteps: cur.TotalSteps, Aborted: true})
 }
 
-func (j *Journal) appendPhase(g *genstore.Guard, head genstore.Head, txnID string, phase Phase, intent []byte) (Record, error) {
+// drive applies steps from rec.StepsDone onward, recording durable progress after
+// each, and marks complete after the last one.
+func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, error) {
+	for i := rec.StepsDone; i < len(steps); i++ {
+		st, err := steps[i].Status()
+		if err != nil {
+			return Record{}, err
+		}
+		switch st {
+		case StatusApplied:
+			// A crash after the effect but before its progress record: advance
+			// without re-applying.
+		case StatusNotApplied:
+			if err := steps[i].Apply(); err != nil {
+				return Record{}, err
+			}
+		default:
+			return Record{}, fmt.Errorf("%w: step %d (%s) is %q", ErrRecoveryRequired, i, steps[i].Name, st)
+		}
+		rec, err = j.advance(g, i+1, i+1 == len(steps))
+		if err != nil {
+			return Record{}, err
+		}
+	}
+	if len(steps) == 0 && !rec.Complete {
+		return j.advance(g, 0, true)
+	}
+	return rec, nil
+}
+
+// advance appends the next progress record, carrying the intent forward.
+func (j *Journal) advance(g *genstore.Guard, stepsDone int, complete bool) (Record, error) {
+	gsRec, cur, ok, err := j.latestGS()
+	if err != nil {
+		return Record{}, err
+	}
+	if !ok {
+		return Record{}, fmt.Errorf("txn: advance with no prepared record")
+	}
+	return j.append(g, gsRec.Head(), Record{
+		Intent:     cur.Intent,
+		StepsDone:  stepsDone,
+		TotalSteps: cur.TotalSteps,
+		Complete:   complete,
+	})
+}
+
+// append validates and persists next, checking the transition from the current
+// record when one exists.
+func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Record, error) {
 	built, err := j.gs.AppendLocked(g, head, func(gen uint64, _ string) ([]byte, error) {
-		next := Record{SchemaVersion: RecordVersion, Revision: gen, TxnID: txnID, Phase: phase, Intent: intent}
+		next.SchemaVersion = RecordVersion
+		next.Revision = gen
 		if err := validate(next); err != nil {
 			return nil, err
 		}
-		// The intent is control data: reject a secret rather than laundering it.
-		if !bytes.Equal(redact.Bytes(next.Intent), next.Intent) {
-			return nil, fmt.Errorf("txn: a secret was detected in the transaction intent")
+		if head != (genstore.Head{}) {
+			prev, perr := j.headRecord()
+			if perr != nil {
+				return nil, perr
+			}
+			if prev.TxnID() == next.TxnID() {
+				// Continuing the same transaction: enforce the step transition.
+				if err := validateTransition(prev, next); err != nil {
+					return nil, err
+				}
+			} else if !prev.Terminal() {
+				// Starting a new transaction requires the previous to be terminal.
+				return nil, fmt.Errorf("%w: %s", ErrPending, prev.TxnID())
+			}
 		}
 		return json.Marshal(next)
 	})
@@ -186,6 +273,18 @@ func (j *Journal) appendPhase(g *genstore.Guard, head genstore.Head, txnID strin
 	return decode(built)
 }
 
+// headRecord decodes the current head (used inside the builder, under the guard).
+func (j *Journal) headRecord() (Record, error) {
+	_, r, ok, err := j.latestGS()
+	if err != nil {
+		return Record{}, err
+	}
+	if !ok {
+		return Record{}, fmt.Errorf("txn: expected a head record")
+	}
+	return r, nil
+}
+
 func validate(r Record) error {
 	if r.SchemaVersion != RecordVersion {
 		return fmt.Errorf("txn: schema_version %d != %d", r.SchemaVersion, RecordVersion)
@@ -193,13 +292,61 @@ func validate(r Record) error {
 	if r.Revision == 0 {
 		return fmt.Errorf("txn: revision must be > 0")
 	}
-	if !validID(r.TxnID) {
-		return fmt.Errorf("txn: invalid txn_id %q", r.TxnID)
+	if err := validateIntent(r.Intent); err != nil {
+		return err
 	}
-	switch r.Phase {
-	case Prepared, Committed, Aborted:
-	default:
-		return fmt.Errorf("txn: unknown phase %q", r.Phase)
+	if r.TotalSteps < 0 || r.StepsDone < 0 || r.StepsDone > r.TotalSteps {
+		return fmt.Errorf("txn: steps_done %d out of range 0..%d", r.StepsDone, r.TotalSteps)
+	}
+	if r.Complete && r.Aborted {
+		return fmt.Errorf("txn: complete and aborted are mutually exclusive")
+	}
+	if r.Complete && r.StepsDone != r.TotalSteps {
+		return fmt.Errorf("txn: complete requires all %d steps done, have %d", r.TotalSteps, r.StepsDone)
+	}
+	if r.Aborted && r.StepsDone != 0 {
+		return fmt.Errorf("txn: abort requires zero applied steps, have %d", r.StepsDone)
+	}
+	return nil
+}
+
+func validateTransition(old, next Record) error {
+	if !reflect.DeepEqual(old.Intent, next.Intent) {
+		return fmt.Errorf("txn: intent is immutable within a transaction")
+	}
+	if old.TotalSteps != next.TotalSteps {
+		return fmt.Errorf("txn: total_steps is immutable within a transaction")
+	}
+	if old.Terminal() {
+		return fmt.Errorf("txn: transaction is already terminal")
+	}
+	if next.StepsDone < old.StepsDone || next.StepsDone > old.StepsDone+1 {
+		return fmt.Errorf("txn: steps_done must advance by 0 or 1 (from %d to %d)", old.StepsDone, next.StepsDone)
+	}
+	if next.StepsDone == old.StepsDone && !next.Terminal() {
+		return fmt.Errorf("txn: a non-terminal record must advance a step")
+	}
+	return nil
+}
+
+func validateIntent(in Intent) error {
+	if in.Version != IntentVersion {
+		return fmt.Errorf("txn: intent version %d != %d", in.Version, IntentVersion)
+	}
+	if !validID(in.TxnID) {
+		return fmt.Errorf("txn: invalid txn_id %q", in.TxnID)
+	}
+	if strings.TrimSpace(in.Kind) == "" || len(in.Kind) > 64 || !validID(in.Kind) {
+		return fmt.Errorf("txn: invalid kind %q", in.Kind)
+	}
+	if len(in.Payload) == 0 || len(in.Payload) > maxPayload {
+		return fmt.Errorf("txn: payload must be non-empty and <= %d bytes", maxPayload)
+	}
+	if !json.Valid(in.Payload) {
+		return fmt.Errorf("txn: payload is not valid json")
+	}
+	if !bytes.Equal(redact.Bytes(in.Payload), in.Payload) {
+		return fmt.Errorf("txn: a secret was detected in the transaction payload")
 	}
 	return nil
 }
