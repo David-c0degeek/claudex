@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudex wait event, version 1",
+  "description": "The result of a bounded wait: the wake reason and the observed run status. Every discriminant a client needs to act is present; unchanged carries the newest observed revision so the client can advance its cursor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "kind",
+    "revision",
+    "phase",
+    "lifecycle",
+    "turn_id",
+    "gate_id",
+    "replacement_generation"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "The protocol major version; always 1 for this schema.",
+      "type": "integer",
+      "const": 1
+    },
+    "message_type": {
+      "description": "Discriminates this message from other protocol messages.",
+      "type": "string",
+      "const": "wait_event"
+    },
+    "kind": {
+      "description": "Why the wait returned.",
+      "type": "string",
+      "enum": [
+        "unchanged",
+        "assignment",
+        "gate",
+        "cancelled",
+        "completed",
+        "failed",
+        "session_replaced",
+        "recovery_required"
+      ]
+    },
+    "revision": {
+      "description": "The newest observed run-state revision.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "phase": {
+      "description": "The observed phase.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "lifecycle": {
+      "description": "The observed lifecycle.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "turn_id": {
+      "description": "The turn to act on, present only for an assignment; null otherwise.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "gate_id": {
+      "description": "The open gate, present for a gate that has an issued gate id; null otherwise.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "replacement_generation": {
+      "description": "The generation of the session that superseded this one, present only for session_replaced; null otherwise.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    }
+  }
+}
