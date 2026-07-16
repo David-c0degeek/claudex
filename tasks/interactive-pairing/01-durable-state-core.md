@@ -43,3 +43,6 @@ git ref move and the state CAS.
 
 ## Progress log
 > One line per slice.
+
+- 2026-07-16 · slice 1 · leaf primitives · Built `internal/atomicfile` (temp→chmod→fsync→rename with injectable ops; POSIX-atomic / Windows best-effort + `replaceWith` retry seam; `PostCommitSyncError`) and `internal/oslock` (flock/LockFileEx advisory locks with kernel death-semantics; cross-process crash-reclaim helper-process test). Pinned `golang.org/x/sys` v0.47.0. Green on Windows + cross-compiles linux/amd64+arm64, darwin/arm64. CX checkpoint AGREE (commits `47559a4`→`147fb12`, 3 review rounds — caught the Windows non-atomic-rename over-claim and the circular Windows-recovery story → D017 immutable-generation persistence adopted).
+- **CX watch-items for the state/recovery checkpoint (01.1/01.4/01.5/01.6):** (1) D017 covers EVERY authoritative mutable locator incl. the repo-level first-attach/current-run allocation catalog (01.4) — any `current` file is an untrusted cache; (2) generation allocation must handle invalid/torn filenames occupying the next revision, and an ambiguous `atomicfile` result reconciles by enumeration/validation before retrying (prove both in the crash-cut matrix); (3) keep ≥1 previously-validated generation through cleanup; never sweep temps/generations outside the exclusive owning lock.
