@@ -186,13 +186,15 @@ func ParseTaskContract(data []byte) (TaskContract, error) {
 	}
 	// Acceptance criteria must be exactly unique (case-sensitive), so a verification
 	// can prove complete, exact coverage of the frozen task without a duplicate
-	// making that impossible.
-	seen := make(map[string]bool, len(tc.AcceptanceCriteria))
-	for _, c := range tc.AcceptanceCriteria {
-		if seen[c] {
-			return TaskContract{}, fmt.Errorf("task contract: duplicate acceptance_criteria %q", c)
+	// making that impossible. The error reports the offending index only: the
+	// criterion text is caller-supplied and could carry a secret, so it is never
+	// echoed.
+	seen := make(map[string]int, len(tc.AcceptanceCriteria))
+	for i, c := range tc.AcceptanceCriteria {
+		if first, ok := seen[c]; ok {
+			return TaskContract{}, fmt.Errorf("task contract: acceptance_criteria[%d] duplicates acceptance_criteria[%d]", i, first)
 		}
-		seen[c] = true
+		seen[c] = i
 	}
 	return tc, nil
 }

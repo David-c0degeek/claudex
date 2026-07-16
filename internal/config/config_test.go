@@ -215,22 +215,28 @@ func TestRunPolicyBudgetCeiling(t *testing.T) {
 	base := DefaultRunPolicy()
 	base.TestGate = TestGate{Command: "go test ./..."}
 
-	atCeiling := base
-	atCeiling.Budgets.PlanRounds = MaxBudget
-	atCeiling.Limits.MaxRunTurns = MaxBudget
-	if err := atCeiling.Validate(); err != nil {
-		t.Fatalf("budgets at the ceiling should be accepted: %v", err)
+	// Every ceiling-bound field, so a later refactor cannot leave one policy field
+	// unrepresentable: each is accepted at the ceiling and rejected one above it.
+	fields := []struct {
+		name string
+		set  func(rp *RunPolicy, v int)
+	}{
+		{"plan_rounds", func(rp *RunPolicy, v int) { rp.Budgets.PlanRounds = v }},
+		{"checkpoint_rounds", func(rp *RunPolicy, v int) { rp.Budgets.CheckpointRounds = v }},
+		{"test_rounds", func(rp *RunPolicy, v int) { rp.Budgets.TestRounds = v }},
+		{"verify_rounds", func(rp *RunPolicy, v int) { rp.Budgets.VerifyRounds = v }},
+		{"max_run_turns", func(rp *RunPolicy, v int) { rp.Limits.MaxRunTurns = v }},
 	}
-
-	overBudget := base
-	overBudget.Budgets.PlanRounds = MaxBudget + 1
-	if err := overBudget.Validate(); err == nil {
-		t.Fatalf("a budget above the ceiling should be rejected")
-	}
-
-	overTurns := base
-	overTurns.Limits.MaxRunTurns = MaxBudget + 1
-	if err := overTurns.Validate(); err == nil {
-		t.Fatalf("max_run_turns above the ceiling should be rejected")
+	for _, f := range fields {
+		atCeiling := base
+		f.set(&atCeiling, MaxBudget)
+		if err := atCeiling.Validate(); err != nil {
+			t.Fatalf("%s at the ceiling should be accepted: %v", f.name, err)
+		}
+		over := base
+		f.set(&over, MaxBudget+1)
+		if err := over.Validate(); err == nil {
+			t.Fatalf("%s above the ceiling should be rejected", f.name)
+		}
 	}
 }

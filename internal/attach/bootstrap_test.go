@@ -267,6 +267,29 @@ func TestFirstAttachRefusesKnownUnsupportedFS(t *testing.T) {
 	}
 }
 
+// An invalid task contract (duplicate acceptance criteria) is refused before any
+// mutation: the task is parsed first, so the git base/worktree seams are never
+// called and .claudex is never created. This pins the ordering the config-level
+// uniqueness check relies on rather than inferring it.
+func TestFirstAttachRefusesDuplicateCriteria(t *testing.T) {
+	repo := t.TempDir()
+	base := &countingBase{commit: strings.Repeat("a", 40)}
+	wt := &fakeWorktree{}
+	req := newRequest(t, repo, wt)
+	req.Base = base
+	req.TaskCanonical = []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+
+	if _, err := FirstAttach(req); err == nil {
+		t.Fatalf("duplicate acceptance_criteria should be refused")
+	}
+	if base.calls != 0 || wt.applyCalls != 0 {
+		t.Fatalf("git seams were called on an invalid task: base=%d worktree=%d", base.calls, wt.applyCalls)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".claudex")); !os.IsNotExist(err) {
+		t.Fatalf(".claudex created despite an invalid task contract: %v", err)
+	}
+}
+
 // The typed decision preserves known-unsupported vs unknown-without-ack.
 func TestDecideFSTypedError(t *testing.T) {
 	pol := config.DefaultRunPolicy()

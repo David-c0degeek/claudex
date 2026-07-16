@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +17,47 @@ func TestIsKey(t *testing.T) {
 	for _, s := range bad {
 		if IsKey(s) {
 			t.Fatalf("IsKey(%q) = true, want false", s)
+		}
+	}
+	// The length bound must equal the wire-schema maxLength exactly: a key at the
+	// ceiling is accepted, one byte over is rejected. This pins MaxKeyLength to the
+	// schema so the two gates cannot silently disagree.
+	atCeiling := strings.Repeat("a", MaxKeyLength)
+	if !IsKey(atCeiling) {
+		t.Fatalf("IsKey(len %d) = false, want true (at ceiling)", MaxKeyLength)
+	}
+	overCeiling := strings.Repeat("a", MaxKeyLength+1)
+	if IsKey(overCeiling) {
+		t.Fatalf("IsKey(len %d) = true, want false (over ceiling)", MaxKeyLength+1)
+	}
+}
+
+// The Go semantic key bound must equal the maxLength every wire schema places on
+// a key field, so the schema and the semantic gate never disagree on validity.
+func TestKeyLengthSchemaParity(t *testing.T) {
+	cases := []struct {
+		typ  string
+		path []string
+	}{
+		{"plan_critique", []string{"properties", "findings", "items", "properties", "key", "maxLength"}},
+		{"plan_critique", []string{"properties", "implementation_checks", "items", "properties", "key", "maxLength"}},
+		{"plan_revision", []string{"properties", "responses", "items", "properties", "finding_key", "maxLength"}},
+	}
+	for _, c := range cases {
+		b, err := Schema(c.typ, SupportedVersion)
+		if err != nil {
+			t.Fatalf("schema %s: %v", c.typ, err)
+		}
+		var m any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("decode %s: %v", c.typ, err)
+		}
+		cur := m
+		for _, k := range c.path {
+			cur = cur.(map[string]any)[k]
+		}
+		if got := int(cur.(float64)); got != MaxKeyLength {
+			t.Fatalf("%s key maxLength = %d, want %d (MaxKeyLength)", c.typ, got, MaxKeyLength)
 		}
 	}
 }

@@ -10,14 +10,17 @@ const (
 	MaxPlanSteps = 64
 )
 
-// maxKeyLen bounds a canonical key.
-const maxKeyLen = 128
+// MaxKeyLength bounds a canonical key. It equals the maxLength the wire schemas
+// place on plan-finding keys, implementation-check keys, and revision finding_key,
+// so a key the schema accepts is never rejected by the semantic gate and vice
+// versa. Changing it requires changing those three schema literals in lockstep.
+const MaxKeyLength = 256
 
 // IsKey reports whether s is a canonical lowercase-hyphen key: `[a-z0-9]+(-[a-z0-9]+)*`,
-// bounded. Finding/check/response keys use this — the schema descriptions do not
-// enforce the grammar, so semantic validation does.
+// bounded by MaxKeyLength. Finding/check/response keys use this — the schema
+// descriptions do not enforce the grammar, so semantic validation does.
 func IsKey(s string) bool {
-	if len(s) == 0 || len(s) > maxKeyLen {
+	if len(s) == 0 || len(s) > MaxKeyLength {
 		return false
 	}
 	afterHyphen := true // a leading hyphen is invalid
