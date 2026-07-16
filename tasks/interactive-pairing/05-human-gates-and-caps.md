@@ -35,6 +35,7 @@ coordinator can observe. Operator commands (`cancel`, `clean`, `export`,
       - **`clean`** refuses a live, pending-transaction, or dirty run (concrete refusal, not merely "safe").
       - Same-role session replacement handoff coordinates with 03.2.
       Test: `cancel` stops the test process but leaves the TUIs alive; `recover` completes a pending transaction; `clean` refuses a live/pending/dirty run; `export` succeeds live.
+- [ ] **05.8** (agent) Provider usage-window auto-resume (D019): when a provider hits its rolling usage limit, the run pauses durably (`rate_limited`/`paused_budget`) carrying a **frozen reset/resume-at timestamp**, and auto-continues when the window passes (Claude resets ~5h) instead of dying — the long unattended pairing loop must survive the boundary. `status` projects the reset time + the exact next action; a read never resumes. Since the coordinator is processless, "auto-resume" = record the reset time and let a scheduled or next invocation resume once it passes; the wake mechanism (a durable resume-after that `wait`/an operator scheduler observes) is defined here. Applies to coordinator-owned provider calls and, in the managed tier (07), the two TUIs' limits. Test: a simulated usage limit pauses with a reset time; before reset, resume is refused/no-op; at/after reset, the run resumes to the same turn without a human action.
 
 ## Hindsight checkpoint
 - [ ] Captain Hindsight review recorded

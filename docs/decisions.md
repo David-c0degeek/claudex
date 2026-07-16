@@ -238,3 +238,25 @@ torn or overwritten artifact (`-race`); non-regular/symlink/oversize reads and
 non-canonical/tampered inboxes are refused; a not-live or stale-assignment submit
 is rejected before the sink; and a required-field state-shape change bumps the
 on-disk schema version (v2) so an older generation fails with clear remediation.
+
+## D019 — Provider usage-window auto-resume
+A long, unattended two-TUI pairing loop must survive hitting a provider usage
+limit, not die at it. When a provider (Claude or Codex) returns a rolling
+usage-limit signal, the run pauses durably in `rate_limited`/`paused_budget`
+carrying a **frozen reset/resume-at timestamp**, and auto-continues to the same
+turn when the window passes (Claude subscriptions reset ~every 5 hours) with no
+human action.
+
+Because the coordinator is processless (D002), "auto-resume" is not a running
+timer: the reset time is recorded in durable state, and a scheduled invocation
+(or the next `wait`/operator poll) performs the resume transition once the window
+has passed. `status` projects the reset time and the exact next action; reads
+never resume. The mechanism carries over the intent of the retired Python
+reliability engine (`limits.py` rate-limit handling, `lifecycle.py`) as a
+requirement, not as ported code (D014). Subject 05 owns the policy and the
+auto-resume transition; the managed tier (07) extends it to the two interactive
+TUIs.
+
+**Acceptance:** a simulated usage-limit pause records a reset time; a resume
+before the reset is refused/no-op; a resume at or after the reset returns the run
+to the same turn without a gate or human decision.
