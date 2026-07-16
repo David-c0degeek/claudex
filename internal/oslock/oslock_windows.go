@@ -35,6 +35,6 @@ func acquire(path string) (*os.File, bool, error) {
 
 func release(f *os.File) error {
 	var ol windows.Overlapped
-	_ = windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)
-	return f.Close()
+	unlockErr := windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)
+	return errors.Join(unlockErr, f.Close())
 }

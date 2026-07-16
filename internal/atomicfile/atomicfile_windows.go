@@ -3,30 +3,40 @@
 package atomicfile
 
 import (
+	"errors"
 	"os"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // replace renames oldpath onto newpath. os.Rename uses MoveFileEx with
-// MOVEFILE_REPLACE_EXISTING, a crash-atomic replacement. Windows can transiently
-// fail with a sharing violation while another process momentarily has the target
-// open, so the rename is retried with a short bounded backoff.
+// MOVEFILE_REPLACE_EXISTING. Go does not guarantee this is atomic on Windows
+// (see the package doc); it retries only the transient sharing/access errors
+// that occur when another process momentarily has the target open, and returns
+// immediately on any other (permanent) error.
 func replace(oldpath, newpath string) error {
 	const attempts = 20
-	var err error
-	for i := 0; i < attempts; i++ {
-		if err = os.Rename(oldpath, newpath); err == nil {
+	for i := 0; ; i++ {
+		err := os.Rename(oldpath, newpath)
+		if err == nil {
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		if i >= attempts-1 || !isTransientRename(err) {
+			return err
+		}
+		time.Sleep(renameBackoff)
 	}
-	return err
 }
 
-// syncDir is a no-op on Windows: there is no directory fsync. MoveFileEx gives
-// crash-atomic replacement; power-loss durability would additionally require
-// MOVEFILE_WRITE_THROUGH (see docs/decisions.md D015), which the default
-// os.Rename does not request.
+func isTransientRename(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) ||
+		errors.Is(err, windows.ERROR_ACCESS_DENIED)
+}
+
+// syncDir is a no-op on Windows: there is no directory fsync. Power-loss
+// durability would additionally require MOVEFILE_WRITE_THROUGH (docs/decisions.md
+// D015), which the default os.Rename does not request.
 func syncDir(string) error {
 	return nil
 }

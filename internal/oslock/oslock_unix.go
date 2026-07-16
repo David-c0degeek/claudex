@@ -18,7 +18,8 @@ func acquire(path string) (*os.File, bool, error) {
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
-		if errors.Is(err, unix.EWOULDBLOCK) {
+		// EWOULDBLOCK and EAGAIN both signal "already locked" portably.
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 			return nil, false, nil
 		}
 		return nil, false, err
@@ -27,6 +28,6 @@ func acquire(path string) (*os.File, bool, error) {
 }
 
 func release(f *os.File) error {
-	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-	return f.Close()
+	unlockErr := unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return errors.Join(unlockErr, f.Close())
 }
