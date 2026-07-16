@@ -259,36 +259,52 @@ func authorizeJoin(lay layout, runID string) (state.CurrentRun, error) {
 	if err != nil {
 		return state.CurrentRun{}, err
 	}
-	if !ok || !cur.Active || cur.RunID != runID || cur.RelDir != state.RunDirRelFor(runID) {
-		return state.CurrentRun{}, fmt.Errorf("%w: not the active run", ErrJoinUnauthorized)
+	if !ok {
+		return state.CurrentRun{}, fmt.Errorf("%w: no active run", ErrJoinUnauthorized)
+	}
+	if err := bindRunToBootstrap(lay, cur, runID); err != nil {
+		return state.CurrentRun{}, err
+	}
+	return cur, nil
+}
+
+// bindRunToBootstrap validates that cur is the exact active run bound to ONE
+// bootstrap allocation. It reads only the repo-level catalog/bootstrap journal
+// (lock-free), so it can authorize a caller-supplied CurrentRun snapshot too.
+func bindRunToBootstrap(lay layout, cur state.CurrentRun, runID string) error {
+	if !cur.Active || cur.RunID != runID || cur.RelDir != state.RunDirRelFor(runID) {
+		return fmt.Errorf("%w: not the active run", ErrJoinUnauthorized)
 	}
 	rec, ok, err := txn.Open(lay.bootstrapJournal, lay.repoLock).Latest()
 	if err != nil {
-		return state.CurrentRun{}, err
+		return err
+	}
+	if err != nil {
+		return err
 	}
 	if !ok || !rec.Complete || rec.Aborted ||
 		rec.Intent.Version != txn.IntentVersion || rec.Intent.Kind != intentKind || rec.Intent.ExpectedStateRevision != 0 {
-		return state.CurrentRun{}, fmt.Errorf("%w: bootstrap not complete", ErrJoinUnauthorized)
+		return fmt.Errorf("%w: bootstrap not complete", ErrJoinUnauthorized)
 	}
 	bi, err := decodeIntent(rec.Intent.Payload)
 	if err != nil {
-		return state.CurrentRun{}, err
+		return err
 	}
 	if rec.TxnID() != bi.TxnID || bi.RunID != cur.RunID || bi.RelDir != cur.RelDir || bi.OperationID != cur.OperationID {
-		return state.CurrentRun{}, fmt.Errorf("%w: bootstrap identity mismatch", ErrJoinUnauthorized)
+		return fmt.Errorf("%w: bootstrap identity mismatch", ErrJoinUnauthorized)
 	}
 	cat, ok, err := state.OpenCatalog(lay.catalogDir, lay.repoLock).Load()
 	if err != nil {
-		return state.CurrentRun{}, err
+		return err
 	}
 	if !ok {
-		return state.CurrentRun{}, fmt.Errorf("%w: no catalog", ErrJoinUnauthorized)
+		return fmt.Errorf("%w: no catalog", ErrJoinUnauthorized)
 	}
 	ref, found := cat.Lookup(runID)
 	if !found || ref != bi.runRef() {
-		return state.CurrentRun{}, fmt.Errorf("%w: catalog ref mismatch", ErrJoinUnauthorized)
+		return fmt.Errorf("%w: catalog ref mismatch", ErrJoinUnauthorized)
 	}
-	return cur, nil
+	return nil
 }
 
 // requireJoinableInitShape enforces the complete, stable initial shape a new pair

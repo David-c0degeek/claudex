@@ -65,84 +65,110 @@ func (req ReattachRequest) validate() error {
 	return nil
 }
 
+// reattachReader is the injectable set of lock-free reads reattach brackets, so a
+// test can deterministically vary the CurrentRun / attach-journal head across the
+// bracketing reads without a mutable global hook. current() is called for the
+// leading and trailing CurrentRun snapshots; journalHead() for the leading and
+// trailing attach-journal heads; registry() once, between them.
+type reattachReader struct {
+	current     func() (state.CurrentRun, bool, error)
+	journalHead func() (txn.Record, bool, error)
+	registry    func() (state.Registry, bool, error)
+}
+
+func realReattachReader(lay layout, runDir string) reattachReader {
+	return reattachReader{
+		current: state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load,
+		journalHead: func() (txn.Record, bool, error) {
+			return txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest()
+		},
+		registry: state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load,
+	}
+}
+
 // Reattach resolves an existing session against the run — genuinely READ-ONLY and
 // LOCK-FREE (no store append, journal recovery, id mint, or directory/lock-file
 // creation), because lead reattach can precede the run lock's very existence.
-//
-// It uses a bracketed stable-snapshot protocol: authorize the exact active run
-// (CurrentRun bound to its bootstrap allocation), snapshot the Registry, then
-// re-read CurrentRun and require the identical generation — an unchanged
-// CurrentRun brackets the Registry read, and a run switch changes its revision or
-// identity and is reported stale. A pending run attach journal is an activation
-// barrier: the run is not yet coherently attached, so reattach reports
-// recovery-required rather than driving it.
 func Reattach(req ReattachRequest) (ReattachResult, error) {
 	if err := req.validate(); err != nil {
 		return ReattachResult{}, err
 	}
 	lay := layoutFor(req.RepoDir)
 	runDir := lay.runDir(state.RunDirRelFor(req.RunID))
-
-	// Authorize the exact active run (lock-free; the same exact bootstrap binding
-	// join uses). A non-active/unbound run is stale, not an error.
-	cur1, err := authorizeJoin(lay, req.RunID)
-	if err != nil {
-		if errors.Is(err, ErrJoinUnauthorized) {
-			return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
-		}
-		return ReattachResult{}, err
-	}
-
-	// A pending attach journal means the pair transaction has not completed — a pair
-	// slot may be visible after registry-pair-fill but before PLAN_DRAFT/journal
-	// completion. Reattach stays read-only and reports recovery-required (the simple
-	// documented rule: any pending run attach journal blocks reattach).
-	if pending, perr := attachJournalPending(lay, runDir); perr != nil {
-		return ReattachResult{}, perr
-	} else if pending {
-		return ReattachResult{Status: ReattachRecoveryRequired, RunID: req.RunID}, nil
-	}
-
-	// Registry snapshot (one immutable generation — a coherent point-in-time read).
-	reg, ok, err := state.OpenRegistry(filepath.Join(runDir, "registry"), runLock(runDir)).Load()
-	if err != nil {
-		return ReattachResult{}, err
-	}
-	if !ok || reg.RunID != req.RunID {
-		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
-	}
-
-	// Re-read CurrentRun; an unchanged generation brackets the Registry read.
-	cur2, ok, err := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
-	if err != nil {
-		return ReattachResult{}, err
-	}
-	if !ok || cur2 != cur1 {
-		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
-	}
-
-	// Resolve the presented session against the bracketed Registry snapshot.
-	r := reg.Resolve(req.SessionID)
-	switch r.Status {
-	case state.RegUnknown:
-		return ReattachResult{Status: ReattachUnknown, RunID: req.RunID}, nil
-	case state.RegReplaced:
-		// No credential; only the current generation for remediation.
-		return ReattachResult{Status: ReattachReplaced, RunID: req.RunID, Role: r.Role, Agent: r.Agent, CurrentGeneration: r.CurrentGeneration}, nil
-	default: // RegCurrent
-		if r.Role != req.Role || r.Agent != req.Agent {
-			return ReattachResult{Status: ReattachMismatch, RunID: req.RunID}, nil
-		}
-		return ReattachResult{Status: ReattachCurrent, RunID: req.RunID, SessionID: req.SessionID, Role: r.Role, Agent: r.Agent, CurrentGeneration: r.CurrentGeneration}, nil
-	}
+	return reattachWith(req, lay, realReattachReader(lay, runDir))
 }
 
-// attachJournalPending reports whether the run's attach journal holds a
-// non-terminal transaction (lock-free; a missing journal is not pending).
-func attachJournalPending(lay layout, runDir string) (bool, error) {
-	rec, ok, err := txn.Open(lay.attachJournalDir(runDir), runLock(runDir)).Latest()
+// reattachWith runs the bracketed stable-snapshot protocol: read CurrentRun and
+// the attach-journal head, snapshot the Registry, then re-read both — requiring an
+// UNCHANGED CurrentRun (revision + identity) AND an unchanged journal head to
+// bracket the Registry read across BOTH authorities. A run switch or a journal
+// head change (even missing->complete) is stale/retry; a nonterminal head is the
+// activation barrier (recovery-required); only then is the Registry snapshot
+// resolved.
+func reattachWith(req ReattachRequest, lay layout, r reattachReader) (ReattachResult, error) {
+	cur1, ok, err := r.current()
 	if err != nil {
-		return false, err
+		return ReattachResult{}, err
 	}
-	return ok && !rec.Terminal(), nil
+	if !ok {
+		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
+	}
+	// Authorize cur1 against its exact bootstrap allocation (repo-level, lock-free).
+	if berr := bindRunToBootstrap(lay, cur1, req.RunID); berr != nil {
+		if errors.Is(berr, ErrJoinUnauthorized) {
+			return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
+		}
+		return ReattachResult{}, berr
+	}
+
+	j1, j1ok, err := r.journalHead()
+	if err != nil {
+		return ReattachResult{}, err
+	}
+	reg, regok, err := r.registry()
+	if err != nil {
+		return ReattachResult{}, err
+	}
+	j2, j2ok, err := r.journalHead()
+	if err != nil {
+		return ReattachResult{}, err
+	}
+	cur2, cur2ok, err := r.current()
+	if err != nil {
+		return ReattachResult{}, err
+	}
+
+	// A run switch (CurrentRun revision/identity changed) invalidates everything.
+	if !cur2ok || cur2 != cur1 {
+		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
+	}
+	// A pending run attach transaction in EITHER bracket is the activation barrier —
+	// checked before the changed-head test, so a terminal->pending change reports
+	// recovery-required (never current), not merely stale.
+	if (j1ok && !j1.Terminal()) || (j2ok && !j2.Terminal()) {
+		return ReattachResult{Status: ReattachRecoveryRequired, RunID: req.RunID}, nil
+	}
+	// A changed (but terminal/missing) journal head — including missing->complete —
+	// is stale/retry: the Registry snapshot was not bracketed by a single head.
+	if j1ok != j2ok || (j1ok && j1.Revision != j2.Revision) {
+		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
+	}
+	if !regok || reg.RunID != req.RunID {
+		return ReattachResult{Status: ReattachStale, RunID: req.RunID}, nil
+	}
+
+	// Resolve the presented session against the bracketed Registry snapshot. For any
+	// KNOWN session, the presented agent/role must match FIRST; then classify.
+	res := reg.Resolve(req.SessionID)
+	if res.Status == state.RegUnknown {
+		return ReattachResult{Status: ReattachUnknown, RunID: req.RunID}, nil
+	}
+	if res.Role != req.Role || res.Agent != req.Agent {
+		return ReattachResult{Status: ReattachMismatch, RunID: req.RunID}, nil
+	}
+	if res.Status == state.RegReplaced {
+		// No credential; only the current generation for remediation.
+		return ReattachResult{Status: ReattachReplaced, RunID: req.RunID, Role: res.Role, Agent: res.Agent, CurrentGeneration: res.CurrentGeneration}, nil
+	}
+	return ReattachResult{Status: ReattachCurrent, RunID: req.RunID, SessionID: req.SessionID, Role: res.Role, Agent: res.Agent, CurrentGeneration: res.CurrentGeneration}, nil
 }
