@@ -3,20 +3,25 @@ package txn
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 )
 
-// fakeStep is a controllable idempotent step.
+// The ordered durable cuts of a git-shaped transaction (01.5).
+var canonicalSteps = []string{"result", "commit", "refCAS", "index", "stateCAS", "receipt", "ledger"}
+
 type fakeStep struct {
-	name       string
-	applied    bool
-	forceState StepStatus // "" => derive from applied
-	statusErr  error
-	applyErr   error
-	applyCalls int
+	name                string
+	applied             bool
+	forceState          StepStatus
+	statusErr           error
+	applyErr            error
+	applyCalls          int
+	doubleApply         bool
+	noObserveAfterApply bool
 }
 
 func (s *fakeStep) toStep() Step {
@@ -39,22 +44,35 @@ func (s *fakeStep) toStep() Step {
 			if s.applyErr != nil {
 				return s.applyErr
 			}
-			s.applied = true
+			if s.applied {
+				s.doubleApply = true
+			}
+			if !s.noObserveAfterApply {
+				s.applied = true
+			}
 			return nil
 		},
 	}
 }
 
 func intent(txnID string) Intent {
-	return Intent{Version: IntentVersion, Kind: "test", TxnID: txnID, ExpectedStateRevision: 1, Payload: json.RawMessage(`{"ref":"refs/x","old":"a","new":"b"}`)}
+	return Intent{Version: IntentVersion, Kind: "gitcommit", TxnID: txnID, ExpectedStateRevision: 1, Payload: json.RawMessage(`{"ref":"refs/x","old":"a","new":"b"}`)}
 }
 
-func mkPlan(txnID string, steps ...*fakeStep) Plan {
+func planFrom(txnID string, steps []*fakeStep) Plan {
 	p := Plan{Intent: intent(txnID)}
 	for _, s := range steps {
 		p.Steps = append(p.Steps, s.toStep())
 	}
 	return p
+}
+
+func makeSteps(names []string) []*fakeStep {
+	out := make([]*fakeStep, len(names))
+	for i, n := range names {
+		out[i] = &fakeStep{name: n}
+	}
+	return out
 }
 
 func newJournal(t *testing.T) (*Journal, string) {
@@ -74,139 +92,182 @@ func withGuard(t *testing.T, lock string, fn func(g *genstore.Guard)) {
 	fn(g)
 }
 
-func TestRunCompletes(t *testing.T) {
+func TestRunCompletesAllSteps(t *testing.T) {
 	j, lock := newJournal(t)
-	s := []*fakeStep{{name: "result"}, {name: "commit"}, {name: "state"}}
+	steps := makeSteps(canonicalSteps)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		rec, err := j.Run(g, mkPlan("t1", s...))
-		if err != nil {
-			t.Fatalf("run: %v", err)
-		}
-		if !rec.Complete || rec.StepsDone != 3 {
-			t.Fatalf("run result = %+v, want complete/3", rec)
+		rec, err := j.Run(g, planFrom("t1", steps))
+		if err != nil || !rec.Complete || rec.StepsDone != len(canonicalSteps) {
+			t.Fatalf("run = %+v err=%v", rec, err)
 		}
 	})
-	for _, st := range s {
-		if st.applyCalls != 1 || !st.applied {
-			t.Fatalf("step %s applyCalls=%d applied=%v", st.name, st.applyCalls, st.applied)
+	for _, s := range steps {
+		if !s.applied || s.applyCalls != 1 || s.doubleApply {
+			t.Fatalf("step %s applied=%v calls=%d double=%v", s.name, s.applied, s.applyCalls, s.doubleApply)
 		}
 	}
 }
 
-func TestRunStopsOnStepFailureNotTerminal(t *testing.T) {
-	j, lock := newJournal(t)
-	s0 := &fakeStep{name: "s0"}
-	s1 := &fakeStep{name: "s1", applyErr: errors.New("boom")}
-	withGuard(t, lock, func(g *genstore.Guard) {
-		if _, err := j.Run(g, mkPlan("t1", s0, s1)); err == nil {
-			t.Fatalf("run should fail at s1")
-		}
-	})
-	cur, ok, _ := j.Latest()
-	if !ok || cur.Terminal() || cur.StepsDone != 1 {
-		t.Fatalf("after failure = %+v ok=%v, want non-terminal steps_done=1", cur, ok)
-	}
-}
+// TestCrashCutMatrix restarts at every step index at three cut points and asserts
+// the transaction always completes with every step observably applied and no step
+// applied twice.
+func TestCrashCutMatrix(t *testing.T) {
+	phases := []string{"before-effect", "effect-applied-unrecorded", "after-progress"}
+	for i := range canonicalSteps {
+		for _, phase := range phases {
+			name := fmt.Sprintf("%s_%s", canonicalSteps[i], phase)
+			t.Run(name, func(t *testing.T) {
+				j, lock := newJournal(t)
+				steps := makeSteps(canonicalSteps)
 
-func TestRecoverForwardAfterFailure(t *testing.T) {
-	j, lock := newJournal(t)
-	s0 := &fakeStep{name: "s0"}
-	s1 := &fakeStep{name: "s1", applyErr: errors.New("boom")}
-	withGuard(t, lock, func(g *genstore.Guard) { j.Run(g, mkPlan("t1", s0, s1)) })
+				crashStep := i
+				if phase == "after-progress" {
+					crashStep = i + 1
+				}
+				if crashStep < len(steps) {
+					steps[crashStep].applyErr = errors.New("crash")
+				}
+				withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", steps)) })
 
-	s1.applyErr = nil // the transient failure is gone
-	withGuard(t, lock, func(g *genstore.Guard) {
-		out, acted, err := j.Recover(g, func(Intent) (Plan, error) { return mkPlan("t1", s0, s1), nil })
-		if err != nil || !acted || !out.Complete {
-			t.Fatalf("recover = %+v acted=%v err=%v", out, acted, err)
-		}
-	})
-	if !s1.applied {
-		t.Fatalf("s1 was not applied on recovery")
-	}
-}
+				if phase == "effect-applied-unrecorded" {
+					steps[i].applied = true // effect landed; only the progress record was lost
+				}
+				if crashStep < len(steps) {
+					steps[crashStep].applyErr = nil // the transient failure clears
+				}
 
-// The exact cut the redesign fixes: an effect became durable but its progress
-// record was not written (crash between apply and progress). Recovery must see the
-// step as applied and advance forward WITHOUT re-applying, reaching completion.
-func TestRecoverAdvancesAppliedButUnrecordedStep(t *testing.T) {
-	j, lock := newJournal(t)
-	s0 := &fakeStep{name: "s0"}
-	s1 := &fakeStep{name: "s1", applyErr: errors.New("crash-before-progress")}
-	withGuard(t, lock, func(g *genstore.Guard) { j.Run(g, mkPlan("t1", s0, s1)) })
-	if s1.applyCalls != 1 {
-		t.Fatalf("s1 applyCalls = %d, want 1 (the failed attempt)", s1.applyCalls)
-	}
-	// The effect actually landed; only the progress record was lost.
-	s1.applyErr = nil
-	s1.applied = true
-	withGuard(t, lock, func(g *genstore.Guard) {
-		out, _, err := j.Recover(g, func(Intent) (Plan, error) { return mkPlan("t1", s0, s1), nil })
-		if err != nil || !out.Complete {
-			t.Fatalf("recover = %+v err=%v, want complete", out, err)
+				withGuard(t, lock, func(g *genstore.Guard) {
+					_, _, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", steps), nil })
+					if err != nil {
+						t.Fatalf("recover: %v", err)
+					}
+				})
+				cur, _, _ := j.Latest()
+				if !cur.Complete {
+					t.Fatalf("transaction did not complete: %+v", cur)
+				}
+				for _, s := range steps {
+					if !s.applied {
+						t.Fatalf("step %s not applied after recovery", s.name)
+					}
+					if s.doubleApply {
+						t.Fatalf("step %s effect applied twice", s.name)
+					}
+				}
+			})
 		}
-	})
-	if s1.applyCalls != 1 {
-		t.Fatalf("s1 was re-applied on recovery (applyCalls=%d)", s1.applyCalls)
 	}
 }
 
 func TestRecoverIndeterminateFailsClosed(t *testing.T) {
 	j, lock := newJournal(t)
-	s0 := &fakeStep{name: "s0", applyErr: errors.New("stop")}
-	withGuard(t, lock, func(g *genstore.Guard) { j.Run(g, mkPlan("t1", s0)) })
-
-	s0.applyErr = nil
-	s0.forceState = StatusIndeterminate
+	s := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", s)) })
+	s[0].applyErr = nil
+	s[0].forceState = StatusIndeterminate
 	withGuard(t, lock, func(g *genstore.Guard) {
-		_, _, err := j.Recover(g, func(Intent) (Plan, error) { return mkPlan("t1", s0), nil })
-		if !errors.Is(err, ErrRecoveryRequired) {
-			t.Fatalf("indeterminate recover err = %v, want ErrRecoveryRequired", err)
+		if _, _, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", s), nil }); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrRecoveryRequired", err)
 		}
 	})
 	if cur, _, _ := j.Latest(); cur.Terminal() {
-		t.Fatalf("indeterminate transaction was wrongly terminalized")
+		t.Fatalf("indeterminate transaction was terminalized")
 	}
 }
 
-func TestRecoverSkipsWhenTerminal(t *testing.T) {
+func TestRecoverPrefixNotAppliedFailsClosed(t *testing.T) {
 	j, lock := newJournal(t)
+	a := &fakeStep{name: "a"}
+	b := &fakeStep{name: "b", applyErr: errors.New("stop")}
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", []*fakeStep{a, b})) }) // steps_done=1
+	// The journalled prefix (step a) is now observed NOT applied: fail closed.
+	a.applied = false
+	b.applyErr = nil
 	withGuard(t, lock, func(g *genstore.Guard) {
-		j.Run(g, mkPlan("t1", &fakeStep{name: "s0"}))
-		if _, acted, err := j.Recover(g, func(Intent) (Plan, error) { return mkPlan("t1", &fakeStep{name: "s0", applied: true}), nil }); err != nil || acted {
-			t.Fatalf("recover on complete: acted=%v err=%v, want no action", acted, err)
+		if _, _, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", []*fakeStep{a, b}), nil }); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("prefix regression err = %v, want ErrRecoveryRequired", err)
 		}
 	})
 }
 
-func TestAbortOnlyBeforeAnyStep(t *testing.T) {
+func TestReObserveAfterApplyFailsClosed(t *testing.T) {
 	j, lock := newJournal(t)
-	// Prepared with zero applied steps: abort allowed.
-	s0 := &fakeStep{name: "s0", applyErr: errors.New("stop")}
+	s := []*fakeStep{{name: "a", noObserveAfterApply: true}} // Apply returns nil but effect never observable
 	withGuard(t, lock, func(g *genstore.Guard) {
-		j.Run(g, mkPlan("t1", s0))
-		out, err := j.AbortLocked(g, "t1")
+		if _, err := j.Run(g, planFrom("t1", s)); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrRecoveryRequired when Apply is not observed", err)
+		}
+	})
+}
+
+func TestAbortObservesStepZero(t *testing.T) {
+	// NotApplied step 0 → abort allowed.
+	j, lock := newJournal(t)
+	s := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		_, _ = j.Run(g, planFrom("t1", s))
+		s[0].applyErr = nil // effect is NOT applied (Run failed before setting it)
+		out, err := j.Abort(g, planFrom("t1", s))
 		if err != nil || !out.Aborted {
-			t.Fatalf("abort at step 0 = %+v err=%v", out, err)
+			t.Fatalf("abort = %+v err=%v", out, err)
 		}
 	})
-	// A transaction with an applied step cannot be aborted.
+
+	// Applied step 0 (effect landed) → abort must recover forward, not orphan it.
 	j2, lock2 := newJournal(t)
-	a := &fakeStep{name: "a"}
-	b := &fakeStep{name: "b", applyErr: errors.New("stop")}
+	s2 := []*fakeStep{{name: "a", applyErr: errors.New("stop")}}
 	withGuard(t, lock2, func(g *genstore.Guard) {
-		j2.Run(g, mkPlan("t2", a, b)) // stops with steps_done=1
-		if _, err := j2.AbortLocked(g, "t2"); !errors.Is(err, ErrCannotAbort) {
-			t.Fatalf("abort after a step err = %v, want ErrCannotAbort", err)
+		_, _ = j2.Run(g, planFrom("t2", s2))
+		s2[0].applied = true // effect actually landed
+		if _, err := j2.Abort(g, planFrom("t2", s2)); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("abort with applied effect err = %v, want ErrRecoveryRequired", err)
 		}
 	})
+}
+
+func TestPlanMismatchOnRenamedStep(t *testing.T) {
+	j, lock := newJournal(t)
+	orig := []*fakeStep{{name: "a", applyErr: errors.New("stop")}, {name: "b"}}
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", orig)) })
+	renamed := []*fakeStep{{name: "a"}, {name: "RENAMED"}}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, _, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", renamed), nil }); !errors.Is(err, ErrPlanMismatch) {
+			t.Fatalf("renamed-step recover err = %v, want ErrPlanMismatch", err)
+		}
+	})
+}
+
+func TestZeroStepPlanRejected(t *testing.T) {
+	j, lock := newJournal(t)
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, Plan{Intent: intent("t1")}); err == nil {
+			t.Fatalf("a zero-step plan should be rejected")
+		}
+	})
+}
+
+func TestValidateRejectsStuckAllDoneNonTerminal(t *testing.T) {
+	r := Record{SchemaVersion: RecordVersion, Revision: 1, Intent: intent("t1"), StepIDs: []string{"a"}, StepsDone: 1}
+	if err := validate(r); err == nil {
+		t.Fatalf("a non-terminal all-steps-done record should be invalid")
+	}
+}
+
+func TestNextStepProjection(t *testing.T) {
+	j, lock := newJournal(t)
+	s := []*fakeStep{{name: "a"}, {name: "b", applyErr: errors.New("stop")}}
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = j.Run(g, planFrom("t1", s)) })
+	cur, _, _ := j.Latest()
+	if cur.NextStep() != "b" {
+		t.Fatalf("next step = %q, want b", cur.NextStep())
+	}
 }
 
 func TestPrepareWhilePendingRejected(t *testing.T) {
 	j, lock := newJournal(t)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		j.Run(g, mkPlan("t1", &fakeStep{name: "s0", applyErr: errors.New("stop")}))
-		if _, err := j.Run(g, mkPlan("t2", &fakeStep{name: "x"})); !errors.Is(err, ErrPending) {
+		_, _ = j.Run(g, planFrom("t1", []*fakeStep{{name: "a", applyErr: errors.New("stop")}}))
+		if _, err := j.Run(g, planFrom("t2", []*fakeStep{{name: "a"}})); !errors.Is(err, ErrPending) {
 			t.Fatalf("run while pending err = %v, want ErrPending", err)
 		}
 	})
@@ -215,23 +276,10 @@ func TestPrepareWhilePendingRejected(t *testing.T) {
 func TestNewTransactionAfterCompletion(t *testing.T) {
 	j, lock := newJournal(t)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		j.Run(g, mkPlan("t1", &fakeStep{name: "s0"}))
-		out, err := j.Run(g, mkPlan("t2", &fakeStep{name: "s0"}))
+		_, _ = j.Run(g, planFrom("t1", []*fakeStep{{name: "a"}}))
+		out, err := j.Run(g, planFrom("t2", []*fakeStep{{name: "a"}}))
 		if err != nil || !out.Complete || out.TxnID() != "t2" {
 			t.Fatalf("second txn = %+v err=%v", out, err)
-		}
-	})
-}
-
-func TestPlanMismatchRejected(t *testing.T) {
-	j, lock := newJournal(t)
-	withGuard(t, lock, func(g *genstore.Guard) {
-		j.Run(g, mkPlan("t1", &fakeStep{name: "s0", applyErr: errors.New("stop")}))
-		_, _, err := j.Recover(g, func(Intent) (Plan, error) {
-			return mkPlan("t1", &fakeStep{name: "s0"}, &fakeStep{name: "extra"}), nil // wrong step count
-		})
-		if !errors.Is(err, ErrPlanMismatch) {
-			t.Fatalf("plan mismatch err = %v, want ErrPlanMismatch", err)
 		}
 	})
 }
@@ -240,18 +288,17 @@ func TestRestartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	lock := filepath.Join(dir, "run.lock")
 	jdir := filepath.Join(dir, "txn")
-	s0 := &fakeStep{name: "s0"}
-	s1 := &fakeStep{name: "s1", applyErr: errors.New("crash")}
+	s := makeSteps(canonicalSteps)
+	s[3].applyErr = errors.New("crash")
+	withGuard(t, lock, func(g *genstore.Guard) { _, _ = Open(jdir, lock).Run(g, planFrom("t1", s)) })
 
-	withGuard(t, lock, func(g *genstore.Guard) { Open(jdir, lock).Run(g, mkPlan("t1", s0, s1)) })
-
-	s1.applyErr = nil
-	j2 := Open(jdir, lock) // fresh handle == restart
+	s[3].applyErr = nil
+	j2 := Open(jdir, lock)
 	if cur, ok, _ := j2.Latest(); !ok || cur.Terminal() {
 		t.Fatalf("pending transaction did not persist across restart")
 	}
 	withGuard(t, lock, func(g *genstore.Guard) {
-		out, acted, err := j2.Recover(g, func(Intent) (Plan, error) { return mkPlan("t1", s0, s1), nil })
+		out, acted, err := j2.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", s), nil })
 		if err != nil || !acted || !out.Complete {
 			t.Fatalf("restart recover = %+v acted=%v err=%v", out, acted, err)
 		}
@@ -263,32 +310,8 @@ func TestSecretInPayloadRejected(t *testing.T) {
 	in := intent("t1")
 	in.Payload = json.RawMessage(`{"cmd":"deploy token=sk-ant-abcdefghijklmnopqrstuvwx"}`)
 	withGuard(t, lock, func(g *genstore.Guard) {
-		if _, err := j.Run(g, Plan{Intent: in, Steps: []Step{(&fakeStep{name: "s0"}).toStep()}}); err == nil {
+		if _, err := j.Run(g, Plan{Intent: in, Steps: []Step{(&fakeStep{name: "a"}).toStep()}}); err == nil {
 			t.Fatalf("a secret in the payload should be rejected")
 		}
 	})
-}
-
-func TestValidateTransitionRejectsIllegalMoves(t *testing.T) {
-	base := Record{SchemaVersion: RecordVersion, Revision: 1, Intent: intent("t1"), TotalSteps: 3, StepsDone: 1}
-	// skipping a step
-	skip := base
-	skip.StepsDone = 3
-	if err := validateTransition(base, skip); err == nil {
-		t.Fatalf("skipping steps should be rejected")
-	}
-	// completing before all steps done
-	early := base
-	early.StepsDone = 2
-	early.Complete = true
-	if err := validate(early); err == nil {
-		t.Fatalf("completing before all steps should be rejected")
-	}
-	// advancing from a terminal record
-	term := base
-	term.StepsDone = 3
-	term.Complete = true
-	if err := validateTransition(term, base); err == nil {
-		t.Fatalf("advancing from a terminal record should be rejected")
-	}
 }

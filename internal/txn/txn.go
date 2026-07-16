@@ -3,15 +3,16 @@
 // atomically together (subject 04 supplies the git ref move, index reconcile, and
 // state CAS as concrete steps).
 //
-// It is a durable PROGRESS machine, not a two-phase flag: the journal records how
-// many ordered steps have durably completed. A transaction is COMPLETE only after
-// every step's effect is durable. Recovery resumes from the last recorded step and
-// drives the remaining idempotent step handlers — checking each step's Status
-// (Applied → advance, NotApplied → apply, Indeterminate → fail closed) — so the
-// classic "external effect done, crash before state" cut is repaired forward, not
-// falsely terminalized. The journal itself is an immutable genstore generation
-// sequence (D017), so it never depends on the replace it diagnoses, and it
-// composes under the run's shared guard with the state store.
+// It is a durable PROGRESS machine, not a two-phase flag: the journal records the
+// ordered step ids and how many have durably completed. A transaction is COMPLETE
+// only after every step's effect is durable and observed. Recovery reconstructs
+// the plan, verifies it matches the journalled step ids, re-observes the durable
+// prefix, then drives the remaining idempotent steps — Applied advances,
+// NotApplied applies and is re-observed, Indeterminate fails closed. So the
+// classic "external effect done, crash before state" cut is repaired forward, and
+// a transaction is never falsely terminalized. The journal itself is an immutable
+// genstore generation sequence (D017), so it never depends on the replace it
+// diagnoses, and it composes under the run's shared guard with the state store.
 //
 // The steps and the intent payload codec are the caller's (subject 04 for git).
 // This package is the generic engine, tested against fake steps.
@@ -24,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/redact"
@@ -34,13 +34,14 @@ const (
 	RecordVersion = 1
 	IntentVersion = 1
 	maxPayload    = 64 * 1024
+	maxSteps      = 64
 )
 
 // Sentinel errors.
 var (
 	ErrPending          = errors.New("txn: a non-terminal transaction is already pending")
 	ErrNoPending        = errors.New("txn: no matching pending transaction")
-	ErrCannotAbort      = errors.New("txn: cannot abort after a step has been applied")
+	ErrCannotAbort      = errors.New("txn: cannot abort; a step effect is present or applied")
 	ErrRecoveryRequired = errors.New("txn: transaction is in an indeterminate state; recovery required")
 	ErrPlanMismatch     = errors.New("txn: recovery plan does not match the journalled transaction")
 )
@@ -62,8 +63,7 @@ type Step struct {
 }
 
 // Intent is the typed, versioned transaction envelope. The payload is a bounded,
-// kind-specific JSON blob whose codec belongs to the caller (subject 04 for git);
-// the journal validates the envelope and carries the replay-critical bindings.
+// kind-specific JSON blob whose codec belongs to the caller (subject 04 for git).
 type Intent struct {
 	Version               int             `json:"version"`
 	Kind                  string          `json:"kind"`
@@ -80,13 +80,13 @@ type Plan struct {
 
 // Record is one journal generation: the durable progress of a transaction.
 type Record struct {
-	SchemaVersion int    `json:"schema_version"`
-	Revision      uint64 `json:"revision"`
-	Intent        Intent `json:"intent"`
-	StepsDone     int    `json:"steps_done"`
-	TotalSteps    int    `json:"total_steps"`
-	Complete      bool   `json:"complete"`
-	Aborted       bool   `json:"aborted"`
+	SchemaVersion int      `json:"schema_version"`
+	Revision      uint64   `json:"revision"`
+	Intent        Intent   `json:"intent"`
+	StepIDs       []string `json:"step_ids"`
+	StepsDone     int      `json:"steps_done"`
+	Complete      bool     `json:"complete"`
+	Aborted       bool     `json:"aborted"`
 }
 
 // Terminal reports whether the transaction is finished (complete or aborted).
@@ -95,16 +95,22 @@ func (r Record) Terminal() bool { return r.Complete || r.Aborted }
 // TxnID returns the transaction id.
 func (r Record) TxnID() string { return r.Intent.TxnID }
 
+// NextStep is the id of the next step to run, or "" when none remain. It lets a
+// read-only status project the exact next action (01.6).
+func (r Record) NextStep() string {
+	if r.Terminal() || r.StepsDone >= len(r.StepIDs) {
+		return ""
+	}
+	return r.StepIDs[r.StepsDone]
+}
+
 // Journal persists transaction progress over a genstore under the run lock.
 type Journal struct {
 	gs *genstore.Store
 }
 
-// Open returns a journal handle (side-effect-free). lockPath must be the run's
-// mutation lock, shared with the run-state store.
-func Open(dir, lockPath string) *Journal {
-	return &Journal{gs: genstore.Open(dir, lockPath)}
-}
+// Open returns a journal handle (side-effect-free).
+func Open(dir, lockPath string) *Journal { return &Journal{gs: genstore.Open(dir, lockPath)} }
 
 // LockPath is the mutation lock guarding this journal.
 func (j *Journal) LockPath() string { return j.gs.LockPath() }
@@ -130,11 +136,10 @@ func (j *Journal) latestGS() (genstore.Record, Record, bool, error) {
 	return gsRec, r, true, nil
 }
 
-// Run drives a NEW transaction to completion under a held guard: it records the
-// intent, then applies and records each step in order, marking complete only after
-// the last step's effect is durable.
+// Run drives a NEW transaction to completion under a held guard.
 func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
-	if err := validateIntent(plan.Intent); err != nil {
+	names, err := validatePlan(plan)
+	if err != nil {
 		return Record{}, err
 	}
 	gsRec, cur, ok, err := j.latestGS()
@@ -148,17 +153,16 @@ func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
 		}
 		head = gsRec.Head()
 	}
-	rec, err := j.append(g, head, Record{Intent: plan.Intent, TotalSteps: len(plan.Steps)})
+	rec, err := j.append(g, head, Record{Intent: plan.Intent, StepIDs: names})
 	if err != nil {
 		return Record{}, err
 	}
 	return j.drive(g, rec, plan.Steps)
 }
 
-// Recover resumes a pending (non-terminal) transaction under a held guard, driving
-// its remaining steps forward. It is idempotent — with no pending transaction it
-// returns the latest record and recovered=false. planFor reconstructs the ordered
-// steps from the journalled intent (subject 04 maps a git intent to git steps).
+// Recover resumes a pending transaction under a held guard. It reconstructs the
+// plan, requires it to match the journalled step ids, re-observes the durable
+// prefix, then drives the remaining steps.
 func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error)) (Record, bool, error) {
 	_, cur, ok, err := j.latestGS()
 	if err != nil {
@@ -171,31 +175,64 @@ func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error))
 	if err != nil {
 		return Record{}, false, err
 	}
-	if len(plan.Steps) != cur.TotalSteps || !reflect.DeepEqual(plan.Intent, cur.Intent) {
-		return Record{}, false, fmt.Errorf("%w: got %d steps, journal has %d", ErrPlanMismatch, len(plan.Steps), cur.TotalSteps)
+	names, err := validatePlan(plan)
+	if err != nil {
+		return Record{}, false, err
+	}
+	if !reflect.DeepEqual(plan.Intent, cur.Intent) || !slicesEqual(names, cur.StepIDs) {
+		return Record{}, false, ErrPlanMismatch
+	}
+	// The durable prefix must still be observably applied.
+	for i := 0; i < cur.StepsDone; i++ {
+		st, serr := plan.Steps[i].Status()
+		if serr != nil {
+			return Record{}, false, serr
+		}
+		if st != StatusApplied {
+			return Record{}, false, fmt.Errorf("%w: prefix step %d (%s) is %q", ErrRecoveryRequired, i, plan.Steps[i].Name, st)
+		}
 	}
 	out, err := j.drive(g, cur, plan.Steps)
 	return out, true, err
 }
 
-// AbortLocked terminates a pending transaction that has applied no steps yet. It is
-// illegal after any (possibly irreversible) step has been applied.
-func (j *Journal) AbortLocked(g *genstore.Guard, txnID string) (Record, error) {
+// Abort terminates a transaction that has applied no steps. It reconstructs the
+// plan and OBSERVES step 0 to close the applied-but-unrecorded window: only a
+// definitively NotApplied first step permits abort; Applied must recover forward
+// and Indeterminate fails closed.
+func (j *Journal) Abort(g *genstore.Guard, plan Plan) (Record, error) {
+	names, err := validatePlan(plan)
+	if err != nil {
+		return Record{}, err
+	}
 	gsRec, cur, ok, err := j.latestGS()
 	if err != nil {
 		return Record{}, err
 	}
-	if !ok || cur.Terminal() || cur.TxnID() != txnID {
-		return Record{}, fmt.Errorf("%w: %s", ErrNoPending, txnID)
+	if !ok || cur.Terminal() || cur.TxnID() != plan.Intent.TxnID {
+		return Record{}, fmt.Errorf("%w: %s", ErrNoPending, plan.Intent.TxnID)
+	}
+	if !slicesEqual(names, cur.StepIDs) {
+		return Record{}, ErrPlanMismatch
 	}
 	if cur.StepsDone != 0 {
 		return Record{}, fmt.Errorf("%w: %d steps applied", ErrCannotAbort, cur.StepsDone)
 	}
-	return j.append(g, gsRec.Head(), Record{Intent: cur.Intent, TotalSteps: cur.TotalSteps, Aborted: true})
+	switch st, serr := plan.Steps[0].Status(); {
+	case serr != nil:
+		return Record{}, serr
+	case st == StatusNotApplied:
+		// safe: nothing has been applied
+	case st == StatusApplied:
+		return Record{}, fmt.Errorf("%w: step 0 effect is present, recover forward", ErrRecoveryRequired)
+	default:
+		return Record{}, fmt.Errorf("%w: step 0 is indeterminate", ErrRecoveryRequired)
+	}
+	return j.append(g, gsRec.Head(), Record{Intent: cur.Intent, StepIDs: cur.StepIDs, Aborted: true})
 }
 
-// drive applies steps from rec.StepsDone onward, recording durable progress after
-// each, and marks complete after the last one.
+// drive applies steps from rec.StepsDone onward, re-observing each applied step
+// before recording durable progress, and marks complete after the last one.
 func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, error) {
 	for i := rec.StepsDone; i < len(steps); i++ {
 		st, err := steps[i].Status()
@@ -204,11 +241,18 @@ func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, er
 		}
 		switch st {
 		case StatusApplied:
-			// A crash after the effect but before its progress record: advance
-			// without re-applying.
+			// effect already durable (crash after apply, before progress)
 		case StatusNotApplied:
 			if err := steps[i].Apply(); err != nil {
 				return Record{}, err
+			}
+			// Terminality is based on observed durable state, not the callback.
+			after, aerr := steps[i].Status()
+			if aerr != nil {
+				return Record{}, aerr
+			}
+			if after != StatusApplied {
+				return Record{}, fmt.Errorf("%w: step %d (%s) not observed applied after Apply", ErrRecoveryRequired, i, steps[i].Name)
 			}
 		default:
 			return Record{}, fmt.Errorf("%w: step %d (%s) is %q", ErrRecoveryRequired, i, steps[i].Name, st)
@@ -218,13 +262,10 @@ func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, er
 			return Record{}, err
 		}
 	}
-	if len(steps) == 0 && !rec.Complete {
-		return j.advance(g, 0, true)
-	}
 	return rec, nil
 }
 
-// advance appends the next progress record, carrying the intent forward.
+// advance appends the next progress record, carrying the intent and step ids forward.
 func (j *Journal) advance(g *genstore.Guard, stepsDone int, complete bool) (Record, error) {
 	gsRec, cur, ok, err := j.latestGS()
 	if err != nil {
@@ -234,15 +275,13 @@ func (j *Journal) advance(g *genstore.Guard, stepsDone int, complete bool) (Reco
 		return Record{}, fmt.Errorf("txn: advance with no prepared record")
 	}
 	return j.append(g, gsRec.Head(), Record{
-		Intent:     cur.Intent,
-		StepsDone:  stepsDone,
-		TotalSteps: cur.TotalSteps,
-		Complete:   complete,
+		Intent:    cur.Intent,
+		StepIDs:   cur.StepIDs,
+		StepsDone: stepsDone,
+		Complete:  complete,
 	})
 }
 
-// append validates and persists next, checking the transition from the current
-// record when one exists.
 func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Record, error) {
 	built, err := j.gs.AppendLocked(g, head, func(gen uint64, _ string) ([]byte, error) {
 		next.SchemaVersion = RecordVersion
@@ -256,12 +295,10 @@ func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Re
 				return nil, perr
 			}
 			if prev.TxnID() == next.TxnID() {
-				// Continuing the same transaction: enforce the step transition.
 				if err := validateTransition(prev, next); err != nil {
 					return nil, err
 				}
 			} else if !prev.Terminal() {
-				// Starting a new transaction requires the previous to be terminal.
 				return nil, fmt.Errorf("%w: %s", ErrPending, prev.TxnID())
 			}
 		}
@@ -273,7 +310,6 @@ func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Re
 	return decode(built)
 }
 
-// headRecord decodes the current head (used inside the builder, under the guard).
 func (j *Journal) headRecord() (Record, error) {
 	_, r, ok, err := j.latestGS()
 	if err != nil {
@@ -295,17 +331,26 @@ func validate(r Record) error {
 	if err := validateIntent(r.Intent); err != nil {
 		return err
 	}
-	if r.TotalSteps < 0 || r.StepsDone < 0 || r.StepsDone > r.TotalSteps {
-		return fmt.Errorf("txn: steps_done %d out of range 0..%d", r.StepsDone, r.TotalSteps)
+	if err := validateStepIDs(r.StepIDs); err != nil {
+		return err
+	}
+	total := len(r.StepIDs)
+	if r.StepsDone < 0 || r.StepsDone > total {
+		return fmt.Errorf("txn: steps_done %d out of range 0..%d", r.StepsDone, total)
 	}
 	if r.Complete && r.Aborted {
 		return fmt.Errorf("txn: complete and aborted are mutually exclusive")
 	}
-	if r.Complete && r.StepsDone != r.TotalSteps {
-		return fmt.Errorf("txn: complete requires all %d steps done, have %d", r.TotalSteps, r.StepsDone)
+	if r.Complete && r.StepsDone != total {
+		return fmt.Errorf("txn: complete requires all %d steps done, have %d", total, r.StepsDone)
 	}
 	if r.Aborted && r.StepsDone != 0 {
 		return fmt.Errorf("txn: abort requires zero applied steps, have %d", r.StepsDone)
+	}
+	// A non-terminal record must have work remaining, so a stuck all-done
+	// non-terminal state cannot exist.
+	if !r.Terminal() && r.StepsDone >= total {
+		return fmt.Errorf("txn: a non-terminal record must have a next step (%d/%d)", r.StepsDone, total)
 	}
 	return nil
 }
@@ -314,8 +359,8 @@ func validateTransition(old, next Record) error {
 	if !reflect.DeepEqual(old.Intent, next.Intent) {
 		return fmt.Errorf("txn: intent is immutable within a transaction")
 	}
-	if old.TotalSteps != next.TotalSteps {
-		return fmt.Errorf("txn: total_steps is immutable within a transaction")
+	if !slicesEqual(old.StepIDs, next.StepIDs) {
+		return fmt.Errorf("txn: step ids are immutable within a transaction")
 	}
 	if old.Terminal() {
 		return fmt.Errorf("txn: transaction is already terminal")
@@ -329,6 +374,40 @@ func validateTransition(old, next Record) error {
 	return nil
 }
 
+func validatePlan(plan Plan) ([]string, error) {
+	if err := validateIntent(plan.Intent); err != nil {
+		return nil, err
+	}
+	if len(plan.Steps) == 0 {
+		return nil, fmt.Errorf("txn: a plan must have at least one step")
+	}
+	names := make([]string, len(plan.Steps))
+	for i, s := range plan.Steps {
+		names[i] = s.Name
+	}
+	if err := validateStepIDs(names); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+func validateStepIDs(ids []string) error {
+	if len(ids) == 0 || len(ids) > maxSteps {
+		return fmt.Errorf("txn: step count %d out of range 1..%d", len(ids), maxSteps)
+	}
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if !validID(id) {
+			return fmt.Errorf("txn: invalid step id %q", id)
+		}
+		if seen[id] {
+			return fmt.Errorf("txn: duplicate step id %q", id)
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
 func validateIntent(in Intent) error {
 	if in.Version != IntentVersion {
 		return fmt.Errorf("txn: intent version %d != %d", in.Version, IntentVersion)
@@ -336,7 +415,7 @@ func validateIntent(in Intent) error {
 	if !validID(in.TxnID) {
 		return fmt.Errorf("txn: invalid txn_id %q", in.TxnID)
 	}
-	if strings.TrimSpace(in.Kind) == "" || len(in.Kind) > 64 || !validID(in.Kind) {
+	if len(in.Kind) > 64 || !validID(in.Kind) {
 		return fmt.Errorf("txn: invalid kind %q", in.Kind)
 	}
 	if len(in.Payload) == 0 || len(in.Payload) > maxPayload {
@@ -368,6 +447,18 @@ func decode(rec genstore.Record) (Record, error) {
 		return Record{}, fmt.Errorf("txn: generation %d invalid: %w", rec.Generation, err)
 	}
 	return r, nil
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // validID is a filename-safe bounded identifier: 1..128 of [A-Za-z0-9._-],
