@@ -202,3 +202,35 @@ func TestHashStableAndSensitive(t *testing.T) {
 }
 
 var _ = validPolicy
+
+func TestParseTaskContractRejectsDuplicateCriteria(t *testing.T) {
+	task := fullTask()
+	task["acceptance_criteria"] = []string{"same", "same"}
+	if _, err := ParseTaskContract(mustJSON(t, task)); err == nil {
+		t.Fatalf("duplicate acceptance_criteria should be rejected")
+	}
+}
+
+func TestRunPolicyBudgetCeiling(t *testing.T) {
+	base := DefaultRunPolicy()
+	base.TestGate = TestGate{Command: "go test ./..."}
+
+	atCeiling := base
+	atCeiling.Budgets.PlanRounds = MaxBudget
+	atCeiling.Limits.MaxRunTurns = MaxBudget
+	if err := atCeiling.Validate(); err != nil {
+		t.Fatalf("budgets at the ceiling should be accepted: %v", err)
+	}
+
+	overBudget := base
+	overBudget.Budgets.PlanRounds = MaxBudget + 1
+	if err := overBudget.Validate(); err == nil {
+		t.Fatalf("a budget above the ceiling should be rejected")
+	}
+
+	overTurns := base
+	overTurns.Limits.MaxRunTurns = MaxBudget + 1
+	if err := overTurns.Validate(); err == nil {
+		t.Fatalf("max_run_turns above the ceiling should be rejected")
+	}
+}

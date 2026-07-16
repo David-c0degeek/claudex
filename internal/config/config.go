@@ -26,6 +26,13 @@ const (
 	RunPolicyVersion    = 1
 )
 
+// MaxBudget is the shared ceiling for every quality budget and the run-turn cap.
+// It bounds the durable counters the engine increments, so a checked used+1 is
+// always representable and a frozen policy can never request a limit the state
+// counters cannot reach. The state store validates its counters against the same
+// ceiling.
+const MaxBudget = 1 << 20
+
 // TaskContract is the run's goal and acceptance definition (harvested shape).
 type TaskContract struct {
 	SchemaVersion      int      `json:"schema_version"`
@@ -177,6 +184,16 @@ func ParseTaskContract(data []byte) (TaskContract, error) {
 	if len(tc.AcceptanceCriteria) == 0 {
 		return TaskContract{}, fmt.Errorf("task contract: at least one acceptance_criteria is required")
 	}
+	// Acceptance criteria must be exactly unique (case-sensitive), so a verification
+	// can prove complete, exact coverage of the frozen task without a duplicate
+	// making that impossible.
+	seen := make(map[string]bool, len(tc.AcceptanceCriteria))
+	for _, c := range tc.AcceptanceCriteria {
+		if seen[c] {
+			return TaskContract{}, fmt.Errorf("task contract: duplicate acceptance_criteria %q", c)
+		}
+		seen[c] = true
+	}
 	return tc, nil
 }
 
@@ -233,7 +250,9 @@ func (rp RunPolicy) Validate() error {
 	default:
 		return fmt.Errorf("unknown_fs_policy must be %q or %q, got %q", UnknownFSRefuse, UnknownFSAcknowledge, rp.UnknownFSPolicy)
 	}
-	// Budgets may be zero but not negative.
+	// Budgets may be zero but not negative, and must fit the shared counter ceiling
+	// so the engine can always represent a checked used+1 (the counters the state
+	// store bounds against MaxBudget). max_run_turns shares the same ceiling.
 	budgets := []struct {
 		name string
 		v    int
@@ -246,6 +265,9 @@ func (rp RunPolicy) Validate() error {
 	for _, b := range budgets {
 		if b.v < 0 {
 			return fmt.Errorf("budgets.%s must be >= 0, got %d", b.name, b.v)
+		}
+		if b.v > MaxBudget {
+			return fmt.Errorf("budgets.%s must be <= %d, got %d", b.name, MaxBudget, b.v)
 		}
 	}
 	// Ceilings must be positive.
@@ -265,6 +287,11 @@ func (rp RunPolicy) Validate() error {
 		if l.v <= 0 {
 			return fmt.Errorf("limits.%s must be positive, got %d", l.name, l.v)
 		}
+	}
+	// max_run_turns shares the counter ceiling so a frozen policy never requests a
+	// turn budget the engine's checked counters cannot represent.
+	if rp.Limits.MaxRunTurns > MaxBudget {
+		return fmt.Errorf("limits.max_run_turns must be <= %d, got %d", MaxBudget, rp.Limits.MaxRunTurns)
 	}
 	if rp.Limits.EvidenceMaxFileBytes > rp.Limits.EvidenceMaxTotalBytes {
 		return fmt.Errorf("limits.evidence_max_file_bytes (%d) exceeds evidence_max_total_bytes (%d)", rp.Limits.EvidenceMaxFileBytes, rp.Limits.EvidenceMaxTotalBytes)

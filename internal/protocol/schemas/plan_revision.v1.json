@@ -69,6 +69,8 @@
     "steps": {
       "description": "Replacement full step list, or null to preserve it.",
       "type": ["array", "null"],
+      "minItems": 1,
+      "maxItems": 64,
       "items": {
         "type": "object",
         "additionalProperties": false,
