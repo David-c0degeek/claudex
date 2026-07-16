@@ -31,6 +31,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,8 +48,11 @@ const (
 	trailerLen    = sha256.Size
 	maxHeaderSize = 4096     // header JSON cap
 	maxRecordSize = 16 << 20 // per-file cap, guards read-allocation from a corrupt file
-	dirPerm       = os.FileMode(0o700)
-	filePerm      = os.FileMode(0o600)
+	// maxPayloadSize is the largest payload whose complete framed record is
+	// guaranteed to fit under maxRecordSize (using the worst-case header size).
+	maxPayloadSize = maxRecordSize - 8 - maxHeaderSize - trailerLen
+	dirPerm        = os.FileMode(0o700)
+	filePerm       = os.FileMode(0o600)
 )
 
 // Sentinel errors (wrap with %w).
@@ -58,7 +62,21 @@ var (
 	ErrCorrupt   = errors.New("genstore: no valid generation chain")
 	ErrWrongLock = errors.New("genstore: guard is for a different lock")
 	ErrAmbiguous = errors.New("genstore: write outcome could not be reconciled")
+	ErrTooLarge  = errors.New("genstore: record exceeds the maximum size")
 )
+
+// PostCommitError reports that the generation was committed but the lock release
+// failed afterwards. A caller must treat the write as done and must NOT retry.
+type PostCommitError struct {
+	Generation uint64
+	Err        error
+}
+
+func (e *PostCommitError) Error() string {
+	return fmt.Sprintf("genstore: generation %d committed but lock release failed: %v", e.Generation, e.Err)
+}
+func (e *PostCommitError) Unwrap() error   { return e.Err }
+func (e *PostCommitError) Committed() bool { return true }
 
 // Guard is a held per-run mutation lock. One guard can serialize appends across
 // several stores that share the same lock path (the run's transaction).
@@ -118,13 +136,40 @@ type Store struct {
 	dir      string
 	lockPath string
 	write    func(path string, data []byte, perm os.FileMode) error
+	release  func(*Guard) error
 }
 
 // Open returns a store handle. It performs no I/O: the directory is created
 // lazily under the guard by the first append, so a read-only Latest never
 // mutates disk.
 func Open(dir, lockPath string) *Store {
-	return &Store{dir: dir, lockPath: lockPath, write: atomicfile.Write}
+	return &Store{
+		dir:      dir,
+		lockPath: lockPath,
+		write:    atomicfile.Write,
+		release:  func(g *Guard) error { return g.Release() },
+	}
+}
+
+// ensureDir creates the store directory private and tightens an existing one.
+func (s *Store) ensureDir() error {
+	if err := os.MkdirAll(s.dir, dirPerm); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(s.dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("genstore: store path %q is not a directory", s.dir)
+	}
+	if runtime.GOOS != "windows" {
+		// MkdirAll does not tighten a pre-existing broad directory.
+		if err := os.Chmod(s.dir, dirPerm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // LockPath is the mutation lock this store's guard must hold.
@@ -166,10 +211,11 @@ func (s *Store) Append(expected Head, build func(next uint64, prevDigest string)
 		return Record{}, ErrBusy
 	}
 	rec, aerr := s.AppendLocked(g, expected, build)
-	rerr := g.Release()
+	rerr := s.release(g)
 	if aerr == nil && rerr != nil {
-		// The record is committed, but the lock release failed: report both.
-		return rec, fmt.Errorf("committed generation %d but lock release failed: %w", rec.Generation, rerr)
+		// The record is committed, but the lock release failed: report it as a
+		// committed error so a caller never retries a done transition.
+		return rec, &PostCommitError{Generation: rec.Generation, Err: rerr}
 	}
 	return rec, aerr
 }
@@ -181,7 +227,7 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 	if err := s.checkGuard(g); err != nil {
 		return Record{}, err
 	}
-	if err := os.MkdirAll(s.dir, dirPerm); err != nil { // init under the lock
+	if err := s.ensureDir(); err != nil { // init under the lock
 		return Record{}, err
 	}
 
@@ -214,6 +260,11 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 	if err != nil {
 		return Record{}, err
 	}
+	// Reject an oversize payload BEFORE encoding/writing, so the old head stays
+	// intact and no unreadable (later-quarantined) generation is ever committed.
+	if len(payload) > maxPayloadSize {
+		return Record{}, fmt.Errorf("%w: payload %d bytes exceeds limit %d", ErrTooLarge, len(payload), maxPayloadSize)
+	}
 	rec, file := encode(next, head.Digest, payload)
 
 	if werr := s.write(s.genPath(next), file, filePerm); werr != nil {
@@ -222,30 +273,27 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 	return rec, nil
 }
 
-// reconcile interprets an ambiguous write outcome by re-reading disk exactly
-// once. It never re-invokes the builder. If the exact candidate is now the
-// validated head, the write committed; if the old head still stands, the write
-// did not commit and the original error is returned; otherwise the state is
-// ambiguous/corrupt.
+// reconcile interprets an ambiguous write outcome by re-validating the WHOLE
+// chain exactly once (not just the candidate file). It never re-invokes the
+// builder. The write committed only if the validated head is exactly the
+// candidate; if the old validated head still stands, the write did not commit and
+// the original error is returned; anything else (corrupt ancestor, broken
+// namespace, a different head) is ambiguous.
 func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, error) {
-	if data, rerr := os.ReadFile(s.genPath(candidate.Generation)); rerr == nil {
-		if got, ok := decode(candidate.Generation, data); ok && got.Digest == candidate.Digest {
-			return candidate, nil // committed and visible despite the write error
-		}
-	}
 	valid, _, present, eerr := s.enumerate()
 	if eerr == nil {
-		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil {
-			var head Head
-			if hasHead {
-				head = headRec.Head()
-			}
-			if head == oldHead {
-				return Record{}, werr // old head intact: write did not commit
+		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil && hasHead {
+			switch headRec.Digest {
+			case candidate.Digest:
+				return candidate, nil // committed: candidate is the validated head
+			case oldHead.Digest:
+				if headRec.Generation == oldHead.Generation {
+					return Record{}, werr // old head intact: write did not commit
+				}
 			}
 		}
 	}
-	return Record{}, fmt.Errorf("%w: after write error: %v", ErrAmbiguous, werr)
+	return Record{}, fmt.Errorf("%w: %w", ErrAmbiguous, werr)
 }
 
 // enumerate lists the generation files, returning the self-intact records
@@ -278,6 +326,9 @@ func (s *Store) enumerate() (valid []Record, occupied map[uint64]bool, present b
 		info, ierr := ent.Info()
 		if ierr != nil {
 			return nil, nil, true, ierr
+		}
+		if !info.Mode().IsRegular() {
+			return nil, nil, true, fmt.Errorf("generation file %q is not a regular file: %w", name, ErrCorrupt)
 		}
 		occupied[g] = true
 		if info.Size() <= int64(maxRecordSize) {
@@ -378,7 +429,7 @@ func encode(gen uint64, prevDigest string, payload []byte) (Record, []byte) {
 // It is overflow- and resource-safe: the header length is bounds-checked without
 // unsigned wraparound and capped.
 func decode(expectGen uint64, file []byte) (Record, bool) {
-	if len(file) < 8+trailerLen {
+	if len(file) < 8+trailerLen || len(file) > maxRecordSize {
 		return Record{}, false
 	}
 	body := file[:len(file)-trailerLen]
@@ -414,7 +465,8 @@ func decode(expectGen uint64, file []byte) (Record, bool) {
 }
 
 // strictHeader decodes a single JSON header, rejecting unknown fields and
-// trailing content.
+// trailing content. The record checksum already makes any accidental byte
+// mutation evident, so duplicate-key/null detection is not repeated here.
 func strictHeader(hb []byte, h *header) bool {
 	dec := json.NewDecoder(bytes.NewReader(hb))
 	dec.DisallowUnknownFields()

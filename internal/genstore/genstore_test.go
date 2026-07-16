@@ -70,23 +70,29 @@ func TestAppendConflict(t *testing.T) {
 	}
 }
 
-func TestComposableCriticalSection(t *testing.T) {
-	s := newStore(t)
-	g, ok, err := Acquire(s.lockPath)
+func TestTwoStoresShareOneGuard(t *testing.T) {
+	// The journal+state contract: two distinct stores committed under one guard.
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "run.lock")
+	a := Open(filepath.Join(dir, "a"), lock)
+	b := Open(filepath.Join(dir, "b"), lock)
+
+	g, ok, err := Acquire(lock)
 	if err != nil || !ok {
 		t.Fatalf("acquire: ok=%v err=%v", ok, err)
 	}
 	defer g.Release()
-	r1, err := s.AppendLocked(g, Head{}, func(uint64, string) ([]byte, error) { return []byte("one"), nil })
+
+	ra, err := a.AppendLocked(g, Head{}, func(uint64, string) ([]byte, error) { return []byte("a1"), nil })
 	if err != nil {
-		t.Fatalf("append 1: %v", err)
+		t.Fatalf("store a append: %v", err)
 	}
-	r2, err := s.AppendLocked(g, r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil })
+	rb, err := b.AppendLocked(g, Head{}, func(uint64, string) ([]byte, error) { return []byte("b1"), nil })
 	if err != nil {
-		t.Fatalf("append 2 in same section: %v", err)
+		t.Fatalf("store b append in the same section: %v", err)
 	}
-	if r2.Generation != 2 {
-		t.Fatalf("gen = %d, want 2", r2.Generation)
+	if ra.Generation != 1 || rb.Generation != 1 {
+		t.Fatalf("generations a=%d b=%d, want 1/1", ra.Generation, rb.Generation)
 	}
 }
 
@@ -208,12 +214,12 @@ func TestWritePrecommitFailurePreservesHead(t *testing.T) {
 	}
 }
 
-func TestWriteCommittedDespiteError(t *testing.T) {
+func TestWriteCommittedDespitePostCommitSyncError(t *testing.T) {
 	s := newStore(t)
 	r1 := appendConst(t, s, Head{}, "one")
 	s.write = func(path string, data []byte, perm os.FileMode) error {
-		_ = atomicfile.Write(path, data, perm) // the record IS written...
-		return errors.New("simulated post-commit sync failure")
+		_ = atomicfile.Write(path, data, perm) // the record IS written and valid...
+		return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync")}
 	}
 	rec, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil })
 	if err != nil {
@@ -222,9 +228,90 @@ func TestWriteCommittedDespiteError(t *testing.T) {
 	if rec.Generation != 2 {
 		t.Fatalf("committed rec gen = %d, want 2", rec.Generation)
 	}
-	got, _, _ := s.Latest()
-	if got.Generation != 2 {
+	if got, _, _ := s.Latest(); got.Generation != 2 {
 		t.Fatalf("head = %d after committed write, want 2", got.Generation)
+	}
+}
+
+func TestOversizePayloadRejectedFirstGen(t *testing.T) {
+	s := newStore(t)
+	big := make([]byte, maxPayloadSize+1)
+	if _, err := s.Append(Head{}, func(uint64, string) ([]byte, error) { return big, nil }); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+	if _, ok, _ := s.Latest(); ok {
+		t.Fatalf("store is not empty after an oversize rejection")
+	}
+}
+
+func TestOversizePayloadRejectedLaterGen(t *testing.T) {
+	s := newStore(t)
+	r1 := appendConst(t, s, Head{}, "one")
+	big := make([]byte, maxPayloadSize+1)
+	if _, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return big, nil }); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+	if got, _, _ := s.Latest(); got.Generation != 1 {
+		t.Fatalf("head moved to %d after an oversize rejection", got.Generation)
+	}
+}
+
+func TestReconcileCorruptAncestorIsAmbiguous(t *testing.T) {
+	s := newStore(t)
+	r1 := appendConst(t, s, Head{}, "one")
+	s.write = func(path string, data []byte, perm os.FileMode) error {
+		_ = atomicfile.Write(path, data, perm)                    // write the exact candidate gen2...
+		_ = os.WriteFile(genFile(s, 1), []byte("garbage"), 0o600) // ...but corrupt the root
+		return errors.New("ambiguous")
+	}
+	if _, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil }); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("corrupt-ancestor + exact-candidate err = %v, want ErrAmbiguous", err)
+	}
+}
+
+func TestReconcileNoncanonicalNamespaceIsAmbiguous(t *testing.T) {
+	s := newStore(t)
+	r1 := appendConst(t, s, Head{}, "one")
+	s.write = func(path string, data []byte, perm os.FileMode) error {
+		_ = atomicfile.Write(path, data, perm)
+		_ = os.WriteFile(filepath.Join(s.dir, "bad"+genFileExt), []byte("x"), 0o600) // breaks the namespace
+		return errors.New("ambiguous")
+	}
+	if _, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil }); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("noncanonical + exact-candidate err = %v, want ErrAmbiguous", err)
+	}
+}
+
+func TestReleaseFailureIsPostCommitError(t *testing.T) {
+	s := newStore(t)
+	s.release = func(g *Guard) error { _ = g.Release(); return errors.New("release failed") }
+	rec, err := s.Append(Head{}, func(uint64, string) ([]byte, error) { return []byte("one"), nil })
+	var pce *PostCommitError
+	if !errors.As(err, &pce) {
+		t.Fatalf("err = %v, want *PostCommitError", err)
+	}
+	if !pce.Committed() || rec.Generation != 1 {
+		t.Fatalf("committed=%v gen=%d", pce.Committed(), rec.Generation)
+	}
+	if got, ok, _ := s.Latest(); !ok || got.Generation != 1 {
+		t.Fatalf("record was not actually persisted")
+	}
+}
+
+func TestInitTightensExistingBroadDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	gens := filepath.Join(dir, "gens")
+	if err := os.MkdirAll(gens, 0o755); err != nil { // pre-existing broad directory
+		t.Fatalf("pre-create: %v", err)
+	}
+	s := Open(gens, filepath.Join(dir, "run.lock"))
+	appendConst(t, s, Head{}, "one")
+	fi, _ := os.Stat(gens)
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("existing dir perm = %o, want tightened to 700", fi.Mode().Perm())
 	}
 }
 
