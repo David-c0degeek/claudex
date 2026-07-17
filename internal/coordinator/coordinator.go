@@ -57,10 +57,26 @@ type Run struct {
 
 	mu     sync.RWMutex // RLocked for a submit's lifetime; Locked by Close
 	closed bool
+}
 
-	// beforeTransport is a test-only barrier fired after precompute and before
-	// transport acquires the run lock; nil in production.
-	beforeTransport func()
+// submitHooks are per-call test barriers carried on the submit context; nil in
+// production. afterFacts fires inside precompute once fact preparation is done (or
+// skipped) and before minting; afterPrecompute fires after precompute and before
+// transport acquires the run lock. Both run while the submit holds its read lock.
+type submitHooks struct {
+	afterFacts      func()
+	afterPrecompute func()
+}
+
+type hooksKey struct{}
+
+func withHooks(ctx context.Context, h *submitHooks) context.Context {
+	return context.WithValue(ctx, hooksKey{}, h)
+}
+
+func hooksFrom(ctx context.Context) *submitHooks {
+	h, _ := ctx.Value(hooksKey{}).(*submitHooks)
+	return h
 }
 
 // OpenRun binds runID to its canonical run paths (through the active-pointer/catalog/
@@ -116,12 +132,12 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 		return transport.SubmitResult{}, ErrClosed
 	}
 
-	prepare, err := rn.precompute(raw)
+	prepare, err := rn.precompute(ctx, raw)
 	if err != nil {
 		return transport.SubmitResult{}, err
 	}
-	if rn.beforeTransport != nil {
-		rn.beforeTransport()
+	if h := hooksFrom(ctx); h != nil && h.afterPrecompute != nil {
+		h.afterPrecompute()
 	}
 	return transport.Submit(ctx, transport.SubmitDeps{
 		Store:    rn.state,
@@ -195,7 +211,7 @@ func failPrepare(err error) transport.Prepare {
 // and pre-mints both candidate identities, capturing them in a closure whose guarded
 // work does no I/O and no RNG. For an already-accepted turn it returns a fail-Prepare
 // (transport resolves the replay before Prepare, independent of facts/RNG).
-func (rn *Run) precompute(raw []byte) (transport.Prepare, error) {
+func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, error) {
 	n, err := transport.Normalize(raw)
 	if err != nil {
 		return nil, err
@@ -221,6 +237,9 @@ func (rn *Run) precompute(raw []byte) (transport.Prepare, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if h := hooksFrom(ctx); h != nil && h.afterFacts != nil {
+		h.afterFacts()
 	}
 	turnCand, gateCand, err := rn.mintPair(takenSet(rs))
 	if err != nil {

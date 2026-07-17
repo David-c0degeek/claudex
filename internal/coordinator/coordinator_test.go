@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -332,27 +333,91 @@ func TestE2EHumanGatePausesRun(t *testing.T) {
 	}
 }
 
-// A submit prepared against a superseded revision is stale.
-func TestE2EStaleSubmit(t *testing.T) {
+// countingRNG counts bytes drawn, proving pre-minted candidates are not regenerated.
+type countingRNG struct {
+	mu sync.Mutex
+	r  io.Reader
+	n  int
+}
+
+func (c *countingRNG) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k, err := c.r.Read(p)
+	c.n += k
+	return k, err
+}
+
+func (c *countingRNG) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// A submit whose facts and ids were captured at one revision, but whose durable state
+// advances (under the real run guard) before transport acquires the lock, is stale:
+// no artifact is published, the state advanced only by the deliberate reissue, and the
+// pre-minted candidate pair is NOT regenerated after the barrier releases.
+func TestE2EStalePrecomputeRace(t *testing.T) {
 	repo := t.TempDir()
-	runID, lead, pair := newPairedRun(t, repo)
-	rn, err := OpenRun(repo, runID, rand.Reader)
+	runID, lead, _ := newPairedRun(t, repo)
+	rng := &countingRNG{r: rand.Reader}
+	rn, err := OpenRun(repo, runID, rng)
 	if err != nil {
 		t.Fatalf("open run: %v", err)
 	}
 	defer rn.Close()
 
-	rs := cur(t, rn)
+	rs := cur(t, rn) // PLAN_DRAFT at revision R
 	staleRev := rs.Revision
-	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, staleRev, false)) // advances past staleRev
+	draft := planArtifact(t, rs.Assignment.ID, staleRev, false)
+	n, _ := transport.Normalize(draft)
 
-	// The current critique turn submitted against the superseded revision is stale
-	// (its turn is not yet accepted, so staleness — not replay — decides).
-	rs = cur(t, rn)
+	advanced := false
+	hooks := &submitHooks{afterPrecompute: func() {
+		// After facts/ids are captured, advance the durable state under the real run
+		// guard (reissue the same assignment at the next generation).
+		g, ok, aerr := genstore.Acquire(rn.RunLock())
+		if aerr != nil || !ok {
+			t.Errorf("advance acquire: ok=%v err=%v", ok, aerr)
+			return
+		}
+		defer g.Release()
+		if _, merr := rn.state.MutateLocked(g, staleRev, func(gen uint64, next *state.RunState) error {
+			next.Assignment = &state.Ref{ID: next.Assignment.ID, IssuedRevision: gen}
+			return nil
+		}); merr != nil {
+			t.Errorf("advance: %v", merr)
+			return
+		}
+		advanced = true
+	}}
+	ctx := withHooks(context.Background(), hooks)
+
+	before := rng.count()
+	_, err = rn.Submit(ctx, lead, draft)
 	var se *transport.StaleError
-	_, err = rn.Submit(context.Background(), pair, critiqueArtifact(t, rs.Assignment.ID, staleRev, "AGREE", false, nil, nil))
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want StaleError", err)
+	}
+	if !advanced {
+		t.Fatal("the advance barrier did not run")
+	}
+	// The pre-minted pair (two candidates, 32 bytes) was drawn once and not regenerated.
+	if got := rng.count() - before; got != 32 {
+		t.Fatalf("RNG consumed %d bytes, want 32 (no regeneration after release)", got)
+	}
+	// State advanced by exactly the deliberate reissue; the blocked turn is unaccepted
+	// and its artifact was never published.
+	rs = cur(t, rn)
+	if rs.Revision != staleRev+1 {
+		t.Fatalf("revision = %d, want %d", rs.Revision, staleRev+1)
+	}
+	if _, seen := rs.AcceptedTurns[n.TurnID]; seen {
+		t.Fatal("the stale turn was accepted")
+	}
+	if _, gerr := rn.store.Get(n.TurnID, n.Digest); gerr == nil {
+		t.Fatal("an artifact was published for the stale submission")
 	}
 }
 
@@ -456,52 +521,6 @@ func TestE2EReplaySkipsRNG(t *testing.T) {
 	}
 	if !again.Idempotent || again.Receipt != first.Receipt {
 		t.Fatalf("replay was not an idempotent re-confirm: %+v", again)
-	}
-}
-
-// Two concurrent submits of the same turn linearize under the run lock: exactly one
-// fresh acceptance, the other an idempotent replay; the run advances once.
-func TestE2EConcurrentSubmitLinearizes(t *testing.T) {
-	repo := t.TempDir()
-	runID, lead, _ := newPairedRun(t, repo)
-	rn, err := OpenRun(repo, runID, rand.Reader)
-	if err != nil {
-		t.Fatalf("open run: %v", err)
-	}
-	defer rn.Close()
-
-	rs := cur(t, rn)
-	draft := planArtifact(t, rs.Assignment.ID, rs.Revision, false)
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	results := make([]transport.SubmitResult, 2)
-	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			<-start
-			results[idx], errs[idx] = rn.Submit(context.Background(), lead, draft)
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-
-	fresh := 0
-	for i := 0; i < 2; i++ {
-		if errs[i] != nil {
-			t.Fatalf("goroutine %d: %v", i, errs[i])
-		}
-		if !results[i].Idempotent {
-			fresh++
-		}
-	}
-	if fresh != 1 {
-		t.Fatalf("want exactly one fresh acceptance, got %d", fresh)
-	}
-	if cur(t, rn).Phase != state.PhasePlanCritique {
-		t.Fatalf("run did not advance exactly once")
 	}
 }
 
@@ -609,8 +628,9 @@ func TestE2EJournalVanishedRecovery(t *testing.T) {
 	}
 }
 
-// Two concurrent submits at PLAN_CRITIQUE prepare facts concurrently (off the guard)
-// and linearize to exactly one fresh acceptance.
+// Two concurrent submits at PLAN_CRITIQUE prepare facts concurrently OFF the guard: a
+// fact-preparation barrier proves BOTH reached the off-guard fact path before either
+// enters transport, then they linearize to exactly one fresh acceptance.
 func TestE2EConcurrentCritiquePrep(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)
@@ -625,7 +645,14 @@ func TestE2EConcurrentCritiquePrep(t *testing.T) {
 	rs = cur(t, rn) // PLAN_CRITIQUE
 	critique := critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil)
 
-	start := make(chan struct{})
+	// Barrier: neither submit may leave fact preparation until BOTH have arrived.
+	var reached sync.WaitGroup
+	reached.Add(2)
+	proceed := make(chan struct{})
+	hooks := &submitHooks{afterFacts: func() { reached.Done(); <-proceed }}
+	go func() { reached.Wait(); close(proceed) }()
+	ctx := withHooks(context.Background(), hooks)
+
 	var wg sync.WaitGroup
 	res := make([]transport.SubmitResult, 2)
 	errs := make([]error, 2)
@@ -633,11 +660,9 @@ func TestE2EConcurrentCritiquePrep(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			<-start
-			res[idx], errs[idx] = rn.Submit(context.Background(), pair, critique)
+			res[idx], errs[idx] = rn.Submit(ctx, pair, critique)
 		}(i)
 	}
-	close(start)
 	wg.Wait()
 
 	fresh := 0
@@ -658,7 +683,8 @@ func TestE2EConcurrentCritiquePrep(t *testing.T) {
 }
 
 // Close blocks until an in-flight submit completes, so it never releases the artifact
-// store under an active Get/Put.
+// store under an active Get/Put. The barrier is placed during precompute (afterFacts),
+// covering the in-flight precompute/submit lifetime.
 func TestE2ECloseWaitsForInflight(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, _ := newPairedRun(t, repo)
@@ -669,13 +695,14 @@ func TestE2ECloseWaitsForInflight(t *testing.T) {
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	rn.beforeTransport = func() { close(entered); <-release }
+	hooks := &submitHooks{afterFacts: func() { close(entered); <-release }}
+	ctx := withHooks(context.Background(), hooks)
 
 	rs := cur(t, rn)
 	draft := planArtifact(t, rs.Assignment.ID, rs.Revision, false)
 	submitDone := make(chan error, 1)
-	go func() { _, e := rn.Submit(context.Background(), lead, draft); submitDone <- e }()
-	<-entered // the submit now holds the read lock inside beforeTransport
+	go func() { _, e := rn.Submit(ctx, lead, draft); submitDone <- e }()
+	<-entered // the submit is paused mid-precompute, holding the read lock
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- rn.Close() }()
@@ -737,6 +764,79 @@ func TestE2EReplacedSessionUnauthorized(t *testing.T) {
 	submitOK(t, rn, newSess, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil))
 	if cur(t, rn).Phase != state.PhaseImplementStep {
 		t.Fatal("the new session's submit did not promote")
+	}
+}
+
+// openPaired opens a Run over a freshly paired repo (for direct loader unit tests).
+func openPaired(t *testing.T) *Run {
+	t.Helper()
+	repo := t.TempDir()
+	runID, _, _ := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	t.Cleanup(func() { rn.Close() })
+	return rn
+}
+
+func hexTurn(i int) string { return fmt.Sprintf("turn-%032x", i) }
+
+// The loader rejects an over-count BEFORE loading any artifact: the store is empty, so
+// a Get would fail with ErrEvidence — an ErrHistoryTooLarge proves the count check ran
+// first.
+func TestLoadFactsOverCountBeforeGet(t *testing.T) {
+	rn := openPaired(t)
+	snap := state.RunState{Phase: state.PhasePlanCritique, AcceptedTurns: map[string]state.AcceptedTurn{}}
+	for i := 0; i <= engine.MaxPlanningArtifacts; i++ {
+		snap.AcceptedTurns[hexTurn(i)] = state.AcceptedTurn{
+			ArtifactDigest: strings.Repeat("a", 64), Phase: state.PhasePlanDraft,
+			Receipt: state.Receipt{Revision: uint64(i + 1)},
+		}
+	}
+	if _, _, err := rn.loadFacts(snap); !errors.Is(err, engine.ErrHistoryTooLarge) {
+		t.Fatalf("err = %v, want ErrHistoryTooLarge", err)
+	}
+}
+
+// A referenced artifact missing from the store is ErrEvidence.
+func TestLoadFactsMissingEvidence(t *testing.T) {
+	rn := openPaired(t)
+	snap := state.RunState{Phase: state.PhasePlanCritique, AcceptedTurns: map[string]state.AcceptedTurn{
+		hexTurn(1): {ArtifactDigest: strings.Repeat("b", 64), Phase: state.PhasePlanDraft, Receipt: state.Receipt{Revision: 1}},
+	}}
+	if _, _, err := rn.loadFacts(snap); !errors.Is(err, ErrEvidence) {
+		t.Fatalf("err = %v, want ErrEvidence", err)
+	}
+}
+
+// The loader rejects when the cumulative artifact bytes exceed the materialize bound.
+func TestLoadFactsByteOverflow(t *testing.T) {
+	rn := openPaired(t)
+	pad := strings.Repeat("x", 64000) // near the 64 KiB plan_markdown cap
+	snap := state.RunState{Phase: state.PhasePlanCritique, AcceptedTurns: map[string]state.AcceptedTurn{}}
+	// Enough ~64 KB artifacts to exceed the 8 MiB cumulative bound.
+	count := engine.MaxMaterializeBytes/64000 + 4
+	for i := 0; i < count; i++ {
+		turnID := hexTurn(i)
+		art := mustJSON(t, map[string]any{
+			"protocol_version": 1, "message_type": "plan", "turn_id": turnID, "state_revision": 1,
+			"human_context": nil, "requires_human_decision": false, "decision_question": nil,
+			"plan_markdown": pad, "steps": stepsJSON(), "risks": []any{}, "open_questions": []any{},
+		})
+		nn, err := transport.Normalize(art)
+		if err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		if err := rn.store.Put(turnID, nn.Digest, []byte(nn.CanonicalRedacted)); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		snap.AcceptedTurns[turnID] = state.AcceptedTurn{
+			ArtifactDigest: nn.Digest, Phase: state.PhasePlanDraft, Receipt: state.Receipt{Revision: uint64(i + 1)},
+		}
+	}
+	if _, _, err := rn.loadFacts(snap); !errors.Is(err, engine.ErrHistoryTooLarge) {
+		t.Fatalf("err = %v, want ErrHistoryTooLarge", err)
 	}
 }
 
