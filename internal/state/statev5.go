@@ -33,6 +33,16 @@ func cloneKeys(in []string) []string {
 	return append([]string{}, in...)
 }
 
+// cloneInts deep-copies an int slice while preserving nil-vs-non-nil-empty, so a
+// non-nil empty StepFixes (a run with no agreed plan) stays non-nil across a
+// generation and paused-immutability's DeepEqual on counters holds for a no-op.
+func cloneInts(in []int) []int {
+	if in == nil {
+		return nil
+	}
+	return append([]int{}, in...)
+}
+
 // qualityPauseTable is the closed set of legal quality-budget pauses: which phase
 // the budget exhausted in, which phase the run resumes into, the budget kind, and
 // the FIX return target it restores. Origin and resume differ for every entry,
@@ -117,6 +127,10 @@ func validateV5Shape(rs *RunState) error {
 	isPaused := rs.Lifecycle == LifecyclePaused
 	if !(hasPause == hasGate && hasGate == isAwait && isAwait == isPaused) {
 		return fmt.Errorf("gate coherence: pause=%v gate=%v await=%v paused=%v must all agree", hasPause, hasGate, isAwait, isPaused)
+	}
+	// A gated run is ownerless: no agent turn is outstanding while it waits.
+	if rs.Pause != nil && rs.Assignment != nil {
+		return fmt.Errorf("a gated run must have no assignment")
 	}
 	if rs.Pause != nil {
 		if err := validatePauseShape(rs); err != nil {
@@ -572,25 +586,30 @@ func validateCandidateChecksTransition(old, next *RunState) error {
 	return nil
 }
 
-// validatePausedImmutability freezes the suspended transition while a pause remains:
-// the pause record, its gate, the cursor, and every counter are byte-identical until
-// the pause is cleared, so nothing rewrites the parked decision or charges a counter
-// before resumption.
+// validatePausedImmutability freezes the suspended transition. Opening a pause must
+// not charge a counter or move the cursor (so a quality-budget label proves the
+// counter was already at the limit before the denied action, and a checkpoint gate
+// parks against the current step); and while a pause remains, the pause record, its
+// gate, the cursor, and every counter are byte-identical until the pause is cleared.
 func validatePausedImmutability(old, next *RunState) error {
-	if old.Pause == nil || next.Pause == nil {
-		return nil // opening or clearing a pause is governed by the other rules
+	opening := old.Pause == nil && next.Pause != nil
+	staying := old.Pause != nil && next.Pause != nil
+	if opening || staying {
+		// The counters and cursor are frozen across the gate boundary and the pause.
+		if !reflect.DeepEqual(old.Counters, next.Counters) {
+			return fmt.Errorf("counters must not change when opening or during a pause")
+		}
+		if !reflect.DeepEqual(old.StepIndex, next.StepIndex) {
+			return fmt.Errorf("step_index must not change when opening or during a pause")
+		}
 	}
-	if !reflect.DeepEqual(old.Pause, next.Pause) {
-		return fmt.Errorf("pause is immutable while the run is paused")
-	}
-	if !reflect.DeepEqual(old.Gate, next.Gate) {
-		return fmt.Errorf("gate is immutable while the run is paused")
-	}
-	if !reflect.DeepEqual(old.StepIndex, next.StepIndex) {
-		return fmt.Errorf("step_index is immutable while the run is paused")
-	}
-	if !reflect.DeepEqual(old.Counters, next.Counters) {
-		return fmt.Errorf("counters are immutable while the run is paused")
+	if staying {
+		if !reflect.DeepEqual(old.Pause, next.Pause) {
+			return fmt.Errorf("pause is immutable while the run is paused")
+		}
+		if !reflect.DeepEqual(old.Gate, next.Gate) {
+			return fmt.Errorf("gate is immutable while the run is paused")
+		}
 	}
 	return nil
 }

@@ -69,32 +69,37 @@ func acceptTurnAdvance(t *testing.T, s *Store, prev RunState, turnID, digest str
 }
 
 // candidatePlan builds the 1-step candidate plan ref sourced by the plan turn.
-func candidatePlan() *PlanRef {
+func candidatePlanN(stepCount int) *PlanRef {
 	return &PlanRef{
 		Source:    EventRef{Digest: planSrcDigest(), TurnID: planTurnID},
 		Digest:    planDocDigest(),
-		StepCount: 1,
+		StepCount: stepCount,
 	}
 }
 
-// driveToCritique drives a pristine INIT to PLAN_CRITIQUE with the first candidate
-// plan and the canonical empty candidate check set (no assignment).
-func driveToCritique(t *testing.T, s *Store, init RunState) RunState {
+func candidatePlan() *PlanRef { return candidatePlanN(1) }
+
+// driveToCritique drives a pristine INIT to PLAN_CRITIQUE with a stepCount-step
+// candidate plan and the canonical empty candidate check set (no assignment).
+func driveToCritiqueN(t *testing.T, s *Store, init RunState, stepCount int) RunState {
 	t.Helper()
 	draft := issueFirstTurn(t, s, init, planTurnID)
 	return acceptTurnAdvance(t, s, draft, planTurnID, planSrcDigest(), func(_ uint64, next *RunState) {
 		next.Phase = PhasePlanCritique
-		next.CandidatePlan = candidatePlan()
+		next.CandidatePlan = candidatePlanN(stepCount)
 		next.CandidateChecks = candidateChecks()
 	})
 }
 
-// driveToAgreedImplement takes a pristine INIT and drives it through the real
-// negotiation (draft -> critique -> agreement) to a 1-step agreed plan at
-// IMPLEMENT_STEP with cursor 0 and no assignment.
-func driveToAgreedImplement(t *testing.T, s *Store, init RunState) RunState {
+func driveToCritique(t *testing.T, s *Store, init RunState) RunState {
+	return driveToCritiqueN(t, s, init, 1)
+}
+
+// driveToAgreedImplementN drives a pristine INIT through the real negotiation to a
+// stepCount-step agreed plan at IMPLEMENT_STEP with cursor 0 and no assignment.
+func driveToAgreedImplementN(t *testing.T, s *Store, init RunState, stepCount int) RunState {
 	t.Helper()
-	critique := driveToCritique(t, s, init)
+	critique := driveToCritiqueN(t, s, init, stepCount)
 	critAssigned := assignAt(t, s, critique, critTurnID)
 	return acceptTurnAdvance(t, s, critAssigned, critTurnID, critSrcDigest(), func(rev uint64, next *RunState) {
 		plan := *next.CandidatePlan
@@ -108,11 +113,15 @@ func driveToAgreedImplement(t *testing.T, s *Store, init RunState) RunState {
 		next.CandidatePlan = nil
 		next.CandidateChecks = nil
 		next.PendingFindings = nil
-		next.Counters.StepFixes = []int{0}
+		next.Counters.StepFixes = make([]int, stepCount)
 		idx := 0
 		next.StepIndex = &idx
 		next.Phase = PhaseImplementStep
 	})
+}
+
+func driveToAgreedImplement(t *testing.T, s *Store, init RunState) RunState {
+	return driveToAgreedImplementN(t, s, init, 1)
 }
 
 // mustAgreedImplement drives a fresh store to a 1-step agreed plan at

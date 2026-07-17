@@ -386,7 +386,7 @@ func cloneForNext(prev *RunState) *RunState {
 		return &RunState{AcceptedTurns: map[string]AcceptedTurn{}, Counters: Counters{StepFixes: []int{}}}
 	}
 	n := *prev
-	n.Counters.StepFixes = append([]int(nil), prev.Counters.StepFixes...)
+	n.Counters.StepFixes = cloneInts(prev.Counters.StepFixes)
 	n.AcceptedTurns = make(map[string]AcceptedTurn, len(prev.AcceptedTurns))
 	for k, v := range prev.AcceptedTurns {
 		n.AcceptedTurns[k] = v

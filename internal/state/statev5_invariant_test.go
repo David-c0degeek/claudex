@@ -380,6 +380,124 @@ func TestV5SamePhaseVerifyPreserved(t *testing.T) {
 	})
 }
 
+// cloneForNext must produce a fully independent copy: mutating any nested
+// pointer/slice of the clone must not touch the original. The value need not be a
+// valid phase snapshot; only the aliasing is under test.
+func TestV5CloneForNextNoAlias(t *testing.T) {
+	idx := 3
+	orig := &RunState{
+		AcceptedTurns:   map[string]AcceptedTurn{},
+		Counters:        Counters{StepFixes: []int{1, 2}},
+		CandidatePlan:   &PlanRef{Source: EventRef{Digest: hex64("1"), TurnID: "p"}, Digest: hex64("2"), StepCount: 2},
+		CandidateChecks: &CheckSetRef{Keys: []string{"a", "b"}, Digest: hex64("e")},
+		PendingFindings: &FindingObligations{Source: EventRef{Digest: hex64("3"), TurnID: "c"}, Keys: []string{"f"}},
+		AgreedPlan:      &PlanAgreement{Plan: PlanRef{StepCount: 1}, Critique: EventRef{TurnID: "c"}, Checks: CheckSetRef{Keys: []string{"x"}, Digest: hex64("e")}, AgreedRevision: 1},
+		StepIndex:       &idx,
+		Verify:          &VerifyRequirement{RequiredGeneration: 2},
+		Pause:           &PauseContext{Kind: PauseQualityBudget, Budget: &BudgetPause{Kind: BudgetCheckpoint}, Verify: &VerifyRequirement{RequiredGeneration: 4}},
+	}
+	cl := cloneForNext(orig)
+	cl.Counters.StepFixes[0] = 99
+	cl.CandidatePlan.StepCount = 99
+	cl.CandidateChecks.Keys[0] = "zzz"
+	cl.PendingFindings.Keys[0] = "zzz"
+	cl.AgreedPlan.Checks.Keys[0] = "zzz"
+	cl.AgreedPlan.AgreedRevision = 99
+	*cl.StepIndex = 99
+	cl.Verify.RequiredGeneration = 99
+	cl.Pause.Budget.Kind = "zzz"
+	cl.Pause.Verify.RequiredGeneration = 99
+
+	if orig.Counters.StepFixes[0] != 1 || orig.CandidatePlan.StepCount != 2 ||
+		orig.CandidateChecks.Keys[0] != "a" || orig.PendingFindings.Keys[0] != "f" ||
+		orig.AgreedPlan.Checks.Keys[0] != "x" || orig.AgreedPlan.AgreedRevision != 1 ||
+		*orig.StepIndex != 3 || orig.Verify.RequiredGeneration != 2 ||
+		orig.Pause.Budget.Kind != BudgetCheckpoint || orig.Pause.Verify.RequiredGeneration != 4 {
+		t.Fatalf("cloneForNext aliased a nested field: %+v", orig)
+	}
+}
+
+// The empty-set biconditional rejects the opposite direction too: non-empty keys
+// carrying the canonical empty digest.
+func TestV5NonEmptyChecksWithEmptyDigestRejected(t *testing.T) {
+	s := newStore(t)
+	draft := issueFirstTurn(t, s, mustInit(t, s), planTurnID)
+	rejects(t, s, draft, "non-empty keys with empty digest", func(_ uint64, n *RunState) {
+		n.Phase = PhasePlanCritique
+		n.CandidatePlan = candidatePlan()
+		n.CandidateChecks = &CheckSetRef{Keys: []string{"chk-a"}, Digest: emptyCheckSetDigest}
+	})
+}
+
+// Opening a gate must not charge the counter or move the cursor in the same
+// generation, so a quality label proves the counter was already at the limit and a
+// checkpoint FIX parks against the current step.
+func TestV5GateOpeningFreezesCounterAndCursor(t *testing.T) {
+	// Bump-to-limit while opening a checkpoint gate is rejected (would let budget
+	// honesty accept a limit the third fix should still have been allowed).
+	s1 := newStore(t)
+	impl1 := mustAgreedImplement(t, s1)
+	lim := impl1.EffectivePolicy.Budgets.CheckpointRounds
+	chk1 := toCheckpoint(t, s1, impl1, func(n *RunState) { n.Counters.StepFixes[0] = lim - 1 })
+	rejects(t, s1, chk1, "bump-to-limit while opening gate", func(rev uint64, n *RunState) {
+		n.AcceptedTurns["c1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "c1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseCheckpoint}
+		n.Assignment = nil
+		n.Counters.StepFixes[0] = lim // the illegal in-transition charge
+		checkpointBudgetGate(rev, n)
+	})
+
+	// Moving a two-step cursor while opening a human gate is rejected (would park a
+	// checkpoint FIX against the wrong step). A human gate avoids budget honesty.
+	s2 := newStore(t)
+	impl2 := driveToAgreedImplementN(t, s2, mustInit(t, s2), 2)
+	chk2 := toCheckpoint(t, s2, impl2, nil) // cursor 0, c1 assigned
+	rejects(t, s2, chk2, "move cursor while opening gate", func(rev uint64, n *RunState) {
+		n.AcceptedTurns["c1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "c1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseCheckpoint}
+		n.Assignment = nil
+		idx := 1
+		n.StepIndex = &idx // the illegal in-transition cursor move
+		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseCheckpoint, ResumePhase: PhaseCheckpoint, Source: EventRef{Digest: hex64("7"), TurnID: "c1"}}
+		n.Gate = &Ref{ID: "g", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+	})
+}
+
+// A gated run must have no outstanding assignment.
+func TestV5GateRejectsLingeringAssignment(t *testing.T) {
+	s := newStore(t)
+	chk := toCheckpoint(t, s, mustAgreedImplement(t, s), nil) // c1 assigned
+	rejects(t, s, chk, "lingering assignment at a gate", func(rev uint64, n *RunState) {
+		n.AcceptedTurns["c1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "c1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseCheckpoint}
+		// Assignment deliberately left set.
+		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseCheckpoint, ResumePhase: PhaseCheckpoint, Source: EventRef{Digest: hex64("7"), TurnID: "c1"}}
+		n.Gate = &Ref{ID: "g", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+	})
+}
+
+// A no-op mutation while a planning-phase human gate remains paused must keep the
+// empty step-fix vector (a clone that collapses [] to nil would fail paused
+// immutability's counter comparison).
+func TestV5PlanningGateNoOpRetainsEmptyStepFixes(t *testing.T) {
+	s := newStore(t)
+	assigned := assignAt(t, s, driveToCritique(t, s, mustInit(t, s)), "c2")
+	gated := acceptTurnAdvance(t, s, assigned, "c2", hex64("9"), func(rev uint64, n *RunState) {
+		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhasePlanCritique, ResumePhase: PhasePlanCritique, Source: EventRef{Digest: hex64("9"), TurnID: "c2"}}
+		n.Gate = &Ref{ID: "g", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+	})
+	if _, err := s.Mutate(gated.Revision, func(_ uint64, _ *RunState) error { return nil }); err != nil {
+		t.Fatalf("no-op while a planning gate is paused should be allowed: %v", err)
+	}
+	loaded, _, _ := s.Load()
+	if loaded.Counters.StepFixes == nil || len(loaded.Counters.StepFixes) != 0 {
+		t.Fatalf("step_fixes did not stay a non-nil empty array: %+v", loaded.Counters.StepFixes)
+	}
+}
+
 func TestV5KeySetCountBound(t *testing.T) {
 	s := newStore(t)
 	draft := issueFirstTurn(t, s, mustInit(t, s), planTurnID)
