@@ -349,7 +349,7 @@ func preparePair(req JoinAttachRequest, reg state.Registry, rs state.RunState) (
 	if err != nil {
 		return PairAttachIntent{}, err
 	}
-	firstTurn, err := mintID("turn-", req.RNG)
+	firstTurn, err := state.MintTurnID(req.RNG, nil) // shared minter (fresh run: no taken ids yet)
 	if err != nil {
 		return PairAttachIntent{}, err
 	}

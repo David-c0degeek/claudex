@@ -117,6 +117,11 @@ func Open(dir, lockPath string) *Journal { return &Journal{gs: genstore.Open(dir
 // LockPath is the mutation lock guarding this journal.
 func (j *Journal) LockPath() string { return j.gs.LockPath() }
 
+// CheckGuard proves the supplied guard is this journal's currently-held lock (not
+// nil, released, or for a different lock), so a reader can read the head under a
+// caller-held guard without a lock-free race. It delegates to the underlying store.
+func (j *Journal) CheckGuard(g *genstore.Guard) error { return j.gs.CheckGuard(g) }
+
 // Latest returns the newest journal record (lock-free).
 func (j *Journal) Latest() (Record, bool, error) {
 	_, r, ok, err := j.latestGS()

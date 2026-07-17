@@ -193,10 +193,29 @@ func projectRevision(cur state.RunState, canonical []byte, src state.EventRef, r
 	if err := verifyCandidateFacts(cur, facts); err != nil {
 		return Event{}, err
 	}
+	if cur.PendingFindings == nil {
+		return Event{}, semanticf("a revision arrived with no outstanding findings")
+	}
+	res, err := applyRevision(canonical, facts.CandidatePlan, cur.CandidatePlan.Digest, cur.PendingFindings.Keys)
+	if err != nil {
+		return Event{}, err
+	}
+	digest, err := planDocDigest(res.Markdown, res.Steps, res.Risks, res.OpenQuestions)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{Kind: EvPlanRevised, Source: src, Materialized: digest, StepCount: len(res.Steps), Decision: rhd}, nil
+}
+
+// applyRevision validates a plan_revision against the base plan digest and the exact
+// outstanding finding keys, then materializes the resulting plan (a null section
+// preserves the base). It is the single revision-materialization the live projector
+// and the history materializer share.
+func applyRevision(canonical []byte, base CanonicalPlan, baseDigest string, pending []string) (CanonicalPlan, error) {
 	var a struct {
 		BasePlanSHA256 string     `json:"base_plan_sha256"`
 		Markdown       *string    `json:"plan_markdown"`
-		Steps          []jsonStep `json:"steps"` // null preserves; decoded as nil
+		Steps          []jsonStep `json:"steps"`
 		Risks          []string   `json:"risks"`
 		OpenQuestions  []string   `json:"open_questions"`
 		Responses      []struct {
@@ -212,64 +231,49 @@ func projectRevision(cur state.RunState, canonical []byte, src state.EventRef, r
 		Markdown      *json.RawMessage `json:"plan_markdown"`
 	}
 	if err := json.Unmarshal(canonical, &a); err != nil {
-		return Event{}, semanticf("undecodable revision artifact")
+		return CanonicalPlan{}, semanticf("undecodable revision artifact")
 	}
 	if err := json.Unmarshal(canonical, &probe); err != nil {
-		return Event{}, semanticf("undecodable revision artifact")
+		return CanonicalPlan{}, semanticf("undecodable revision artifact")
 	}
-	// The revision must be guarded against the exact current candidate plan.
-	if a.BasePlanSHA256 != cur.CandidatePlan.Digest {
-		return Event{}, semanticf("revision base does not match the current candidate plan")
+	if a.BasePlanSHA256 != baseDigest {
+		return CanonicalPlan{}, semanticf("revision base does not match the current candidate plan")
 	}
 	// Responses must answer exactly the outstanding obligations — no missing, no extra.
-	if cur.PendingFindings == nil {
-		return Event{}, semanticf("a revision arrived with no outstanding findings")
-	}
 	respKeys := make([]string, 0, len(a.Responses))
 	for _, r := range a.Responses {
 		respKeys = append(respKeys, r.FindingKey)
 	}
 	if err := protocol.ValidateKeySet("responses", respKeys); err != nil {
-		return Event{}, semanticf("%v", err)
+		return CanonicalPlan{}, semanticf("%v", err)
 	}
 	sort.Strings(respKeys)
-	want := append([]string(nil), cur.PendingFindings.Keys...)
+	want := append([]string(nil), pending...)
 	sort.Strings(want)
 	if !reflect.DeepEqual(respKeys, want) {
-		return Event{}, semanticf("revision responses are not an exact match for the outstanding findings")
+		return CanonicalPlan{}, semanticf("revision responses are not an exact match for the outstanding findings")
 	}
 
-	// Materialize the resulting plan (null section preserves the base).
-	markdown := facts.CandidatePlan.Markdown
+	res := CanonicalPlan{Markdown: base.Markdown, Steps: base.Steps, Risks: base.Risks, OpenQuestions: base.OpenQuestions}
 	if isPresent(probe.Markdown) && a.Markdown != nil {
-		markdown = *a.Markdown
+		res.Markdown = *a.Markdown
 	}
-	steps := facts.CandidatePlan.Steps
 	if isPresent(probe.Steps) {
-		steps = toPlanSteps(a.Steps)
+		res.Steps = toPlanSteps(a.Steps)
 	}
-	risks := facts.CandidatePlan.Risks
 	if isPresent(probe.Risks) {
-		risks = a.Risks
+		res.Risks = a.Risks
 	}
-	openQ := facts.CandidatePlan.OpenQuestions
 	if isPresent(probe.OpenQuestions) {
-		openQ = a.OpenQuestions
+		res.OpenQuestions = a.OpenQuestions
 	}
-	titles := stepTitles(steps)
-	if err := protocol.ValidateStepTitles(titles); err != nil {
-		return Event{}, semanticf("revised plan step titles are invalid: %v", err)
+	if err := protocol.ValidateStepTitles(stepTitles(res.Steps)); err != nil {
+		return CanonicalPlan{}, semanticf("revised plan step titles are invalid: %v", err)
 	}
-	// The materialized plan must satisfy the same non-empty prose invariant as the
-	// initial plan (a null replacement preserves the base, which is already non-empty).
-	if markdown == "" {
-		return Event{}, semanticf("the materialized plan markdown is empty")
+	if res.Markdown == "" {
+		return CanonicalPlan{}, semanticf("the materialized plan markdown is empty")
 	}
-	digest, err := planDocDigest(markdown, steps, risks, openQ)
-	if err != nil {
-		return Event{}, err
-	}
-	return Event{Kind: EvPlanRevised, Source: src, Materialized: digest, StepCount: len(steps), Decision: rhd}, nil
+	return res, nil
 }
 
 // isPresent reports whether a nullable section was supplied as a non-null value.
@@ -295,6 +299,9 @@ func verifyCandidateFacts(cur state.RunState, facts ProjectionFacts) error {
 	}
 	if digest != cur.CandidatePlan.Digest {
 		return semanticf("the supplied candidate plan does not match the durable digest")
+	}
+	if facts.CandidateSource != cur.CandidatePlan.Source {
+		return semanticf("the supplied candidate source does not match the durable source")
 	}
 	checks, err := materializeChecks(facts.CandidateChecks)
 	if err != nil {

@@ -15,6 +15,8 @@ import (
 const (
 	sessionIDPrefix   = "sess-"
 	operationIDPrefix = "op-"
+	turnIDPrefix      = "turn-"
+	gateIDPrefix      = "gate-"
 )
 
 // isMintedID enforces an EXACT coordinator-minted grammar: a fixed prefix + 32
@@ -243,6 +245,27 @@ func MintSessionID(rng io.Reader, taken func(string) bool) (string, error) {
 // releases the incumbent lead session, so it must be unguessable.
 func MintOperationID(rng io.Reader) (string, error) {
 	return mintID(operationIDPrefix, rng, nil)
+}
+
+// MintTurnID and MintGateID mint a fresh identity under the minting convention
+// (a fixed "turn-"/"gate-" prefix + 32 lowercase hex, which is also a valid
+// IsRunID). The prefix is only a readability convention: IsRunID remains the single
+// persisted authority every consumer enforces, so there is no separate IsTurnID /
+// IsGateID predicate. taken is a READ-ONLY set of already-used identities the new id
+// must avoid; the minter only reads it and retries a bounded number of times.
+func MintTurnID(rng io.Reader, taken map[string]bool) (string, error) {
+	return mintID(turnIDPrefix, rng, takenSet(taken))
+}
+
+func MintGateID(rng io.Reader, taken map[string]bool) (string, error) {
+	return mintID(gateIDPrefix, rng, takenSet(taken))
+}
+
+func takenSet(taken map[string]bool) func(string) bool {
+	if taken == nil {
+		return nil
+	}
+	return func(id string) bool { return taken[id] }
 }
 
 func mintID(prefix string, rng io.Reader, taken func(string) bool) (string, error) {

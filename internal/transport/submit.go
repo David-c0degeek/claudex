@@ -184,6 +184,58 @@ type submitEnvelope struct {
 	DecisionQuestion      *string `json:"decision_question"`
 }
 
+// Normalized is the immutable result of read-only submission normalization: the
+// canonical redacted bytes (as a string, so no caller can mutate the authoritative
+// bytes), their digest, and the bounded envelope facts. It is the single source both
+// Submit and an outer adapter use, so raw canonicalization/redaction is never
+// duplicated.
+type Normalized struct {
+	CanonicalRedacted       string
+	Digest                  string
+	TurnID                  string
+	StateRevision           uint64
+	RequiresHumanDecision   bool
+	DecisionQuestion        string
+	DecisionQuestionPresent bool
+}
+
+func (n Normalized) envelope() submitEnvelope {
+	env := submitEnvelope{TurnID: n.TurnID, StateRevision: n.StateRevision, RequiresHumanDecision: n.RequiresHumanDecision}
+	if n.DecisionQuestionPresent {
+		q := n.DecisionQuestion
+		env.DecisionQuestion = &q
+	}
+	return env
+}
+
+// Normalize canonicalizes, redacts, re-canonicalizes, digests, and parses the
+// envelope of a raw submission. Parse errors are redacted (canonjson diagnostics can
+// echo a token that could be a secret). It performs no I/O and holds no lock.
+func Normalize(raw []byte) (Normalized, error) {
+	canonRaw, err := canonjson.Canonicalize(raw)
+	if err != nil {
+		return Normalized{}, fmt.Errorf("transport: submission is not valid canonical JSON: %s", redact.Text(err.Error()))
+	}
+	canonRedacted, err := canonjson.Canonicalize(redact.Bytes(canonRaw))
+	if err != nil {
+		return Normalized{}, fmt.Errorf("transport: redacted submission is not valid canonical JSON: %s", redact.Text(err.Error()))
+	}
+	sum := sha256.Sum256(canonRedacted)
+	var env submitEnvelope
+	if err := json.Unmarshal(canonRedacted, &env); err != nil {
+		return Normalized{}, fmt.Errorf("transport: submission has no readable envelope: %s", redact.Text(err.Error()))
+	}
+	return Normalized{
+		CanonicalRedacted:       string(canonRedacted),
+		Digest:                  hex.EncodeToString(sum[:]),
+		TurnID:                  env.TurnID,
+		StateRevision:           env.StateRevision,
+		RequiresHumanDecision:   env.RequiresHumanDecision,
+		DecisionQuestion:        deref(env.DecisionQuestion),
+		DecisionQuestionPresent: env.DecisionQuestion != nil,
+	}, nil
+}
+
 // Submit validates an artifact against the durable assignment, authorizes the
 // session against the locked Registry, publishes the immutable artifact, then
 // records accept-once acceptance and the prepared transition — all under one held
@@ -194,22 +246,14 @@ func Submit(ctx context.Context, deps SubmitDeps, sessionID string, raw []byte) 
 		return SubmitResult{}, err
 	}
 
-	// Read-only prep (no guard). Errors from parsing the RAW artifact are redacted:
-	// canonjson diagnostics can echo a token that could be a secret.
-	canonRaw, err := canonjson.Canonicalize(raw)
+	// Read-only prep (no guard), via the single shared normalizer.
+	n, err := Normalize(raw)
 	if err != nil {
-		return SubmitResult{}, fmt.Errorf("transport: submission is not valid canonical JSON: %s", redact.Text(err.Error()))
+		return SubmitResult{}, err
 	}
-	canonRedacted, err := canonjson.Canonicalize(redact.Bytes(canonRaw))
-	if err != nil {
-		return SubmitResult{}, fmt.Errorf("transport: redacted submission is not valid canonical JSON: %s", redact.Text(err.Error()))
-	}
-	sum := sha256.Sum256(canonRedacted)
-	digest := hex.EncodeToString(sum[:])
-	var env submitEnvelope
-	if err := json.Unmarshal(canonRedacted, &env); err != nil {
-		return SubmitResult{}, fmt.Errorf("transport: submission has no readable envelope: %s", redact.Text(err.Error()))
-	}
+	canonRedacted := []byte(n.CanonicalRedacted)
+	digest := n.Digest
+	env := n.envelope()
 
 	// Optional cheap pre-guard rejection over a lock-free load; never definitive.
 	if deps.Preflight != nil {

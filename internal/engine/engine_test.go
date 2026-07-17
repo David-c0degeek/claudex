@@ -42,6 +42,12 @@ func step(t *testing.T, store *state.Store, facts ProjectionFacts, canonical []b
 	if env.StateRevision != cur.Revision {
 		return state.RunState{}, fmt.Errorf("stale: artifact revision %d != current %d", env.StateRevision, cur.Revision)
 	}
+	// The production loader reconstructs the candidate facts from the accepted history
+	// (MaterializeCandidate), whose source always equals the durable candidate source.
+	// Mirror that here when the caller left it unset, so fixtures need not thread it.
+	if facts.CandidateSource == (state.EventRef{}) && cur.CandidatePlan != nil {
+		facts.CandidateSource = cur.CandidatePlan.Source
+	}
 	ev, err := Project(cur, canon, facts)
 	if err != nil {
 		return state.RunState{}, err

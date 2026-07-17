@@ -92,10 +92,11 @@ type MaterializedCheck struct {
 }
 
 // ProjectionFacts are the materialized artifacts the loader read and revalidated.
-// Project rechecks their digests/keys against cur before deriving anything.
+// Project rechecks their digests/keys/source against cur before deriving anything.
 type ProjectionFacts struct {
 	CandidatePlan   CanonicalPlan       // current plan (revise/critique need it)
 	CandidateChecks []MaterializedCheck // current materialized check set
+	CandidateSource state.EventRef      // the accepted event that produced the current plan
 }
 
 // --- projected events ---
