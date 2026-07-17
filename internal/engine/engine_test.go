@@ -221,7 +221,7 @@ func bootstrapPlanDraft(t *testing.T, store *state.Store, turnID string) state.R
 		n.Lifecycle = state.LifecycleRunning
 		n.Phase = state.PhaseInit
 		n.CreatedUnix = 1000
-		n.TaskSnapshot = state.SnapshotRef{RelPath: "inputs/task.json", Digest: strings.Repeat("a", 64)}
+		n.TaskSnapshot = state.SnapshotRef{RelPath: "inputs/task.json", Digest: config.Hash(taskContractBytes())}
 		n.PolicySnapshot = state.SnapshotRef{RelPath: "inputs/policy.json", Digest: strings.Repeat("b", 64)}
 		pol := config.DefaultRunPolicy()
 		pol.TestGate = config.TestGate{Disabled: true}

@@ -6,11 +6,13 @@
 // Apply to realize that Decision into an already-cloned next run state. State's own
 // transition validation is the backstop.
 //
-// Scope: this build covers PLAN_DRAFT/PLAN_CRITIQUE/PLAN_REVISE, IMPLEMENT_STEP,
-// CHECKPOINT, and FIX-returning-to-CHECKPOINT, plus the plan and checkpoint quality
-// gates and human-decision gates. The final-checkpoint edge into TESTS and the
-// FIX->VERIFY edge are deliberately uncallable (Evaluate returns ErrPhaseUnsupported)
-// until the run-lock Registry reauthorization and ownerless-VERIFY support land.
+// Scope: this build covers the full pairing loop — PLAN_DRAFT/PLAN_CRITIQUE/
+// PLAN_REVISE, IMPLEMENT_STEP, CHECKPOINT, FIX (returning to CHECKPOINT/TESTS/VERIFY),
+// the coordinator-authored ownerless TESTS phase, the ownerless VERIFY phase (its
+// fresh-generation threshold and the verifier's verification), and DONE, plus every
+// plan/checkpoint/test/verify quality gate and human-decision gate. The runtime
+// wiring of the ownerless edges (the TESTS runner, the replacement that issues the
+// verifier turn) lives in the outer layers, not here.
 package engine
 
 import (
@@ -22,10 +24,6 @@ import (
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
-
-// ErrPhaseUnsupported is returned by Evaluate for a legal-but-not-yet-implemented
-// edge (the final-checkpoint transition into TESTS/VERIFY). It produces no Decision.
-var ErrPhaseUnsupported = errors.New("engine: phase edge not yet supported")
 
 // ErrSemantic is a projection error: the artifact is schema-valid but semantically
 // inconsistent with the current state (a wrong base digest, non-exact revision
@@ -102,12 +100,11 @@ type ProjectionFacts struct {
 	Task            TaskFacts           // the frozen task contract (VERIFY needs it)
 }
 
-// TaskFacts is the immutable frozen task contract the loader read from the run's
-// TaskSnapshot. Project rechecks its digest against cur.TaskSnapshot.Digest and
-// requires a VERIFY submission's criteria to cover AcceptanceCriteria exactly.
+// TaskFacts carries the EXACT immutable task-snapshot bytes the loader read. Project
+// recomputes their digest against cur.TaskSnapshot.Digest and parses the contract
+// itself, so a caller cannot assert a digest with a forged criteria list.
 type TaskFacts struct {
-	Digest             string   // must equal cur.TaskSnapshot.Digest
-	AcceptanceCriteria []string // the frozen acceptance criteria, in canonical task order
+	SnapshotBytes string // the frozen task-snapshot bytes (config.Hash must match the run)
 }
 
 // RuntimeFacts are value-only NON-artifact facts the impure caller reads under the run
@@ -253,9 +250,11 @@ func humanGate(base Decision, cur state.RunState, origin state.Phase) Decision {
 		g.FixReturn = cur.FixReturn
 	}
 	// A human gate raised from a running VERIFY transfers the verify requirement into
-	// the pause (state's context-transfer invariant requires it).
-	if origin == state.PhaseVerify {
-		g.Verify = cur.Verify
+	// the pause (state's context-transfer invariant requires it); deep-copy so the
+	// decision never aliases the input state's pointer.
+	if origin == state.PhaseVerify && cur.Verify != nil {
+		v := *cur.Verify
+		g.Verify = &v
 	}
 	base.Next = state.PhaseAwaitGuidance
 	base.Route = RouteGate
@@ -264,9 +263,16 @@ func humanGate(base Decision, cur state.RunState, origin state.Phase) Decision {
 }
 
 // verifyRequirement returns the ownerless-VERIFY threshold: one generation newer than
-// the locked current pair generation.
-func verifyRequirement(rt RuntimeFacts) *state.VerifyRequirement {
-	return &state.VerifyRequirement{RequiredGeneration: rt.CurrentPairGeneration + 1}
+// the locked current pair generation. A zero pair generation (a missing Registry fact)
+// or a max value (which would overflow the +1) is rejected before a Decision forms.
+func verifyRequirement(rt RuntimeFacts) (*state.VerifyRequirement, error) {
+	if rt.CurrentPairGeneration == 0 {
+		return nil, semanticf("entering VERIFY requires a positive current pair generation")
+	}
+	if rt.CurrentPairGeneration == ^uint64(0) {
+		return nil, semanticf("current pair generation overflows the verify threshold")
+	}
+	return &state.VerifyRequirement{RequiredGeneration: rt.CurrentPairGeneration + 1}, nil
 }
 
 func evalPlanDrafted(cur state.RunState, ev Event, base Decision) (Decision, error) {
@@ -419,9 +425,13 @@ func evalFixImplemented(cur state.RunState, ev Event, rt RuntimeFacts, base Deci
 	case state.PhaseVerify:
 		// Re-enter ownerless VERIFY with a FRESH threshold (newer than the verifier
 		// that failed): another qualifying replacement must issue the verifier turn.
+		req, err := verifyRequirement(rt)
+		if err != nil {
+			return Decision{}, err
+		}
 		base.Next = state.PhaseVerify
 		base.Route = RouteToVerify
-		base.Verify = verifyRequirement(rt)
+		base.Verify = req
 		return base, nil
 	}
 	return Decision{}, semanticf("unexpected fix return target %q", cur.FixReturn)
@@ -432,9 +442,13 @@ func evalFixImplemented(cur state.RunState, ev Event, rt RuntimeFacts, base Deci
 func evalTestsOutcome(cur state.RunState, ev Event, rt RuntimeFacts, base Decision) (Decision, error) {
 	if ev.Pass {
 		// Enter ownerless VERIFY with the fresh-session threshold.
+		req, err := verifyRequirement(rt)
+		if err != nil {
+			return Decision{}, err
+		}
 		base.Next = state.PhaseVerify
 		base.Route = RouteToVerify
-		base.Verify = verifyRequirement(rt)
+		base.Verify = req
 		return base, nil
 	}
 	// Fail: route to the lead's FIX (returning to TESTS) unless the test budget is spent.
@@ -678,6 +692,11 @@ func anyPayload(dec Decision) bool {
 // table), the gate subset table, and the local well-formedness of every payload
 // Apply persists — all before the first write.
 func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState) error {
+	// A verify requirement payload belongs to exactly one route; every other route
+	// (including a gate that transfers it via GateSpec.Verify) carries none.
+	if dec.Route != RouteToVerify && dec.Verify != nil {
+		return badDecision("only to-verify carries a verify requirement payload")
+	}
 	b := next.EffectivePolicy.Budgets
 	switch dec.Route {
 	case RouteGate:
@@ -744,7 +763,9 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 		if anyPayload(dec) {
 			return badDecision("to-tests carries no payload")
 		}
-		if err := checkAtPlanEnd(next); err != nil {
+		// CHECKPOINT enters TESTS from the final step (cursor sc-1, Apply advances it);
+		// a FIX return is already at the plan end. No verify requirement yet.
+		if err := checkTerminalShape(next, dec.FromPhase == state.PhaseCheckpoint, false); err != nil {
 			return err
 		}
 		if dec.FromPhase == state.PhaseFix && next.FixReturn != state.PhaseTests {
@@ -754,7 +775,9 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil || dec.Verify == nil || dec.Verify.RequiredGeneration == 0 {
 			return badDecision("to-verify requires exactly a positive verify requirement")
 		}
-		if err := checkAtPlanEnd(next); err != nil {
+		// Entering VERIFY from TESTS or a FIX return: at the plan end, no current
+		// requirement yet.
+		if err := checkTerminalShape(next, false, false); err != nil {
 			return err
 		}
 		if dec.FromPhase == state.PhaseFix && next.FixReturn != state.PhaseVerify {
@@ -764,17 +787,23 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 		if anyPayload(dec) {
 			return badDecision("to-done carries no payload")
 		}
-		if err := checkAtPlanEnd(next); err != nil {
+		if err := checkTerminalShape(next, false, true); err != nil {
 			return err
 		}
 	case RouteTestsFix:
 		if anyPayload(dec) {
 			return badDecision("tests-fix carries no payload")
 		}
+		if err := checkTerminalShape(next, false, false); err != nil {
+			return err
+		}
 		return runningBudget(next.Counters.TestFixes, b.TestRounds)
 	case RouteVerifyFix:
 		if anyPayload(dec) {
 			return badDecision("verify-fix carries no payload")
+		}
+		if err := checkTerminalShape(next, false, true); err != nil {
+			return err
 		}
 		return runningBudget(next.Counters.VerifyFixes, b.VerifyRounds)
 	default:
@@ -783,16 +812,27 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 	return nil
 }
 
-// checkAtPlanEnd requires an agreed plan with the cursor at the plan end (or, for the
-// final CHECKPOINT that Apply advances into TESTS, one before it). The state validator
-// enforces the exact plan-end position of the resulting TESTS/VERIFY/DONE state.
-func checkAtPlanEnd(next *state.RunState) error {
+// checkTerminalShape enforces the exact pre-state a terminal-graph edge requires: an
+// agreed plan with a positive step count, the cursor at the plan end (or, for the final
+// CHECKPOINT that Apply advances into TESTS, one before it), and the current verify
+// requirement present exactly for a VERIFY-origin edge.
+func checkTerminalShape(next *state.RunState, atFinalStep, wantVerify bool) error {
 	if next.AgreedPlan == nil || next.StepIndex == nil {
 		return badDecision("the terminal graph requires an agreed plan and cursor")
 	}
 	sc := next.AgreedPlan.Plan.StepCount
-	if *next.StepIndex < sc-1 || *next.StepIndex > sc {
-		return badDecision("the terminal graph requires the cursor at (or one before) the plan end")
+	if sc < 1 {
+		return badDecision("the terminal graph requires a positive plan step count")
+	}
+	want := sc
+	if atFinalStep {
+		want = sc - 1
+	}
+	if *next.StepIndex != want {
+		return badDecision("the terminal graph cursor is not at the required position")
+	}
+	if (next.Verify != nil) != wantVerify {
+		return badDecision("the verify requirement presence is wrong for this edge")
 	}
 	return nil
 }
@@ -823,9 +863,12 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 		} else if g.FixReturn != "" {
 			return badDecision("only a FIX human gate carries a fix return")
 		}
-		// A VERIFY human gate transfers the current verify requirement into the pause;
-		// every other human gate carries none.
+		// A VERIFY human gate transfers the current verify requirement into the pause
+		// (present, at the plan end); every other human gate carries none.
 		if g.OriginPhase == state.PhaseVerify {
+			if err := checkTerminalShape(next, false, true); err != nil {
+				return err
+			}
 			if next.Verify == nil || g.Verify == nil || *g.Verify != *next.Verify {
 				return badDecision("a VERIFY human gate transfers the current verify requirement")
 			}
@@ -869,6 +912,9 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 			if dec.Checks != nil || dec.Findings != nil {
 				return badDecision("a test quality gate carries no checks/findings")
 			}
+			if err := checkTerminalShape(next, false, false); err != nil {
+				return err
+			}
 			return gateBudget(next.Counters.TestFixes, b.TestRounds)
 		case state.BudgetVerify:
 			if g.OriginPhase != state.PhaseVerify || g.ResumePhase != state.PhaseFix || g.FixReturn != state.PhaseVerify {
@@ -876,6 +922,9 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 			}
 			if dec.Checks != nil || dec.Findings != nil {
 				return badDecision("a verify quality gate carries no checks/findings")
+			}
+			if err := checkTerminalShape(next, false, true); err != nil {
+				return err
 			}
 			return gateBudget(next.Counters.VerifyFixes, b.VerifyRounds)
 		default:

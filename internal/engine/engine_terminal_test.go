@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -12,6 +13,12 @@ import (
 // --- terminal-graph fixtures + drivers ---
 
 var acceptanceCriteria = []string{"criterion one", "criterion two"}
+
+// taskContractBytes is a valid frozen task contract whose acceptance_criteria are
+// acceptanceCriteria; the run's TaskSnapshot digest is config.Hash of these bytes.
+func taskContractBytes() []byte {
+	return []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["criterion one","criterion two"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+}
 
 func oneStepPlan() planFixture {
 	return planFixture{
@@ -41,7 +48,7 @@ func reachTests(t *testing.T, store *state.Store) state.RunState {
 // taskFacts are the frozen task facts the loader supplies for VERIFY, bound to the
 // bootstrap task-snapshot digest.
 func taskFacts() TaskFacts {
-	return TaskFacts{Digest: strings.Repeat("a", 64), AcceptanceCriteria: acceptanceCriteria}
+	return TaskFacts{SnapshotBytes: string(taskContractBytes())}
 }
 
 // applyTests drives a coordinator-authored TESTS outcome (Evaluate -> Apply) with an
@@ -317,12 +324,12 @@ func TestVerifyProjectionRejects(t *testing.T) {
 		})
 	}
 
-	// A digest mismatch (wrong task facts) is rejected.
-	t.Run("task digest mismatch", func(t *testing.T) {
+	// Task snapshot bytes that do not hash to the run's TaskSnapshot digest are rejected.
+	t.Run("task snapshot digest mismatch", func(t *testing.T) {
 		store := reach(t)
 		cur, _, _ := store.Load()
 		art := verificationArtifact(t, "t-v", cur.Revision, "pass", false, acceptanceCriteria, true, true, nil, nil)
-		bad := ProjectionFacts{Task: TaskFacts{Digest: strings.Repeat("f", 64), AcceptanceCriteria: acceptanceCriteria}}
+		bad := ProjectionFacts{Task: TaskFacts{SnapshotBytes: `{"schema_version":1,"goal":"other"}`}}
 		if _, err := stepRT(t, store, bad, RuntimeFacts{}, "verification", art, Ids{}); !errors.Is(err, ErrSemantic) {
 			t.Fatalf("err = %v, want ErrSemantic", err)
 		}
@@ -341,8 +348,112 @@ func TestVerifyProjectionRejects(t *testing.T) {
 	})
 }
 
-// Apply rejects a forged ownerless decision that supplies an identity, and a RouteToVerify
-// that omits its verify requirement.
+// projectVerified takes the acceptance criteria only from parsing the frozen task
+// snapshot whose digest matches the run; a forged criteria list, a non-matching
+// snapshot, malformed bytes, or a duplicate/empty contract are all rejected.
+func TestVerifyTaskContractBinding(t *testing.T) {
+	src := state.EventRef{TurnID: "turn-v", Digest: strings.Repeat("d", 64)}
+	proj := func(t *testing.T, snapshot []byte, runDigest string, crit []string) error {
+		t.Helper()
+		cur := state.RunState{Phase: state.PhaseVerify, TaskSnapshot: state.SnapshotRef{Digest: runDigest}}
+		art := verificationArtifact(t, "turn-v", 1, "pass", false, crit, true, true, nil, nil)
+		_, err := projectVerified(cur, art, src, false, ProjectionFacts{Task: TaskFacts{SnapshotBytes: string(snapshot)}})
+		return err
+	}
+	good := taskContractBytes()
+	goodDigest := config.Hash(good)
+	if err := proj(t, good, goodDigest, acceptanceCriteria); err != nil {
+		t.Fatalf("a matching contract with covering criteria should project: %v", err)
+	}
+	// Correct run digest, but the artifact's criteria do not cover the parsed contract.
+	if err := proj(t, good, goodDigest, nil); !errors.Is(err, ErrSemantic) {
+		t.Fatalf("forged (empty) artifact criteria: err = %v", err)
+	}
+	// Snapshot bytes that do not hash to the run's digest.
+	if err := proj(t, []byte(`{"x":1}`), goodDigest, acceptanceCriteria); !errors.Is(err, ErrSemantic) {
+		t.Fatalf("digest mismatch: err = %v", err)
+	}
+	// A hash-matching but structurally invalid contract fails the parser.
+	malformed := []byte("not a task contract")
+	if err := proj(t, malformed, config.Hash(malformed), acceptanceCriteria); !errors.Is(err, ErrSemantic) {
+		t.Fatalf("malformed contract: err = %v", err)
+	}
+	// A hash-matching contract with duplicate criteria fails the parser.
+	dup := []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	if err := proj(t, dup, config.Hash(dup), []string{"same", "same"}); !errors.Is(err, ErrSemantic) {
+		t.Fatalf("duplicate criteria: err = %v", err)
+	}
+}
+
+// Entering VERIFY with a zero or overflowing pair generation is rejected before a
+// Decision, on both the TESTS-pass and the FIX->VERIFY edges.
+func TestVerifyThresholdZeroOverflow(t *testing.T) {
+	for _, gen := range []uint64{0, ^uint64(0)} {
+		store := newStore(t)
+		reachTests(t, store)
+		if _, err := applyTests(t, store, true, RuntimeFacts{CurrentPairGeneration: gen}, Ids{}); !errors.Is(err, ErrSemantic) {
+			t.Fatalf("tests pass with pair gen %d: err = %v, want ErrSemantic", gen, err)
+		}
+	}
+	// FIX->VERIFY: drive to a FIX returning to VERIFY, then a zero pair generation.
+	store := newStore(t)
+	reachTests(t, store)
+	applyTests(t, store, true, RuntimeFacts{CurrentPairGeneration: 2}, Ids{})
+	issueVerifier(t, store, "t-v")
+	verify(t, store, "t-v", "fail", false, true, nil, nil, assign("t-fix"))
+	if _, err := stepRT(t, store, ProjectionFacts{}, RuntimeFacts{CurrentPairGeneration: 0}, "implementation_report", fixReport(t, store, "t-fix"), Ids{}); !errors.Is(err, ErrSemantic) {
+		t.Fatalf("fix->verify with a zero pair gen: err = %v, want ErrSemantic", err)
+	}
+}
+
+// A VERIFY human gate carries a DEEP COPY of the verify requirement, never an alias of
+// the input state's pointer.
+func TestHumanGateVerifyNoAlias(t *testing.T) {
+	store := newStore(t)
+	reachTests(t, store)
+	applyTests(t, store, true, RuntimeFacts{CurrentPairGeneration: 3}, Ids{})
+	cur := issueVerifier(t, store, "t-v")
+	ev := Event{Kind: EvVerified, Source: state.EventRef{TurnID: "t-v", Digest: strings.Repeat("e", 64)}, Decision: true}
+	dec, err := Evaluate(cur, ev, RuntimeFacts{})
+	if err != nil {
+		t.Fatalf("evaluate human gate: %v", err)
+	}
+	if dec.Gate == nil || dec.Gate.Verify == nil {
+		t.Fatalf("no verify transferred into the gate: %+v", dec)
+	}
+	if dec.Gate.Verify == cur.Verify {
+		t.Fatal("the gate verify aliases the input state's pointer")
+	}
+	cur.Verify.RequiredGeneration = 999
+	if dec.Gate.Verify.RequiredGeneration == 999 {
+		t.Fatal("mutating the input state changed the decision's verify")
+	}
+}
+
+// A contradictory verification that ALSO requests a human decision gates first
+// (priority), transferring the unchanged threshold — exact criteria coverage is still
+// enforced.
+func TestVerifyHumanPriorityOverBlocker(t *testing.T) {
+	store := newStore(t)
+	reachTests(t, store)
+	rs, _ := applyTests(t, store, true, RuntimeFacts{CurrentPairGeneration: 2}, Ids{})
+	want := *rs.Verify
+	rs = issueVerifier(t, store, "t-v")
+	// pass verdict WITH a scope expansion (a blocker) is contradictory, but the human
+	// decision request takes priority.
+	art := verificationArtifact(t, "t-v", rs.Revision, "pass", true, acceptanceCriteria, true, true, []string{"extra"}, nil)
+	rs, err := stepRT(t, store, ProjectionFacts{Task: taskFacts()}, RuntimeFacts{}, "verification", art, gate("g-v"))
+	if err != nil {
+		t.Fatalf("human-priority over a blocker: %v", err)
+	}
+	if rs.Pause == nil || rs.Pause.Kind != state.PauseHumanDecision || rs.Pause.Verify == nil || *rs.Pause.Verify != want {
+		t.Fatalf("contradiction+human should gate with the unchanged threshold: %+v", rs)
+	}
+}
+
+// Apply rejects a forged ownerless decision that supplies an identity, a RouteToVerify
+// that omits its verify requirement, a non-to-verify decision carrying a verify
+// payload, and a terminal edge with the wrong cursor/verify presence.
 func TestTerminalApplyAdversarial(t *testing.T) {
 	t.Run("an ownerless route rejects a supplied id", func(t *testing.T) {
 		store := newStore(t)
@@ -353,19 +464,52 @@ func TestTerminalApplyAdversarial(t *testing.T) {
 		}
 	})
 
+	// forgeAtTests applies a forged coordinator-authored decision from ownerless TESTS.
+	forgeAtTests := func(t *testing.T, mut func(cur state.RunState) (Decision, Ids)) error {
+		store := newStore(t)
+		reachTests(t, store)
+		cur, _, _ := store.Load()
+		dec, ids := mut(cur)
+		dec.FromPhase = state.PhaseTests
+		dec.ExpectedStateRevision = cur.Revision
+		dec.Source = state.EventRef{Digest: strings.Repeat("e", 64)}
+		_, err := store.Mutate(cur.Revision, func(gen uint64, next *state.RunState) error {
+			return Apply(dec, dec.Source, ids, gen, next)
+		})
+		return err
+	}
+
 	t.Run("to-verify without a verify requirement", func(t *testing.T) {
+		if err := forgeAtTests(t, func(state.RunState) (Decision, Ids) {
+			return Decision{Next: state.PhaseVerify, Route: RouteToVerify}, Ids{}
+		}); !errors.Is(err, ErrBadDecision) {
+			t.Fatalf("err = %v, want ErrBadDecision", err)
+		}
+	})
+
+	t.Run("a non-to-verify route carrying a verify payload", func(t *testing.T) {
+		if err := forgeAtTests(t, func(state.RunState) (Decision, Ids) {
+			return Decision{Next: state.PhaseFix, Route: RouteTestsFix, Verify: &state.VerifyRequirement{RequiredGeneration: 2}}, assign("t-x")
+		}); !errors.Is(err, ErrBadDecision) {
+			t.Fatalf("err = %v, want ErrBadDecision", err)
+		}
+	})
+
+	t.Run("to-verify with the cursor off the plan end", func(t *testing.T) {
 		store := newStore(t)
 		reachTests(t, store)
 		cur, _, _ := store.Load()
 		dec := Decision{
 			FromPhase: state.PhaseTests, ExpectedStateRevision: cur.Revision,
 			Source: state.EventRef{Digest: strings.Repeat("e", 64)}, Next: state.PhaseVerify, Route: RouteToVerify,
+			Verify: &state.VerifyRequirement{RequiredGeneration: 2},
 		}
 		_, err := store.Mutate(cur.Revision, func(gen uint64, next *state.RunState) error {
+			*next.StepIndex = 0 // off the plan end before Apply validates the shape
 			return Apply(dec, dec.Source, Ids{}, gen, next)
 		})
 		if !errors.Is(err, ErrBadDecision) {
-			t.Fatalf("err = %v, want ErrBadDecision", err)
+			t.Fatalf("wrong cursor err = %v, want ErrBadDecision", err)
 		}
 	})
 }

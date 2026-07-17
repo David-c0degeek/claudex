@@ -42,6 +42,11 @@ var (
 	// ErrReplayInPrepare means Prepare was invoked for an already-accepted turn, which
 	// the locked transport resolves before Prepare — a defensive invariant.
 	ErrReplayInPrepare = errors.New("coordinator: prepare invoked for an already-accepted turn")
+	// ErrTerminalNotWired means the engine routed into an ownerless terminal-graph edge
+	// (TESTS/VERIFY/DONE, which issue no identity) that this build does not yet wire.
+	// It is a stable rejection boundary the submit fails closed on before any Put; the
+	// TESTS/VERIFY composition (checkpoint 4d) deletes it when it wires those edges.
+	ErrTerminalNotWired = errors.New("coordinator: the terminal-graph edge is not yet wired")
 )
 
 // Run is an opened run: its bound paths, the state/registry/artifact stores under the
@@ -273,7 +278,8 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 		case engine.IDGate:
 			ids.GateID, issuedGate = gateCand, gateCand
 		default:
-			return transport.PreparedTransition{}, fmt.Errorf("coordinator: unsupported id kind %d", idKind)
+			// IDNone: an ownerless terminal-graph edge this build does not wire yet.
+			return transport.PreparedTransition{}, ErrTerminalNotWired
 		}
 		submitted := ev.Source
 		apply := func(gen uint64, next *state.RunState) error {

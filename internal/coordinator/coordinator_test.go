@@ -298,16 +298,21 @@ func TestE2ENonGatedChain(t *testing.T) {
 		t.Fatalf("not advanced to step 1: %+v", rs)
 	}
 
-	// IMPLEMENT the final step, then AGREE on it. The engine now routes into ownerless
-	// TESTS, but this coordinator build does not yet wire the TESTS/VERIFY graph, so the
-	// submit is rejected (before any Put) at the ownerless id kind it cannot issue.
+	// IMPLEMENT the final step, then AGREE on it. The engine routes into ownerless
+	// TESTS, which this build does not yet wire, so the submit fails closed on the
+	// explicit ErrTerminalNotWired boundary before any Put and without advancing.
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
-	if _, err := rn.Submit(context.Background(), pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)); err == nil {
-		t.Fatal("final checkpoint into the unwired TESTS edge should be rejected")
+	final := checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)
+	n, _ := transport.Normalize(final)
+	if _, err := rn.Submit(context.Background(), pair, final); !errors.Is(err, ErrTerminalNotWired) {
+		t.Fatalf("final checkpoint err = %v, want ErrTerminalNotWired", err)
 	}
 	if cur(t, rn).Phase != state.PhaseCheckpoint {
 		t.Fatal("a rejected final checkpoint must not advance the run")
+	}
+	if _, gerr := rn.store.Get(n.TurnID, n.Digest); gerr == nil {
+		t.Fatal("no artifact should be published for the rejected terminal edge")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -60,18 +61,26 @@ func projectVerified(cur state.RunState, canonical []byte, src state.EventRef, r
 	if err := json.Unmarshal(canonical, &a); err != nil {
 		return Event{}, semanticf("undecodable verification artifact")
 	}
-	// The frozen task facts must be the run's own snapshot.
-	if facts.Task.Digest != cur.TaskSnapshot.Digest {
-		return Event{}, semanticf("the supplied task facts do not match the run's task snapshot")
+	// The frozen task snapshot bytes must hash to the run's own snapshot, and their
+	// acceptance criteria come only from parsing that immutable contract — never a
+	// caller-asserted list.
+	snapshot := []byte(facts.Task.SnapshotBytes)
+	if config.Hash(snapshot) != cur.TaskSnapshot.Digest {
+		return Event{}, semanticf("the supplied task snapshot does not match the run's task-snapshot digest")
 	}
+	tc, err := config.ParseTaskContract(snapshot)
+	if err != nil {
+		return Event{}, semanticf("the task snapshot is not a valid task contract")
+	}
+	criteria := tc.AcceptanceCriteria
 	// The criteria must cover the acceptance criteria exactly once, in canonical order
 	// (value-free index diagnostics).
-	if len(a.Criteria) != len(facts.Task.AcceptanceCriteria) {
-		return Event{}, semanticf("verification covers %d criteria; the task contract has %d", len(a.Criteria), len(facts.Task.AcceptanceCriteria))
+	if len(a.Criteria) != len(criteria) {
+		return Event{}, semanticf("verification covers %d criteria; the task contract has %d", len(a.Criteria), len(criteria))
 	}
 	blockers := false
-	for i := range facts.Task.AcceptanceCriteria {
-		if a.Criteria[i].Criterion != facts.Task.AcceptanceCriteria[i] {
+	for i := range criteria {
+		if a.Criteria[i].Criterion != criteria[i] {
 			return Event{}, semanticf("verification criterion %d does not match the frozen acceptance criterion in order", i)
 		}
 		if !a.Criteria[i].Met {
