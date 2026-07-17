@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -45,12 +46,55 @@ func passToVerify() TestPrepare {
 	})
 }
 
+func passApply(next *state.RunState, p PreparedTestOutcome) {
+	next.Assignment = nil
+	next.Phase = state.PhaseVerify
+	next.Verify = &state.VerifyRequirement{RequiredGeneration: p.CurrentPairGeneration + 1}
+}
+
+func failToFixApply(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
+	next.Phase = state.PhaseFix
+	next.FixReturn = state.PhaseTests
+	next.Counters.TestFixes++
+	next.Assignment = &state.Ref{ID: "t-turn", IssuedRevision: gen}
+	return nil
+}
+
 func failToFix() TestPrepare {
 	return prepFn("fix-turn", "", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
 		next.Phase = state.PhaseFix
 		next.FixReturn = state.PhaseTests
 		next.Counters.TestFixes++
 		next.Assignment = &state.Ref{ID: "fix-turn", IssuedRevision: gen}
+		return nil
+	})
+}
+
+// runAtTestsBudget puts the run at TESTS with the test budget already at the frozen
+// limit (so a fail gates), returning the store + revision.
+func runAtTestsBudget(t *testing.T) (*state.Store, uint64) {
+	t.Helper()
+	store, rev := newStoreAt(t, func(gen uint64, n *state.RunState) {
+		*n.StepIndex = n.AgreedPlan.Plan.StepCount
+		n.Phase = state.PhaseTests
+		n.Assignment = nil
+		n.Counters.TestFixes = n.EffectivePolicy.Budgets.TestRounds
+	})
+	registryPairGen(t, store, 2)
+	return store, rev
+}
+
+// gatePrep builds a TESTS quality-gate transition whose pause carries the given source.
+func gatePrep(source state.EventRef) TestPrepare {
+	return prepFn("", "gate-turn", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
+		next.Assignment = nil
+		next.Phase = state.PhaseAwaitGuidance
+		next.Lifecycle = state.LifecyclePaused
+		next.Gate = &state.Ref{ID: "gate-turn", IssuedRevision: gen}
+		next.Pause = &state.PauseContext{
+			Kind: state.PauseQualityBudget, OriginPhase: state.PhaseTests, ResumePhase: state.PhaseFix,
+			FixReturn: state.PhaseTests, Source: source, Budget: &state.BudgetPause{Kind: state.BudgetTest},
+		}
 		return nil
 	})
 }
@@ -94,31 +138,70 @@ func TestTestOutcomeFailToFix(t *testing.T) {
 }
 
 func TestTestOutcomeFailToQualityGate(t *testing.T) {
-	// A run at TESTS with the test budget already spent gates on a fail.
-	store, rev := newStoreAt(t, func(gen uint64, n *state.RunState) {
-		*n.StepIndex = n.AgreedPlan.Plan.StepCount
-		n.Phase = state.PhaseTests
-		n.Assignment = nil
-		n.Counters.TestFixes = n.EffectivePolicy.Budgets.TestRounds // at the frozen limit
-	})
-	registryPairGen(t, store, 2)
-	prep := prepFn("", "gate-turn", func(gen uint64, next *state.RunState, p PreparedTestOutcome) error {
-		next.Assignment = nil
-		next.Phase = state.PhaseAwaitGuidance
-		next.Lifecycle = state.LifecyclePaused
-		next.Gate = &state.Ref{ID: "gate-turn", IssuedRevision: gen}
-		next.Pause = &state.PauseContext{
-			Kind: state.PauseQualityBudget, OriginPhase: state.PhaseTests, ResumePhase: state.PhaseFix,
-			FixReturn: state.PhaseTests, Source: p.Source, Budget: &state.BudgetPause{Kind: state.BudgetTest},
-		}
-		return nil
-	})
-	if _, err := SubmitTestOutcome(context.Background(), testOutcomeDeps(store, prep), rev, evDigest); err != nil {
+	store, rev := runAtTestsBudget(t)
+	// The gate carries the ACCEPTED empty-turn evidence source.
+	if _, err := SubmitTestOutcome(context.Background(), testOutcomeDeps(store, gatePrep(state.EventRef{Digest: evDigest})), rev, evDigest); err != nil {
 		t.Fatalf("fail -> quality gate: %v", err)
 	}
 	rs, _, _ := store.Load()
 	if rs.Lifecycle != state.LifecyclePaused || rs.Pause == nil || rs.Pause.Budget == nil || rs.Pause.Budget.Kind != state.BudgetTest {
 		t.Fatalf("not a test-quality gate: %+v", rs)
+	}
+	if rs.Pause.Source != (state.EventRef{Digest: evDigest}) {
+		t.Fatalf("gate source = %+v, want the empty-turn evidence {Digest: %s}", rs.Pause.Source, evDigest)
+	}
+}
+
+// A gate whose pause carries a different (still-valid) evidence digest than the public
+// operation accepted is rejected.
+func TestTestOutcomeSubstitutedEvidenceRejected(t *testing.T) {
+	store, rev := runAtTestsBudget(t)
+	other := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := SubmitTestOutcome(context.Background(), testOutcomeDeps(store, gatePrep(state.EventRef{Digest: other})), rev, evDigest); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("substituted evidence err = %v, want ErrTransitionInvalid", err)
+	}
+	if rs, _, _ := store.Load(); rs.Revision != rev {
+		t.Fatalf("a rejected outcome advanced the run: %d -> %d", rev, rs.Revision)
+	}
+}
+
+func TestClassifyTestOutcome(t *testing.T) {
+	// Committed, clean release.
+	if res, err := classifyTestOutcome(7, nil, nil); err != nil || res.Revision != 7 || res.ReleaseWarning != nil {
+		t.Fatalf("committed: res=%+v err=%v", res, err)
+	}
+	// Committed, release failed -> a post-commit warning over the revision.
+	res, err := classifyTestOutcome(7, nil, errors.New("release-x"))
+	var pce *genstore.PostCommitError
+	if err != nil || res.Revision != 7 || !errors.As(res.ReleaseWarning, &pce) {
+		t.Fatalf("committed+release-fail: res=%+v err=%v", res, err)
+	}
+	// Ambiguous -> zero result, both ErrOutcomeUnknown and ErrAmbiguous, NOT
+	// mislabeled proven-uncommitted.
+	res, err = classifyTestOutcome(0, fmt.Errorf("%w: x", genstore.ErrAmbiguous), nil)
+	if res != (TestOutcomeResult{}) || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, genstore.ErrAmbiguous) {
+		t.Fatalf("ambiguous: res=%+v err=%v", res, err)
+	}
+	// A proven-uncommitted failure -> zero result, the error, NOT outcome-unknown.
+	boom := errors.New("boom")
+	res, err = classifyTestOutcome(0, boom, nil)
+	if res != (TestOutcomeResult{}) || !errors.Is(err, boom) || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("proven-uncommitted: res=%+v err=%v", res, err)
+	}
+}
+
+// The journal recovery check runs before the registry: an absent Registry (which would
+// be a run mismatch) plus a nonterminal journal yields recovery-required.
+func TestTestOutcomeJournalBeforeRegistry(t *testing.T) {
+	store, rev := newStoreAt(t, func(gen uint64, n *state.RunState) {
+		*n.StepIndex = n.AgreedPlan.Plan.StepCount
+		n.Phase = state.PhaseTests
+		n.Assignment = nil
+	})
+	d := testOutcomeDeps(store, passToVerify())
+	d.Journal = fakeJournal{lockPath: store.LockPath(), head: JournalNonterminal}
+	if _, err := SubmitTestOutcome(context.Background(), d, rev, evDigest); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("err = %v, want ErrRecoveryRequired (journal before registry)", err)
 	}
 }
 
@@ -283,6 +366,65 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
 				next.Phase = state.PhaseVerify
 				next.Verify = &state.VerifyRequirement{RequiredGeneration: p.CurrentPairGeneration + 9}
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"forged TESTS -> DONE bypass", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, _ PreparedTestOutcome) error {
+				next.Assignment = nil
+				next.Phase = state.PhaseDone
+				next.Lifecycle = state.LifecycleCompleted
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"declared id collides with an accepted turn", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("plan-turn", "", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
+				next.Phase = state.PhaseFix
+				next.FixReturn = state.PhaseTests
+				next.Counters.TestFixes++
+				next.Assignment = &state.Ref{ID: "plan-turn", IssuedRevision: gen}
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"both an assignment and a gate declared", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("t-turn", "g-gate", failToFixApply)), rev
+		}, ErrTransitionInvalid},
+		{"declared id does not match the applied assignment", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("declared", "", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
+				next.Phase = state.PhaseFix
+				next.FixReturn = state.PhaseTests
+				next.Counters.TestFixes++
+				next.Assignment = &state.Ref{ID: "applied-other", IssuedRevision: gen}
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"accepted turns nil'd", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
+				passApply(next, p)
+				next.AcceptedTurns = nil
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"accepted turn deleted", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
+				passApply(next, p)
+				delete(next.AcceptedTurns, "plan-turn")
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
+		{"accepted turn altered", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
+				passApply(next, p)
+				at := next.AcceptedTurns["plan-turn"]
+				at.Phase = state.PhaseFix
+				next.AcceptedTurns["plan-turn"] = at
 				return nil
 			})), rev
 		}, ErrTransitionInvalid},

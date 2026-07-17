@@ -191,9 +191,11 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 		if !reflect.DeepEqual(before, next.AcceptedTurns) {
 			return fmt.Errorf("%w: a test outcome must not change the accepted-turns ledger", ErrTransitionInvalid)
 		}
-		// A test outcome MUST leave TESTS (to VERIFY, FIX, or a quality gate).
-		if next.Phase == state.PhaseTests {
-			return fmt.Errorf("%w: a test outcome must advance out of TESTS", ErrTransitionInvalid)
+		// The resulting shape must be one of the exact TESTS-graph outcomes ("not TESTS"
+		// is insufficient — state encodes no phase edges and any terminal lifecycle is
+		// locally valid, so a faulty Prepare could otherwise reach DONE).
+		if serr := checkTestOutcomeShape(rs, next, prepared); serr != nil {
+			return serr
 		}
 		if lerr := requireLiveOwner(next, "", gen); lerr != nil {
 			return lerr
@@ -206,18 +208,64 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 		}
 		return nil
 	})
-	if merr != nil {
-		if errors.Is(merr, genstore.ErrAmbiguous) {
-			// The append MAY have committed; the caller must reload to determine the
-			// outcome. A zero result here does NOT prove no mutation.
-			return TestOutcomeResult{}, errors.Join(fmt.Errorf("%w: %w", ErrOutcomeUnknown, merr), release())
+	return classifyTestOutcome(committed.Revision, merr, release())
+}
+
+// checkTestOutcomeShape admits ONLY the three legal TESTS outcomes and rejects every
+// other phase/lifecycle (including a forged TESTS->DONE): a pass into ownerless VERIFY
+// (counter unchanged), an assigned fail into FIX returning to TESTS (test_fixes +1
+// exactly), or the exact TESTS quality-budget gate whose pause carries the ACCEPTED
+// evidence source (so a Prepare cannot substitute a different valid digest).
+func checkTestOutcomeShape(rs state.RunState, next *state.RunState, prepared PreparedTestOutcome) error {
+	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrTransitionInvalid, msg) }
+	switch next.Phase {
+	case state.PhaseVerify:
+		if next.Assignment != nil || next.Verify == nil {
+			return bad("a TESTS pass enters ownerless VERIFY")
 		}
-		if errors.Is(merr, state.ErrRevisionConflict) || errors.Is(merr, genstore.ErrBusy) {
-			return reject(fmt.Errorf("transport: unexpected lock/revision state under the run guard: %w", merr))
+		if next.Counters.TestFixes != rs.Counters.TestFixes {
+			return bad("a TESTS pass must not change test_fixes")
 		}
-		return reject(merr)
+	case state.PhaseFix:
+		if next.Assignment == nil || next.FixReturn != state.PhaseTests {
+			return bad("a TESTS fail assigns a FIX returning to TESTS")
+		}
+		if next.Counters.TestFixes != rs.Counters.TestFixes+1 {
+			return bad("a TESTS fail increments test_fixes exactly once")
+		}
+	case state.PhaseAwaitGuidance:
+		p := next.Pause
+		if p == nil || p.Kind != state.PauseQualityBudget || p.Budget == nil || p.Budget.Kind != state.BudgetTest ||
+			p.OriginPhase != state.PhaseTests || p.ResumePhase != state.PhaseFix || p.FixReturn != state.PhaseTests {
+			return bad("a TESTS quality gate is the closed TESTS->FIX budget shape")
+		}
+		if p.Source != prepared.Source {
+			return bad("the TESTS gate source must be the accepted evidence digest")
+		}
+		if next.Counters.TestFixes != rs.Counters.TestFixes {
+			return bad("a TESTS quality gate must not change test_fixes")
+		}
+	default:
+		return bad("a TESTS outcome must enter VERIFY, FIX, or the TESTS quality gate")
 	}
-	return TestOutcomeResult{Revision: committed.Revision, ReleaseWarning: releaseOutcome(true, committed.Revision, release())}, nil
+	return nil
+}
+
+// classifyTestOutcome is the pure post-CAS result classifier: a committed append yields
+// the revision plus a committed release-warning; a genstore.ErrAmbiguous is a typed
+// outcome-unknown (never a proven-uncommitted zero result); every other failure is a
+// proven-uncommitted zero result.
+func classifyTestOutcome(committedRev uint64, merr, relErr error) (TestOutcomeResult, error) {
+	switch {
+	case merr == nil:
+		return TestOutcomeResult{Revision: committedRev, ReleaseWarning: releaseOutcome(true, committedRev, relErr)}, nil
+	case errors.Is(merr, genstore.ErrAmbiguous):
+		return TestOutcomeResult{}, errors.Join(fmt.Errorf("%w: %w", ErrOutcomeUnknown, merr), relErr)
+	case errors.Is(merr, state.ErrRevisionConflict) || errors.Is(merr, genstore.ErrBusy):
+		return TestOutcomeResult{}, errors.Join(fmt.Errorf("transport: unexpected lock/revision state under the run guard: %w", merr), relErr)
+	default:
+		return TestOutcomeResult{}, errors.Join(merr, relErr)
+	}
 }
 
 // cloneAcceptedTurns deep-copies the accepted-turns ledger for a before/after compare.
