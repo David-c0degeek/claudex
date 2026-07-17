@@ -14,6 +14,7 @@
     "turn_id",
     "gate_id",
     "replacement_generation",
+    "required_generation",
     "code",
     "reason",
     "next_action"
@@ -42,6 +43,7 @@
         "completed",
         "failed",
         "session_replaced",
+        "fresh_session_required",
         "recovery_required"
       ]
     },
@@ -95,6 +97,11 @@
     },
     "replacement_generation": {
       "description": "The generation of the session that superseded this one, present only for session_replaced; null otherwise.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "required_generation": {
+      "description": "The fresh pair-session generation that must attach before a verifier turn issues, present only for fresh_session_required; null otherwise.",
       "type": ["integer", "null"],
       "minimum": 1
     },

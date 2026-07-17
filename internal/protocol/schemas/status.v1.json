@@ -14,6 +14,7 @@
     "whose_turn",
     "turn_id",
     "gate_id",
+    "waiting",
     "stop",
     "caps",
     "honesty"
@@ -38,6 +39,16 @@
     },
     "turn_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
     "gate_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "waiting": {
+      "description": "The ownerless agent-phase wait, present only for a running VERIFY blocked for a fresh pair-session generation; null otherwise.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "required_generation"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["fresh_session"] },
+        "required_generation": { "type": "integer", "minimum": 1 }
+      }
+    },
     "stop": {
       "description": "The discriminated stop reason, present when failed or a recovery is required; null otherwise.",
       "type": ["object", "null"],

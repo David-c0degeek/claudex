@@ -19,6 +19,16 @@ const (
 	// each tier, so the tier label is not a bare assertion.
 	tierMechanismBYO     = "durable-byo-registration"
 	tierMechanismManaged = "managed-launch-record"
+
+	// waitingFreshSession is the one waiting kind: a running ownerless VERIFY blocked
+	// for a fresh pair-session generation.
+	waitingFreshSession = "fresh_session"
+
+	// capMechFreshProcess is the managed-only mechanism for a real new-process launch.
+	// A protocol-only/BYO run enforces the session GENERATION, not process freshness,
+	// and reports capMechFreshSessionDeclared instead; it must never claim fresh-process.
+	capMechFreshProcess         = "fresh-process"
+	capMechFreshSessionDeclared = "fresh-session-declared"
 )
 
 // tierMechanisms binds each tier to the one mechanism that may back it.
@@ -109,6 +119,15 @@ type CapsReport struct {
 	CheckpointRounds CheckpointCap `json:"checkpoint_rounds"`
 }
 
+// WaitingProjection is the honest projection of a deliberate ownerless agent-phase
+// wait. Today the only kind is the running ownerless VERIFY blocked for a fresh
+// pair-session generation: no owner and no turn are fabricated, and the required
+// generation the pair slot must reach is reported.
+type WaitingProjection struct {
+	Kind               string `json:"kind"` // fresh_session
+	RequiredGeneration uint64 `json:"required_generation"`
+}
+
 // StopProjection is the discriminated stop reason, present when the run failed or
 // needs recovery.
 type StopProjection struct {
@@ -121,18 +140,19 @@ type StopProjection struct {
 
 // StatusReport is the lock-free status projection wire message.
 type StatusReport struct {
-	ProtocolVersion int             `json:"protocol_version"`
-	MessageType     string          `json:"message_type"`
-	RunID           string          `json:"run_id"`
-	Revision        uint64          `json:"revision"`
-	Lifecycle       state.Lifecycle `json:"lifecycle"`
-	Phase           state.Phase     `json:"phase"`
-	WhoseTurn       *Role           `json:"whose_turn"`
-	TurnID          *string         `json:"turn_id"`
-	GateID          *string         `json:"gate_id"`
-	Stop            *StopProjection `json:"stop"`
-	Caps            CapsReport      `json:"caps"`
-	Honesty         HonestyLabels   `json:"honesty"`
+	ProtocolVersion int                `json:"protocol_version"`
+	MessageType     string             `json:"message_type"`
+	RunID           string             `json:"run_id"`
+	Revision        uint64             `json:"revision"`
+	Lifecycle       state.Lifecycle    `json:"lifecycle"`
+	Phase           state.Phase        `json:"phase"`
+	WhoseTurn       *Role              `json:"whose_turn"`
+	TurnID          *string            `json:"turn_id"`
+	GateID          *string            `json:"gate_id"`
+	Waiting         *WaitingProjection `json:"waiting"`
+	Stop            *StopProjection    `json:"stop"`
+	Caps            CapsReport         `json:"caps"`
+	Honesty         HonestyLabels      `json:"honesty"`
 }
 
 // Status reads run state once without the mutation lock and projects a validated
@@ -165,6 +185,7 @@ func Status(store *state.Store, honesty HonestySource) (StatusReport, error) {
 	if err != nil {
 		return StatusReport{}, err
 	}
+	waiting := projectWaiting(facts, recoveryPresent)
 
 	labels, err := honesty(StatusInput{RunID: rs.RunID, Revision: rs.Revision, Phase: rs.Phase, Lifecycle: rs.Lifecycle})
 	if err != nil {
@@ -186,6 +207,7 @@ func Status(store *state.Store, honesty HonestySource) (StatusReport, error) {
 		Phase:           rs.Phase,
 		WhoseTurn:       whose,
 		TurnID:          turnID,
+		Waiting:         waiting,
 		Stop:            stop,
 		Caps:            projectCaps(rs),
 		Honesty:         labels,
@@ -219,12 +241,29 @@ func projectOwner(f runFacts, recoveryPresent bool) (*Role, *string, error) {
 		id := f.assignmentID
 		return &role, &id, nil
 	}
-	// A running agent phase normally needs an owner; a pending recovery is the
-	// next actor instead.
-	if agentPhase && running && !recoveryPresent {
+	// A running agent phase normally needs an owner, EXCEPT the one deliberate
+	// ownerless agent phase: a running VERIFY holding a fresh-session requirement is
+	// blocked for a fresh pair generation and has no owner. A pending recovery is the
+	// next actor instead. Every other running ownerless agent phase fails closed.
+	ownerlessVerify := f.phase == state.PhaseVerify && running && f.hasVerify
+	if agentPhase && running && !recoveryPresent && !ownerlessVerify {
 		return nil, nil, fmt.Errorf("%w: running agent phase %s with no assignment", ErrCorruptState, f.phase)
 	}
 	return nil, nil, nil
+}
+
+// projectWaiting reports the one deliberate ownerless agent-phase wait: a running
+// VERIFY with no assignment is blocked for a fresh pair-session generation. A pending
+// recovery dominates (as it suppresses the owner), so it reports no wait. coherence
+// guarantees a nonzero threshold at VERIFY.
+func projectWaiting(f runFacts, recoveryPresent bool) *WaitingProjection {
+	if recoveryPresent {
+		return nil
+	}
+	if f.phase == state.PhaseVerify && f.lifecycle == state.LifecycleRunning && f.assignmentID == "" && f.hasVerify {
+		return &WaitingProjection{Kind: waitingFreshSession, RequiredGeneration: f.verifyGen}
+	}
+	return nil
 }
 
 func projectStop(f runFacts) (*StopProjection, error) {
@@ -301,6 +340,13 @@ func validateHonesty(l HonestyLabels) error {
 		if !capabilityStatuses[c.Status] {
 			return fmt.Errorf("%w: a capability has an unknown status", ErrHonestySource)
 		}
+		// Process freshness is a managed-only claim, backed by a real launch record. A
+		// protocol-only/BYO run enforces the session generation (fresh-session-declared)
+		// and must never claim fresh-process, which would imply process/model-context
+		// freshness it does not provide.
+		if c.Mechanism == capMechFreshProcess && l.Tier != TierManaged {
+			return fmt.Errorf("%w: fresh-process is reserved for the managed tier", ErrHonestySource)
+		}
 		if seen[c.Name] {
 			return fmt.Errorf("%w: a duplicate capability", ErrHonestySource)
 		}
@@ -362,7 +408,28 @@ func (s StatusReport) semanticValidate() error {
 			return fail("whose_turn disagrees with the phase")
 		}
 	} else if agentPhase && running && !recoveryStop {
-		return fail("a running agent phase must have an owner")
+		// The one legal ownerless running agent phase is the VERIFY fresh-session wait,
+		// which MUST carry the waiting projection; every other one fails closed.
+		if s.Phase != state.PhaseVerify || s.Waiting == nil {
+			return fail("a running agent phase must have an owner or be the fresh-session VERIFY wait")
+		}
+	}
+
+	// Waiting projection: present exactly for the running ownerless VERIFY fresh-session
+	// wait — no fabricated owner/turn, no recovery stop, and a nonzero threshold.
+	if s.Waiting != nil {
+		if s.Phase != state.PhaseVerify || !running || recoveryStop {
+			return fail("a fresh-session wait requires a running VERIFY with no recovery stop")
+		}
+		if hasWhose || hasTurn {
+			return fail("a fresh-session wait excludes an owner")
+		}
+		if s.Waiting.Kind != waitingFreshSession {
+			return fail("unknown waiting kind")
+		}
+		if s.Waiting.RequiredGeneration == 0 {
+			return fail("a fresh-session wait needs a nonzero required_generation")
+		}
 	}
 
 	// Gate / pause coherence.

@@ -28,20 +28,27 @@ func ptr(s string) *string { return &s }
 func absWorktree() string { return filepath.Join(os.TempDir(), "claudex-wt", "run-a") }
 
 func runStateAt(phase state.Phase) state.RunState {
-	return state.RunState{
+	rs := state.RunState{
 		RunID:      "run-a",
 		Revision:   5,
 		Phase:      phase,
 		Assignment: &state.Ref{ID: "turn-1", IssuedRevision: 5},
 	}
+	// An active VERIFY carries the retained fresh-session threshold.
+	if phase == state.PhaseVerify {
+		rs.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
+	}
+	return rs
 }
 
 func editInputs() PullInputs {
 	return PullInputs{SessionID: sessLead, Role: RoleLead, BindingGuidance: []string{"prefer small steps"}, Worktree: ptr(absWorktree())}
 }
 
+// evidenceInputs carries a qualifying pair generation (== the VERIFY fixture's
+// threshold); it is ignored for non-VERIFY phases.
 func evidenceInputs(role Role) PullInputs {
-	return PullInputs{SessionID: sessPair, Role: role, Evidence: &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()}}
+	return PullInputs{SessionID: sessPair, Role: role, CurrentPairGeneration: 3, Evidence: &EvidenceRef{ManifestRelPath: "evidence/checkpoint-1/manifest.json", RootDigest: hex64()}}
 }
 
 // A non-minted (mixed-case / wrong-shape) session id never builds an assignment.

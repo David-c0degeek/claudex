@@ -111,6 +111,12 @@ type PullInputs struct {
 	BindingGuidance []string
 	Worktree        *string
 	Evidence        *EvidenceRef
+	// CurrentPairGeneration is the pair slot's current session generation, resolved
+	// by the caller from the durable Registry (exactly as submit derives it) — never
+	// a session's own claim. It gates a VERIFY assignment against the fresh-session
+	// threshold; it is unused for non-VERIFY phases. Zero is a missing fact and, at
+	// VERIFY, fails closed.
+	CurrentPairGeneration uint64
 }
 
 // Assignment is the read-only, phase/role-specific contract pull returns. It
@@ -151,6 +157,19 @@ func BuildAssignment(rs state.RunState, in PullInputs) (Assignment, error) {
 	}
 	if !state.IsSessionID(in.SessionID) {
 		return Assignment{}, fmt.Errorf("transport: session_id must be a canonical minted session id")
+	}
+	// An ACTIVE VERIFY assignment (ownerless VERIFY has no assignment and returned
+	// ErrNoActiveTurn above) may only be projected once the pair slot has reached the
+	// retained fresh-session threshold. A missing (zero) or below-threshold generation
+	// fails closed with the same typed refusal submit uses, so the stale incumbent is
+	// never handed the verifier turn.
+	if rs.Phase == state.PhaseVerify {
+		if rs.Verify == nil {
+			return Assignment{}, fmt.Errorf("%w: a VERIFY assignment has no fresh-session requirement", ErrAssignmentInvalid)
+		}
+		if in.CurrentPairGeneration < rs.Verify.RequiredGeneration {
+			return Assignment{}, ErrFreshSessionRequired
+		}
 	}
 
 	schemaBytes, err := protocol.Schema(spec.ArtifactMessageType, protocol.SupportedVersion)

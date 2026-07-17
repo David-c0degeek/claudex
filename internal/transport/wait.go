@@ -18,16 +18,17 @@ const waitEventType = "wait_event"
 type WaitKind string
 
 const (
-	WaitUnchanged        WaitKind = "unchanged"
-	WaitAssignment       WaitKind = "assignment"
-	WaitGate             WaitKind = "gate"
-	WaitPausedBudget     WaitKind = "paused_budget"
-	WaitRateLimited      WaitKind = "rate_limited"
-	WaitCancelled        WaitKind = "cancelled"
-	WaitCompleted        WaitKind = "completed"
-	WaitFailed           WaitKind = "failed"
-	WaitSessionReplaced  WaitKind = "session_replaced"
-	WaitRecoveryRequired WaitKind = "recovery_required"
+	WaitUnchanged            WaitKind = "unchanged"
+	WaitAssignment           WaitKind = "assignment"
+	WaitGate                 WaitKind = "gate"
+	WaitPausedBudget         WaitKind = "paused_budget"
+	WaitRateLimited          WaitKind = "rate_limited"
+	WaitCancelled            WaitKind = "cancelled"
+	WaitCompleted            WaitKind = "completed"
+	WaitFailed               WaitKind = "failed"
+	WaitSessionReplaced      WaitKind = "session_replaced"
+	WaitFreshSessionRequired WaitKind = "fresh_session_required"
+	WaitRecoveryRequired     WaitKind = "recovery_required"
 )
 
 var (
@@ -70,6 +71,7 @@ type WaitEvent struct {
 	TurnID                *string         `json:"turn_id"`
 	GateID                *string         `json:"gate_id"`
 	ReplacementGeneration *uint64         `json:"replacement_generation"`
+	RequiredGeneration    *uint64         `json:"required_generation"`
 	Code                  *string         `json:"code"`
 	Reason                *string         `json:"reason"`
 	NextAction            *string         `json:"next_action"`
@@ -85,12 +87,20 @@ type SessionInput struct {
 }
 
 // SessionView is the fact projection the seam returns. Wait constructs the
-// authoritative event; the seam only reports whether this session owns the
-// active turn and whether it has been replaced (with the superseding generation).
+// authoritative event; the seam only reports registration facts about this
+// session: whether it owns the active turn, whether it has been replaced (with
+// the superseding generation), and — for the ownerless-VERIFY fresh-generation
+// boundary — whether it is the pair slot's CURRENT session and that session's
+// generation. IsCurrentPair/PairGeneration are the minimum durable role facts
+// wait needs to decide the incumbent pair session must bring a fresh generation;
+// they are false/zero for lead, unknown, and replaced sessions. The seam resolves
+// them from the durable Registry (never a session's own claim).
 type SessionView struct {
 	OwnsActiveTurn        bool
 	Replaced              bool
 	ReplacementGeneration uint64
+	IsCurrentPair         bool
+	PairGeneration        uint64
 }
 
 // SessionViewer answers the session-specific facts from durable registration. It
@@ -202,6 +212,8 @@ type runFacts struct {
 	lifecycle    state.Lifecycle
 	assignmentID string
 	gateID       string
+	hasVerify    bool
+	verifyGen    uint64 // the ownerless-VERIFY fresh-session threshold; 0 when hasVerify is false
 	recovery     *projFacts
 	failure      *projFacts
 }
@@ -218,6 +230,10 @@ func captureFacts(rs state.RunState) runFacts {
 	}
 	if rs.Gate != nil {
 		f.gateID = rs.Gate.ID
+	}
+	if rs.Verify != nil {
+		f.hasVerify = true
+		f.verifyGen = rs.Verify.RequiredGeneration
 	}
 	if rs.Recovery != nil {
 		f.recovery = &projFacts{rs.Recovery.Code, redact.Text(rs.Recovery.Reason), rs.Recovery.NextAction, rs.Recovery.AtRevision}
@@ -261,6 +277,27 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return ev, true, nil
 	}
 
+	// The fresh-generation boundary at ownerless VERIFY: the run entered VERIFY with
+	// no assignment and holds a fresh-session threshold, so a verifier turn issues only
+	// once the pair slot reaches it. Like a replacement this is a registration-vs-state
+	// standing condition (it wakes even at the same revision), but terminal (above) and
+	// recovery keep priority. Only the CURRENT pair session is told to bring a fresh
+	// generation; lead, unknown, and replaced sessions get no pair signal.
+	if f.phase == state.PhaseVerify && f.lifecycle == state.LifecycleRunning && f.assignmentID == "" && f.recovery == nil && v.IsCurrentPair {
+		// coherence guarantees verifyGen > 0 here.
+		if v.PairGeneration >= f.verifyGen {
+			// A qualifying current pair generation while VERIFY is still ownerless means
+			// the fresh-session issuance that should have advanced the run to an assigned
+			// verifier has not been recorded: fail closed rather than report unchanged or
+			// a false downgrade.
+			return WaitEvent{}, false, fmt.Errorf("%w: a qualifying pair generation at ownerless VERIFY", ErrSessionView)
+		}
+		ev := newEvent(WaitFreshSessionRequired, f)
+		g := f.verifyGen
+		ev.RequiredGeneration = &g
+		return ev, true, nil
+	}
+
 	// The remaining events are revision-gated. Terminal was already handled above.
 	if f.revision <= since {
 		return WaitEvent{}, false, nil
@@ -296,6 +333,18 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 // human-decision gate is exactly AWAIT_GUIDANCE with a gate and a paused
 // lifecycle, and none of those three appears without the others.
 func coherenceCheck(f runFacts) error {
+	// The live VERIFY requirement is present exactly at phase VERIFY (during a VERIFY
+	// pause it is transferred into the pause and cleared from the live state), and its
+	// fresh-session threshold is nonzero.
+	atVerify := f.phase == state.PhaseVerify
+	if atVerify {
+		if !f.hasVerify || f.verifyGen == 0 {
+			return fmt.Errorf("%w: VERIFY requires a nonzero fresh-session threshold", ErrCorruptState)
+		}
+	} else if f.hasVerify {
+		return fmt.Errorf("%w: a verify requirement outside VERIFY", ErrCorruptState)
+	}
+
 	atGate := f.phase == state.PhaseAwaitGuidance
 	hasGate := f.gateID != ""
 	isPaused := f.lifecycle == state.LifecyclePaused
@@ -324,6 +373,19 @@ func validateView(v SessionView, activeTurnID string) error {
 	}
 	if v.OwnsActiveTurn && activeTurnID == "" {
 		return fmt.Errorf("%w: claims turn ownership but no turn is active", ErrSessionView)
+	}
+	// The pair-generation facts describe only the pair slot's CURRENT session, so they
+	// appear together and never for a replaced session: a current session carries a
+	// nonzero generation, and any other session carries none.
+	if v.IsCurrentPair {
+		if v.Replaced {
+			return fmt.Errorf("%w: a current pair session cannot also be replaced", ErrSessionView)
+		}
+		if v.PairGeneration == 0 {
+			return fmt.Errorf("%w: a current pair session needs a nonzero generation", ErrSessionView)
+		}
+	} else if v.PairGeneration != 0 {
+		return fmt.Errorf("%w: only the current pair session carries a pair generation", ErrSessionView)
 	}
 	return nil
 }
@@ -372,7 +434,7 @@ func (e WaitEvent) semanticValidate() error {
 		}
 		return false
 	}
-	turn, gate, gen := has(e.TurnID), has(e.GateID), has(e.ReplacementGeneration)
+	turn, gate, gen, reqGen := has(e.TurnID), has(e.GateID), has(e.ReplacementGeneration), has(e.RequiredGeneration)
 	proj := has(e.Code) && has(e.Reason) && has(e.NextAction)
 	anyProj := has(e.Code) || has(e.Reason) || has(e.NextAction)
 
@@ -380,61 +442,71 @@ func (e WaitEvent) semanticValidate() error {
 	_, agentPhase := TurnSpec(e.Phase)
 	switch e.Kind {
 	case WaitAssignment:
-		if !turn || gate || gen || anyProj {
+		if !turn || gate || gen || reqGen || anyProj {
 			return fail("assignment needs a turn_id only")
 		}
 		if !agentPhase || e.Lifecycle != state.LifecycleRunning {
 			return fail("assignment must be a running agent phase")
 		}
 	case WaitGate:
-		if !gate || turn || gen || anyProj {
+		if !gate || turn || gen || reqGen || anyProj {
 			return fail("gate needs a gate_id only")
 		}
 		if e.Phase != state.PhaseAwaitGuidance || e.Lifecycle != state.LifecyclePaused {
 			return fail("gate must be AWAIT_GUIDANCE and paused")
 		}
 	case WaitPausedBudget:
-		if turn || gate || gen || anyProj {
+		if turn || gate || gen || reqGen || anyProj {
 			return fail("paused_budget carries no discriminant")
 		}
 		if e.Lifecycle != state.LifecyclePausedBudget {
 			return fail("paused_budget requires a paused_budget lifecycle")
 		}
 	case WaitRateLimited:
-		if turn || gate || gen || anyProj {
+		if turn || gate || gen || reqGen || anyProj {
 			return fail("rate_limited carries no discriminant")
 		}
 		if e.Lifecycle != state.LifecycleRateLimited {
 			return fail("rate_limited requires a rate_limited lifecycle")
 		}
 	case WaitCancelled:
-		if turn || gate || gen || anyProj || e.Lifecycle != state.LifecycleCancelled {
+		if turn || gate || gen || reqGen || anyProj || e.Lifecycle != state.LifecycleCancelled {
 			return fail("cancelled requires a cancelled lifecycle and no discriminant")
 		}
 	case WaitCompleted:
-		if turn || gate || gen || anyProj || e.Lifecycle != state.LifecycleCompleted {
+		if turn || gate || gen || reqGen || anyProj || e.Lifecycle != state.LifecycleCompleted {
 			return fail("completed requires a completed lifecycle and no discriminant")
 		}
 	case WaitFailed:
-		if !proj || turn || gate || gen {
+		if !proj || turn || gate || gen || reqGen {
 			return fail("failed needs code, reason, and next_action")
 		}
 		if !state.IsFailureLifecycle(e.Lifecycle) {
 			return fail("failed requires a failure lifecycle")
 		}
 	case WaitRecoveryRequired:
-		if !proj || turn || gate || gen {
+		if !proj || turn || gate || gen || reqGen {
 			return fail("recovery_required needs code, reason, and next_action")
 		}
 		if e.Lifecycle != state.LifecycleRunning {
 			return fail("recovery_required requires a running lifecycle")
 		}
 	case WaitSessionReplaced:
-		if !gen || turn || gate || anyProj {
+		if !gen || turn || gate || reqGen || anyProj {
 			return fail("session_replaced needs a replacement_generation only")
 		}
+	case WaitFreshSessionRequired:
+		if !reqGen || turn || gate || gen || anyProj {
+			return fail("fresh_session_required needs a required_generation only")
+		}
+		if e.Phase != state.PhaseVerify || e.Lifecycle != state.LifecycleRunning {
+			return fail("fresh_session_required must be a running VERIFY")
+		}
+		if *e.RequiredGeneration == 0 {
+			return fail("fresh_session_required needs a nonzero required_generation")
+		}
 	case WaitUnchanged:
-		if turn || gate || gen || anyProj {
+		if turn || gate || gen || reqGen || anyProj {
 			return fail("unchanged carries no discriminant")
 		}
 	default:
