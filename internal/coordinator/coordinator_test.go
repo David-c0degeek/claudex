@@ -299,8 +299,8 @@ func TestE2ENonGatedChain(t *testing.T) {
 	}
 
 	// IMPLEMENT the final step, then AGREE on it. The final checkpoint is accepted and
-	// the run enters ownerless TESTS (the coordinator-authored TESTS outcome that
-	// leaves TESTS is not wired until 4d).
+	// the run enters ownerless TESTS; this build does not yet author the coordinator
+	// TESTS outcome that would leave TESTS.
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
 	final := checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)

@@ -10,10 +10,10 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// --- pure 4b-1 authority helpers ---
+// --- pure ownerless/threshold helpers ---
 
 func TestCurrentPairGeneration(t *testing.T) {
-	sess := "sess-" + fmt.Sprintf("%032x", 7)
+	sess := fmt.Sprintf("sess-%032x", 7)
 	reg := state.Registry{
 		RunID: "run-a",
 		Pair:  &state.RoleSlot{Agent: state.AgentCodex, CurrentSessionID: sess, Sessions: []state.SessionRecord{{SessionID: sess, Generation: 3, IssuedRegistryRevision: 1}}},
@@ -28,47 +28,59 @@ func TestCurrentPairGeneration(t *testing.T) {
 
 func TestCheckEnterVerifyThreshold(t *testing.T) {
 	req := func(g uint64) *state.VerifyRequirement { return &state.VerifyRequirement{RequiredGeneration: g} }
+	ownerless := func(v *state.VerifyRequirement) *state.RunState {
+		return &state.RunState{Phase: state.PhaseVerify, Verify: v}
+	}
 	fromTests := state.RunState{Phase: state.PhaseTests}
 
 	// Enters ownerless VERIFY with the exact threshold (pair gen 3 -> required 4).
-	if err := checkEnterVerifyThreshold(fromTests, &state.RunState{Phase: state.PhaseVerify, Verify: req(4)}, 3); err != nil {
+	if err := checkEnterVerifyThreshold(fromTests, ownerless(req(4)), 3); err != nil {
 		t.Fatalf("exact threshold: %v", err)
 	}
-	// A wrong threshold is rejected.
-	if err := checkEnterVerifyThreshold(fromTests, &state.RunState{Phase: state.PhaseVerify, Verify: req(5)}, 3); !errors.Is(err, ErrTransitionInvalid) {
-		t.Fatalf("wrong threshold: %v", err)
+	// Rejections on entry: wrong threshold, missing requirement, zero/overflow pair gen.
+	for name, tc := range map[string]struct {
+		next *state.RunState
+		gen  uint64
+	}{
+		"wrong threshold": {ownerless(req(5)), 3},
+		"missing":         {ownerless(nil), 3},
+		"zero pair gen":   {ownerless(req(1)), 0},
+		"overflow":        {ownerless(req(1)), ^uint64(0)},
+	} {
+		if err := checkEnterVerifyThreshold(fromTests, tc.next, tc.gen); !errors.Is(err, ErrTransitionInvalid) {
+			t.Fatalf("%s: err = %v, want ErrTransitionInvalid", name, err)
+		}
 	}
-	// A missing requirement is rejected.
-	if err := checkEnterVerifyThreshold(fromTests, &state.RunState{Phase: state.PhaseVerify}, 3); !errors.Is(err, ErrTransitionInvalid) {
-		t.Fatalf("missing requirement: %v", err)
+	// Entering VERIFY WITH an assignment forges past the mandatory ownerless wait.
+	assigned := &state.RunState{Phase: state.PhaseVerify, Assignment: &state.Ref{ID: "x"}, Verify: req(4)}
+	if err := checkEnterVerifyThreshold(fromTests, assigned, 3); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("assigned entry should be rejected: %v", err)
 	}
-	// An overflowing pair generation is rejected.
-	if err := checkEnterVerifyThreshold(fromTests, &state.RunState{Phase: state.PhaseVerify, Verify: req(1)}, ^uint64(0)); !errors.Is(err, ErrTransitionInvalid) {
-		t.Fatalf("overflow: %v", err)
+	// Same-phase ownerless->assigned (a replacement issuing the verifier) is allowed.
+	if err := checkEnterVerifyThreshold(state.RunState{Phase: state.PhaseVerify}, assigned, 3); err != nil {
+		t.Fatalf("replacement issuance should be allowed: %v", err)
 	}
-	// NOT entering VERIFY (already there) is a no-op — replacement's later same-phase
-	// issuance is not this check's concern.
-	if err := checkEnterVerifyThreshold(state.RunState{Phase: state.PhaseVerify}, &state.RunState{Phase: state.PhaseVerify, Verify: req(5)}, 3); err != nil {
-		t.Fatalf("same-phase should be a no-op: %v", err)
+	// Same-phase active->ownerless (clearing the assignment) would strand the run.
+	activeOld := state.RunState{Phase: state.PhaseVerify, Assignment: &state.Ref{ID: "x"}}
+	if err := checkEnterVerifyThreshold(activeOld, ownerless(req(4)), 3); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("clearing an active VERIFY should be rejected: %v", err)
 	}
-	// An assignment present means an issued verifier, not a fresh entry — no-op.
-	if err := checkEnterVerifyThreshold(fromTests, &state.RunState{Phase: state.PhaseVerify, Assignment: &state.Ref{ID: "x"}, Verify: req(5)}, 3); err != nil {
-		t.Fatalf("with an assignment should be a no-op: %v", err)
+	// A verifier outcome that leaves VERIFY is not this check's concern.
+	if err := checkEnterVerifyThreshold(activeOld, &state.RunState{Phase: state.PhaseDone}, 3); err != nil {
+		t.Fatalf("leaving VERIFY should be a no-op: %v", err)
 	}
 }
 
 func TestRequireLiveOwnerOwnerlessVerify(t *testing.T) {
-	// Ownerless VERIFY: running, no assignment, a requirement present.
 	if err := requireLiveOwner(&state.RunState{Phase: state.PhaseVerify, Lifecycle: state.LifecycleRunning, Verify: &state.VerifyRequirement{RequiredGeneration: 2}}, "t", 5); err != nil {
 		t.Fatalf("ownerless VERIFY: %v", err)
 	}
-	// Ownerless VERIFY without a requirement is invalid.
 	if err := requireLiveOwner(&state.RunState{Phase: state.PhaseVerify, Lifecycle: state.LifecycleRunning}, "t", 5); !errors.Is(err, ErrTransitionInvalid) {
 		t.Fatalf("ownerless VERIFY without a requirement: %v", err)
 	}
 }
 
-// --- the active-VERIFY fresh-generation submit authorization ---
+// --- fixtures + fake Prepares ---
 
 func pairSessGen(i uint64) string { return fmt.Sprintf("sess-%032x", 0x100+i) }
 
@@ -87,9 +99,9 @@ func registryPairGen(t *testing.T, store *state.Store, gen uint64) string {
 	}
 	rev := r.Revision
 	for i := uint64(1); i <= gen; i++ {
-		gen := i
+		gi := i
 		r, err = reg.Mutate(rev, func(g uint64, n *state.Registry) error {
-			s := state.SessionRecord{SessionID: pairSessGen(gen), Generation: gen, IssuedRegistryRevision: g}
+			s := state.SessionRecord{SessionID: pairSessGen(gi), Generation: gi, IssuedRegistryRevision: g}
 			if n.Pair == nil {
 				n.Pair = &state.RoleSlot{Agent: state.AgentCodex, CurrentSessionID: s.SessionID, Sessions: []state.SessionRecord{s}}
 			} else {
@@ -106,9 +118,7 @@ func registryPairGen(t *testing.T, store *state.Store, gen uint64) string {
 	return pairSessGen(gen)
 }
 
-// runAtActiveVerify drives a one-step agreed plan to an active VERIFY (a verifier turn
-// issued, the requirement retained) and returns the store and the VERIFY revision.
-func runAtActiveVerify(t *testing.T, requiredGen uint64) (*state.Store, uint64) {
+func newStoreAt(t *testing.T, mut func(gen uint64, n *state.RunState)) (*state.Store, uint64) {
 	t.Helper()
 	dir := t.TempDir()
 	store := state.Open(filepath.Join(dir, "state"), filepath.Join(dir, "run.lock"))
@@ -117,48 +127,139 @@ func runAtActiveVerify(t *testing.T, requiredGen uint64) (*state.Store, uint64) 
 		t.Fatalf("init: %v", err)
 	}
 	implRev := driveAgreedImplement(t, store, r1.Revision)
-	rv, err := store.Mutate(implRev, func(gen uint64, n *state.RunState) error {
-		*n.StepIndex = n.AgreedPlan.Plan.StepCount // the cursor sits at the plan end
+	r2, err := store.Mutate(implRev, func(gen uint64, n *state.RunState) error { mut(gen, n); return nil })
+	if err != nil {
+		t.Fatalf("shape mutation: %v", err)
+	}
+	return store, r2.Revision
+}
+
+// runAtActiveVerify puts the run at an active VERIFY (a verifier turn issued, the
+// requirement retained).
+func runAtActiveVerify(t *testing.T, requiredGen uint64) (*state.Store, uint64) {
+	return newStoreAt(t, func(gen uint64, n *state.RunState) {
+		*n.StepIndex = n.AgreedPlan.Plan.StepCount
 		n.Phase = state.PhaseVerify
 		n.Verify = &state.VerifyRequirement{RequiredGeneration: requiredGen}
 		n.Assignment = &state.Ref{ID: "verify-turn", IssuedRevision: gen}
-		return nil
 	})
-	if err != nil {
-		t.Fatalf("to active VERIFY: %v", err)
-	}
-	return store, rv.Revision
+}
+
+// runAtFixReturningVerify puts the run at a FIX whose return target is VERIFY.
+func runAtFixReturningVerify(t *testing.T) (*state.Store, uint64) {
+	return newStoreAt(t, func(gen uint64, n *state.RunState) {
+		*n.StepIndex = n.AgreedPlan.Plan.StepCount
+		n.Phase = state.PhaseFix
+		n.FixReturn = state.PhaseVerify
+		n.Assignment = &state.Ref{ID: "fix-turn", IssuedRevision: gen}
+	})
 }
 
 func verificationRaw(turnID string, rev uint64) []byte {
 	return []byte(fmt.Sprintf(`{"protocol_version":1,"message_type":"verification","turn_id":%q,"state_revision":%d,"human_context":null,"requires_human_decision":false,"decision_question":null,"verdict":"pass","criteria":[],"scope_expansion":[],"tests_meaningful":true,"unsupported_claims":[],"notes":"n"}`, turnID, rev))
 }
 
-// The incumbent pair generation is a fresh-session rejection before schema/Prepare/sink;
-// a generation at or above the retained threshold passes the fresh-session gate.
+// capturedPrep records what it received and returns a fixed transition.
+type capturedPrep struct {
+	called  bool
+	pairGen uint64
+	turn    string
+	gate    string
+	apply   func(gen uint64, next *state.RunState) error
+}
+
+func (c *capturedPrep) prep() Prepare {
+	return func(_ state.RunState, prepared PreparedSubmit) (PreparedTransition, error) {
+		c.called = true
+		c.pairGen = prepared.CurrentPairGeneration
+		return NewPreparedTransition(c.turn, c.gate, c.apply), nil
+	}
+}
+
+// verifyToDone is a valid VERIFY -> DONE transition.
+func verifyToDone(_ uint64, next *state.RunState) error {
+	next.Assignment = nil
+	next.Phase = state.PhaseDone
+	next.Lifecycle = state.LifecycleCompleted
+	next.Verify = nil
+	return nil
+}
+
+// The incumbent pair generation is rejected before Prepare/sink; a qualifying
+// generation reaches Prepare with the locked pair generation and commits.
 func TestVerifyFreshGenerationAuth(t *testing.T) {
 	const required = 3
-	for _, tc := range []struct {
-		name    string
-		pairGen uint64
-		fresh   bool
-	}{
-		{"required-1 (incumbent)", required - 1, true},
-		{"exactly required", required, false},
-		{"above required", required + 1, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+
+	t.Run("incumbent rejected before Prepare and sink", func(t *testing.T) {
+		store, rev := runAtActiveVerify(t, required)
+		registryPairGen(t, store, required-1)
+		cp := &capturedPrep{apply: verifyToDone}
+		sink := newMemSink()
+		_, err := Submit(context.Background(), submitDeps(store, sink, cp.prep()), pairSessGen(required-1), verificationRaw("verify-turn", rev))
+		if !errors.Is(err, ErrFreshSessionRequired) {
+			t.Fatalf("err = %v, want ErrFreshSessionRequired", err)
+		}
+		if cp.called {
+			t.Fatal("Prepare was called for an incumbent submit")
+		}
+		if len(sink.m) != 0 {
+			t.Fatal("the sink was touched for an incumbent submit")
+		}
+	})
+
+	for _, gen := range []uint64{required, required + 1} {
+		t.Run(fmt.Sprintf("generation %d reaches Prepare with the locked fact", gen), func(t *testing.T) {
 			store, rev := runAtActiveVerify(t, required)
-			pairSession := registryPairGen(t, store, tc.pairGen)
-			adv := &advancer{}
-			_, err := Submit(context.Background(), submitDeps(store, newMemSink(), adv.prep()), pairSession, verificationRaw("verify-turn", rev))
-			if tc.fresh {
-				if !errors.Is(err, ErrFreshSessionRequired) {
-					t.Fatalf("incumbent err = %v, want ErrFreshSessionRequired", err)
-				}
-			} else if errors.Is(err, ErrFreshSessionRequired) {
-				t.Fatalf("a qualifying generation must pass the fresh-session gate, got %v", err)
+			sess := registryPairGen(t, store, gen)
+			cp := &capturedPrep{apply: verifyToDone}
+			res, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), sess, verificationRaw("verify-turn", rev))
+			if err != nil {
+				t.Fatalf("qualifying submit: %v", err)
+			}
+			if !cp.called {
+				t.Fatal("Prepare was not reached")
+			}
+			if cp.pairGen != gen {
+				t.Fatalf("PreparedSubmit.CurrentPairGeneration = %d, want the locked %d", cp.pairGen, gen)
+			}
+			if res.Receipt.TurnID != "verify-turn" {
+				t.Fatalf("receipt = %+v", res.Receipt)
 			}
 		})
 	}
+}
+
+// A forged Prepare cannot enter VERIFY with an assignment (bypassing the ownerless
+// fresh-session wait), nor clear an active VERIFY back to the ownerless wait.
+func TestVerifyForgedTransitionsRejected(t *testing.T) {
+	t.Run("entering VERIFY with an assignment", func(t *testing.T) {
+		store, rev := runAtFixReturningVerify(t)
+		registryPairGen(t, store, 2)
+		cp := &capturedPrep{turn: "forged-verify", apply: func(gen uint64, next *state.RunState) error {
+			*next.StepIndex = next.AgreedPlan.Plan.StepCount
+			next.Phase = state.PhaseVerify
+			next.FixReturn = ""
+			next.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
+			next.Assignment = &state.Ref{ID: "forged-verify", IssuedRevision: gen}
+			return nil
+		}}
+		_, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), leadSess, report("fix-turn", rev, "fixed"))
+		if !errors.Is(err, ErrTransitionInvalid) {
+			t.Fatalf("assigned entry err = %v, want ErrTransitionInvalid", err)
+		}
+	})
+
+	t.Run("clearing an active VERIFY to ownerless", func(t *testing.T) {
+		const required = 3
+		store, rev := runAtActiveVerify(t, required)
+		sess := registryPairGen(t, store, required)
+		cp := &capturedPrep{apply: func(_ uint64, next *state.RunState) error {
+			next.Assignment = nil // strand the run back at the ownerless wait
+			return nil
+		}}
+		_, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), sess, verificationRaw("verify-turn", rev))
+		if !errors.Is(err, ErrTransitionInvalid) {
+			t.Fatalf("strand err = %v, want ErrTransitionInvalid", err)
+		}
+	})
 }

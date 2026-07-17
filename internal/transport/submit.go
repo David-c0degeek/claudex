@@ -553,19 +553,34 @@ func currentPairGeneration(reg state.Registry) (uint64, error) {
 	return r.CurrentGeneration, nil
 }
 
-// checkEnterVerifyThreshold enforces the cross-store coupling exactly when a transition
-// ENTERS ownerless VERIFY (old phase != VERIFY, next VERIFY, no assignment) — not a
-// replacement's later same-phase verifier issuance. The requirement must be present and
-// exactly one generation past the locked current pair generation.
+// checkEnterVerifyThreshold enforces the cross-store coupling RunState alone cannot.
+// A transition that ENTERS VERIFY (old phase != VERIFY) MUST land ownerless (no
+// assignment) with the requirement exactly one generation past a nonzero,
+// non-overflowing locked pair generation — a forged Prepare cannot skip the mandatory
+// fresh-session wait by issuing a verifier assignment on entry. Within VERIFY, only a
+// replacement's ownerless->assigned issuance is legitimate; an active VERIFY that a
+// submit clears back to the ownerless wait would strand the run at a threshold the
+// incumbent already meets, so it is rejected.
 func checkEnterVerifyThreshold(old state.RunState, next *state.RunState, curPairGen uint64) error {
-	if old.Phase == state.PhaseVerify || next.Phase != state.PhaseVerify || next.Assignment != nil {
+	if next.Phase != state.PhaseVerify {
 		return nil
 	}
-	if curPairGen == ^uint64(0) {
-		return fmt.Errorf("%w: the pair generation overflows the verify threshold", ErrTransitionInvalid)
+	if old.Phase != state.PhaseVerify {
+		if next.Assignment != nil {
+			return fmt.Errorf("%w: entering VERIFY must be ownerless (no assignment)", ErrTransitionInvalid)
+		}
+		if curPairGen == 0 || curPairGen == ^uint64(0) {
+			return fmt.Errorf("%w: the pair generation is missing or overflows the verify threshold", ErrTransitionInvalid)
+		}
+		if next.Verify == nil || next.Verify.RequiredGeneration != curPairGen+1 {
+			return fmt.Errorf("%w: entering ownerless VERIFY requires the fresh-session threshold", ErrTransitionInvalid)
+		}
+		return nil
 	}
-	if next.Verify == nil || next.Verify.RequiredGeneration != curPairGen+1 {
-		return fmt.Errorf("%w: entering ownerless VERIFY requires the fresh-session threshold", ErrTransitionInvalid)
+	// Same-phase VERIFY: an active verifier must not be cleared back to the ownerless
+	// fresh-session wait.
+	if old.Assignment != nil && next.Assignment == nil {
+		return fmt.Errorf("%w: an active VERIFY must not return to the ownerless fresh-session wait", ErrTransitionInvalid)
 	}
 	return nil
 }
