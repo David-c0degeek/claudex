@@ -298,11 +298,16 @@ func TestE2ENonGatedChain(t *testing.T) {
 		t.Fatalf("not advanced to step 1: %+v", rs)
 	}
 
-	// IMPLEMENT the final step, then AGREE on it -> the deferred TESTS edge.
+	// IMPLEMENT the final step, then AGREE on it. The engine now routes into ownerless
+	// TESTS, but this coordinator build does not yet wire the TESTS/VERIFY graph, so the
+	// submit is rejected (before any Put) at the ownerless id kind it cannot issue.
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
-	if _, err := rn.Submit(context.Background(), pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)); !errors.Is(err, engine.ErrPhaseUnsupported) {
-		t.Fatalf("final checkpoint should reject with the deferred TESTS edge; err = %v", err)
+	if _, err := rn.Submit(context.Background(), pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)); err == nil {
+		t.Fatal("final checkpoint into the unwired TESTS edge should be rejected")
+	}
+	if cur(t, rn).Phase != state.PhaseCheckpoint {
+		t.Fatal("a rejected final checkpoint must not advance the run")
 	}
 }
 

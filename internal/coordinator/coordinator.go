@@ -257,7 +257,7 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 		if perr != nil {
 			return transport.PreparedTransition{}, perr
 		}
-		dec, perr := engine.Evaluate(snapshot, ev)
+		dec, perr := engine.Evaluate(snapshot, ev, engine.RuntimeFacts{})
 		if perr != nil {
 			return transport.PreparedTransition{}, perr
 		}

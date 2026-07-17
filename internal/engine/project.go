@@ -35,8 +35,59 @@ func Project(cur state.RunState, canonical []byte, facts ProjectionFacts) (Event
 		return projectCheckpoint(canonical, src, rhd)
 	case state.PhaseFix:
 		return Event{Kind: EvFixImplemented, Source: src, Decision: rhd}, nil
+	case state.PhaseVerify:
+		return projectVerified(cur, canonical, src, rhd, facts)
 	}
 	return Event{}, semanticf("no submit is projected for phase %s", cur.Phase)
+}
+
+// projectVerified validates a verification artifact against the frozen task contract:
+// its criteria must cover the acceptance criteria exactly once in canonical order, and
+// (unless a human decision is requested) the verdict must be consistent with its
+// findings. Blockers are any unmet criterion, non-meaningful tests, unsupported
+// claims, or any scope expansion (D020).
+func projectVerified(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
+	var a struct {
+		Verdict  string `json:"verdict"`
+		Criteria []struct {
+			Criterion string `json:"criterion"`
+			Met       bool   `json:"met"`
+		} `json:"criteria"`
+		ScopeExpansion    []string `json:"scope_expansion"`
+		TestsMeaningful   bool     `json:"tests_meaningful"`
+		UnsupportedClaims []string `json:"unsupported_claims"`
+	}
+	if err := json.Unmarshal(canonical, &a); err != nil {
+		return Event{}, semanticf("undecodable verification artifact")
+	}
+	// The frozen task facts must be the run's own snapshot.
+	if facts.Task.Digest != cur.TaskSnapshot.Digest {
+		return Event{}, semanticf("the supplied task facts do not match the run's task snapshot")
+	}
+	// The criteria must cover the acceptance criteria exactly once, in canonical order
+	// (value-free index diagnostics).
+	if len(a.Criteria) != len(facts.Task.AcceptanceCriteria) {
+		return Event{}, semanticf("verification covers %d criteria; the task contract has %d", len(a.Criteria), len(facts.Task.AcceptanceCriteria))
+	}
+	blockers := false
+	for i := range facts.Task.AcceptanceCriteria {
+		if a.Criteria[i].Criterion != facts.Task.AcceptanceCriteria[i] {
+			return Event{}, semanticf("verification criterion %d does not match the frozen acceptance criterion in order", i)
+		}
+		if !a.Criteria[i].Met {
+			blockers = true
+		}
+	}
+	if !a.TestsMeaningful || len(a.UnsupportedClaims) > 0 || len(a.ScopeExpansion) > 0 {
+		blockers = true
+	}
+	pass := a.Verdict == "pass"
+	// A human decision gates first (after schema, identity, and criteria coverage); a
+	// verdict inconsistent with its findings fails closed.
+	if !rhd && pass == blockers {
+		return Event{}, semanticf("the verification verdict is inconsistent with its findings")
+	}
+	return Event{Kind: EvVerified, Source: src, Decision: rhd, Pass: pass}, nil
 }
 
 func hashHex(b []byte) string {

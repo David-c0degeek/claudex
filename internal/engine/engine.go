@@ -56,6 +56,8 @@ var phaseEvent = map[state.Phase]EventKind{
 	state.PhaseImplementStep: EvStepImplemented,
 	state.PhaseCheckpoint:    EvStepCheckpointed,
 	state.PhaseFix:           EvFixImplemented,
+	state.PhaseTests:         EvTestsOutcome,
+	state.PhaseVerify:        EvVerified,
 }
 
 func semanticf(format string, a ...any) error {
@@ -97,6 +99,23 @@ type ProjectionFacts struct {
 	CandidatePlan   CanonicalPlan       // current plan (revise/critique need it)
 	CandidateChecks []MaterializedCheck // current materialized check set
 	CandidateSource state.EventRef      // the accepted event that produced the current plan
+	Task            TaskFacts           // the frozen task contract (VERIFY needs it)
+}
+
+// TaskFacts is the immutable frozen task contract the loader read from the run's
+// TaskSnapshot. Project rechecks its digest against cur.TaskSnapshot.Digest and
+// requires a VERIFY submission's criteria to cover AcceptanceCriteria exactly.
+type TaskFacts struct {
+	Digest             string   // must equal cur.TaskSnapshot.Digest
+	AcceptanceCriteria []string // the frozen acceptance criteria, in canonical task order
+}
+
+// RuntimeFacts are value-only NON-artifact facts the impure caller reads under the run
+// guard and supplies to Evaluate: currently the locked current pair generation, used
+// to compute the ownerless-VERIFY threshold. It is nonzero-but-irrelevant on edges
+// that do not enter VERIFY.
+type RuntimeFacts struct {
+	CurrentPairGeneration uint64
 }
 
 // --- projected events ---
@@ -111,6 +130,8 @@ const (
 	EvStepImplemented
 	EvStepCheckpointed
 	EvFixImplemented
+	EvTestsOutcome // coordinator-authored TESTS pass/fail (ownerless; not an agent turn)
+	EvVerified     // the verifier's verification artifact
 )
 
 // Event is the value-only projection of one accepted submit. Evaluate is a pure
@@ -130,6 +151,9 @@ type Event struct {
 	MissingEvidence bool
 	TestsAdequate   bool // checkpoint only
 	Decision        bool // requires_human_decision
+
+	// Terminal-phase-derived (tests outcome / verification):
+	Pass bool // TESTS outcome pass, or a converged VERIFY pass
 
 	// Critique payload (materialized for every valid critique; used only when routed):
 	ResultingChecks state.CheckSetRef // check ops applied to the current set
@@ -152,6 +176,11 @@ const (
 	RouteToCheckpoint                // advance to CHECKPOINT (from IMPLEMENT or FIX)
 	RouteNextStep                    // advance the cursor to the next step
 	RouteToFix                       // ++StepFixes[cursor], set FixReturn=CHECKPOINT
+	RouteToTests                     // enter TESTS ownerless (final CHECKPOINT converged, or FIX return)
+	RouteToVerify                    // enter VERIFY ownerless with a fresh RequiredGeneration (TESTS pass, or FIX return)
+	RouteTestsFix                    // TESTS fail -> FIX, ++TestFixes, FixReturn=TESTS
+	RouteVerifyFix                   // VERIFY fail -> FIX, ++VerifyFixes, FixReturn=VERIFY, clear Verify
+	RouteToDone                      // VERIFY pass -> DONE (terminal, ownerless)
 )
 
 // GateSpec describes a gate to open.
@@ -159,8 +188,9 @@ type GateSpec struct {
 	Kind        state.PauseKind
 	OriginPhase state.Phase
 	ResumePhase state.Phase
-	FixReturn   state.Phase      // set iff ResumePhase==FIX
-	Budget      state.BudgetKind // set iff Kind==quality_budget
+	FixReturn   state.Phase              // set iff ResumePhase==FIX
+	Budget      state.BudgetKind         // set iff Kind==quality_budget
+	Verify      *state.VerifyRequirement // set iff a human gate resumes to VERIFY (transferred in)
 }
 
 // Decision is the pure, value-only result of Evaluate. It is bound to the source
@@ -176,6 +206,7 @@ type Decision struct {
 	Plan     *state.PlanRef            // RouteDraftAccepted, RouteReviseAccepted
 	Checks   *state.CheckSetRef        // RouteDraftAccepted (empty), RouteToRevise (updated), RoutePromote (freeze)
 	Findings *state.FindingObligations // RouteToRevise
+	Verify   *state.VerifyRequirement  // RouteToVerify (the fresh ownerless-VERIFY threshold)
 }
 
 // Ids are the prepared identities the adapter minted before the CAS loop. Apply
@@ -187,9 +218,10 @@ type Ids struct {
 
 // --- evaluate: the sole phase-edge/convergence table ---
 
-// Evaluate returns the Decision for the current state and a projected event, or
-// ErrPhaseUnsupported for the deferred final edge. Pure; mints nothing.
-func Evaluate(cur state.RunState, ev Event) (Decision, error) {
+// Evaluate returns the Decision for the current state and a projected event. rt
+// supplies the value-only runtime facts (the locked pair generation) an edge that
+// enters ownerless VERIFY needs. Pure; mints nothing.
+func Evaluate(cur state.RunState, ev Event, rt RuntimeFacts) (Decision, error) {
 	if want, ok := phaseEvent[cur.Phase]; !ok || want != ev.Kind {
 		return Decision{}, fmt.Errorf("%w: phase %s, kind %d", ErrPhaseMismatch, cur.Phase, ev.Kind)
 	}
@@ -206,7 +238,11 @@ func Evaluate(cur state.RunState, ev Event) (Decision, error) {
 	case EvStepCheckpointed:
 		return evalStepCheckpointed(cur, ev, base)
 	case EvFixImplemented:
-		return evalFixImplemented(cur, ev, base)
+		return evalFixImplemented(cur, ev, rt, base)
+	case EvTestsOutcome:
+		return evalTestsOutcome(cur, ev, rt, base)
+	case EvVerified:
+		return evalVerified(cur, ev, base)
 	}
 	return Decision{}, fmt.Errorf("engine: unknown event kind %d", ev.Kind)
 }
@@ -216,10 +252,21 @@ func humanGate(base Decision, cur state.RunState, origin state.Phase) Decision {
 	if origin == state.PhaseFix {
 		g.FixReturn = cur.FixReturn
 	}
+	// A human gate raised from a running VERIFY transfers the verify requirement into
+	// the pause (state's context-transfer invariant requires it).
+	if origin == state.PhaseVerify {
+		g.Verify = cur.Verify
+	}
 	base.Next = state.PhaseAwaitGuidance
 	base.Route = RouteGate
 	base.Gate = g
 	return base
+}
+
+// verifyRequirement returns the ownerless-VERIFY threshold: one generation newer than
+// the locked current pair generation.
+func verifyRequirement(rt RuntimeFacts) *state.VerifyRequirement {
+	return &state.VerifyRequirement{RequiredGeneration: rt.CurrentPairGeneration + 1}
 }
 
 func evalPlanDrafted(cur state.RunState, ev Event, base Decision) (Decision, error) {
@@ -321,8 +368,10 @@ func evalStepCheckpointed(cur state.RunState, ev Event, base Decision) (Decision
 	converged := ev.Verdict == "AGREE" && !ev.MissingEvidence && !ev.Actionable && ev.TestsAdequate
 	if converged {
 		if cursor >= stepCount-1 {
-			// The final step converged: the edge into TESTS is deferred.
-			return Decision{}, ErrPhaseUnsupported
+			// The final step converged: enter TESTS ownerless (coordinator-authored).
+			base.Next = state.PhaseTests
+			base.Route = RouteToTests
+			return base, nil
 		}
 		base.Next = state.PhaseImplementStep
 		base.Route = RouteNextStep
@@ -353,17 +402,84 @@ func evalStepCheckpointed(cur state.RunState, ev Event, base Decision) (Decision
 	return base, nil
 }
 
-func evalFixImplemented(cur state.RunState, ev Event, base Decision) (Decision, error) {
+func evalFixImplemented(cur state.RunState, ev Event, rt RuntimeFacts, base Decision) (Decision, error) {
 	if ev.Decision {
 		return humanGate(base, cur, state.PhaseFix), nil
 	}
-	// This subset only supports FIX returning to CHECKPOINT.
-	if cur.FixReturn != state.PhaseCheckpoint {
-		return Decision{}, ErrPhaseUnsupported
+	// A FIX returns to the phase whose review sent it here.
+	switch cur.FixReturn {
+	case state.PhaseCheckpoint:
+		base.Next = state.PhaseCheckpoint
+		base.Route = RouteToCheckpoint
+		return base, nil
+	case state.PhaseTests:
+		base.Next = state.PhaseTests
+		base.Route = RouteToTests
+		return base, nil
+	case state.PhaseVerify:
+		// Re-enter ownerless VERIFY with a FRESH threshold (newer than the verifier
+		// that failed): another qualifying replacement must issue the verifier turn.
+		base.Next = state.PhaseVerify
+		base.Route = RouteToVerify
+		base.Verify = verifyRequirement(rt)
+		return base, nil
 	}
-	base.Next = state.PhaseCheckpoint
-	base.Route = RouteToCheckpoint
-	return base, nil
+	return Decision{}, semanticf("unexpected fix return target %q", cur.FixReturn)
+}
+
+// evalTestsOutcome routes the coordinator-authored TESTS pass/fail. TESTS is
+// ownerless and cannot raise a human decision.
+func evalTestsOutcome(cur state.RunState, ev Event, rt RuntimeFacts, base Decision) (Decision, error) {
+	if ev.Pass {
+		// Enter ownerless VERIFY with the fresh-session threshold.
+		base.Next = state.PhaseVerify
+		base.Route = RouteToVerify
+		base.Verify = verifyRequirement(rt)
+		return base, nil
+	}
+	// Fail: route to the lead's FIX (returning to TESTS) unless the test budget is spent.
+	limit := cur.EffectivePolicy.Budgets.TestRounds
+	switch cmpBudget(cur.Counters.TestFixes, limit) {
+	case budgetOver:
+		return Decision{}, ErrBudgetCorrupt
+	case budgetUnder:
+		base.Next = state.PhaseFix
+		base.Route = RouteTestsFix
+		return base, nil
+	default: // at limit: test-quality gate resuming to FIX.
+		base.Next = state.PhaseAwaitGuidance
+		base.Route = RouteGate
+		base.Gate = &GateSpec{Kind: state.PauseQualityBudget, OriginPhase: state.PhaseTests, ResumePhase: state.PhaseFix, FixReturn: state.PhaseTests, Budget: state.BudgetTest}
+		return base, nil
+	}
+}
+
+// evalVerified routes the verifier's verification (Project already enforced exact
+// criteria coverage and the pass/blocker consistency). Human decision has priority.
+func evalVerified(cur state.RunState, ev Event, base Decision) (Decision, error) {
+	if ev.Decision {
+		return humanGate(base, cur, state.PhaseVerify), nil
+	}
+	if ev.Pass {
+		base.Next = state.PhaseDone
+		base.Route = RouteToDone
+		return base, nil
+	}
+	// Fail: route to the lead's FIX (returning to VERIFY) unless the verify budget is spent.
+	limit := cur.EffectivePolicy.Budgets.VerifyRounds
+	switch cmpBudget(cur.Counters.VerifyFixes, limit) {
+	case budgetOver:
+		return Decision{}, ErrBudgetCorrupt
+	case budgetUnder:
+		base.Next = state.PhaseFix
+		base.Route = RouteVerifyFix
+		return base, nil
+	default: // at limit: verify-quality gate resuming to FIX.
+		base.Next = state.PhaseAwaitGuidance
+		base.Route = RouteGate
+		base.Gate = &GateSpec{Kind: state.PauseQualityBudget, OriginPhase: state.PhaseVerify, ResumePhase: state.PhaseFix, FixReturn: state.PhaseVerify, Budget: state.BudgetVerify}
+		return base, nil
+	}
 }
 
 type budgetCmp int
@@ -449,6 +565,27 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		next.Counters.StepFixes[*next.StepIndex]++
 		next.FixReturn = state.PhaseCheckpoint
 		issue(next, ids, gen)
+	case RouteToTests:
+		// Ownerless: from the final CHECKPOINT (cursor at last step) or a FIX return.
+		next.FixReturn = ""
+		*next.StepIndex = next.AgreedPlan.Plan.StepCount // the cursor sits at the plan end
+	case RouteToVerify:
+		next.FixReturn = ""
+		*next.StepIndex = next.AgreedPlan.Plan.StepCount
+		v := *dec.Verify
+		next.Verify = &v
+	case RouteTestsFix:
+		next.Counters.TestFixes++
+		next.FixReturn = state.PhaseTests
+		issue(next, ids, gen)
+	case RouteVerifyFix:
+		next.Counters.VerifyFixes++
+		next.FixReturn = state.PhaseVerify
+		next.Verify = nil // leaving VERIFY for FIX clears the requirement
+		issue(next, ids, gen)
+	case RouteToDone:
+		next.Verify = nil
+		next.Lifecycle = state.LifecycleCompleted // terminal: no assignment, no gate
 	}
 	return nil
 }
@@ -456,12 +593,18 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 // validateApply proves the decision is well-formed and bound to this exact turn,
 // reading only — it performs no mutation, so a failure leaves next untouched.
 func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *state.RunState) error {
-	// Source binding — and the independent submitted event must be well-formed on its
-	// own (a canonical turn id and a sha256 digest), not merely equal to dec.Source.
 	if submitted != dec.Source {
 		return fmt.Errorf("%w: submitted event does not match the decision source", ErrBadDecision)
 	}
-	if !state.IsRunID(submitted.TurnID) || !state.IsHex64(submitted.Digest) {
+	// Source well-formedness by authoring mode. A coordinator-authored TESTS outcome
+	// carries an ownerless evidence digest (empty turn id); every other edge is an
+	// agent submit whose source is a canonical turn.
+	ownerless := isOwnerlessAuthoringPhase(dec.FromPhase)
+	if ownerless {
+		if submitted.TurnID != "" || !state.IsHex64(submitted.Digest) {
+			return fmt.Errorf("%w: a TESTS outcome source is an empty-turn evidence digest", ErrBadDecision)
+		}
+	} else if !state.IsRunID(submitted.TurnID) || !state.IsHex64(submitted.Digest) {
 		return fmt.Errorf("%w: the submitted event is not well-formed", ErrBadDecision)
 	}
 	if next.Revision != gen {
@@ -470,48 +613,64 @@ func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, 
 	if next.Phase != dec.FromPhase {
 		return fmt.Errorf("%w: from-phase %s != current phase %s", ErrBadDecision, dec.FromPhase, next.Phase)
 	}
-	// The pre-state must be a live run with the bound assignment outstanding.
+	// The pre-state must be a live run.
 	if next.Lifecycle != state.LifecycleRunning || next.Pause != nil || next.Gate != nil || next.Recovery != nil {
 		return fmt.Errorf("%w: the run is not live", ErrBadDecision)
 	}
-	if next.Assignment == nil || next.Assignment.ID != submitted.TurnID {
-		return fmt.Errorf("%w: the submitted turn is not the outstanding assignment", ErrBadDecision)
+	// Owner precondition: an ownerless authoring phase has NO outstanding assignment;
+	// every agent submit consumes the bound assignment at its issued revision.
+	if ownerless {
+		if next.Assignment != nil {
+			return fmt.Errorf("%w: an ownerless TESTS outcome has no outstanding assignment", ErrBadDecision)
+		}
+	} else {
+		if next.Assignment == nil || next.Assignment.ID != submitted.TurnID {
+			return fmt.Errorf("%w: the submitted turn is not the outstanding assignment", ErrBadDecision)
+		}
+		if next.Assignment.IssuedRevision != dec.ExpectedStateRevision {
+			return fmt.Errorf("%w: the assignment was not issued at the expected revision %d", ErrBadDecision, dec.ExpectedStateRevision)
+		}
 	}
-	if next.Assignment.IssuedRevision != dec.ExpectedStateRevision {
-		return fmt.Errorf("%w: the assignment was not issued at the expected revision %d", ErrBadDecision, dec.ExpectedStateRevision)
+	// Route/edge + id kind come from the ONE route table (RequiredID also rejects an
+	// illegal edge and a gate-presence mismatch).
+	idKind, err := RequiredID(dec)
+	if err != nil {
+		return err
 	}
-	// Route/edge table.
-	if !routeAllowed(dec.Route, dec.FromPhase, dec.Next) {
-		return fmt.Errorf("%w: route %d is not legal for %s->%s", ErrBadDecision, dec.Route, dec.FromPhase, dec.Next)
-	}
-	// Gate is the sole paused discriminant.
-	if (dec.Route == RouteGate) != (dec.Gate != nil) {
-		return fmt.Errorf("%w: gate presence must match the gate route", ErrBadDecision)
-	}
-	// Id exactness: canonical (state's persisted grammar), exactly the id this edge
-	// issues, and a new assignment that is neither the consumed nor an accepted turn.
-	if dec.Gate != nil {
+	switch idKind {
+	case IDGate:
 		if !state.IsRunID(ids.GateID) || ids.AssignmentTurnID != "" {
 			return fmt.Errorf("%w: a gate requires exactly a canonical gate id", ErrBadDecision)
 		}
-	} else {
+	case IDAssignment:
 		if !state.IsRunID(ids.AssignmentTurnID) || ids.GateID != "" {
 			return fmt.Errorf("%w: a running edge requires exactly a canonical assignment id", ErrBadDecision)
 		}
-		if ids.AssignmentTurnID == submitted.TurnID {
+		if !ownerless && ids.AssignmentTurnID == submitted.TurnID {
 			return fmt.Errorf("%w: the next assignment reuses the consumed turn", ErrBadDecision)
 		}
 		if _, ok := next.AcceptedTurns[ids.AssignmentTurnID]; ok {
 			return fmt.Errorf("%w: the next assignment reuses an accepted turn", ErrBadDecision)
 		}
+	case IDNone:
+		if ids.AssignmentTurnID != "" || ids.GateID != "" {
+			return fmt.Errorf("%w: an ownerless edge issues no identity", ErrBadDecision)
+		}
+	default:
+		return fmt.Errorf("%w: unknown id kind %d", ErrBadDecision, idKind)
 	}
 	return validateRoute(dec, submitted, next)
 }
 
+// isOwnerlessAuthoringPhase reports whether the phase's transition is coordinator-
+// authored with no outstanding assignment (only TESTS; the verifier submit in VERIFY
+// is a normal agent turn).
+func isOwnerlessAuthoringPhase(p state.Phase) bool { return p == state.PhaseTests }
+
 func badDecision(msg string) error { return fmt.Errorf("%w: %s", ErrBadDecision, msg) }
 
 func anyPayload(dec Decision) bool {
-	return dec.Plan != nil || dec.Checks != nil || dec.Findings != nil
+	return dec.Plan != nil || dec.Checks != nil || dec.Findings != nil || dec.Verify != nil
 }
 
 // validateRoute enforces the exact route→edge table, the running-edge budget
@@ -581,8 +740,59 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 			return badDecision("to-fix requires a valid step cursor")
 		}
 		return runningBudget(next.Counters.StepFixes[*next.StepIndex], b.CheckpointRounds)
+	case RouteToTests:
+		if anyPayload(dec) {
+			return badDecision("to-tests carries no payload")
+		}
+		if err := checkAtPlanEnd(next); err != nil {
+			return err
+		}
+		if dec.FromPhase == state.PhaseFix && next.FixReturn != state.PhaseTests {
+			return badDecision("a FIX to TESTS requires a TESTS fix return")
+		}
+	case RouteToVerify:
+		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil || dec.Verify == nil || dec.Verify.RequiredGeneration == 0 {
+			return badDecision("to-verify requires exactly a positive verify requirement")
+		}
+		if err := checkAtPlanEnd(next); err != nil {
+			return err
+		}
+		if dec.FromPhase == state.PhaseFix && next.FixReturn != state.PhaseVerify {
+			return badDecision("a FIX to VERIFY requires a VERIFY fix return")
+		}
+	case RouteToDone:
+		if anyPayload(dec) {
+			return badDecision("to-done carries no payload")
+		}
+		if err := checkAtPlanEnd(next); err != nil {
+			return err
+		}
+	case RouteTestsFix:
+		if anyPayload(dec) {
+			return badDecision("tests-fix carries no payload")
+		}
+		return runningBudget(next.Counters.TestFixes, b.TestRounds)
+	case RouteVerifyFix:
+		if anyPayload(dec) {
+			return badDecision("verify-fix carries no payload")
+		}
+		return runningBudget(next.Counters.VerifyFixes, b.VerifyRounds)
 	default:
 		return badDecision("unknown route")
+	}
+	return nil
+}
+
+// checkAtPlanEnd requires an agreed plan with the cursor at the plan end (or, for the
+// final CHECKPOINT that Apply advances into TESTS, one before it). The state validator
+// enforces the exact plan-end position of the resulting TESTS/VERIFY/DONE state.
+func checkAtPlanEnd(next *state.RunState) error {
+	if next.AgreedPlan == nil || next.StepIndex == nil {
+		return badDecision("the terminal graph requires an agreed plan and cursor")
+	}
+	sc := next.AgreedPlan.Plan.StepCount
+	if *next.StepIndex < sc-1 || *next.StepIndex > sc {
+		return badDecision("the terminal graph requires the cursor at (or one before) the plan end")
 	}
 	return nil
 }
@@ -607,13 +817,25 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 			return badDecision("a human gate resumes to its submit origin")
 		}
 		if g.OriginPhase == state.PhaseFix {
-			if g.FixReturn != state.PhaseCheckpoint || next.FixReturn != state.PhaseCheckpoint {
-				return badDecision("a FIX human gate preserves the CHECKPOINT return")
+			if g.FixReturn != next.FixReturn || !isFixReturnPhase(next.FixReturn) {
+				return badDecision("a FIX human gate preserves the current fix return")
 			}
 		} else if g.FixReturn != "" {
 			return badDecision("only a FIX human gate carries a fix return")
 		}
+		// A VERIFY human gate transfers the current verify requirement into the pause;
+		// every other human gate carries none.
+		if g.OriginPhase == state.PhaseVerify {
+			if next.Verify == nil || g.Verify == nil || *g.Verify != *next.Verify {
+				return badDecision("a VERIFY human gate transfers the current verify requirement")
+			}
+		} else if g.Verify != nil {
+			return badDecision("only a VERIFY human gate carries a verify requirement")
+		}
 	case state.PauseQualityBudget:
+		if g.Verify != nil {
+			return badDecision("a quality gate carries no verify requirement")
+		}
 		switch g.Budget {
 		case state.BudgetPlan:
 			if g.OriginPhase != state.PhasePlanCritique || g.ResumePhase != state.PhasePlanRevise || g.FixReturn != "" {
@@ -640,6 +862,22 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 				return badDecision("a checkpoint quality gate needs a valid cursor")
 			}
 			return gateBudget(next.Counters.StepFixes[*next.StepIndex], b.CheckpointRounds)
+		case state.BudgetTest:
+			if g.OriginPhase != state.PhaseTests || g.ResumePhase != state.PhaseFix || g.FixReturn != state.PhaseTests {
+				return badDecision("a test quality gate is TESTS->FIX")
+			}
+			if dec.Checks != nil || dec.Findings != nil {
+				return badDecision("a test quality gate carries no checks/findings")
+			}
+			return gateBudget(next.Counters.TestFixes, b.TestRounds)
+		case state.BudgetVerify:
+			if g.OriginPhase != state.PhaseVerify || g.ResumePhase != state.PhaseFix || g.FixReturn != state.PhaseVerify {
+				return badDecision("a verify quality gate is VERIFY->FIX")
+			}
+			if dec.Checks != nil || dec.Findings != nil {
+				return badDecision("a verify quality gate carries no checks/findings")
+			}
+			return gateBudget(next.Counters.VerifyFixes, b.VerifyRounds)
 		default:
 			return badDecision("unknown budget kind")
 		}
@@ -684,7 +922,11 @@ type routeSpec struct {
 }
 
 var routeTable = map[Route]routeSpec{
-	RouteGate: {IDGate, func(from, next state.Phase) bool { return isSubmitPhase(from) && next == state.PhaseAwaitGuidance }},
+	// A gate may be raised from an agent submit phase OR the coordinator-authored TESTS
+	// phase (the test-quality gate).
+	RouteGate: {IDGate, func(from, next state.Phase) bool {
+		return (isSubmitPhase(from) || from == state.PhaseTests) && next == state.PhaseAwaitGuidance
+	}},
 	RouteDraftAccepted: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanDraft && next == state.PhasePlanCritique
 	}},
@@ -708,6 +950,20 @@ var routeTable = map[Route]routeSpec{
 		return from == state.PhaseCheckpoint && next == state.PhaseImplementStep
 	}},
 	RouteToFix: {IDAssignment, func(from, next state.Phase) bool { return from == state.PhaseCheckpoint && next == state.PhaseFix }},
+	// Ownerless terminal-graph edges issue no identity (IDNone).
+	RouteToTests: {IDNone, func(from, next state.Phase) bool {
+		return (from == state.PhaseCheckpoint || from == state.PhaseFix) && next == state.PhaseTests
+	}},
+	RouteToVerify: {IDNone, func(from, next state.Phase) bool {
+		return (from == state.PhaseTests || from == state.PhaseFix) && next == state.PhaseVerify
+	}},
+	RouteToDone: {IDNone, func(from, next state.Phase) bool { return from == state.PhaseVerify && next == state.PhaseDone }},
+	RouteTestsFix: {IDAssignment, func(from, next state.Phase) bool {
+		return from == state.PhaseTests && next == state.PhaseFix
+	}},
+	RouteVerifyFix: {IDAssignment, func(from, next state.Phase) bool {
+		return from == state.PhaseVerify && next == state.PhaseFix
+	}},
 }
 
 func routeAllowed(r Route, from, next state.Phase) bool {
@@ -716,14 +972,21 @@ func routeAllowed(r Route, from, next state.Phase) bool {
 }
 
 // isSubmitPhase reports whether a phase may raise a human-decision gate (every
-// agent submit phase; TESTS is coordinator-authored and cannot).
+// agent submit phase, including VERIFY's verifier turn; TESTS is coordinator-authored
+// and cannot). It mirrors state.isHumanOriginPhase.
 func isSubmitPhase(p state.Phase) bool {
 	switch p {
 	case state.PhasePlanDraft, state.PhasePlanCritique, state.PhasePlanRevise,
-		state.PhaseImplementStep, state.PhaseCheckpoint, state.PhaseFix:
+		state.PhaseImplementStep, state.PhaseCheckpoint, state.PhaseFix, state.PhaseVerify:
 		return true
 	}
 	return false
+}
+
+// isFixReturnPhase reports whether a phase is a legal FIX return target (mirrors
+// state.isFixReturnPhase, which is unexported).
+func isFixReturnPhase(p state.Phase) bool {
+	return p == state.PhaseCheckpoint || p == state.PhaseTests || p == state.PhaseVerify
 }
 
 func checkPlanRef(p *state.PlanRef, submitted state.EventRef) error {
@@ -825,6 +1088,14 @@ func applyGate(g *GateSpec, source state.EventRef, gateID string, gen uint64, ne
 	if g.Kind == state.PauseQualityBudget {
 		pc.Budget = &state.BudgetPause{Kind: g.Budget}
 	}
+	// A human VERIFY gate moves the verify requirement into the pause; every gate
+	// clears the top-level requirement (a paused run has none). A quality gate raised
+	// from VERIFY drops the requirement entirely (a fresh one is created on re-entry).
+	if g.Verify != nil {
+		v := *g.Verify
+		pc.Verify = &v
+	}
+	next.Verify = nil
 	// A human gate raised from FIX moves the return target into the pause.
 	next.FixReturn = ""
 	next.Gate = &state.Ref{ID: gateID, IssuedRevision: gen}

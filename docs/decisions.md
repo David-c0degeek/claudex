@@ -260,3 +260,22 @@ TUIs.
 **Acceptance:** a simulated usage-limit pause records a reset time; a resume
 before the reset is refused/no-op; a resume at or after the reset returns the run
 to the same turn without a gate or human decision.
+
+## D020 — Verification scope expansion is a convergence blocker
+The final VERIFY acceptance check treats `scope_expansion` (work done beyond the
+agreed scope) as a convergence **blocker**, alongside an unmet acceptance
+criterion, non-meaningful tests, and unsupported claims — not as an
+informational field. With no human decision requested: `verdict=fail` plus any
+non-empty `scope_expansion` routes to FIX; `verdict=pass` plus a non-empty
+`scope_expansion` is a contradiction and is rejected as a semantic error. A
+`requires_human_decision` request gates first, after schema, identity, and exact
+acceptance-criteria coverage validation. Verification convergence therefore is:
+the criteria cover the frozen `TaskContract.AcceptanceCriteria` exactly once in
+canonical order; blockers are any unmet criterion, `!tests_meaningful`, non-empty
+`unsupported_claims`, or non-empty `scope_expansion`; then `pass && no blockers`
+reaches DONE, `fail && blockers` routes to FIX (or the verify-quality gate at the
+budget), and `pass && blockers` or `fail && no blockers` fails closed.
+
+**Acceptance:** the pure engine's VERIFY projection rejects partial/reordered
+criteria and a pass verdict that carries any blocker (including a scope
+expansion); a fail verdict with a scope expansion routes to FIX.

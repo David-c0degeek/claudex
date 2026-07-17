@@ -52,7 +52,7 @@ func step(t *testing.T, store *state.Store, facts ProjectionFacts, canonical []b
 	if err != nil {
 		return state.RunState{}, err
 	}
-	dec, err := Evaluate(cur, ev)
+	dec, err := Evaluate(cur, ev, RuntimeFacts{})
 	if err != nil {
 		return state.RunState{}, err
 	}
@@ -348,9 +348,10 @@ func TestDryRunPlanThroughCheckpointFix(t *testing.T) {
 	}
 
 	rs = mustStep(t, store, ProjectionFacts{}, implReport(t, "t-impl2", rs.Revision, false), assign("t-chk3"))
-	// AGREE on the FINAL step -> ErrPhaseUnsupported.
-	if _, err := step(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk3", rs.Revision, "AGREE", false, true, nil, nil), assign("t-x")); err != ErrPhaseUnsupported {
-		t.Fatalf("final checkpoint err = %v, want ErrPhaseUnsupported", err)
+	// AGREE on the FINAL step -> enter ownerless TESTS (coordinator-authored; no id).
+	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk3", rs.Revision, "AGREE", false, true, nil, nil), Ids{})
+	if rs.Phase != state.PhaseTests || rs.Assignment != nil || rs.StepIndex == nil || *rs.StepIndex != rs.AgreedPlan.Plan.StepCount {
+		t.Fatalf("final checkpoint should enter ownerless TESTS: %+v", rs)
 	}
 }
 

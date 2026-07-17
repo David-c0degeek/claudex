@@ -457,6 +457,11 @@ func TestRequiredID(t *testing.T) {
 		{RouteToCheckpoint, state.PhaseImplementStep, state.PhaseCheckpoint, nil, IDAssignment},
 		{RouteNextStep, state.PhaseCheckpoint, state.PhaseImplementStep, nil, IDAssignment},
 		{RouteToFix, state.PhaseCheckpoint, state.PhaseFix, nil, IDAssignment},
+		{RouteToTests, state.PhaseCheckpoint, state.PhaseTests, nil, IDNone},
+		{RouteToVerify, state.PhaseTests, state.PhaseVerify, nil, IDNone},
+		{RouteToDone, state.PhaseVerify, state.PhaseDone, nil, IDNone},
+		{RouteTestsFix, state.PhaseTests, state.PhaseFix, nil, IDAssignment},
+		{RouteVerifyFix, state.PhaseVerify, state.PhaseFix, nil, IDAssignment},
 	}
 	for _, c := range cases {
 		got, err := RequiredID(Decision{Route: c.route, FromPhase: c.from, Next: c.next, Gate: c.gate})
@@ -489,7 +494,7 @@ func TestRequiredIDMatchesEvaluate(t *testing.T) {
 	src := state.EventRef{TurnID: "turn-" + hex.EncodeToString(make([]byte, 16)), Digest: hex.EncodeToString(make([]byte, 32))}
 	base := Event{Kind: EvPlanDrafted, Source: src, Materialized: hex.EncodeToString(make([]byte, 32)), StepCount: 2}
 
-	accept, err := Evaluate(cur, base)
+	accept, err := Evaluate(cur, base, RuntimeFacts{})
 	if err != nil {
 		t.Fatalf("evaluate accept: %v", err)
 	}
@@ -499,7 +504,7 @@ func TestRequiredIDMatchesEvaluate(t *testing.T) {
 
 	gated := base
 	gated.Decision = true
-	dec, err := Evaluate(cur, gated)
+	dec, err := Evaluate(cur, gated, RuntimeFacts{})
 	if err != nil {
 		t.Fatalf("evaluate gate: %v", err)
 	}

@@ -24,9 +24,10 @@ const (
 // RequiredID derives, from the SAME route table Apply's edge guard consumes, which
 // identity the decision issues. It fails closed on a malformed decision — an unknown
 // route, an illegal from->next edge, or a gate-presence that disagrees with the route
-// — before any id is minted, so a fabricated decision cannot request the wrong id. In
-// this subset IDNone is unreachable from a successful Evaluate (every supported
-// non-gate route issues an assignment); a None result is always an error.
+// — before any id is minted, so a fabricated decision cannot request the wrong id.
+// IDNone is a valid result for the ownerless terminal-graph edges (to-tests, to-verify,
+// to-done), which issue no identity; the adapter must supply neither an assignment nor
+// a gate id for them.
 func RequiredID(dec Decision) (IDKind, error) {
 	s, ok := routeTable[dec.Route]
 	if !ok {

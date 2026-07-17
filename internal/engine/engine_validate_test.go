@@ -15,7 +15,7 @@ import (
 // Evaluate rejects an event kind that the current phase does not accept.
 func TestEvaluateWrongKindRejected(t *testing.T) {
 	cur := state.RunState{Phase: state.PhasePlanCritique, Revision: 5, EffectivePolicy: config.DefaultRunPolicy()}
-	if _, err := Evaluate(cur, Event{Kind: EvStepImplemented, Source: src()}); !errors.Is(err, ErrPhaseMismatch) {
+	if _, err := Evaluate(cur, Event{Kind: EvStepImplemented, Source: src()}, RuntimeFacts{}); !errors.Is(err, ErrPhaseMismatch) {
 		t.Fatalf("wrong kind err = %v, want ErrPhaseMismatch", err)
 	}
 }

@@ -27,15 +27,15 @@ func TestEvaluatePlanBudgetBoundary(t *testing.T) {
 	}
 	ev := Event{Kind: EvPlanCritiqued, Source: src(), Verdict: "REVISE", Actionable: true, ResultingChecks: state.CheckSetRef{Keys: []string{}, Digest: hx()}}
 
-	d, err := Evaluate(mk(0), ev) // under the limit -> revise, counter increments in Apply
+	d, err := Evaluate(mk(0), ev, RuntimeFacts{}) // under the limit -> revise, counter increments in Apply
 	if err != nil || d.Route != RouteToRevise || d.Next != state.PhasePlanRevise {
 		t.Fatalf("under: route=%v next=%v err=%v", d.Route, d.Next, err)
 	}
-	d, err = Evaluate(mk(1), ev) // at the limit -> plan quality gate
+	d, err = Evaluate(mk(1), ev, RuntimeFacts{}) // at the limit -> plan quality gate
 	if err != nil || d.Route != RouteGate || d.Gate == nil || d.Gate.Budget != state.BudgetPlan || d.Gate.ResumePhase != state.PhasePlanRevise {
 		t.Fatalf("at limit: route=%v gate=%+v err=%v", d.Route, d.Gate, err)
 	}
-	if _, err := Evaluate(mk(2), ev); !errors.Is(err, ErrBudgetCorrupt) { // above the limit -> fail closed
+	if _, err := Evaluate(mk(2), ev, RuntimeFacts{}); !errors.Is(err, ErrBudgetCorrupt) { // above the limit -> fail closed
 		t.Fatalf("over limit err = %v, want ErrBudgetCorrupt", err)
 	}
 }
@@ -51,15 +51,15 @@ func TestEvaluateCheckpointBudgetBoundary(t *testing.T) {
 	}
 	ev := Event{Kind: EvStepCheckpointed, Source: src(), Verdict: "REVISE", Actionable: true, TestsAdequate: true}
 
-	d, err := Evaluate(mk(1), ev) // under -> FIX
+	d, err := Evaluate(mk(1), ev, RuntimeFacts{}) // under -> FIX
 	if err != nil || d.Route != RouteToFix || d.Next != state.PhaseFix {
 		t.Fatalf("under: route=%v err=%v", d.Route, err)
 	}
-	d, err = Evaluate(mk(2), ev) // at -> checkpoint quality gate, resume FIX
+	d, err = Evaluate(mk(2), ev, RuntimeFacts{}) // at -> checkpoint quality gate, resume FIX
 	if err != nil || d.Route != RouteGate || d.Gate.Budget != state.BudgetCheckpoint || d.Gate.ResumePhase != state.PhaseFix || d.Gate.FixReturn != state.PhaseCheckpoint {
 		t.Fatalf("at limit: gate=%+v err=%v", d.Gate, err)
 	}
-	if _, err := Evaluate(mk(3), ev); !errors.Is(err, ErrBudgetCorrupt) {
+	if _, err := Evaluate(mk(3), ev, RuntimeFacts{}); !errors.Is(err, ErrBudgetCorrupt) {
 		t.Fatalf("over limit err = %v, want ErrBudgetCorrupt", err)
 	}
 }
@@ -74,7 +74,7 @@ func TestEvaluateReviewerRetry(t *testing.T) {
 		{Kind: EvPlanCritiqued, Source: src(), Verdict: "AGREE", MissingEvidence: true},
 		{Kind: EvPlanCritiqued, Source: src(), Verdict: "REVISE", Actionable: false},
 	} {
-		d, err := Evaluate(cur, ev)
+		d, err := Evaluate(cur, ev, RuntimeFacts{})
 		if err != nil || d.Route != RouteRetryReview || d.Next != state.PhasePlanCritique {
 			t.Fatalf("critique retry: route=%v next=%v err=%v", d.Route, d.Next, err)
 		}
@@ -83,7 +83,7 @@ func TestEvaluateReviewerRetry(t *testing.T) {
 	idx := 0
 	cp := state.RunState{Phase: state.PhaseCheckpoint, Revision: 5, EffectivePolicy: config.DefaultRunPolicy(),
 		StepIndex: &idx, AgreedPlan: &state.PlanAgreement{Plan: state.PlanRef{StepCount: 2}}, Counters: state.Counters{StepFixes: []int{0, 0}}}
-	d, err := Evaluate(cp, Event{Kind: EvStepCheckpointed, Source: src(), Verdict: "AGREE", MissingEvidence: true, TestsAdequate: true})
+	d, err := Evaluate(cp, Event{Kind: EvStepCheckpointed, Source: src(), Verdict: "AGREE", MissingEvidence: true, TestsAdequate: true}, RuntimeFacts{})
 	if err != nil || d.Route != RouteRetryReview || d.Next != state.PhaseCheckpoint {
 		t.Fatalf("checkpoint retry: route=%v err=%v", d.Route, err)
 	}
@@ -93,12 +93,12 @@ func TestEvaluateReviewerRetry(t *testing.T) {
 func TestEvaluateConvergenceTargets(t *testing.T) {
 	cur := state.RunState{Phase: state.PhasePlanCritique, Revision: 5, EffectivePolicy: config.DefaultRunPolicy()}
 	converged := Event{Kind: EvPlanCritiqued, Source: src(), Verdict: "AGREE", Actionable: false, ResultingChecks: state.CheckSetRef{Keys: []string{}, Digest: hx()}, TargetsValid: true}
-	if d, err := Evaluate(cur, converged); err != nil || d.Route != RoutePromote {
+	if d, err := Evaluate(cur, converged, RuntimeFacts{}); err != nil || d.Route != RoutePromote {
 		t.Fatalf("converged: route=%v err=%v", d.Route, err)
 	}
 	dangling := converged
 	dangling.TargetsValid = false
-	if _, err := Evaluate(cur, dangling); !errors.Is(err, ErrSemantic) {
+	if _, err := Evaluate(cur, dangling, RuntimeFacts{}); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("dangling target err = %v, want ErrSemantic", err)
 	}
 }
@@ -107,13 +107,13 @@ func TestEvaluateConvergenceTargets(t *testing.T) {
 
 func TestEvaluateHumanGateFirst(t *testing.T) {
 	cur := state.RunState{Phase: state.PhaseImplementStep, Revision: 5, EffectivePolicy: config.DefaultRunPolicy()}
-	d, err := Evaluate(cur, Event{Kind: EvStepImplemented, Source: src(), Decision: true})
+	d, err := Evaluate(cur, Event{Kind: EvStepImplemented, Source: src(), Decision: true}, RuntimeFacts{})
 	if err != nil || d.Route != RouteGate || d.Gate.Kind != state.PauseHumanDecision || d.Gate.OriginPhase != state.PhaseImplementStep || d.Gate.ResumePhase != state.PhaseImplementStep {
 		t.Fatalf("human gate: gate=%+v err=%v", d.Gate, err)
 	}
 	// A human gate from FIX carries the return target into the pause spec.
 	fix := state.RunState{Phase: state.PhaseFix, Revision: 5, FixReturn: state.PhaseCheckpoint, EffectivePolicy: config.DefaultRunPolicy()}
-	d, err = Evaluate(fix, Event{Kind: EvFixImplemented, Source: src(), Decision: true})
+	d, err = Evaluate(fix, Event{Kind: EvFixImplemented, Source: src(), Decision: true}, RuntimeFacts{})
 	if err != nil || d.Gate == nil || d.Gate.ResumePhase != state.PhaseFix || d.Gate.FixReturn != state.PhaseCheckpoint {
 		t.Fatalf("fix human gate: gate=%+v err=%v", d.Gate, err)
 	}
