@@ -62,8 +62,9 @@
       "maxLength": 64
     },
     "plan_markdown": {
-      "description": "Replacement architecture/decisions, or null to preserve the baseline section.",
+      "description": "Replacement architecture/decisions, or null to preserve the baseline section. A non-null replacement must be non-empty, so a materialized plan can never lose its required prose.",
       "type": ["string", "null"],
+      "minLength": 1,
       "maxLength": 65536
     },
     "steps": {

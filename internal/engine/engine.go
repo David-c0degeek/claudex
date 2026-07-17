@@ -483,13 +483,14 @@ func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, 
 	if (dec.Route == RouteGate) != (dec.Gate != nil) {
 		return fmt.Errorf("%w: gate presence must match the gate route", ErrBadDecision)
 	}
-	// Id exactness (canonical + not the consumed or an already-accepted turn).
+	// Id exactness: canonical (state's persisted grammar), exactly the id this edge
+	// issues, and a new assignment that is neither the consumed nor an accepted turn.
 	if dec.Gate != nil {
-		if !validID(ids.GateID) || ids.AssignmentTurnID != "" {
+		if !state.IsRunID(ids.GateID) || ids.AssignmentTurnID != "" {
 			return fmt.Errorf("%w: a gate requires exactly a canonical gate id", ErrBadDecision)
 		}
 	} else {
-		if !validID(ids.AssignmentTurnID) || ids.GateID != "" {
+		if !state.IsRunID(ids.AssignmentTurnID) || ids.GateID != "" {
 			return fmt.Errorf("%w: a running edge requires exactly a canonical assignment id", ErrBadDecision)
 		}
 		if ids.AssignmentTurnID == submitted.TurnID {
@@ -499,68 +500,169 @@ func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, 
 			return fmt.Errorf("%w: the next assignment reuses an accepted turn", ErrBadDecision)
 		}
 	}
-	return validateRoutePayload(dec, next)
+	return validateRoute(dec, submitted, next)
 }
 
-func validateRoutePayload(dec Decision, next *state.RunState) error {
-	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrBadDecision, msg) }
+func badDecision(msg string) error { return fmt.Errorf("%w: %s", ErrBadDecision, msg) }
+
+func anyPayload(dec Decision) bool {
+	return dec.Plan != nil || dec.Checks != nil || dec.Findings != nil
+}
+
+// validateRoute enforces the exact route→edge table, the running-edge budget
+// preconditions (so a forged over/at-limit edge cannot bypass the sole budget
+// table), the gate subset table, and the local well-formedness of every payload
+// Apply persists — all before the first write.
+func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState) error {
+	b := next.EffectivePolicy.Budgets
 	switch dec.Route {
 	case RouteGate:
-		if dec.Gate.OriginPhase != dec.FromPhase {
-			return bad("gate origin must be the from-phase")
-		}
-		planGate := dec.Gate.Kind == state.PauseQualityBudget && dec.Gate.Budget == state.BudgetPlan
-		if planGate {
-			if dec.Checks == nil || dec.Findings == nil {
-				return bad("a plan quality gate must carry checks and findings")
-			}
-		} else if dec.Checks != nil || dec.Findings != nil {
-			return bad("this gate must carry no checks or findings")
-		}
-		if dec.Plan != nil {
-			return bad("a gate carries no plan")
-		}
+		return validateGate(dec, submitted, next)
 	case RouteDraftAccepted:
 		if dec.Plan == nil || dec.Checks == nil || dec.Findings != nil {
-			return bad("draft-accept requires a plan and checks and no findings")
+			return badDecision("draft-accept requires a plan and checks and no findings")
 		}
+		if err := checkPlanRef(dec.Plan, submitted); err != nil {
+			return err
+		}
+		return checkCheckSet(dec.Checks)
 	case RoutePromote:
 		if dec.Checks == nil || dec.Plan != nil || dec.Findings != nil {
-			return bad("promote requires frozen checks and no plan/findings")
+			return badDecision("promote requires frozen checks and no plan/findings")
 		}
 		if next.CandidatePlan == nil {
-			return bad("promote requires a candidate plan to freeze")
+			return badDecision("promote requires a candidate plan to freeze")
 		}
+		return checkCheckSet(dec.Checks)
 	case RouteToRevise:
 		if dec.Checks == nil || dec.Findings == nil || dec.Plan != nil {
-			return bad("revise requires checks and findings and no plan")
+			return badDecision("revise requires checks and findings and no plan")
 		}
+		if err := runningBudget(next.Counters.PlanRevisions, b.PlanRounds); err != nil {
+			return err
+		}
+		if err := checkCheckSet(dec.Checks); err != nil {
+			return err
+		}
+		return checkFindings(dec.Findings, submitted)
 	case RouteReviseAccepted:
 		if dec.Plan == nil || dec.Checks != nil || dec.Findings != nil {
-			return bad("revise-accept requires a plan and no checks/findings")
+			return badDecision("revise-accept requires a plan and no checks/findings")
 		}
-	case RouteRetryReview, RouteToCheckpoint:
-		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
-			return bad("this route carries no payload")
+		return checkPlanRef(dec.Plan, submitted)
+	case RouteRetryReview:
+		if anyPayload(dec) {
+			return badDecision("reviewer-retry carries no payload")
+		}
+	case RouteToCheckpoint:
+		if anyPayload(dec) {
+			return badDecision("to-checkpoint carries no payload")
+		}
+		if dec.FromPhase == state.PhaseFix && next.FixReturn != state.PhaseCheckpoint {
+			return badDecision("only a FIX returning to CHECKPOINT is supported")
 		}
 	case RouteNextStep:
-		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
-			return bad("next-step carries no payload")
+		if anyPayload(dec) {
+			return badDecision("next-step carries no payload")
 		}
-		if next.StepIndex == nil || next.AgreedPlan == nil || *next.StepIndex+1 > next.AgreedPlan.Plan.StepCount {
-			return bad("next-step requires an advanceable cursor")
+		if next.StepIndex == nil || next.AgreedPlan == nil || *next.StepIndex >= next.AgreedPlan.Plan.StepCount-1 {
+			return badDecision("next-step requires a cursor before the final step")
 		}
 	case RouteToFix:
-		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
-			return bad("to-fix carries no payload")
+		if anyPayload(dec) {
+			return badDecision("to-fix carries no payload")
 		}
 		if next.StepIndex == nil || *next.StepIndex < 0 || *next.StepIndex >= len(next.Counters.StepFixes) {
-			return bad("to-fix requires a valid step cursor")
+			return badDecision("to-fix requires a valid step cursor")
 		}
+		return runningBudget(next.Counters.StepFixes[*next.StepIndex], b.CheckpointRounds)
 	default:
-		return bad("unknown route")
+		return badDecision("unknown route")
 	}
 	return nil
+}
+
+// validateGate enforces the exact two-kind gate subset table.
+func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) error {
+	if dec.Plan != nil {
+		return badDecision("a gate carries no plan")
+	}
+	g := dec.Gate
+	b := next.EffectivePolicy.Budgets
+	switch g.Kind {
+	case state.PauseHumanDecision:
+		if g.Budget != "" || dec.Checks != nil || dec.Findings != nil {
+			return badDecision("a human gate carries no budget/checks/findings")
+		}
+		if g.OriginPhase != dec.FromPhase || g.ResumePhase != dec.FromPhase || !isSubmitPhase(g.OriginPhase) {
+			return badDecision("a human gate resumes to its submit origin")
+		}
+		if g.OriginPhase == state.PhaseFix {
+			if g.FixReturn != state.PhaseCheckpoint || next.FixReturn != state.PhaseCheckpoint {
+				return badDecision("a FIX human gate preserves the CHECKPOINT return")
+			}
+		} else if g.FixReturn != "" {
+			return badDecision("only a FIX human gate carries a fix return")
+		}
+	case state.PauseQualityBudget:
+		switch g.Budget {
+		case state.BudgetPlan:
+			if g.OriginPhase != state.PhasePlanCritique || g.ResumePhase != state.PhasePlanRevise || g.FixReturn != "" {
+				return badDecision("a plan quality gate is PLAN_CRITIQUE->PLAN_REVISE")
+			}
+			if dec.Checks == nil || dec.Findings == nil {
+				return badDecision("a plan quality gate carries checks and findings")
+			}
+			if err := checkCheckSet(dec.Checks); err != nil {
+				return err
+			}
+			if err := checkFindings(dec.Findings, submitted); err != nil {
+				return err
+			}
+			return gateBudget(next.Counters.PlanRevisions, b.PlanRounds)
+		case state.BudgetCheckpoint:
+			if g.OriginPhase != state.PhaseCheckpoint || g.ResumePhase != state.PhaseFix || g.FixReturn != state.PhaseCheckpoint {
+				return badDecision("a checkpoint quality gate is CHECKPOINT->FIX")
+			}
+			if dec.Checks != nil || dec.Findings != nil {
+				return badDecision("a checkpoint quality gate carries no checks/findings")
+			}
+			if next.StepIndex == nil || *next.StepIndex < 0 || *next.StepIndex >= len(next.Counters.StepFixes) {
+				return badDecision("a checkpoint quality gate needs a valid cursor")
+			}
+			return gateBudget(next.Counters.StepFixes[*next.StepIndex], b.CheckpointRounds)
+		default:
+			return badDecision("unknown budget kind")
+		}
+	default:
+		return badDecision("unknown pause kind")
+	}
+	return nil
+}
+
+// runningBudget requires a running fix/revise edge to be strictly under the frozen
+// limit; used>limit is a corrupt counter, used==limit is the wrong route.
+func runningBudget(used, limit int) error {
+	switch cmpBudget(used, limit) {
+	case budgetUnder:
+		return nil
+	case budgetOver:
+		return ErrBudgetCorrupt
+	default:
+		return badDecision("a running edge chosen at the budget limit")
+	}
+}
+
+// gateBudget requires a quality gate to sit exactly at the frozen limit.
+func gateBudget(used, limit int) error {
+	switch cmpBudget(used, limit) {
+	case budgetAt:
+		return nil
+	case budgetOver:
+		return ErrBudgetCorrupt
+	default:
+		return badDecision("a quality gate raised below the budget limit")
+	}
 }
 
 func routeAllowed(r Route, from, next state.Phase) bool {
@@ -588,9 +690,82 @@ func routeAllowed(r Route, from, next state.Phase) bool {
 	return false
 }
 
-// validID is a minimal non-empty check; the canonical id grammar is enforced by the
-// state layer's transition validation, which is the authoritative backstop.
-func validID(s string) bool { return s != "" }
+// isSubmitPhase reports whether a phase may raise a human-decision gate (every
+// agent submit phase; TESTS is coordinator-authored and cannot).
+func isSubmitPhase(p state.Phase) bool {
+	switch p {
+	case state.PhasePlanDraft, state.PhasePlanCritique, state.PhasePlanRevise,
+		state.PhaseImplementStep, state.PhaseCheckpoint, state.PhaseFix:
+		return true
+	}
+	return false
+}
+
+func checkPlanRef(p *state.PlanRef, submitted state.EventRef) error {
+	if p.Source != submitted {
+		return badDecision("plan source is not the submitted event")
+	}
+	if !isHex64(p.Digest) {
+		return badDecision("plan digest is not a 64-char lower-hex sha256")
+	}
+	if p.StepCount < protocol.MinPlanSteps || p.StepCount > protocol.MaxPlanSteps {
+		return badDecision("plan step count is out of range")
+	}
+	return nil
+}
+
+func checkCheckSet(c *state.CheckSetRef) error {
+	if c.Keys == nil {
+		return badDecision("check keys must be a non-nil array")
+	}
+	if err := protocol.ValidateKeySet("checks", c.Keys); err != nil {
+		return fmt.Errorf("%w: %v", ErrBadDecision, err)
+	}
+	if !sortedStrings(c.Keys) {
+		return badDecision("check keys must be strictly sorted")
+	}
+	if !isHex64(c.Digest) {
+		return badDecision("check digest is not a 64-char lower-hex sha256")
+	}
+	return nil
+}
+
+func checkFindings(f *state.FindingObligations, submitted state.EventRef) error {
+	if len(f.Keys) == 0 {
+		return badDecision("findings must be non-empty")
+	}
+	if err := protocol.ValidateKeySet("findings", f.Keys); err != nil {
+		return fmt.Errorf("%w: %v", ErrBadDecision, err)
+	}
+	if !sortedStrings(f.Keys) {
+		return badDecision("finding keys must be strictly sorted")
+	}
+	if f.Source != submitted {
+		return badDecision("findings source is not the submitted event")
+	}
+	return nil
+}
+
+func sortedStrings(ss []string) bool {
+	for i := 1; i < len(ss); i++ {
+		if ss[i-1] >= ss[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func copyPlanRef(p *state.PlanRef) *state.PlanRef { c := *p; return &c }
 

@@ -260,6 +260,11 @@ func projectRevision(cur state.RunState, canonical []byte, src state.EventRef, r
 	if err := protocol.ValidateStepTitles(titles); err != nil {
 		return Event{}, semanticf("revised plan step titles are invalid: %v", err)
 	}
+	// The materialized plan must satisfy the same non-empty prose invariant as the
+	// initial plan (a null replacement preserves the base, which is already non-empty).
+	if markdown == "" {
+		return Event{}, semanticf("the materialized plan markdown is empty")
+	}
 	digest, err := planDocDigest(markdown, steps, risks, openQ)
 	if err != nil {
 		return Event{}, err
