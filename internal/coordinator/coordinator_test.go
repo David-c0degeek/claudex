@@ -749,8 +749,12 @@ func TestE2EReplacedSessionUnauthorized(t *testing.T) {
 	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)) // -> PLAN_CRITIQUE (pair owns it)
 
 	// Supersede the pair session with the real replacement API (no RunState advance).
+	replOp, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint operation id: %v", err)
+	}
 	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
-		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex, ExpectedGeneration: 1, RNG: rand.Reader,
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex, ExpectedGeneration: 1, OperationID: replOp, RNG: rand.Reader,
 	})
 	if err != nil {
 		t.Fatalf("replace pair session: %v", err)

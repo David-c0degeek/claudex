@@ -33,6 +33,10 @@ var (
 	// recovery and MUST NOT be treated as the current session until recovery resolves
 	// the Registry.
 	ErrReplaceOutcomeUnknown = errors.New("attach: replacement outcome is unknown; recovery required before use")
+	// ErrReplaceConflict means the request reuses an operation id that a different
+	// replacement (different role/agent/superseded generation) already recorded, so it
+	// is not an idempotent retry.
+	ErrReplaceConflict = errors.New("attach: operation id names a different replacement")
 )
 
 // ReplaceRequest is an explicit same-role session replacement: it supersedes the
@@ -45,7 +49,11 @@ type ReplaceRequest struct {
 	Role               state.SlotRole
 	Agent              state.Agent
 	ExpectedGeneration uint64
-	RNG                io.Reader
+	// OperationID is a mandatory, caller-stable idempotency key ("op-" + 32 lower-hex).
+	// A lost response is safely retried with the SAME id: it returns the same result
+	// and never re-mints or double-applies. A different id is a distinct replacement.
+	OperationID string
+	RNG         io.Reader
 }
 
 // ReplaceResult is the outcome: the new session id and its generation. When the error
@@ -92,6 +100,9 @@ func (r ReplaceRequest) validate() error {
 	if r.ExpectedGeneration == 0 {
 		return fmt.Errorf("attach: expected_generation must be > 0")
 	}
+	if !state.IsOperationID(r.OperationID) {
+		return fmt.Errorf("attach: replacement requires a minted operation_id")
+	}
 	if r.RNG == nil {
 		return fmt.Errorf("attach: replacement requires an RNG")
 	}
@@ -104,12 +115,12 @@ func ReplaceAttach(req ReplaceRequest) (ReplaceResult, error) {
 }
 
 // replaceAttach authorizes the exact active bootstrap allocation under the repo guard
-// (no lock-free TOCTOU), then under the run guard requires a consistent attach shape
-// (a pristine pre-pair lead-only run, or a completed pairing with landed effects) and
-// the exact filled slot at expected_generation, and appends ONE new session to the
-// Registry — the sole durable effect, leaving RunState untouched. Identities are
-// pre-minted off the guards. Both guards are released exactly once, reverse order,
-// with joined errors on every path.
+// (no lock-free TOCTOU), then under the run guard RECOVERS any pending replacement,
+// reconciles an idempotent same-operation retry, and otherwise journals a NEW same-role
+// session replacement whose sole 4c-1 effect is appending ONE new session to the
+// Registry (RunState untouched). The dedicated replacement journal makes the Registry
+// append crash-recoverable and backs the mandatory operation id's lost-response
+// idempotency. Both guards are released exactly once, reverse order, with joined errors.
 func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error) {
 	if err := req.validate(); err != nil {
 		return ReplaceResult{}, err
@@ -117,12 +128,7 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	lay := layoutFor(req.RepoDir)
 	loc := runLocationFor(lay, req.RunID)
 	registry := state.OpenRegistry(loc.RegistryDir, loc.RunLock)
-
-	// Pre-mint OFF the guards from an optimistic complete taken-session set.
-	newSess, err := mintReplacementSession(registry, req.RNG)
-	if err != nil {
-		return ReplaceResult{}, err
-	}
+	journal := txn.Open(loc.ReplaceDir, loc.RunLock)
 
 	repoGuard, ok, err := genstore.Acquire(lay.repoLock)
 	if err != nil {
@@ -163,6 +169,38 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	// releaseAll releases in reverse acquisition order (run, then repo).
 	releaseAll := func() error { return errors.Join(releaseRun(), releaseRepo()) }
 
+	// 1. Recover any pending replacement FIRST, before authorizing a new one. A pending
+	//    operation that cannot be completed (ambiguous/indeterminate) blocks every
+	//    request — a different one cannot step around it.
+	if _, _, rerr := journal.Recover(runGuard, func(tin txn.Intent) (txn.Plan, error) {
+		in, derr := decodeReplaceIntent(tin.Payload)
+		if derr != nil {
+			return txn.Plan{}, derr
+		}
+		return replacePlanFor(registry, runGuard, in, seams.mutate)
+	}); rerr != nil {
+		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, rerr), releaseAll())
+	}
+
+	// 2. The head is now terminal or absent. A same-operation head is an idempotent
+	//    retry (identical bindings) or a conflict (a different replacement's bindings).
+	head, hasHead, herr := journal.Latest()
+	if herr != nil {
+		return ReplaceResult{}, errors.Join(herr, releaseAll())
+	}
+	if hasHead {
+		hin, derr := decodeReplaceIntent(head.Intent.Payload)
+		if derr != nil {
+			return ReplaceResult{}, errors.Join(derr, releaseAll())
+		}
+		if hin.OperationID == req.OperationID {
+			res, serr := sameReplaceResult(registry, req, hin)
+			return res, errors.Join(serr, releaseAll())
+		}
+	}
+
+	// 3. A genuinely new replacement. Authorize the replaceable shape and the exact
+	//    filled slot at expected_generation before minting or journaling.
 	reg, err := verifyReplaceable(loc, registry, runGuard, req.RunID, cur)
 	if err != nil {
 		return ReplaceResult{}, errors.Join(err, releaseAll())
@@ -180,54 +218,95 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	if req.ExpectedGeneration != currentGen {
 		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: expected %d, current %d", ErrReplaceStaleGeneration, req.ExpectedGeneration, currentGen), releaseAll())
 	}
-	// Recheck the pre-minted id against the LOCKED registry before the mutation.
-	if !state.IsSessionID(newSess) || reg.Resolve(newSess).Status != state.RegUnknown {
-		return ReplaceResult{}, errors.Join(fmt.Errorf("attach: minted session id is not usable under the lock"), releaseAll())
-	}
 
-	// The shape is stable and the run guard is held; the mutation is a per-run store
+	// The shape is stable and the run guard is held; the replacement is a per-run store
 	// effect, so the repo guard is no longer needed.
 	if err := releaseRepo(); err != nil {
 		return ReplaceResult{}, errors.Join(err, releaseRun())
 	}
 
-	newGen := currentGen + 1
-	committed, merr := seams.mutate(registry, runGuard, reg.Revision, func(nextRev uint64, next *state.Registry) error {
-		target := regSlot(*next, req.Role)
-		target.Sessions = append(target.Sessions, state.SessionRecord{
-			SessionID: newSess, Generation: newGen, IssuedRegistryRevision: nextRev,
-		})
-		target.CurrentSessionID = newSess
-		return nil
-	})
-	candidate := ReplaceResult{RunID: req.RunID, SessionID: newSess, Role: req.Role, Agent: req.Agent, Generation: newGen}
-	if merr != nil {
-		if errors.Is(merr, genstore.ErrAmbiguous) {
-			// The append MAY have committed; retain the identity for recovery and do NOT
-			// present it as current.
-			return candidate, errors.Join(fmt.Errorf("%w: %w", ErrReplaceOutcomeUnknown, merr), releaseRun())
-		}
-		// Proven uncommitted: nothing durable.
-		return ReplaceResult{}, errors.Join(merr, releaseRun())
+	in, err := prepareReplace(req, reg, currentGen)
+	if err != nil {
+		return ReplaceResult{}, errors.Join(err, releaseRun())
+	}
+	plan, err := replacePlanFor(registry, runGuard, in, seams.mutate)
+	if err != nil {
+		return ReplaceResult{}, errors.Join(err, releaseRun())
 	}
 
-	// Proven committed: the new session is durable. A run-guard release error is a warning.
+	candidate := replaceCandidate(in)
+	final, rerr := journal.Run(runGuard, plan)
+	if rerr != nil {
+		if errors.Is(rerr, genstore.ErrAmbiguous) {
+			// The append MAY have committed; the pending journal retains the frozen
+			// candidate for recovery. Do NOT present it as current.
+			return candidate, errors.Join(fmt.Errorf("%w: %w", ErrReplaceOutcomeUnknown, rerr), releaseRun())
+		}
+		// Proven uncommitted, or a step left recoverably pending: nothing authoritative.
+		return ReplaceResult{}, errors.Join(rerr, releaseRun())
+	}
+
+	// Proven committed: the new session is durable and authoritative.
 	if relErr := releaseRun(); relErr != nil {
-		candidate.CommitWarning = &genstore.PostCommitError{Generation: committed.Revision, Err: relErr}
+		candidate.CommitWarning = &genstore.PostCommitError{Generation: final.Revision, Err: relErr}
 	}
 	return candidate, nil
 }
 
-// mintReplacementSession pre-mints a fresh session id off the guards, avoiding every
-// id in the optimistic registry (the Registry's own Resolve is the authority). The
-// under-guard recheck re-validates it against the locked registry before the mutation.
-func mintReplacementSession(registry *state.RegistryStore, rng io.Reader) (string, error) {
+// prepareReplace freezes the replacement intent read-only under the run guard: it
+// mints the new session id (avoiding every registered id) and a txn id, and binds the
+// superseded/new generations and the Registry revision the append compares against.
+func prepareReplace(req ReplaceRequest, reg state.Registry, currentGen uint64) (ReplaceIntent, error) {
+	taken := func(id string) bool { return reg.Resolve(id).Status != state.RegUnknown }
+	newSess, err := state.MintSessionID(req.RNG, taken)
+	if err != nil {
+		return ReplaceIntent{}, err
+	}
+	txnID, err := mintID("rpl-", req.RNG)
+	if err != nil {
+		return ReplaceIntent{}, err
+	}
+	in := ReplaceIntent{
+		RunID:                    req.RunID,
+		TxnID:                    txnID,
+		OperationID:              req.OperationID,
+		Role:                     req.Role,
+		Agent:                    req.Agent,
+		SupersededGeneration:     currentGen,
+		NewSessionID:             newSess,
+		NewGeneration:            currentGen + 1,
+		ExpectedRegistryRevision: reg.Revision,
+	}
+	if err := in.validate(); err != nil {
+		return ReplaceIntent{}, err
+	}
+	return in, nil
+}
+
+func replaceCandidate(in ReplaceIntent) ReplaceResult {
+	return ReplaceResult{RunID: in.RunID, SessionID: in.NewSessionID, Role: in.Role, Agent: in.Agent, Generation: in.NewGeneration}
+}
+
+// sameReplaceResult is the identity-bound idempotent return for a completed
+// operation: the request bindings must match the frozen intent (else the operation id
+// names a different replacement), and the Registry must still show the new session
+// current for the bound role/agent/generation.
+func sameReplaceResult(registry *state.RegistryStore, req ReplaceRequest, in ReplaceIntent) (ReplaceResult, error) {
+	if req.Role != in.Role || req.Agent != in.Agent || req.ExpectedGeneration != in.SupersededGeneration {
+		return ReplaceResult{}, fmt.Errorf("%w: %s", ErrReplaceConflict, in.OperationID)
+	}
 	reg, ok, err := registry.Load()
 	if err != nil {
-		return "", err
+		return ReplaceResult{}, err
 	}
-	taken := func(id string) bool { return ok && reg.Resolve(id).Status != state.RegUnknown }
-	return state.MintSessionID(rng, taken)
+	if !ok || reg.RunID != in.RunID {
+		return ReplaceResult{}, fmt.Errorf("%w: registry effect is missing", ErrReplaceRecoveryRequired)
+	}
+	r := reg.Resolve(in.NewSessionID)
+	if r.Status != state.RegCurrent || r.Role != in.Role || r.Agent != in.Agent || r.CurrentGeneration != in.NewGeneration {
+		return ReplaceResult{}, fmt.Errorf("%w: the replacement Registry effect is missing", ErrReplaceRecoveryRequired)
+	}
+	return replaceCandidate(in), nil
 }
 
 // authorizeReplace binds the run to the active bootstrap allocation under the repo

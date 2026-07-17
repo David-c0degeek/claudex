@@ -28,6 +28,7 @@ func TestResolveRunBindsActiveRun(t *testing.T) {
 		StateDir:     filepath.Join(runDir, "state"),
 		RegistryDir:  filepath.Join(runDir, "registry"),
 		AttachDir:    lay.attachJournalDir(runDir),
+		ReplaceDir:   lay.replaceJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 	}
 	if loc != want {

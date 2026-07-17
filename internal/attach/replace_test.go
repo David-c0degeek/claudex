@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,11 +17,17 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// replaceReq builds a same-role replacement request with a deterministic RNG.
+// replaceOp derives a canonical operation id from a seed byte, so distinct-seed
+// replacements in a test are distinct operations (not idempotent retries of each other).
+func replaceOp(seed byte) string { return "op-" + strings.Repeat(fmt.Sprintf("%02x", seed), 16) }
+
+// replaceReq builds a same-role replacement request with a deterministic RNG and an
+// operation id derived from the seed.
 func replaceReq(repo, runID string, role state.SlotRole, agent state.Agent, gen uint64, seed byte) ReplaceRequest {
 	return ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: role, Agent: agent, ExpectedGeneration: gen,
-		RNG: bytes.NewReader(bytes.Repeat([]byte{seed, 0x11, 0x22, 0x33}, 32)),
+		OperationID: replaceOp(seed),
+		RNG:         bytes.NewReader(bytes.Repeat([]byte{seed, 0x11, 0x22, 0x33}, 32)),
 	}
 }
 
@@ -282,6 +289,8 @@ func TestReplaceAttachValidation(t *testing.T) {
 		{"zero generation", func(r *ReplaceRequest) { r.ExpectedGeneration = 0 }},
 		{"bad role", func(r *ReplaceRequest) { r.Role = "middle" }},
 		{"non-canonical run", func(r *ReplaceRequest) { r.RunID = "not-a-run" }},
+		{"empty operation id", func(r *ReplaceRequest) { r.OperationID = "" }},
+		{"non-canonical operation id", func(r *ReplaceRequest) { r.OperationID = "op-not-hex" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
@@ -294,19 +303,22 @@ func TestReplaceAttachValidation(t *testing.T) {
 }
 
 // The optimistic mint retries past a collision with an existing session id, and
-// exhausts when every draw collides.
+// exhausts when every draw collides. Each subtest uses its own run so the mint (which
+// now runs under the guard, after the idempotency/generation checks) is actually
+// reached.
 func TestReplaceAttachCollision(t *testing.T) {
-	repo := t.TempDir()
-	a, _ := pairedRun(t, repo)
-	collide, err := hex.DecodeString(a.SessionID[len("sess-"):]) // the lead session's bytes
-	if err != nil {
-		t.Fatalf("decode session: %v", err)
-	}
-
 	t.Run("retry", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		collide, err := hex.DecodeString(a.SessionID[len("sess-"):]) // the lead session's bytes
+		if err != nil {
+			t.Fatalf("decode session: %v", err)
+		}
 		fresh := bytes.Repeat([]byte{0xa5}, 16)
+		txnBytes := bytes.Repeat([]byte{0xb6}, 16) // the txn id mint that follows the session mint
 		req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
-		req.RNG = bytes.NewReader(append(append([]byte{}, collide...), fresh...)) // collide, then fresh
+		// collide, then fresh (session mint), then the txn-id mint bytes.
+		req.RNG = bytes.NewReader(bytes.Join([][]byte{collide, fresh, txnBytes}, nil))
 		res, err := ReplaceAttach(req)
 		if err != nil {
 			t.Fatalf("replace: %v", err)
@@ -317,6 +329,12 @@ func TestReplaceAttachCollision(t *testing.T) {
 	})
 
 	t.Run("exhaustion", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		collide, err := hex.DecodeString(a.SessionID[len("sess-"):])
+		if err != nil {
+			t.Fatalf("decode session: %v", err)
+		}
 		req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
 		req.RNG = bytes.NewReader(bytes.Repeat(collide, 8)) // every draw collides
 		if _, err := ReplaceAttach(req); !errors.Is(err, state.ErrMintExhausted) {
@@ -370,6 +388,125 @@ func TestReplaceAttachConcurrent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(reg.Lead, leadBefore) {
 		t.Fatalf("the untouched lead slot changed: %+v -> %+v", leadBefore, reg.Lead)
+	}
+}
+
+func ambiguousMutate() registryMutate {
+	return func(*state.RegistryStore, *genstore.Guard, uint64, func(uint64, *state.Registry) error) (state.Registry, error) {
+		return state.Registry{}, fmt.Errorf("%w: injected", genstore.ErrAmbiguous)
+	}
+}
+
+// A same-operation retry after an ambiguous (pending) first attempt recovers the frozen
+// transaction and completes to the SAME session, without re-minting.
+func TestReplaceAttachIdempotentRecoversPending(t *testing.T) {
+	repo := t.TempDir()
+	a, oldPair := pairedRun(t, repo)
+
+	amb := defaultReplaceSeams()
+	amb.mutate = ambiguousMutate()
+	req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+	res1, err1 := replaceAttach(req, amb)
+	if !errors.Is(err1, ErrReplaceOutcomeUnknown) {
+		t.Fatalf("attempt 1 err = %v, want ErrReplaceOutcomeUnknown", err1)
+	}
+	// The ambiguous mutate applied nothing: the Registry effect did not land.
+	if reg := loadReg(t, repo, a.RunID); len(reg.Pair.Sessions) != 1 {
+		t.Fatalf("ambiguous attempt appended a session: %+v", reg.Pair)
+	}
+
+	// Retry with the SAME operation id and an RNG that ERRORS if minted — proving the
+	// retry recovers the frozen intent and never re-mints.
+	retry := req
+	retry.RNG = errReader{}
+	res2, err2 := ReplaceAttach(retry)
+	if err2 != nil {
+		t.Fatalf("retry: %v", err2)
+	}
+	if res2.SessionID != res1.SessionID || res2.Generation != 2 {
+		t.Fatalf("retry did not reconcile to the frozen candidate: res1=%+v res2=%+v", res1, res2)
+	}
+	reg := loadReg(t, repo, a.RunID)
+	if r := reg.Resolve(res2.SessionID); r.Status != state.RegCurrent || r.CurrentGeneration != 2 {
+		t.Fatalf("recovered session not current: %+v", r)
+	}
+	if r := reg.Resolve(oldPair); r.Status != state.RegReplaced {
+		t.Fatalf("old pair not replaced after recovery: %+v", r)
+	}
+	if len(reg.Pair.Sessions) != 2 {
+		t.Fatalf("recovery double-appended: %+v", reg.Pair)
+	}
+}
+
+// A same-operation retry after a clean completion returns the same result and does not
+// replace a second time.
+func TestReplaceAttachIdempotentAfterCompletion(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+	res1, err := ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	retry := req
+	retry.RNG = errReader{} // a retry never re-mints
+	res2, err := ReplaceAttach(retry)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if res2.SessionID != res1.SessionID || res2.Generation != res1.Generation {
+		t.Fatalf("idempotent retry differs: %+v vs %+v", res1, res2)
+	}
+	if reg := loadReg(t, repo, a.RunID); len(reg.Pair.Sessions) != 2 {
+		t.Fatalf("retry double-appended: %+v", reg.Pair)
+	}
+}
+
+// Reusing an operation id for a different replacement (a different role/agent binding)
+// is a conflict, not an idempotent retry.
+func TestReplaceAttachOperationConflict(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	// Same seed => same operation id, but now targeting the lead role.
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotLead, state.AgentClaude, 1, 0x20)); !errors.Is(err, ErrReplaceConflict) {
+		t.Fatalf("err = %v, want ErrReplaceConflict", err)
+	}
+}
+
+// A different operation cannot step around a pending one: it recovers the pending
+// replacement first, then applies its own.
+func TestReplaceAttachDifferentOpRecoversPending(t *testing.T) {
+	repo := t.TempDir()
+	a, oldPair := pairedRun(t, repo)
+
+	amb := defaultReplaceSeams()
+	amb.mutate = ambiguousMutate()
+	resA, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20), amb)
+	if !errors.Is(err, ErrReplaceOutcomeUnknown) {
+		t.Fatalf("op-A err = %v, want ErrReplaceOutcomeUnknown", err)
+	}
+
+	// op-B (a different operation) at the generation op-A will recover to: it recovers
+	// op-A first (its session becomes current at generation 2), then supersedes it.
+	resB, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 2, 0x21))
+	if err != nil {
+		t.Fatalf("op-B: %v", err)
+	}
+	reg := loadReg(t, repo, a.RunID)
+	if r := reg.Resolve(resA.SessionID); r.Status != state.RegReplaced || r.CurrentGeneration != 3 {
+		t.Fatalf("op-A's pending session was not recovered then superseded: %+v", r)
+	}
+	if r := reg.Resolve(resB.SessionID); r.Status != state.RegCurrent || r.CurrentGeneration != 3 {
+		t.Fatalf("op-B not current at gen 3: %+v", r)
+	}
+	if r := reg.Resolve(oldPair); r.Status != state.RegReplaced {
+		t.Fatalf("original pair: %+v", r)
+	}
+	if len(reg.Pair.Sessions) != 3 {
+		t.Fatalf("want 3 pair sessions (original + op-A + op-B), got %d", len(reg.Pair.Sessions))
 	}
 }
 

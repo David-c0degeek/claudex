@@ -20,6 +20,7 @@ type RunLocation struct {
 	StateDir     string // the RunState genstore directory
 	RegistryDir  string // the Registry genstore directory
 	AttachDir    string // the pair-attach transaction journal directory
+	ReplaceDir   string // the dedicated session-replacement transaction journal directory
 	ArtifactsDir string // the content-addressed submit-artifact store directory
 }
 
@@ -61,6 +62,7 @@ func runLocationFor(lay layout, runID string) RunLocation {
 		StateDir:     filepath.Join(runDir, "state"),
 		RegistryDir:  filepath.Join(runDir, "registry"),
 		AttachDir:    lay.attachJournalDir(runDir),
+		ReplaceDir:   lay.replaceJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 	}
 }
