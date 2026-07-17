@@ -1,0 +1,327 @@
+package engine
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"reflect"
+	"sort"
+
+	"github.com/David-c0degeek/claudex/internal/protocol"
+	"github.com/David-c0degeek/claudex/internal/state"
+)
+
+// Project derives a typed Event from a schema-valid canonical artifact for the
+// current phase and the materialized facts the loader supplied. It is PURE: it
+// rechecks the facts' digests/keys against cur and returns a semantic error for any
+// state-inconsistency, but performs no I/O. A semantic error rejects the submit; it
+// never becomes a human gate.
+func Project(cur state.RunState, canonical []byte, facts ProjectionFacts) (Event, error) {
+	turnID, rhd, err := envelope(canonical)
+	if err != nil {
+		return Event{}, err
+	}
+	src := state.EventRef{Digest: hashHex(canonical), TurnID: turnID}
+	switch cur.Phase {
+	case state.PhasePlanDraft:
+		return projectPlan(canonical, src, rhd)
+	case state.PhasePlanCritique:
+		return projectCritique(cur, canonical, src, rhd, facts)
+	case state.PhasePlanRevise:
+		return projectRevision(cur, canonical, src, rhd, facts)
+	case state.PhaseImplementStep:
+		return Event{Kind: EvStepImplemented, Source: src, Decision: rhd}, nil
+	case state.PhaseCheckpoint:
+		return projectCheckpoint(canonical, src, rhd)
+	case state.PhaseFix:
+		return Event{Kind: EvFixImplemented, Source: src, Decision: rhd}, nil
+	}
+	return Event{}, semanticf("no submit is projected for phase %s", cur.Phase)
+}
+
+func hashHex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func envelope(canonical []byte) (turnID string, requiresDecision bool, err error) {
+	var env struct {
+		TurnID                string `json:"turn_id"`
+		RequiresHumanDecision bool   `json:"requires_human_decision"`
+	}
+	if err := json.Unmarshal(canonical, &env); err != nil {
+		return "", false, semanticf("undecodable artifact envelope")
+	}
+	return env.TurnID, env.RequiresHumanDecision, nil
+}
+
+type jsonStep struct {
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Files       []string `json:"files"`
+	Tests       []string `json:"tests"`
+}
+
+func toPlanSteps(js []jsonStep) []PlanStep {
+	out := make([]PlanStep, 0, len(js))
+	for _, s := range js {
+		out = append(out, PlanStep{Title: s.Title, Description: s.Description, Files: s.Files, Tests: s.Tests})
+	}
+	return out
+}
+
+func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) {
+	var a struct {
+		Markdown      string     `json:"plan_markdown"`
+		Steps         []jsonStep `json:"steps"`
+		Risks         []string   `json:"risks"`
+		OpenQuestions []string   `json:"open_questions"`
+	}
+	if err := json.Unmarshal(canonical, &a); err != nil {
+		return Event{}, semanticf("undecodable plan artifact")
+	}
+	steps := toPlanSteps(a.Steps)
+	digest, err := planDocDigest(a.Markdown, steps, a.Risks, a.OpenQuestions)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{Kind: EvPlanDrafted, Source: src, Materialized: digest, StepCount: len(steps), Decision: rhd}, nil
+}
+
+type jsonCheckOp struct {
+	Key        string  `json:"key"`
+	Action     string  `json:"action"`
+	TargetStep *string `json:"target_step"`
+}
+
+func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
+	if err := verifyCandidateFacts(cur, facts); err != nil {
+		return Event{}, err
+	}
+	var a struct {
+		Verdict  string `json:"verdict"`
+		Findings []struct {
+			Key      string `json:"key"`
+			Severity string `json:"severity"`
+		} `json:"findings"`
+		ImplementationChecks []jsonCheckOp `json:"implementation_checks"`
+		MissingEvidence      []string      `json:"missing_evidence"`
+	}
+	if err := json.Unmarshal(canonical, &a); err != nil {
+		return Event{}, semanticf("undecodable critique artifact")
+	}
+	var actionableKeys []string
+	for _, f := range a.Findings {
+		if f.Severity == "blocking" || f.Severity == "major" {
+			actionableKeys = append(actionableKeys, f.Key)
+		}
+	}
+	sort.Strings(actionableKeys)
+
+	resulting, err := applyCheckOps(facts.CandidateChecks, a.ImplementationChecks)
+	if err != nil {
+		return Event{}, err
+	}
+	checks, err := materializeChecks(resulting)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{
+		Kind:            EvPlanCritiqued,
+		Source:          src,
+		Verdict:         a.Verdict,
+		Actionable:      len(actionableKeys) > 0,
+		MissingEvidence: len(a.MissingEvidence) > 0,
+		Decision:        rhd,
+		ResultingChecks: checks,
+		TargetsValid:    targetsValidFor(resulting, stepTitles(facts.CandidatePlan.Steps)),
+		Findings:        actionableKeys,
+	}, nil
+}
+
+func projectCheckpoint(canonical []byte, src state.EventRef, rhd bool) (Event, error) {
+	var a struct {
+		Verdict  string `json:"verdict"`
+		Findings []struct {
+			Severity string `json:"severity"`
+		} `json:"findings"`
+		MissingEvidence []string `json:"missing_evidence"`
+		TestsAdequate   bool     `json:"tests_adequate"`
+	}
+	if err := json.Unmarshal(canonical, &a); err != nil {
+		return Event{}, semanticf("undecodable checkpoint artifact")
+	}
+	blockingMajor := false
+	for _, f := range a.Findings {
+		if f.Severity == "blocking" || f.Severity == "major" {
+			blockingMajor = true
+		}
+	}
+	return Event{
+		Kind:            EvStepCheckpointed,
+		Source:          src,
+		Verdict:         a.Verdict,
+		Actionable:      blockingMajor || !a.TestsAdequate,
+		MissingEvidence: len(a.MissingEvidence) > 0,
+		TestsAdequate:   a.TestsAdequate,
+		Decision:        rhd,
+	}, nil
+}
+
+func projectRevision(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
+	if err := verifyCandidateFacts(cur, facts); err != nil {
+		return Event{}, err
+	}
+	var a struct {
+		BasePlanSHA256 string     `json:"base_plan_sha256"`
+		Markdown       *string    `json:"plan_markdown"`
+		Steps          []jsonStep `json:"steps"` // null preserves; decoded as nil
+		Risks          []string   `json:"risks"`
+		OpenQuestions  []string   `json:"open_questions"`
+		Responses      []struct {
+			FindingKey string `json:"finding_key"`
+		} `json:"responses"`
+	}
+	// A null steps/risks/open_questions preserves the base; distinguish null from an
+	// empty replacement with a presence probe.
+	var probe struct {
+		Steps         *json.RawMessage `json:"steps"`
+		Risks         *json.RawMessage `json:"risks"`
+		OpenQuestions *json.RawMessage `json:"open_questions"`
+		Markdown      *json.RawMessage `json:"plan_markdown"`
+	}
+	if err := json.Unmarshal(canonical, &a); err != nil {
+		return Event{}, semanticf("undecodable revision artifact")
+	}
+	if err := json.Unmarshal(canonical, &probe); err != nil {
+		return Event{}, semanticf("undecodable revision artifact")
+	}
+	// The revision must be guarded against the exact current candidate plan.
+	if a.BasePlanSHA256 != cur.CandidatePlan.Digest {
+		return Event{}, semanticf("revision base does not match the current candidate plan")
+	}
+	// Responses must answer exactly the outstanding obligations — no missing, no extra.
+	if cur.PendingFindings == nil {
+		return Event{}, semanticf("a revision arrived with no outstanding findings")
+	}
+	respKeys := make([]string, 0, len(a.Responses))
+	seen := map[string]bool{}
+	for _, r := range a.Responses {
+		if seen[r.FindingKey] {
+			return Event{}, semanticf("duplicate revision response key")
+		}
+		seen[r.FindingKey] = true
+		respKeys = append(respKeys, r.FindingKey)
+	}
+	sort.Strings(respKeys)
+	want := append([]string(nil), cur.PendingFindings.Keys...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(respKeys, want) {
+		return Event{}, semanticf("revision responses are not an exact match for the outstanding findings")
+	}
+
+	// Materialize the resulting plan (null section preserves the base).
+	markdown := facts.CandidatePlan.Markdown
+	if isPresent(probe.Markdown) && a.Markdown != nil {
+		markdown = *a.Markdown
+	}
+	steps := facts.CandidatePlan.Steps
+	if isPresent(probe.Steps) {
+		steps = toPlanSteps(a.Steps)
+	}
+	risks := facts.CandidatePlan.Risks
+	if isPresent(probe.Risks) {
+		risks = a.Risks
+	}
+	openQ := facts.CandidatePlan.OpenQuestions
+	if isPresent(probe.OpenQuestions) {
+		openQ = a.OpenQuestions
+	}
+	titles := stepTitles(steps)
+	if err := protocol.ValidateStepTitles(titles); err != nil {
+		return Event{}, semanticf("revised plan step titles are invalid: %v", err)
+	}
+	digest, err := planDocDigest(markdown, steps, risks, openQ)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{Kind: EvPlanRevised, Source: src, Materialized: digest, StepCount: len(steps), Decision: rhd}, nil
+}
+
+// isPresent reports whether a nullable section was supplied as a non-null value.
+func isPresent(raw *json.RawMessage) bool {
+	return raw != nil && string(*raw) != "null"
+}
+
+// verifyCandidateFacts rechecks that the loader-supplied materialized plan and
+// checks digest/key match the current durable candidate.
+func verifyCandidateFacts(cur state.RunState, facts ProjectionFacts) error {
+	if cur.CandidatePlan == nil || cur.CandidateChecks == nil {
+		return semanticf("no candidate plan in state for this phase")
+	}
+	digest, err := planDocDigest(facts.CandidatePlan.Markdown, facts.CandidatePlan.Steps, facts.CandidatePlan.Risks, facts.CandidatePlan.OpenQuestions)
+	if err != nil {
+		return err
+	}
+	if digest != cur.CandidatePlan.Digest {
+		return semanticf("the supplied candidate plan does not match the durable digest")
+	}
+	checks, err := materializeChecks(facts.CandidateChecks)
+	if err != nil {
+		return err
+	}
+	if checks.Digest != cur.CandidateChecks.Digest || !reflect.DeepEqual(checks.Keys, cur.CandidateChecks.Keys) {
+		return semanticf("the supplied candidate checks do not match the durable set")
+	}
+	return nil
+}
+
+// applyCheckOps applies a critique's add/remove ops to the current materialized set
+// (add is an upsert; remove of a missing key is a semantic error).
+func applyCheckOps(current []MaterializedCheck, ops []jsonCheckOp) ([]MaterializedCheck, error) {
+	m := make(map[string]MaterializedCheck, len(current))
+	order := make([]string, 0, len(current))
+	for _, c := range current {
+		if _, ok := m[c.Key]; !ok {
+			order = append(order, c.Key)
+		}
+		m[c.Key] = c
+	}
+	for _, op := range ops {
+		switch op.Action {
+		case "add":
+			if _, ok := m[op.Key]; !ok {
+				order = append(order, op.Key)
+			}
+			m[op.Key] = MaterializedCheck{Key: op.Key, TargetStep: op.TargetStep}
+		case "remove":
+			if _, ok := m[op.Key]; !ok {
+				return nil, semanticf("remove of a check key that is not present")
+			}
+			delete(m, op.Key)
+		default:
+			return nil, semanticf("unknown check action %q", op.Action)
+		}
+	}
+	out := make([]MaterializedCheck, 0, len(m))
+	for _, k := range order {
+		if c, ok := m[k]; ok {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// targetsValidFor reports whether every non-null target names a current step title.
+func targetsValidFor(checks []MaterializedCheck, titles []string) bool {
+	set := make(map[string]bool, len(titles))
+	for _, t := range titles {
+		set[t] = true
+	}
+	for _, c := range checks {
+		if c.TargetStep != nil && !set[*c.TargetStep] {
+			return false
+		}
+	}
+	return true
+}
