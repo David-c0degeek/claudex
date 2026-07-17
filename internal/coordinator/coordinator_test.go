@@ -735,26 +735,14 @@ func TestE2EReplacedSessionUnauthorized(t *testing.T) {
 	rs := cur(t, rn)
 	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)) // -> PLAN_CRITIQUE (pair owns it)
 
-	newSess, err := state.MintSessionID(rand.Reader, nil)
-	if err != nil {
-		t.Fatalf("mint session: %v", err)
-	}
-	g, ok, err := genstore.Acquire(rn.RunLock())
-	if err != nil || !ok {
-		t.Fatalf("acquire: ok=%v err=%v", ok, err)
-	}
-	reg, _, _ := rn.registry.Load()
-	_, err = rn.registry.MutateLocked(g, reg.Revision, func(rev uint64, next *state.Registry) error {
-		next.Pair.Sessions = append(next.Pair.Sessions, state.SessionRecord{
-			SessionID: newSess, Generation: uint64(len(next.Pair.Sessions)) + 1, IssuedRegistryRevision: rev,
-		})
-		next.Pair.CurrentSessionID = newSess
-		return nil
+	// Supersede the pair session with the real replacement API (no RunState advance).
+	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex, ExpectedGeneration: 1, RNG: rand.Reader,
 	})
-	_ = g.Release()
 	if err != nil {
-		t.Fatalf("supersede pair session: %v", err)
+		t.Fatalf("replace pair session: %v", err)
 	}
+	newSess := rep.SessionID
 
 	rs = cur(t, rn)
 	if _, err := rn.Submit(context.Background(), pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil)); !errors.Is(err, transport.ErrUnauthorized) {

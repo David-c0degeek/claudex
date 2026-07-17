@@ -2,13 +2,17 @@ package attach
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -144,13 +148,93 @@ func TestReplaceAttachUnauthorized(t *testing.T) {
 	}
 }
 
-// A run that is not a completed pairing (no pair journal yet) cannot be replaced.
-func TestReplaceAttachNotPaired(t *testing.T) {
+// The lead slot can be replaced BEFORE pairing (a crashed initiator): the pair
+// journal is legitimately Absent and the run is a pristine joinable INIT. JoinAttach
+// still succeeds afterward against the replacement lead.
+func TestReplaceAttachLeadBeforePairing(t *testing.T) {
 	repo := t.TempDir()
-	a := bootstrapRun(t, repo) // lead only; no JoinAttach
+	a := bootstrapRun(t, repo) // lead only; no JoinAttach yet
+	res, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotLead, state.AgentClaude, 1, 0x20))
+	if err != nil {
+		t.Fatalf("replace lead before pairing: %v", err)
+	}
+	reg := loadReg(t, repo, a.RunID)
+	if r := reg.Resolve(res.SessionID); r.Status != state.RegCurrent || r.Role != state.SlotLead {
+		t.Fatalf("replacement lead not current: %+v", r)
+	}
+	if r := reg.Resolve(a.SessionID); r.Status != state.RegReplaced {
+		t.Fatalf("original lead not replaced: %+v", r)
+	}
+	if reg.Pair != nil {
+		t.Fatalf("pair slot should still be empty: %+v", reg.Pair)
+	}
+	// Pairing still completes and advances to PLAN_DRAFT.
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err != nil {
+		t.Fatalf("join after lead replacement: %v", err)
+	}
+	if rs := loadRunState(t, repo, a.RunID); rs.Phase != state.PhasePlanDraft {
+		t.Fatalf("run did not pair after lead replacement: %s", rs.Phase)
+	}
+}
+
+// Replacing the empty pair slot before pairing is ErrReplaceSlotEmpty.
+func TestReplaceAttachEmptyPairSlot(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)); !errors.Is(err, ErrReplaceSlotEmpty) {
+		t.Fatalf("err = %v, want ErrReplaceSlotEmpty", err)
+	}
+}
+
+// A pending (mid-transaction) pair journal is recovery-required before a replacement.
+func TestReplaceAttachPendingJournal(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	fired := false
+	stepFailpoint = func(s string) error {
+		if s == "registry-pair-fill" && !fired {
+			fired = true
+			return errors.New("injected crash after pair-fill")
+		}
+		return nil
+	}
+	defer func() { stepFailpoint = nil }()
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+		t.Fatal("expected a crash after pair-fill")
+	}
+	stepFailpoint = nil
+
 	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotLead, state.AgentClaude, 1, 0x20)); !errors.Is(err, ErrReplaceRecoveryRequired) {
 		t.Fatalf("err = %v, want ErrReplaceRecoveryRequired", err)
 	}
+}
+
+// A terminal pair journal whose durable effects are missing (a deleted RunState or
+// Registry) is recovery-required, not a blind trust of the record class.
+func TestReplaceAttachTerminalMissingEffects(t *testing.T) {
+	lay := func(repo, runID string) RunLocation { return runLocationFor(layoutFor(repo), runID) }
+
+	t.Run("missing run state", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		if err := os.RemoveAll(lay(repo, a.RunID).StateDir); err != nil {
+			t.Fatalf("remove state: %v", err)
+		}
+		if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)); !errors.Is(err, ErrReplaceRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrReplaceRecoveryRequired", err)
+		}
+	})
+
+	t.Run("missing registry", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		if err := os.RemoveAll(lay(repo, a.RunID).RegistryDir); err != nil {
+			t.Fatalf("remove registry: %v", err)
+		}
+		if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)); !errors.Is(err, ErrReplaceRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrReplaceRecoveryRequired", err)
+		}
+	})
 }
 
 // A vanished pair journal (after pairing) forces recovery before any Registry change.
@@ -209,11 +293,45 @@ func TestReplaceAttachValidation(t *testing.T) {
 	}
 }
 
+// The optimistic mint retries past a collision with an existing session id, and
+// exhausts when every draw collides.
+func TestReplaceAttachCollision(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	collide, err := hex.DecodeString(a.SessionID[len("sess-"):]) // the lead session's bytes
+	if err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+
+	t.Run("retry", func(t *testing.T) {
+		fresh := bytes.Repeat([]byte{0xa5}, 16)
+		req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+		req.RNG = bytes.NewReader(append(append([]byte{}, collide...), fresh...)) // collide, then fresh
+		res, err := ReplaceAttach(req)
+		if err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		if res.SessionID == a.SessionID || res.SessionID != "sess-"+hex.EncodeToString(fresh) {
+			t.Fatalf("collision was not retried to the fresh id: %s", res.SessionID)
+		}
+	})
+
+	t.Run("exhaustion", func(t *testing.T) {
+		req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+		req.RNG = bytes.NewReader(bytes.Repeat(collide, 8)) // every draw collides
+		if _, err := ReplaceAttach(req); !errors.Is(err, state.ErrMintExhausted) {
+			t.Fatalf("err = %v, want ErrMintExhausted", err)
+		}
+	})
+}
+
 // Concurrent replacements at the same expected generation produce exactly one winner;
-// the durable history gains exactly one new session.
+// the loser is busy or stale, a retry at the same generation is stale, exactly one
+// session is appended, and the untouched slot is byte-identical.
 func TestReplaceAttachConcurrent(t *testing.T) {
 	repo := t.TempDir()
 	a, _ := pairedRun(t, repo)
+	leadBefore := loadReg(t, repo, a.RunID).Lead
 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -233,12 +351,118 @@ func TestReplaceAttachConcurrent(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if errs[i] == nil {
 			wins++
+			continue
+		}
+		if !errors.Is(errs[i], genstore.ErrBusy) && !errors.Is(errs[i], ErrReplaceStaleGeneration) {
+			t.Fatalf("loser err = %v, want ErrBusy or ErrReplaceStaleGeneration", errs[i])
 		}
 	}
 	if wins != 1 {
 		t.Fatalf("want exactly one winner, got %d (errs: %v)", wins, errs)
 	}
-	if reg := loadReg(t, repo, a.RunID); len(reg.Pair.Sessions) != 2 {
+	// A retry at the now-superseded generation is stale.
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x40)); !errors.Is(err, ErrReplaceStaleGeneration) {
+		t.Fatalf("retry at generation 1 err = %v, want ErrReplaceStaleGeneration", err)
+	}
+	reg := loadReg(t, repo, a.RunID)
+	if len(reg.Pair.Sessions) != 2 {
 		t.Fatalf("want exactly one appended session, pair has %d", len(reg.Pair.Sessions))
 	}
+	if !reflect.DeepEqual(reg.Lead, leadBefore) {
+		t.Fatalf("the untouched lead slot changed: %+v -> %+v", leadBefore, reg.Lead)
+	}
+}
+
+// failRelease still releases the real OS lock (so the file is freed and the run can be
+// cleaned up) but reports the injected release error.
+func failRelease(err error) func(*genstore.Guard) error {
+	return func(g *genstore.Guard) error { _ = g.Release(); return err }
+}
+
+// The exact-release-once + joined-errors contract holds on rejection and post-commit
+// paths, proven with injected per-call release/mutation seams.
+func TestReplaceAttachSeams(t *testing.T) {
+	t.Run("early reject joins both release errors", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		repoErr := errors.New("repo-release-x")
+		runErr := errors.New("run-release-x")
+		seams := defaultReplaceSeams()
+		seams.releaseRepo = failRelease(repoErr)
+		seams.releaseRun = failRelease(runErr)
+		// A stale generation rejects while both guards are held.
+		_, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 99, 0x20), seams)
+		if !errors.Is(err, ErrReplaceStaleGeneration) || !errors.Is(err, repoErr) || !errors.Is(err, runErr) {
+			t.Fatalf("err did not join the stale error and both release errors: %v", err)
+		}
+	})
+
+	t.Run("repo release failure aborts before mutation", func(t *testing.T) {
+		repo := t.TempDir()
+		a, oldPair := pairedRun(t, repo)
+		repoErr := errors.New("repo-drop-x")
+		seams := defaultReplaceSeams()
+		seams.releaseRepo = failRelease(repoErr)
+		_, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20), seams)
+		if !errors.Is(err, repoErr) {
+			t.Fatalf("err = %v, want the repo release error", err)
+		}
+		if reg := loadReg(t, repo, a.RunID); len(reg.Pair.Sessions) != 1 || reg.Pair.CurrentSessionID != oldPair {
+			t.Fatalf("a mutation happened despite the repo-release abort: %+v", reg.Pair)
+		}
+	})
+
+	t.Run("post-commit run release failure returns result plus PostCommitError", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		runErr := errors.New("run-drop-x")
+		seams := defaultReplaceSeams()
+		seams.releaseRun = failRelease(runErr)
+		res, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20), seams)
+		if err != nil {
+			t.Fatalf("a committed append must not be an error: %v", err)
+		}
+		var pce *genstore.PostCommitError
+		if !errors.As(res.CommitWarning, &pce) {
+			t.Fatalf("CommitWarning = %v, want *genstore.PostCommitError", res.CommitWarning)
+		}
+		if reg := loadReg(t, repo, a.RunID); reg.Pair.CurrentSessionID != res.SessionID {
+			t.Fatalf("the append is not durable: %+v", reg.Pair)
+		}
+	})
+
+	t.Run("ambiguous mutation retains the candidate as outcome-unknown", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		seams := defaultReplaceSeams()
+		seams.mutate = func(*state.RegistryStore, *genstore.Guard, uint64, func(uint64, *state.Registry) error) (state.Registry, error) {
+			return state.Registry{}, fmt.Errorf("%w: injected", genstore.ErrAmbiguous)
+		}
+		res, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20), seams)
+		if !errors.Is(err, ErrReplaceOutcomeUnknown) || !errors.Is(err, genstore.ErrAmbiguous) {
+			t.Fatalf("err = %v, want ErrReplaceOutcomeUnknown wrapping ErrAmbiguous", err)
+		}
+		if !state.IsSessionID(res.SessionID) || res.Generation != 2 {
+			t.Fatalf("the candidate identity was not retained for recovery: %+v", res)
+		}
+		if res.CommitWarning != nil {
+			t.Fatalf("CommitWarning must be reserved for a proven commit: %v", res.CommitWarning)
+		}
+	})
+
+	t.Run("proven-uncommitted mutation returns a zero result", func(t *testing.T) {
+		repo := t.TempDir()
+		a, _ := pairedRun(t, repo)
+		seams := defaultReplaceSeams()
+		seams.mutate = func(*state.RegistryStore, *genstore.Guard, uint64, func(uint64, *state.Registry) error) (state.Registry, error) {
+			return state.Registry{}, errors.New("plain proven failure")
+		}
+		res, err := replaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20), seams)
+		if err == nil {
+			t.Fatal("a proven-uncommitted mutation must be an error")
+		}
+		if res.SessionID != "" || res.Generation != 0 {
+			t.Fatalf("want a zero result for a proven-uncommitted failure: %+v", res)
+		}
+	})
 }
