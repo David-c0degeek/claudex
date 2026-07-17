@@ -21,13 +21,14 @@ func TestResolveRunBindsActiveRun(t *testing.T) {
 	lay := layoutFor(repo)
 	runDir := lay.runDir(state.RunDirRelFor(a.RunID))
 	want := RunLocation{
-		RunID:       a.RunID,
-		RelDir:      state.RunDirRelFor(a.RunID),
-		RunDir:      runDir,
-		RunLock:     runLock(runDir),
-		StateDir:    filepath.Join(runDir, "state"),
-		RegistryDir: filepath.Join(runDir, "registry"),
-		AttachDir:   lay.attachJournalDir(runDir),
+		RunID:        a.RunID,
+		RelDir:       state.RunDirRelFor(a.RunID),
+		RunDir:       runDir,
+		RunLock:      runLock(runDir),
+		StateDir:     filepath.Join(runDir, "state"),
+		RegistryDir:  filepath.Join(runDir, "registry"),
+		AttachDir:    lay.attachJournalDir(runDir),
+		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 	}
 	if loc != want {
 		t.Fatalf("location =\n %+v\nwant\n %+v", loc, want)

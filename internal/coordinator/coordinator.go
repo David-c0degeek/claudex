@@ -1,9 +1,10 @@
 // Package coordinator wires the pure phase engine to the durable stores behind one
 // production entrypoint. OpenRun binds a run to its canonical paths, and Run.Submit
 // drives an accepted submit through the locked transport with an engine-backed
-// Prepare: it loads the immutable planning history from the real ArtifactStore,
-// reconstructs the candidate facts, cross-checks them against the locked state, then
-// projects/evaluates the transition and mints the one identity the chosen edge issues.
+// Prepare that is PRECOMPUTED off the run guard: the fact reconstruction (artifact
+// I/O) and identity minting (RNG) happen against an optimistic snapshot before
+// transport acquires the lock, so the guarded critical section is only the pure
+// engine work (re-validate refs, Project, Evaluate, choose the pre-minted id, Apply).
 //
 // Scope: this build serves the PLAN_DRAFT..FIX submit subset the engine supports. It
 // does NOT implement TESTS/VERIFY, gate resolution, session replacement, or any CLI;
@@ -15,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"sync"
@@ -36,13 +36,16 @@ var (
 	// state — the immutable history and the run state are inconsistent, so the submit
 	// is rejected before any artifact is published.
 	ErrFactDrift = errors.New("coordinator: reconstructed facts disagree with the durable state")
+	// ErrEvidence means a referenced planning artifact is missing or corrupt in the
+	// store, so the candidate cannot be reconstructed.
+	ErrEvidence = errors.New("coordinator: referenced artifact evidence is missing or corrupt")
 	// ErrReplayInPrepare means Prepare was invoked for an already-accepted turn, which
 	// the locked transport resolves before Prepare — a defensive invariant.
 	ErrReplayInPrepare = errors.New("coordinator: prepare invoked for an already-accepted turn")
 )
 
 // Run is an opened run: its bound paths, the state/registry/artifact stores under the
-// shared run lock, and the RNG the Prepare adapter mints identities from.
+// shared run lock, and the RNG the precompute mints identities from.
 type Run struct {
 	loc      attach.RunLocation
 	state    *state.Store
@@ -50,10 +53,14 @@ type Run struct {
 	store    *transport.ArtifactStore
 	rng      io.Reader
 
-	mintMu sync.Mutex // serializes RNG-backed minting across concurrent submits
+	mintMu sync.Mutex // serializes RNG-backed minting across concurrent precomputes
 
 	mu     sync.RWMutex // RLocked for a submit's lifetime; Locked by Close
 	closed bool
+
+	// beforeTransport is a test-only barrier fired after precompute and before
+	// transport acquires the run lock; nil in production.
+	beforeTransport func()
 }
 
 // OpenRun binds runID to its canonical run paths (through the active-pointer/catalog/
@@ -78,17 +85,14 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}
 	class, cerr := attach.ClassifyPairJournal(g, loc)
 	rerr := g.Release()
-	if cerr != nil {
-		return nil, cerr
-	}
-	if rerr != nil {
-		return nil, rerr
+	if cerr != nil || rerr != nil {
+		return nil, errors.Join(cerr, rerr)
 	}
 	if class != attach.JournalTerminal {
 		return nil, fmt.Errorf("%w: pair journal class %d", ErrNotReady, class)
 	}
 
-	store, err := transport.NewArtifactStore(filepath.Join(loc.RunDir, "artifacts"))
+	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -101,21 +105,30 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}, nil
 }
 
-// Submit drives one accepted submit through the locked transport. It holds a read
-// lock for the submit's whole lifetime so Close cannot release the artifact store
-// under an in-flight Get/Put.
+// Submit drives one accepted submit. It precomputes the Prepare OFF the run guard
+// (fact I/O + minting against an optimistic snapshot), then hands transport a closure
+// whose guarded work is pure. It holds a read lock for the submit's whole lifetime so
+// Close cannot release the artifact store under an in-flight Get/Put.
 func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transport.SubmitResult, error) {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
 	if rn.closed {
 		return transport.SubmitResult{}, ErrClosed
 	}
+
+	prepare, err := rn.precompute(raw)
+	if err != nil {
+		return transport.SubmitResult{}, err
+	}
+	if rn.beforeTransport != nil {
+		rn.beforeTransport()
+	}
 	return transport.Submit(ctx, transport.SubmitDeps{
 		Store:    rn.state,
 		Registry: rn.registry,
 		Journal:  pairJournalReader{loc: rn.loc},
 		Sink:     rn.store,
-		Prepare:  rn.prepare,
+		Prepare:  prepare,
 	}, sessionID, raw)
 }
 
@@ -144,6 +157,11 @@ type pairJournalReader struct {
 
 func (r pairJournalReader) LockPath() string { return r.loc.RunLock }
 
+// Head classifies the pair journal under the held submit guard. A Run is opened only
+// after the pairing completed, so ONLY a still-Terminal journal may proceed: a
+// NonTerminal maps to recovery, and an Absent/unknown/error (a completed journal that
+// vanished or corrupted after OpenRun) fails closed to recovery-required rather than
+// transport's permissive Absent-proceed.
 func (r pairJournalReader) Head(g *genstore.Guard, runID string) (transport.JournalHead, error) {
 	if runID != r.loc.RunID {
 		return transport.JournalUnknown, fmt.Errorf("coordinator: submit run id %q is not the opened run %q", runID, r.loc.RunID)
@@ -157,113 +175,161 @@ func (r pairJournalReader) Head(g *genstore.Guard, runID string) (transport.Jour
 		return transport.JournalTerminal, nil
 	case attach.JournalNonTerminal:
 		return transport.JournalNonterminal, nil
-	case attach.JournalAbsent:
-		return transport.JournalAbsent, nil
-	default:
-		return transport.JournalUnknown, fmt.Errorf("coordinator: unknown pair journal class %d", class)
+	default: // JournalAbsent or an unknown value: the completed pairing is gone.
+		return transport.JournalUnknown, fmt.Errorf("coordinator: pair journal for %s is no longer a completed pairing (class %d)", runID, class)
 	}
 }
 
-// --- the engine-backed Prepare ---
+// --- precompute: build the Prepare off the run guard ---
 
-// prepare is the transport Prepare seam: from a deep clone of the locked state and
-// the validated submit it reconstructs the candidate facts (for the plan-negotiation
-// phases), projects and evaluates the transition, mints the one identity the chosen
-// edge issues, and returns an honest PreparedTransition whose apply calls engine.Apply
-// with exactly that decision and identity. Any unsupported edge, semantic rejection,
-// or fact drift returns an error, so transport rejects before publishing the artifact.
-func (rn *Run) prepare(snapshot state.RunState, prepared transport.PreparedSubmit) (transport.PreparedTransition, error) {
-	// Defensive: the locked transport resolves an already-accepted turn before Prepare.
-	if _, seen := snapshot.AcceptedTurns[prepared.TurnID]; seen {
-		return transport.PreparedTransition{}, ErrReplayInPrepare
+// failPrepare returns a Prepare that always fails; transport uses it only when it
+// would not otherwise call Prepare (a replay or a missing run), so its error is a
+// defensive backstop, never the surfaced result.
+func failPrepare(err error) transport.Prepare {
+	return func(state.RunState, transport.PreparedSubmit) (transport.PreparedTransition, error) {
+		return transport.PreparedTransition{}, err
+	}
+}
+
+// precompute reads the optimistic state and, for a NEW turn, reconstructs the facts
+// and pre-mints both candidate identities, capturing them in a closure whose guarded
+// work does no I/O and no RNG. For an already-accepted turn it returns a fail-Prepare
+// (transport resolves the replay before Prepare, independent of facts/RNG).
+func (rn *Run) precompute(raw []byte) (transport.Prepare, error) {
+	n, err := transport.Normalize(raw)
+	if err != nil {
+		return nil, err
+	}
+	rs, ok, err := rn.state.Load()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return failPrepare(transport.ErrNoRun), nil // transport rejects at load, before Prepare
+	}
+	if _, seen := rs.AcceptedTurns[n.TurnID]; seen {
+		return failPrepare(ErrReplayInPrepare), nil // replay: no facts, no RNG
 	}
 
-	// Facts are reconstructed only for the plan-negotiation phases that need them;
-	// every other new-turn phase projects against empty facts.
+	// New turn: reconstruct facts (only where the phase needs them) and pre-mint both
+	// candidates against the optimistic snapshot.
+	phaseNeedsFacts := rs.Phase == state.PhasePlanCritique || rs.Phase == state.PhasePlanRevise
 	var facts engine.ProjectionFacts
-	if snapshot.Phase == state.PhasePlanCritique || snapshot.Phase == state.PhasePlanRevise {
-		f, err := rn.loadFacts(snapshot)
+	var refs engine.CandidateRefs
+	if phaseNeedsFacts {
+		facts, refs, err = rn.loadFacts(rs)
 		if err != nil {
-			return transport.PreparedTransition{}, err
+			return nil, err
 		}
-		facts = f
+	}
+	turnCand, gateCand, err := rn.mintPair(takenSet(rs))
+	if err != nil {
+		return nil, err
 	}
 
-	canonical := []byte(prepared.CanonicalJSON)
-	ev, err := engine.Project(snapshot, canonical, facts)
-	if err != nil {
-		return transport.PreparedTransition{}, err
+	prepare := func(snapshot state.RunState, prepared transport.PreparedSubmit) (transport.PreparedTransition, error) {
+		// Re-validate the captured refs against the LOCKED snapshot before use.
+		if phaseNeedsFacts {
+			if derr := compareRefs(refs, snapshot); derr != nil {
+				return transport.PreparedTransition{}, derr
+			}
+		}
+		ev, perr := engine.Project(snapshot, []byte(prepared.CanonicalJSON), facts)
+		if perr != nil {
+			return transport.PreparedTransition{}, perr
+		}
+		dec, perr := engine.Evaluate(snapshot, ev)
+		if perr != nil {
+			return transport.PreparedTransition{}, perr
+		}
+		idKind, perr := engine.RequiredID(dec)
+		if perr != nil {
+			return transport.PreparedTransition{}, perr
+		}
+		var ids engine.Ids
+		var issuedTurn, issuedGate string
+		switch idKind {
+		case engine.IDAssignment:
+			ids.AssignmentTurnID, issuedTurn = turnCand, turnCand
+		case engine.IDGate:
+			ids.GateID, issuedGate = gateCand, gateCand
+		default:
+			return transport.PreparedTransition{}, fmt.Errorf("coordinator: unsupported id kind %d", idKind)
+		}
+		submitted := ev.Source
+		apply := func(gen uint64, next *state.RunState) error {
+			return engine.Apply(dec, submitted, ids, gen, next)
+		}
+		return transport.NewPreparedTransition(issuedTurn, issuedGate, apply), nil
 	}
-	dec, err := engine.Evaluate(snapshot, ev)
-	if err != nil {
-		return transport.PreparedTransition{}, err
-	}
-	idKind, err := engine.RequiredID(dec)
-	if err != nil {
-		return transport.PreparedTransition{}, err
-	}
-
-	issuedTurn, issuedGate, err := rn.mint(idKind, takenSet(snapshot))
-	if err != nil {
-		return transport.PreparedTransition{}, err
-	}
-	ids := engine.Ids{AssignmentTurnID: issuedTurn, GateID: issuedGate}
-	submitted := ev.Source
-	apply := func(gen uint64, next *state.RunState) error {
-		return engine.Apply(dec, submitted, ids, gen, next)
-	}
-	return transport.NewPreparedTransition(issuedTurn, issuedGate, apply), nil
+	return prepare, nil
 }
 
-// mint issues the single identity the chosen edge requires, serialized so concurrent
-// submits cannot interleave reads of the shared RNG.
-func (rn *Run) mint(kind engine.IDKind, taken map[string]bool) (turn, gate string, err error) {
+// mintPair issues BOTH candidate identities once (adding the assignment candidate to
+// the taken set before minting the gate candidate), serialized so concurrent
+// precomputes cannot interleave reads of the shared RNG. Only the one the chosen edge
+// needs is persisted; the other is discarded.
+func (rn *Run) mintPair(taken map[string]bool) (turn, gate string, err error) {
 	rn.mintMu.Lock()
 	defer rn.mintMu.Unlock()
-	switch kind {
-	case engine.IDAssignment:
-		id, e := state.MintTurnID(rn.rng, taken)
-		return id, "", e
-	case engine.IDGate:
-		id, e := state.MintGateID(rn.rng, taken)
-		return "", id, e
-	default:
-		return "", "", fmt.Errorf("coordinator: unsupported id kind %d", kind)
+	turn, err = state.MintTurnID(rn.rng, taken)
+	if err != nil {
+		return "", "", err
 	}
+	taken[turn] = true
+	gate, err = state.MintGateID(rn.rng, taken)
+	if err != nil {
+		return "", "", err
+	}
+	return turn, gate, nil
 }
 
-// loadFacts reconstructs the candidate facts from the real ArtifactStore: it filters
-// the accepted planning turns, loads each exact (turn,digest) artifact, folds them in
-// receipt order via the engine, then cross-checks EVERY reconstructed ref against the
-// durable state, so a state that drifted from its immutable history is rejected.
-func (rn *Run) loadFacts(snapshot state.RunState) (engine.ProjectionFacts, error) {
-	var arts []engine.AcceptedArtifact
+// loadFacts reconstructs the candidate facts from the real ArtifactStore, bounding
+// the work BEFORE loading: it collects the durable planning-turn refs, rejects a
+// count over the artifact bound, then loads each exact (turn,digest) in receipt order
+// while enforcing the cumulative byte cap, folds via the engine, and cross-checks
+// every reconstructed ref against the durable state.
+func (rn *Run) loadFacts(snapshot state.RunState) (engine.ProjectionFacts, engine.CandidateRefs, error) {
+	type planRef struct {
+		turnID, digest string
+		phase          state.Phase
+		receipt        uint64
+	}
+	var refs []planRef
 	for tid, acc := range snapshot.AcceptedTurns {
-		if !isPlanningPhase(acc.Phase) {
-			continue
+		if isPlanningPhase(acc.Phase) {
+			refs = append(refs, planRef{tid, acc.ArtifactDigest, acc.Phase, acc.Receipt.Revision})
 		}
-		canonical, err := rn.store.Get(tid, acc.ArtifactDigest)
-		if err != nil {
-			return engine.ProjectionFacts{}, fmt.Errorf("coordinator: load artifact for turn %s: %w", tid, err)
+	}
+	if len(refs) > engine.MaxPlanningArtifacts {
+		return engine.ProjectionFacts{}, engine.CandidateRefs{}, fmt.Errorf("%w: %d planning artifacts", engine.ErrHistoryTooLarge, len(refs))
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].receipt < refs[j].receipt })
+
+	arts := make([]engine.AcceptedArtifact, 0, len(refs))
+	total := 0
+	for _, r := range refs {
+		canonical, gerr := rn.store.Get(r.turnID, r.digest)
+		if gerr != nil {
+			return engine.ProjectionFacts{}, engine.CandidateRefs{}, fmt.Errorf("%w: turn %s: %v", ErrEvidence, r.turnID, gerr)
 		}
+		if len(canonical) > engine.MaxMaterializeBytes || total > engine.MaxMaterializeBytes-len(canonical) {
+			return engine.ProjectionFacts{}, engine.CandidateRefs{}, fmt.Errorf("%w: over %d bytes", engine.ErrHistoryTooLarge, engine.MaxMaterializeBytes)
+		}
+		total += len(canonical)
 		arts = append(arts, engine.AcceptedArtifact{
-			TurnID:          tid,
-			Digest:          acc.ArtifactDigest,
-			Phase:           acc.Phase,
-			ReceiptRevision: acc.Receipt.Revision,
-			Canonical:       canonical,
+			TurnID: r.turnID, Digest: r.digest, Phase: r.phase, ReceiptRevision: r.receipt, Canonical: canonical,
 		})
 	}
-	sort.Slice(arts, func(i, j int) bool { return arts[i].ReceiptRevision < arts[j].ReceiptRevision })
 
-	facts, refs, err := engine.MaterializeCandidate(arts)
+	facts, materRefs, err := engine.MaterializeCandidate(arts)
 	if err != nil {
-		return engine.ProjectionFacts{}, err
+		return engine.ProjectionFacts{}, engine.CandidateRefs{}, err
 	}
-	if err := compareRefs(refs, snapshot); err != nil {
-		return engine.ProjectionFacts{}, err
+	if err := compareRefs(materRefs, snapshot); err != nil {
+		return engine.ProjectionFacts{}, engine.CandidateRefs{}, err
 	}
-	return facts, nil
+	return facts, materRefs, nil
 }
 
 // compareRefs asserts every reconstructed ref equals the durable state exactly: plan

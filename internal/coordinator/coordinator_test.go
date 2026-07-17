@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/fsclass"
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -49,9 +52,13 @@ func supportedFS() fakeClassifier {
 	return fakeClassifier{res: fsclass.Result{Class: fsclass.SupportedLocal, Reason: "local fixed drive"}}
 }
 
-func policyBytes() []byte {
+func policyBytes() []byte { return policyBytesWith(1, 3) }
+
+func policyBytesWith(planRounds, checkpointRounds int) []byte {
 	p := config.DefaultRunPolicy()
 	p.TestGate = config.TestGate{Disabled: true}
+	p.Budgets.PlanRounds = planRounds
+	p.Budgets.CheckpointRounds = checkpointRounds
 	b, _ := json.Marshal(p)
 	return b
 }
@@ -63,10 +70,14 @@ func taskBytes() []byte {
 // newPairedRun bootstraps a lead-claude run and fills the codex pair, leaving the run
 // at PLAN_DRAFT with the lead's first turn issued.
 func newPairedRun(t *testing.T, repo string) (runID, lead, pair string) {
+	return newPairedRunWithPolicy(t, repo, policyBytes())
+}
+
+func newPairedRunWithPolicy(t *testing.T, repo string, pol []byte) (runID, lead, pair string) {
 	t.Helper()
 	fa, err := attach.FirstAttach(attach.FirstAttachRequest{
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
-		TaskCanonical: taskBytes(), PolicyCanonical: policyBytes(),
+		TaskCanonical: taskBytes(), PolicyCanonical: pol,
 		CreatedUnix: 1000, RNG: rand.Reader,
 		Base: fakeBase{commit: strings.Repeat("a", 40)}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
 	})
@@ -200,9 +211,9 @@ func submitOK(t *testing.T, rn *Run, sess string, raw []byte) transport.SubmitRe
 
 // --- tests ---
 
-// The full non-gated chain through the real stores: plan -> critique(revise) ->
-// revision -> critique(agree/promote) -> implement -> checkpoint(next) -> implement ->
-// final checkpoint (the deferred TESTS edge).
+// The full non-gated chain through the real stores, exercising a plan reviewer retry,
+// a revise cycle, a checkpoint reviewer retry, CHECKPOINT->FIX, FIX->CHECKPOINT, a
+// next-step advance, and the deferred final TESTS edge.
 func TestE2ENonGatedChain(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)
@@ -219,27 +230,33 @@ func TestE2ENonGatedChain(t *testing.T) {
 	}
 	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false))
 
-	// PLAN_CRITIQUE REVISE with a blocking finding + a check add (pair).
+	// PLAN_CRITIQUE reviewer retry: REVISE with only a nit -> stays at PLAN_CRITIQUE.
 	rs = cur(t, rn)
 	if rs.Phase != state.PhasePlanCritique {
 		t.Fatalf("not at PLAN_CRITIQUE: %s", rs.Phase)
 	}
-	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", false, []string{"blocking"}, []map[string]any{addCheck("chk-1", "step one")}))
-
-	// PLAN_REVISE answering the finding exactly (lead).
+	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", false, []string{"nit"}, nil))
 	rs = cur(t, rn)
-	if rs.Phase != state.PhasePlanRevise || rs.PendingFindings == nil {
+	if rs.Phase != state.PhasePlanCritique || rs.CandidatePlan == nil {
+		t.Fatalf("reviewer retry should stay at PLAN_CRITIQUE: %+v", rs)
+	}
+
+	// PLAN_CRITIQUE REVISE with a blocking finding + a check add -> PLAN_REVISE.
+	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", false, []string{"blocking"}, []map[string]any{addCheck("chk-1", "step one")}))
+	rs = cur(t, rn)
+	if rs.Phase != state.PhasePlanRevise || rs.PendingFindings == nil || rs.Counters.PlanRevisions != 1 {
 		t.Fatalf("not at PLAN_REVISE with pending: %+v", rs)
 	}
+
+	// PLAN_REVISE answering the finding exactly (lead) -> PLAN_CRITIQUE.
 	submitOK(t, rn, lead, revisionArtifact(t, rs.Assignment.ID, rs.Revision, rs.CandidatePlan.Digest, rs.PendingFindings.Keys))
 
-	// PLAN_CRITIQUE AGREE (targets valid) -> promote to IMPLEMENT_STEP (pair).
+	// PLAN_CRITIQUE AGREE (targets valid) -> promote to IMPLEMENT_STEP.
 	rs = cur(t, rn)
 	if rs.Phase != state.PhasePlanCritique || rs.PendingFindings != nil {
 		t.Fatalf("not back at PLAN_CRITIQUE: %+v", rs)
 	}
 	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil))
-
 	rs = cur(t, rn)
 	if rs.Phase != state.PhaseImplementStep || rs.AgreedPlan == nil || rs.StepIndex == nil || *rs.StepIndex != 0 {
 		t.Fatalf("not promoted to IMPLEMENT_STEP: %+v", rs)
@@ -252,7 +269,28 @@ func TestE2ENonGatedChain(t *testing.T) {
 		t.Fatalf("not at CHECKPOINT: %s", rs.Phase)
 	}
 
-	// CHECKPOINT AGREE on the non-final step (pair) -> next IMPLEMENT_STEP.
+	// CHECKPOINT reviewer retry: REVISE, only a nit, tests adequate -> stays CHECKPOINT.
+	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"nit"}))
+	rs = cur(t, rn)
+	if rs.Phase != state.PhaseCheckpoint {
+		t.Fatalf("checkpoint reviewer retry should stay at CHECKPOINT: %s", rs.Phase)
+	}
+
+	// CHECKPOINT REVISE with a blocking finding -> FIX.
+	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"blocking"}))
+	rs = cur(t, rn)
+	if rs.Phase != state.PhaseFix || rs.FixReturn != state.PhaseCheckpoint || rs.Counters.StepFixes[0] != 1 {
+		t.Fatalf("not at FIX: %+v", rs)
+	}
+
+	// FIX implementation report -> back to CHECKPOINT.
+	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
+	rs = cur(t, rn)
+	if rs.Phase != state.PhaseCheckpoint || rs.FixReturn != "" {
+		t.Fatalf("FIX did not return to CHECKPOINT: %+v", rs)
+	}
+
+	// CHECKPOINT AGREE on the non-final step -> next IMPLEMENT_STEP.
 	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil))
 	rs = cur(t, rn)
 	if rs.Phase != state.PhaseImplementStep || *rs.StepIndex != 1 {
@@ -397,8 +435,9 @@ func (f *failAfterN) Read(p []byte) (int, error) {
 func TestE2EReplaySkipsRNG(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, _ := newPairedRun(t, repo)
-	// Exactly 16 bytes: enough for the single mint the first accept performs.
-	rn, err := OpenRun(repo, runID, &failAfterN{left: 16})
+	// Exactly 32 bytes: enough for the two candidates (assignment + gate) the first
+	// accept pre-mints, and nothing more.
+	rn, err := OpenRun(repo, runID, &failAfterN{left: 32})
 	if err != nil {
 		t.Fatalf("open run: %v", err)
 	}
@@ -480,6 +519,224 @@ func TestOpenRunRejectsUnpaired(t *testing.T) {
 	}
 	if _, err := OpenRun(repo, fa.RunID, rand.Reader); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("open unpaired err = %v, want ErrNotReady", err)
+	}
+}
+
+// An actionable critique at an exhausted plan budget parks at a plan-quality gate.
+func TestE2EPlanQualityGate(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRunWithPolicy(t, repo, policyBytesWith(0, 3)) // 0 plan rounds
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	rs := cur(t, rn)
+	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false))
+	rs = cur(t, rn)
+	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", false, []string{"blocking"}, []map[string]any{addCheck("chk-1", "step one")}))
+
+	rs = cur(t, rn)
+	if rs.Lifecycle != state.LifecyclePaused || rs.Pause == nil || rs.Pause.Kind != state.PauseQualityBudget {
+		t.Fatalf("not paused at a quality gate: %+v", rs)
+	}
+	if rs.Pause.Budget == nil || rs.Pause.Budget.Kind != state.BudgetPlan {
+		t.Fatalf("not a plan-budget gate: %+v", rs.Pause)
+	}
+	// The gate carries the actionable projection (updated checks + pending) for resume.
+	if rs.PendingFindings == nil || rs.CandidateChecks == nil || len(rs.CandidateChecks.Keys) != 1 {
+		t.Fatalf("plan gate did not carry the actionable projection: %+v", rs)
+	}
+}
+
+// A needs-fix checkpoint at an exhausted checkpoint budget parks at a checkpoint-quality gate.
+func TestE2ECheckpointQualityGate(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRunWithPolicy(t, repo, policyBytesWith(1, 0)) // 0 checkpoint rounds
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	rs := cur(t, rn)
+	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false))
+	rs = cur(t, rn)
+	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil))
+	rs = cur(t, rn)
+	if rs.Phase != state.PhaseImplementStep {
+		t.Fatalf("not promoted: %s", rs.Phase)
+	}
+	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
+	rs = cur(t, rn)
+	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"blocking"}))
+
+	rs = cur(t, rn)
+	if rs.Lifecycle != state.LifecyclePaused || rs.Pause == nil || rs.Pause.Kind != state.PauseQualityBudget {
+		t.Fatalf("not paused at a quality gate: %+v", rs)
+	}
+	if rs.Pause.Budget == nil || rs.Pause.Budget.Kind != state.BudgetCheckpoint {
+		t.Fatalf("not a checkpoint-budget gate: %+v", rs.Pause)
+	}
+}
+
+// A completed pair journal that vanishes after OpenRun forces recovery — the per-submit
+// seam does not fail open on Absent.
+func TestE2EJournalVanishedRecovery(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, _ := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	if err := os.RemoveAll(rn.loc.AttachDir); err != nil {
+		t.Fatalf("remove journal: %v", err)
+	}
+	rs := cur(t, rn)
+	draft := planArtifact(t, rs.Assignment.ID, rs.Revision, false)
+	n, _ := transport.Normalize(draft)
+	if _, err := rn.Submit(context.Background(), lead, draft); !errors.Is(err, transport.ErrRecoveryRequired) {
+		t.Fatalf("err = %v, want ErrRecoveryRequired", err)
+	}
+	if _, gerr := rn.store.Get(rs.Assignment.ID, n.Digest); gerr == nil {
+		t.Fatal("an artifact was published despite recovery-required")
+	}
+	if cur(t, rn).Phase != state.PhasePlanDraft {
+		t.Fatal("the run advanced despite recovery-required")
+	}
+}
+
+// Two concurrent submits at PLAN_CRITIQUE prepare facts concurrently (off the guard)
+// and linearize to exactly one fresh acceptance.
+func TestE2EConcurrentCritiquePrep(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	rs := cur(t, rn)
+	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false))
+	rs = cur(t, rn) // PLAN_CRITIQUE
+	critique := critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	res := make([]transport.SubmitResult, 2)
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			res[idx], errs[idx] = rn.Submit(context.Background(), pair, critique)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	fresh := 0
+	for i := 0; i < 2; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if !res[i].Idempotent {
+			fresh++
+		}
+	}
+	if fresh != 1 {
+		t.Fatalf("want exactly one fresh acceptance, got %d", fresh)
+	}
+	if cur(t, rn).Phase != state.PhaseImplementStep {
+		t.Fatalf("run did not promote exactly once")
+	}
+}
+
+// Close blocks until an in-flight submit completes, so it never releases the artifact
+// store under an active Get/Put.
+func TestE2ECloseWaitsForInflight(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, _ := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	rn.beforeTransport = func() { close(entered); <-release }
+
+	rs := cur(t, rn)
+	draft := planArtifact(t, rs.Assignment.ID, rs.Revision, false)
+	submitDone := make(chan error, 1)
+	go func() { _, e := rn.Submit(context.Background(), lead, draft); submitDone <- e }()
+	<-entered // the submit now holds the read lock inside beforeTransport
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- rn.Close() }()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while a submit was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release) // let the submit finish
+	if e := <-submitDone; e != nil {
+		t.Fatalf("submit: %v", e)
+	}
+	if e := <-closeDone; e != nil {
+		t.Fatalf("close: %v", e)
+	}
+}
+
+// A session superseded by a later Registry generation can no longer submit; the new
+// session can. (Replacement is not yet a coordinator feature — a direct Registry
+// mutation stands in for the ordering it will produce.)
+func TestE2EReplacedSessionUnauthorized(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	rs := cur(t, rn)
+	submitOK(t, rn, lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)) // -> PLAN_CRITIQUE (pair owns it)
+
+	newSess, err := state.MintSessionID(rand.Reader, nil)
+	if err != nil {
+		t.Fatalf("mint session: %v", err)
+	}
+	g, ok, err := genstore.Acquire(rn.RunLock())
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	reg, _, _ := rn.registry.Load()
+	_, err = rn.registry.MutateLocked(g, reg.Revision, func(rev uint64, next *state.Registry) error {
+		next.Pair.Sessions = append(next.Pair.Sessions, state.SessionRecord{
+			SessionID: newSess, Generation: uint64(len(next.Pair.Sessions)) + 1, IssuedRegistryRevision: rev,
+		})
+		next.Pair.CurrentSessionID = newSess
+		return nil
+	})
+	_ = g.Release()
+	if err != nil {
+		t.Fatalf("supersede pair session: %v", err)
+	}
+
+	rs = cur(t, rn)
+	if _, err := rn.Submit(context.Background(), pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil)); !errors.Is(err, transport.ErrUnauthorized) {
+		t.Fatalf("superseded session err = %v, want ErrUnauthorized", err)
+	}
+	// The new current session submits successfully.
+	submitOK(t, rn, newSess, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil))
+	if cur(t, rn).Phase != state.PhaseImplementStep {
+		t.Fatal("the new session's submit did not promote")
 	}
 }
 

@@ -13,13 +13,14 @@ import (
 // derived here from the repository layout so a consumer (the coordinator) never joins
 // run paths of its own — it opens exactly these stores under RunLock.
 type RunLocation struct {
-	RunID       string
-	RelDir      string // repo-relative run directory
-	RunDir      string // absolute run directory
-	RunLock     string // the per-run mutation lock (the two-tier protocol's inner lock)
-	StateDir    string // the RunState genstore directory
-	RegistryDir string // the Registry genstore directory
-	AttachDir   string // the pair-attach transaction journal directory
+	RunID        string
+	RelDir       string // repo-relative run directory
+	RunDir       string // absolute run directory
+	RunLock      string // the per-run mutation lock (the two-tier protocol's inner lock)
+	StateDir     string // the RunState genstore directory
+	RegistryDir  string // the Registry genstore directory
+	AttachDir    string // the pair-attach transaction journal directory
+	ArtifactsDir string // the content-addressed submit-artifact store directory
 }
 
 // ResolveRun binds runID to the repository's single active bootstrap allocation and
@@ -53,13 +54,14 @@ func runLocationFor(lay layout, runID string) RunLocation {
 	rel := state.RunDirRelFor(runID)
 	runDir := lay.runDir(rel)
 	return RunLocation{
-		RunID:       runID,
-		RelDir:      rel,
-		RunDir:      runDir,
-		RunLock:     runLock(runDir),
-		StateDir:    filepath.Join(runDir, "state"),
-		RegistryDir: filepath.Join(runDir, "registry"),
-		AttachDir:   lay.attachJournalDir(runDir),
+		RunID:        runID,
+		RelDir:       rel,
+		RunDir:       runDir,
+		RunLock:      runLock(runDir),
+		StateDir:     filepath.Join(runDir, "state"),
+		RegistryDir:  filepath.Join(runDir, "registry"),
+		AttachDir:    lay.attachJournalDir(runDir),
+		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 	}
 }
 
