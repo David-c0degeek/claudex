@@ -2,7 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -51,7 +50,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("cancel: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("cancelled submit err = %v, want ErrNotAccepting", err)
 		}
@@ -70,7 +69,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("recovery: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rr.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-1", report("turn-1", rr.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("recovering submit err = %v, want ErrNotAccepting", err)
 		}
@@ -91,7 +90,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("advance: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", r2.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-1", report("turn-1", r2.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("stale-assignment submit err = %v, want ErrNotAccepting", err)
 		}
@@ -113,7 +112,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("cancel: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("cancelled-cleared submit err = %v, want ErrNotAccepting", err)
 		}
@@ -136,7 +135,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 		sink := &countingSink{}
 		// turn-1 is the accepted gate source; submit a fresh turn so the not-accepting
 		// refusal (not an already-accepted replay) is what surfaces.
-		_, err = Submit(context.Background(), store, sink, "sess-1", report("turn-2", rg.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-1", report("turn-2", rg.Revision, "x"), ownerAuth("sess-1"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("paused-gate submit err = %v, want ErrNotAccepting", err)
 		}
@@ -157,7 +156,7 @@ func TestSubmitDoesNotAdvanceOnSinkSyncFailure(t *testing.T) {
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 		return nil
 	}
-	_, err := Submit(context.Background(), store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
+	_, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
 	var pce *atomicfile.PostCommitSyncError
 	if !errors.As(err, &pce) {
 		t.Fatalf("submit err = %v, want *atomicfile.PostCommitSyncError", err)
@@ -357,7 +356,7 @@ func TestArtifactStoreAsSubmitSink(t *testing.T) {
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 		return nil
 	}
-	res, err := Submit(context.Background(), store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
+	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}

@@ -108,6 +108,7 @@ func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {
 	if err != nil {
 		t.Fatalf("assign turn-1: %v", err)
 	}
+	initRegistry(t, store)
 	return store, r2.Revision
 }
 
@@ -115,8 +116,17 @@ func report(turnID string, rev uint64, notes string) []byte {
 	return []byte(fmt.Sprintf(`{"protocol_version":1,"message_type":"implementation_report","turn_id":%q,"state_revision":%d,"human_context":null,"requires_human_decision":false,"decision_question":null,"files_changed":["a.go"],"deviations_from_plan":[],"notes":%q}`, turnID, rev, notes))
 }
 
-func submit(store *state.Store, sink ArtifactSink, sess string, raw []byte, auth Authorizer, adv Transition) (SubmitResult, error) {
-	return Submit(context.Background(), store, sink, sess, raw, auth, adv)
+// submit is a legacy-shaped shim: it builds the locked-Submit dependencies (the
+// fixture registry + a terminal journal) and adapts the transition, so existing
+// tests keep their call shape. Authorization is definitive via the registry, so the
+// passed Authorizer is dropped (it was never definitive); a nil sink or transition
+// still surfaces ErrMissingSeam.
+func submit(store *state.Store, sink ArtifactSink, sess string, raw []byte, _ Authorizer, adv Transition) (SubmitResult, error) {
+	var prep Prepare
+	if adv != nil {
+		prep = adaptTransition(adv)
+	}
+	return Submit(context.Background(), submitDeps(store, sink, prep), canonSess(sess), raw)
 }
 
 func TestSubmitAccepts(t *testing.T) {
@@ -484,14 +494,18 @@ func TestAuthorizerCannotInjectAcceptance(t *testing.T) {
 func TestSubmitRequiresSeams(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	r := report("turn-1", rev, "x")
+	// The store/registry/journal/sink/prepare are all required; the preflight
+	// Authorizer is optional (never definitive), so a nil authorizer is not an error.
 	if _, err := submit(store, nil, "s", r, ownerAuth("s"), (&advancer{}).fn); !errors.Is(err, ErrMissingSeam) {
 		t.Fatalf("nil sink")
 	}
-	if _, err := submit(store, newMemSink(), "s", r, nil, (&advancer{}).fn); !errors.Is(err, ErrMissingSeam) {
-		t.Fatalf("nil authorizer")
-	}
 	if _, err := submit(store, newMemSink(), "s", r, ownerAuth("s"), nil); !errors.Is(err, ErrMissingSeam) {
 		t.Fatalf("nil transition")
+	}
+	// A lock-path mismatch across the dependencies fails closed.
+	bad := SubmitDeps{Store: store, Registry: openRunRegistry(store), Journal: fakeJournal{lockPath: "/somewhere/else"}, Sink: newMemSink(), Prepare: adaptTransition((&advancer{}).fn)}
+	if _, err := Submit(context.Background(), bad, leadSess, r); !errors.Is(err, ErrLockMismatch) {
+		t.Fatalf("lock mismatch err = %v, want ErrLockMismatch", err)
 	}
 }
 
@@ -525,31 +539,32 @@ func TestSubmitContextCancelled(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Submit(ctx, store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), (&advancer{}).fn); !errors.Is(err, context.Canceled) {
+	deps := submitDeps(store, newMemSink(), adaptTransition((&advancer{}).fn))
+	if _, err := Submit(ctx, deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
 
-// classifyMutateOutcome reconciles a committed submit whose lock release failed.
-func TestClassifyReconcilesCommittedPostCommitError(t *testing.T) {
-	receipt := state.Receipt{TurnID: "turn-1", Revision: 7, ArtifactDigest: strings.Repeat("c", 64)}
-	committed := state.RunState{AcceptedTurns: map[string]state.AcceptedTurn{
-		"turn-1": {ArtifactDigest: receipt.ArtifactDigest, Receipt: receipt},
-	}}
-	pce := &genstore.PostCommitError{Generation: 7, Err: errors.New("release failed")}
-	res, retry, err := classifyMutateOutcome(committed, pce, "turn-1", receipt.ArtifactDigest)
-	if err != nil || retry {
-		t.Fatalf("committed post-commit err should reconcile: retry=%v err=%v", retry, err)
+// releaseOutcome classifies a lock-release result before vs after a committed append.
+func TestReleaseOutcome(t *testing.T) {
+	if err := releaseOutcome(false, 0, nil); err != nil {
+		t.Fatalf("no release error should be nil, got %v", err)
 	}
-	if res.Receipt != receipt || res.ReleaseWarning == nil {
-		t.Fatalf("committed receipt not reconciled: %+v", res)
+	relErr := errors.New("release failed")
+	// Before acceptance: an ordinary error (never looks committed).
+	if err := releaseOutcome(false, 0, relErr); err != relErr {
+		t.Fatalf("pre-acceptance release should be the plain error, got %v", err)
 	}
-	// A conflict retries; an unrelated error is fatal.
-	if _, retry, _ := classifyMutateOutcome(state.RunState{}, state.ErrRevisionConflict, "turn-1", "d"); !retry {
-		t.Fatalf("conflict should retry")
+	var pce *genstore.PostCommitError
+	if !errors.As(releaseOutcome(false, 0, relErr), &pce) {
+		// (expected: not a PostCommitError)
+	} else {
+		t.Fatalf("pre-acceptance release must not be a PostCommitError")
 	}
-	if _, _, err := classifyMutateOutcome(state.RunState{}, errors.New("boom"), "turn-1", "d"); err == nil {
-		t.Fatalf("an unrelated error should be fatal")
+	// After a committed append: a PostCommitError over the committed revision.
+	out := releaseOutcome(true, 7, relErr)
+	if !errors.As(out, &pce) || pce.Generation != 7 {
+		t.Fatalf("post-commit release = %v, want a PostCommitError over generation 7", out)
 	}
 }
 
@@ -594,7 +609,10 @@ func TestSubmitConcurrentSameDigest(t *testing.T) {
 	}
 }
 
-func TestSubmitConcurrentDifferentDigestOrphanIsIdentifiable(t *testing.T) {
+// Two concurrent submits with different digests for the same turn: they serialize
+// on the run guard, so exactly one accepts and the other is rejected as a conflict
+// BEFORE it can publish — the locked ordering leaves no orphan artifact at all.
+func TestSubmitConcurrentDifferentDigestNoOrphan(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	adv := &advancer{}
@@ -625,20 +643,9 @@ func TestSubmitConcurrentDifferentDigestOrphanIsIdentifiable(t *testing.T) {
 	if accepted != 1 || conflicts != 1 || adv.calls.Load() != 1 {
 		t.Fatalf("want 1 accept + 1 conflict + 1 transition; got %d/%d/%d", accepted, conflicts, adv.calls.Load())
 	}
-	// The conflicting submit's artifact is an identifiable orphan: it is in the
-	// sink under a digest that AcceptedTurns does not reference (safe for sweep).
-	loaded, _, _ := store.Load()
-	acceptedDigest := loaded.AcceptedTurns["turn-1"].ArtifactDigest
-	if sink.count() != 2 {
-		t.Fatalf("expected an accepted artifact and one orphan, sink has %d", sink.count())
-	}
-	orphans := 0
-	for key := range sink.m {
-		if !strings.HasSuffix(key, acceptedDigest) {
-			orphans++
-		}
-	}
-	if orphans != 1 {
-		t.Fatalf("expected exactly one identifiable orphan, got %d", orphans)
+	// The conflicting submit was rejected before publishing, so the sink holds only
+	// the single accepted artifact — no orphan.
+	if sink.count() != 1 {
+		t.Fatalf("expected exactly the accepted artifact, sink has %d", sink.count())
 	}
 }

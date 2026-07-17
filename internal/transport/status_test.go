@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -195,7 +194,7 @@ func TestStatusAfterSubmit(t *testing.T) {
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 		return nil
 	}
-	res, err := Submit(context.Background(), store, newMemSink(), "sess-1", report("turn-1", rev, "done"), ownerAuth("sess-1"), adv)
+	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "done"), ownerAuth("sess-1"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
