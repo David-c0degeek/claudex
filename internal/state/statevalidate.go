@@ -489,8 +489,20 @@ func redactAndGuard(rs *RunState) error {
 			control[fmt.Sprintf("agreed_plan.checks.keys.%d", i)] = k
 		}
 	}
+	if rs.FixReturn != "" {
+		control["fix_return"] = string(rs.FixReturn)
+	}
 	if rs.Pause != nil {
 		addEventRefControls(control, "pause.source", rs.Pause.Source)
+		control["pause.kind"] = string(rs.Pause.Kind)
+		control["pause.origin_phase"] = string(rs.Pause.OriginPhase)
+		control["pause.resume_phase"] = string(rs.Pause.ResumePhase)
+		if rs.Pause.FixReturn != "" {
+			control["pause.fix_return"] = string(rs.Pause.FixReturn)
+		}
+		if rs.Pause.Budget != nil {
+			control["pause.budget.kind"] = string(rs.Pause.Budget.Kind)
+		}
 	}
 	if rs.Recovery != nil {
 		control["recovery.code"] = rs.Recovery.Code

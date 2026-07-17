@@ -31,7 +31,13 @@ const (
 // always representable and a frozen policy can never request a limit the state
 // counters cannot reach. The state store validates its counters against the same
 // ceiling.
-const MaxBudget = 1 << 20
+//
+// It is deliberately storage-safe, not merely integer-safe: every accepted turn
+// stays in run state, and genstore hard-caps each generation at 16 MiB. At a
+// worst-case accepted-turn entry of a few hundred bytes, 1<<14 turns keeps the
+// accepted-turn history well under that record cap, so a frozen max_run_turns can
+// always be persisted to its limit.
+const MaxBudget = 1 << 14
 
 // TaskContract is the run's goal and acceptance definition (harvested shape).
 type TaskContract struct {

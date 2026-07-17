@@ -63,6 +63,7 @@
     "findings": {
       "description": "Plan-level findings; content facts belong in implementation_checks.",
       "type": "array",
+      "maxItems": 256,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -139,6 +140,7 @@
     "implementation_checks": {
       "description": "Non-plan-blocking obligations carried into implementation and verification.",
       "type": "array",
+      "maxItems": 256,
       "items": {
         "type": "object",
         "additionalProperties": false,

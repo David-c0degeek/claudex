@@ -130,6 +130,7 @@
     "responses": {
       "description": "Point-by-point responses to critique findings.",
       "type": "array",
+      "maxItems": 256,
       "items": {
         "type": "object",
         "additionalProperties": false,

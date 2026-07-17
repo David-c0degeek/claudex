@@ -409,17 +409,17 @@ func cloneForNext(prev *RunState) *RunState {
 	}
 	if prev.CandidateChecks != nil {
 		cc := *prev.CandidateChecks
-		cc.Keys = append([]string(nil), prev.CandidateChecks.Keys...)
+		cc.Keys = cloneKeys(prev.CandidateChecks.Keys)
 		n.CandidateChecks = &cc
 	}
 	if prev.PendingFindings != nil {
 		pf := *prev.PendingFindings
-		pf.Keys = append([]string(nil), prev.PendingFindings.Keys...)
+		pf.Keys = cloneKeys(prev.PendingFindings.Keys)
 		n.PendingFindings = &pf
 	}
 	if prev.AgreedPlan != nil {
 		ap := *prev.AgreedPlan
-		ap.Checks.Keys = append([]string(nil), prev.AgreedPlan.Checks.Keys...)
+		ap.Checks.Keys = cloneKeys(prev.AgreedPlan.Checks.Keys)
 		n.AgreedPlan = &ap
 	}
 	if prev.StepIndex != nil {

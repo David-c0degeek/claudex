@@ -62,6 +62,33 @@ func TestKeyLengthSchemaParity(t *testing.T) {
 	}
 }
 
+// The keyed-array maxItems in every schema must equal MaxKeySetItems, so a durable
+// set can never exceed the bound the state layer also enforces.
+func TestKeySetItemsSchemaParity(t *testing.T) {
+	cases := []struct {
+		typ   string
+		array string
+	}{
+		{"plan_critique", "findings"},
+		{"plan_critique", "implementation_checks"},
+		{"plan_revision", "responses"},
+	}
+	for _, c := range cases {
+		b, err := Schema(c.typ, SupportedVersion)
+		if err != nil {
+			t.Fatalf("schema %s: %v", c.typ, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("decode %s: %v", c.typ, err)
+		}
+		arr := m["properties"].(map[string]any)[c.array].(map[string]any)
+		if got := int(arr["maxItems"].(float64)); got != MaxKeySetItems {
+			t.Fatalf("%s.%s maxItems = %d, want %d (MaxKeySetItems)", c.typ, c.array, got, MaxKeySetItems)
+		}
+	}
+}
+
 func TestValidateKeySet(t *testing.T) {
 	if err := ValidateKeySet("findings", []string{"a", "b", "c-d"}); err != nil {
 		t.Fatalf("valid key set: %v", err)

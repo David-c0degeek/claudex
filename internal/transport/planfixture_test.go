@@ -3,6 +3,7 @@ package transport
 import (
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/canonjson"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -13,6 +14,16 @@ func dig(c string) string {
 		b[i] = c[0]
 	}
 	return string(b)
+}
+
+// emptyChecks builds the canonical empty implementation-check set the first
+// candidate must carry.
+func emptyChecks() *state.CheckSetRef {
+	d, err := canonjson.Digest([]byte("[]"))
+	if err != nil {
+		panic(err)
+	}
+	return &state.CheckSetRef{Keys: []string{}, Digest: d}
 }
 
 // driveAgreedImplement drives a run from its pristine INIT (at initRev) through the
@@ -39,7 +50,7 @@ func driveAgreedImplement(t *testing.T, store *state.Store, initRev uint64) uint
 		n.Assignment = nil
 		n.Phase = state.PhasePlanCritique
 		n.CandidatePlan = &state.PlanRef{Source: state.EventRef{Digest: dig("1"), TurnID: "plan-turn"}, Digest: dig("2"), StepCount: 1}
-		n.CandidateChecks = &state.CheckSetRef{Keys: []string{"chk-a"}, Digest: dig("e")}
+		n.CandidateChecks = emptyChecks()
 	})
 	critAssigned := mutate(t, store, critique, func(rev uint64, n *state.RunState) {
 		n.Assignment = &state.Ref{ID: "crit-turn", IssuedRevision: rev}

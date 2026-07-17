@@ -16,6 +16,13 @@ const (
 // versa. Changing it requires changing those three schema literals in lockstep.
 const MaxKeyLength = 256
 
+// MaxKeySetItems bounds the number of entries in a keyed set — plan-critique
+// findings and implementation checks, plan-revision responses, and the durable
+// state check-set/finding key lists. It keeps a durable set bounded so the
+// cumulative materialized check set can never grow a generation past the genstore
+// record cap. It is pinned to the schemas' maxItems by a parity test.
+const MaxKeySetItems = 256
+
 // IsKey reports whether s is a canonical lowercase-hyphen key: `[a-z0-9]+(-[a-z0-9]+)*`,
 // bounded by MaxKeyLength. Finding/check/response keys use this — the schema
 // descriptions do not enforce the grammar, so semantic validation does.
@@ -44,6 +51,9 @@ func IsKey(s string) bool {
 // keys (plan-critique findings, implementation checks, or plan-revision
 // responses). Errors are value-free (no key echoed).
 func ValidateKeySet(field string, keys []string) error {
+	if len(keys) > MaxKeySetItems {
+		return fmt.Errorf("protocol: %s has more than %d keys", field, MaxKeySetItems)
+	}
 	seen := make(map[string]bool, len(keys))
 	for _, k := range keys {
 		if !IsKey(k) {

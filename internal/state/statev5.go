@@ -22,6 +22,17 @@ func mustCanonDigest(raw string) string {
 	return d
 }
 
+// cloneKeys deep-copies a key slice while preserving nil-vs-non-nil-empty: a
+// non-nil empty set stays a non-nil empty set, so an empty check set keeps its one
+// durable encoding across generations (append([]string(nil), empty...) would
+// collapse it to nil).
+func cloneKeys(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string{}, in...)
+}
+
 // qualityPauseTable is the closed set of legal quality-budget pauses: which phase
 // the budget exhausted in, which phase the run resumes into, the budget kind, and
 // the FIX return target it restores. Origin and resume differ for every entry,
@@ -316,6 +327,10 @@ func validateV5Refs(rs *RunState) error {
 		if ag.AgreedRevision == 0 || ag.AgreedRevision > rs.Revision {
 			return fmt.Errorf("agreed_plan.agreed_revision %d out of range 1..%d", ag.AgreedRevision, rs.Revision)
 		}
+		// The agreement was reached at the revision the agreeing critique was accepted.
+		if rs.AcceptedTurns[ag.Critique.TurnID].Receipt.Revision != ag.AgreedRevision {
+			return fmt.Errorf("agreed_plan.critique was not accepted at the agreed revision %d", ag.AgreedRevision)
+		}
 	}
 	if rs.Pause != nil {
 		if err := validatePauseSource(rs); err != nil {
@@ -336,14 +351,20 @@ func validatePlanRef(field string, pr PlanRef, rs *RunState, allowed ...Phase) e
 }
 
 func validateCheckSet(field string, cs CheckSetRef) error {
+	if cs.Keys == nil {
+		return fmt.Errorf("%s.keys must be a non-nil array (use [] for the empty set)", field)
+	}
 	if err := validateSortedKeys(field, cs.Keys); err != nil {
 		return err
 	}
 	if !isHex64(cs.Digest) {
 		return fmt.Errorf("%s.digest is not a 64-char lower-hex sha256", field)
 	}
-	if len(cs.Keys) == 0 && cs.Digest != emptyCheckSetDigest {
-		return fmt.Errorf("%s empty key set must carry the canonical empty-array digest", field)
+	// The empty-set digest is biconditional: a key set is empty exactly when it
+	// carries the canonical digest of the empty array, so neither a non-empty set
+	// with the empty digest nor an empty set with any other digest can slip through.
+	if (len(cs.Keys) == 0) != (cs.Digest == emptyCheckSetDigest) {
+		return fmt.Errorf("%s: keys are empty iff the digest is the canonical empty-array digest", field)
 	}
 	return nil
 }
@@ -403,7 +424,14 @@ func validatePauseSource(rs *RunState) error {
 		}
 		return nil
 	}
-	return validateEventRef("pause.source", p.Source, rs, p.OriginPhase)
+	if err := validateEventRef("pause.source", p.Source, rs, p.OriginPhase); err != nil {
+		return err
+	}
+	// An agent gate's source was accepted at the same revision the gate was issued.
+	if rs.Gate == nil || rs.AcceptedTurns[p.Source.TurnID].Receipt.Revision != rs.Gate.IssuedRevision {
+		return fmt.Errorf("pause.source must be accepted at the gate's issued revision")
+	}
+	return nil
 }
 
 // validateBudgetHonesty requires a quality-budget label to be truthful: the durable
@@ -510,7 +538,82 @@ func validateV5Transition(old, next *RunState) error {
 			return err
 		}
 	}
+	if err := validateCandidateChecksTransition(old, next); err != nil {
+		return err
+	}
+	if err := validatePausedImmutability(old, next); err != nil {
+		return err
+	}
+	if err := validateSamePhasePreservation(old, next); err != nil {
+		return err
+	}
 	return validateContextTransfer(old, next)
+}
+
+// validateCandidateChecksTransition pins the materialized check-set lifecycle: the
+// first candidate initializes the canonical empty set; thereafter the set changes
+// only with a freshly accepted, actionable critique (the one that sets
+// PendingFindings this generation). A plan revision, which carries no check ops,
+// therefore preserves it, and a human-gated/inconclusive critique cannot change it.
+func validateCandidateChecksTransition(old, next *RunState) error {
+	if next.CandidateChecks == nil || reflect.DeepEqual(old.CandidateChecks, next.CandidateChecks) {
+		return nil
+	}
+	if old.CandidatePlan == nil { // first candidate creation (from PLAN_DRAFT)
+		if len(next.CandidateChecks.Keys) != 0 || next.CandidateChecks.Digest != emptyCheckSetDigest {
+			return fmt.Errorf("the initial candidate_checks must be the canonical empty set")
+		}
+		return nil
+	}
+	freshCritique := next.PendingFindings != nil && !reflect.DeepEqual(old.PendingFindings, next.PendingFindings)
+	if !freshCritique {
+		return fmt.Errorf("candidate_checks may change only with a freshly accepted actionable critique")
+	}
+	return nil
+}
+
+// validatePausedImmutability freezes the suspended transition while a pause remains:
+// the pause record, its gate, the cursor, and every counter are byte-identical until
+// the pause is cleared, so nothing rewrites the parked decision or charges a counter
+// before resumption.
+func validatePausedImmutability(old, next *RunState) error {
+	if old.Pause == nil || next.Pause == nil {
+		return nil // opening or clearing a pause is governed by the other rules
+	}
+	if !reflect.DeepEqual(old.Pause, next.Pause) {
+		return fmt.Errorf("pause is immutable while the run is paused")
+	}
+	if !reflect.DeepEqual(old.Gate, next.Gate) {
+		return fmt.Errorf("gate is immutable while the run is paused")
+	}
+	if !reflect.DeepEqual(old.StepIndex, next.StepIndex) {
+		return fmt.Errorf("step_index is immutable while the run is paused")
+	}
+	if !reflect.DeepEqual(old.Counters, next.Counters) {
+		return fmt.Errorf("counters are immutable while the run is paused")
+	}
+	return nil
+}
+
+// validateSamePhasePreservation keeps the VERIFY attempt and the FIX return target
+// stable while the run stays in that phase (a reissued assignment must not silently
+// become another verify attempt). The transfer/restore rules add to these.
+func validateSamePhasePreservation(old, next *RunState) error {
+	running := old.Pause == nil && next.Pause == nil
+	if running && old.Phase == PhaseVerify && next.Phase == PhaseVerify {
+		if !reflect.DeepEqual(old.Verify, next.Verify) {
+			return fmt.Errorf("verify requirement must be preserved while the run stays in VERIFY")
+		}
+		if old.Counters.VerifyFixes != next.Counters.VerifyFixes {
+			return fmt.Errorf("verify_fixes must not change while the run stays in VERIFY")
+		}
+	}
+	if running && old.Phase == PhaseFix && next.Phase == PhaseFix {
+		if old.FixReturn != next.FixReturn {
+			return fmt.Errorf("fix_return must be preserved while the run stays in FIX")
+		}
+	}
+	return nil
 }
 
 // validateContextTransfer enforces that a human gate raised from VERIFY or FIX

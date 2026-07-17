@@ -1,10 +1,12 @@
 package state
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/config"
+	"github.com/David-c0degeek/claudex/internal/protocol"
 )
 
 // rejects asserts a mutation from prev is refused by validation.
@@ -282,4 +284,112 @@ func TestV5SecretRejectedInControlField(t *testing.T) {
 	if strings.Contains(secret, "REDACTED") { // guard against an accidental rewrite path
 		t.Fatal("secret constant unexpectedly redacted")
 	}
+}
+
+// A secret placed in an enum control field must be rejected too — redaction runs
+// before validation, so an error message would otherwise echo it.
+func TestV5SecretRejectedInEnumField(t *testing.T) {
+	s := newStore(t)
+	secret := "sk-ant-abcdefghijklmnopqrstuvwx"
+	assigned := assignAt(t, s, mustAgreedImplement(t, s), "t1")
+	rejects(t, s, assigned, "secret in pause kind", func(rev uint64, n *RunState) {
+		n.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseImplementStep}
+		n.Pause = &PauseContext{Kind: PauseKind(secret), OriginPhase: PhaseImplementStep, ResumePhase: PhaseImplementStep, Source: EventRef{Digest: hex64("7"), TurnID: "t1"}}
+		n.Gate = &Ref{ID: "g", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+	})
+}
+
+// An empty check set persists as a non-nil empty array and survives cloning into the
+// next generation (append([]string(nil),...) would collapse it to null and fail the
+// non-nil requirement on the following mutation).
+func TestV5EmptyCheckSetSurvivesClone(t *testing.T) {
+	s := newStore(t)
+	critique := driveToCritique(t, s, mustInit(t, s)) // empty candidate checks
+	// The next generation clones the empty check set; if it collapsed to nil the
+	// mutation would be rejected.
+	assignAt(t, s, critique, critTurnID)
+	loaded, _, _ := s.Load()
+	if loaded.CandidateChecks == nil || loaded.CandidateChecks.Keys == nil || len(loaded.CandidateChecks.Keys) != 0 {
+		t.Fatalf("empty check set did not survive as a non-nil empty array: %+v", loaded.CandidateChecks)
+	}
+}
+
+func TestV5CandidateChecksLifecycle(t *testing.T) {
+	s := newStore(t)
+	init := mustInit(t, s)
+	draft := issueFirstTurn(t, s, init, planTurnID)
+
+	// The first candidate must initialize the canonical empty check set.
+	rejects(t, s, draft, "initial non-empty checks", func(_ uint64, n *RunState) {
+		n.Phase = PhasePlanCritique
+		n.CandidatePlan = candidatePlan()
+		n.CandidateChecks = &CheckSetRef{Keys: []string{"chk-a"}, Digest: hex64("e")}
+	})
+
+	// From a valid PLAN_CRITIQUE (built from the same draft), the check set cannot
+	// change without a fresh critique.
+	critique := acceptTurnAdvance(t, s, draft, planTurnID, planSrcDigest(), func(_ uint64, n *RunState) {
+		n.Phase = PhasePlanCritique
+		n.CandidatePlan = candidatePlan()
+		n.CandidateChecks = candidateChecks()
+	})
+	rejects(t, s, critique, "checks change without a critique", func(_ uint64, n *RunState) {
+		n.CandidateChecks = &CheckSetRef{Keys: []string{"chk-x"}, Digest: hex64("e")}
+	})
+}
+
+func TestV5PausedImmutability(t *testing.T) {
+	s := newStore(t)
+	assigned := assignAt(t, s, mustAgreedImplement(t, s), "t1")
+	gated := acceptTurnAdvance(t, s, assigned, "t1", hex64("7"), func(rev uint64, n *RunState) {
+		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseImplementStep, ResumePhase: PhaseImplementStep, Source: EventRef{Digest: hex64("7"), TurnID: "t1"}}
+		n.Gate = &Ref{ID: "gate-1", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+	})
+	// A counter cannot advance while the run stays paused.
+	rejects(t, s, gated, "counter changed while paused", func(_ uint64, n *RunState) {
+		n.Counters.PlanRevisions++
+	})
+	// The pause record itself is frozen while paused.
+	rejects(t, s, gated, "pause resume target changed", func(_ uint64, n *RunState) {
+		n.Pause.ResumePhase = PhaseCheckpoint
+	})
+}
+
+func TestV5SamePhaseVerifyPreserved(t *testing.T) {
+	s := newStore(t)
+	impl := mustAgreedImplement(t, s)
+	tests := toTests(t, s, impl)
+	verify, err := s.Mutate(tests.Revision, func(_ uint64, n *RunState) error {
+		n.Phase = PhaseVerify
+		n.Verify = &VerifyRequirement{RequiredGeneration: 1}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	// Staying in VERIFY must preserve the requirement and the fix counter.
+	rejects(t, s, verify, "verify requirement changed in VERIFY", func(_ uint64, n *RunState) {
+		n.Verify.RequiredGeneration = 9
+	})
+	rejects(t, s, verify, "verify_fixes changed in VERIFY", func(_ uint64, n *RunState) {
+		n.Counters.VerifyFixes++
+	})
+}
+
+func TestV5KeySetCountBound(t *testing.T) {
+	s := newStore(t)
+	draft := issueFirstTurn(t, s, mustInit(t, s), planTurnID)
+	rejects(t, s, draft, "too many check keys", func(_ uint64, n *RunState) {
+		n.Phase = PhasePlanCritique
+		n.CandidatePlan = candidatePlan()
+		keys := make([]string, protocol.MaxKeySetItems+1)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("k-%05d", i) // canonical, sorted, distinct
+		}
+		n.CandidateChecks = &CheckSetRef{Keys: keys, Digest: hex64("e")}
+	})
 }
