@@ -432,3 +432,92 @@ func TestSubmitWinsThenReplacementProceeds(t *testing.T) {
 		t.Fatalf("replacement after the submit released: %v", err)
 	}
 }
+
+// emptyRegistry opens an uninitialized registry handle sharing the store's run lock.
+func emptyRegistry(store *state.Store) *state.RegistryStore {
+	return state.OpenRegistry(filepath.Join(runDir(store), "empty-registry"), store.LockPath())
+}
+
+// The journal is classified BEFORE the registry, so a crash that left the run state
+// present, the attach journal nonterminal/unreadable, and the registry not yet
+// created routes to recovery rather than a permanent run mismatch.
+func TestSubmitJournalPrecedesRegistry(t *testing.T) {
+	t.Run("nonterminal journal + empty registry", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		sink := newMemSink()
+		deps := depsWith(store, sink, fakeJournal{lockPath: store.LockPath(), head: JournalNonterminal}, emptyRegistry(store), checkpointPrep())
+		if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrRecoveryRequired", err)
+		}
+		if sink.count() != 0 {
+			t.Fatalf("sink touched")
+		}
+	})
+	t.Run("journal read error + empty registry", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		sink := newMemSink()
+		deps := depsWith(store, sink, fakeJournal{lockPath: store.LockPath(), err: errors.New("corrupt")}, emptyRegistry(store), checkpointPrep())
+		if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("err = %v, want ErrRecoveryRequired", err)
+		}
+		if sink.count() != 0 {
+			t.Fatalf("sink touched")
+		}
+	})
+	t.Run("terminal journal + empty registry", func(t *testing.T) {
+		store, rev := newRunWithActiveTurn(t)
+		sink := newMemSink()
+		deps := depsWith(store, sink, terminalJournal(store), emptyRegistry(store), checkpointPrep())
+		if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRunMismatch) {
+			t.Fatalf("err = %v, want ErrRunMismatch", err)
+		}
+		if sink.count() != 0 {
+			t.Fatalf("sink touched")
+		}
+	})
+}
+
+// A declared gate id that collides with an accepted turn is rejected before Put
+// (turn and gate ids share one canonical namespace).
+func TestSubmitIssuedGateCollisionRecheck(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	sink := newMemSink()
+	// "plan-turn" is an accepted turn; declaring it as the issued gate id collides.
+	prep := prepareIssuing("", "plan-turn", func(uint64, *state.RunState) error { return nil })
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), prep)
+	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("gate collision err = %v, want ErrTransitionInvalid", err)
+	}
+	if sink.count() != 0 {
+		t.Fatalf("sink written despite a gate-id collision")
+	}
+}
+
+// An Apply that directly returns an error after Put leaves exactly one orphan,
+// releases the guard, and a later valid submit re-confirms and accepts.
+func TestSubmitApplyErrorLeavesOneOrphan(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	sink := newMemSink()
+	raw := report("turn-1", rev, "did it")
+	errApply := prepareIssuing("turn-2", "", func(uint64, *state.RunState) error {
+		return errors.New("apply boom")
+	})
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), errApply)
+	if _, err := Submit(context.Background(), deps, leadSess, raw); err == nil {
+		t.Fatalf("an apply error should reject the submit")
+	}
+	if sink.count() != 1 {
+		t.Fatalf("apply error left %d artifacts, want exactly one orphan", sink.count())
+	}
+	if loaded, _, _ := store.Load(); loaded.Revision != rev {
+		t.Fatalf("an apply error still advanced the run")
+	}
+	// The guard was released: a fresh valid submit re-confirms the orphan and accepts.
+	res, err := submit(store, sink, "sess-1", raw, ownerAuth("sess-1"), checkpointPrep())
+	if err != nil {
+		t.Fatalf("fresh submit after the apply-error orphan: %v", err)
+	}
+	if res.Receipt.Revision != rev+1 || sink.count() != 1 {
+		t.Fatalf("fresh submit did not re-confirm+accept: rev=%d sink=%d", res.Receipt.Revision, sink.count())
+	}
+}

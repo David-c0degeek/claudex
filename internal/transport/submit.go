@@ -260,16 +260,11 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 	if !ok {
 		return reject(ErrNoRun)
 	}
-	reg, ok, rerr := deps.Registry.Load()
-	if rerr != nil {
-		return reject(rerr)
-	}
-	if !ok {
-		return reject(ErrRunMismatch)
-	}
 
-	// Attach-journal policy: only a terminal or truly-absent journal proceeds; a
-	// nonterminal, unknown, out-of-range, or unreadable journal fails closed.
+	// Attach-journal policy comes BEFORE the registry: a crash can leave the run
+	// state present, the attach intent nonterminal, and the registry not yet created,
+	// which is recovery — not a permanent run mismatch. Only a terminal or truly-absent
+	// journal proceeds; nonterminal/unknown/out-of-range/unreadable fails closed.
 	head, jerr := deps.Journal.Head(g, rs.RunID)
 	if jerr != nil {
 		return reject(fmt.Errorf("%w: %v", ErrRecoveryRequired, jerr))
@@ -279,6 +274,14 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		// proceed
 	default: // JournalNonterminal, JournalUnknown, or any out-of-range value
 		return reject(ErrRecoveryRequired)
+	}
+
+	reg, ok, rerr := deps.Registry.Load()
+	if rerr != nil {
+		return reject(rerr)
+	}
+	if !ok {
+		return reject(ErrRunMismatch)
 	}
 	// Run identity: the registry must belong to this run.
 	if reg.RunID != rs.RunID {
