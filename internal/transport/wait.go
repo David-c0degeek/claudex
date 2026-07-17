@@ -298,6 +298,25 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return ev, true, nil
 	}
 
+	// The ownership boundary at ACTIVE VERIFY: an assigned verifier turn is owned
+	// exactly by the current pair session that meets the fresh-session threshold — the
+	// same boundary pull and submit enforce. Terminal and replacement dominated above;
+	// a required recovery still dominates (deferred to the revision-gated recovery
+	// check below via the recovery==nil guard). Ownership and current-pair identity
+	// must agree: both true is the qualifying verifier (it must meet the threshold, and
+	// falls through to the revision-gated assignment); both false is a legitimate
+	// lead/other-role waiter (unchanged); a mismatch — a claimed owner that is not the
+	// current pair, or a current pair that does not own the turn — is a seam/state
+	// contradiction that would otherwise strand the verifier or leak a stale turn.
+	if f.phase == state.PhaseVerify && f.lifecycle == state.LifecycleRunning && f.assignmentID != "" && f.recovery == nil {
+		if v.IsCurrentPair != v.OwnsActiveTurn {
+			return WaitEvent{}, false, fmt.Errorf("%w: an active VERIFY turn's ownership must match the current pair session", ErrSessionView)
+		}
+		if v.IsCurrentPair && v.PairGeneration < f.verifyGen {
+			return WaitEvent{}, false, fmt.Errorf("%w: an active VERIFY owner is below the fresh-session threshold", ErrSessionView)
+		}
+	}
+
 	// The remaining events are revision-gated. Terminal was already handled above.
 	if f.revision <= since {
 		return WaitEvent{}, false, nil
@@ -321,13 +340,8 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return ev, true, nil
 	}
 	if v.OwnsActiveTurn {
-		// An ACTIVE VERIFY turn is owned only by the current pair session that meets the
-		// fresh-session threshold — the same boundary pull and submit enforce. A stale or
-		// unqualified owner claim (not the current pair, or below the threshold) is a
-		// seam/state contradiction, never a handed-out assignment notification.
-		if f.phase == state.PhaseVerify && (!v.IsCurrentPair || v.PairGeneration < f.verifyGen) {
-			return WaitEvent{}, false, fmt.Errorf("%w: an active VERIFY turn requires the current pair session at the fresh-session threshold", ErrSessionView)
-		}
+		// At VERIFY the active-ownership boundary above already required the owner to be
+		// the current pair session at the fresh-session threshold.
 		ev := newEvent(WaitAssignment, f)
 		id := f.assignmentID
 		ev.TurnID = &id

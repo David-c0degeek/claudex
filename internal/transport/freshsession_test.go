@@ -129,18 +129,38 @@ func TestWaitActiveVerifyIsAssignment(t *testing.T) {
 	}
 }
 
-// Wait must not hand the active VERIFY turn to a stale/unqualified owner: the same
-// fresh-session boundary pull and submit enforce.
-func TestWaitActiveVerifyStaleOwnerRejected(t *testing.T) {
+// At active VERIFY, ownership and current-pair identity must agree, and the owner must
+// meet the threshold. Every mismatch is a fail-closed contradiction — it would
+// otherwise leak a stale turn or strand the qualifying verifier.
+func TestWaitActiveVerifyOwnershipContradictions(t *testing.T) {
 	store, rev := runAtActiveVerify(t, 3)
-	// The current pair owns the turn but is below the threshold.
-	if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewCurrentPairOwner(2)); !errors.Is(err, ErrSessionView) {
-		t.Fatalf("below-threshold owner err = %v, want ErrSessionView", err)
+	cases := map[string]SessionViewer{
+		"owner below threshold":                      viewCurrentPairOwner(2), // both true, gen < 3
+		"owner without current-pair facts":           viewForRole(RolePair, nil),
+		"qualifying current pair without ownership":  viewCurrentPair(3), // current pair, gen ok, not owning
+		"below-threshold current pair without owner": viewCurrentPair(2),
 	}
-	// A claimed owner that is not the current pair (no pair-generation facts) is a
-	// contradiction, not a handed-out assignment.
-	if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrSessionView) {
-		t.Fatalf("owner without pair facts err = %v, want ErrSessionView", err)
+	for name, v := range cases {
+		if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, v); !errors.Is(err, ErrSessionView) {
+			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
+		}
+	}
+}
+
+// A lead/other-role waiter at active VERIFY (neither owner nor current pair) is
+// legitimate and stays unchanged.
+func TestWaitActiveVerifyLeadUnchanged(t *testing.T) {
+	store, rev := runAtActiveVerify(t, 3)
+	clk := newFakeClock()
+	ch := make(chan WaitEvent, 1)
+	go func() {
+		ev, _ := waitWithClock(context.Background(), store, sessLead, rev-1, time.Second, viewNotPair(), clk)
+		ch <- ev
+	}()
+	<-clk.timeoutAsked
+	clk.timeoutCh <- time.Time{}
+	if ev := <-ch; ev.Kind != WaitUnchanged {
+		t.Fatalf("lead at active VERIFY ev = %+v, want unchanged", ev)
 	}
 }
 
@@ -339,6 +359,36 @@ func TestStatusFreshSessionHonestyLabel(t *testing.T) {
 	}
 	if _, err := Status(store, managedFresh); err != nil {
 		t.Fatalf("managed fresh-process rejected: %v", err)
+	}
+}
+
+// The protocol-only generation-enforcement label cannot be omitted, downgraded, or
+// laundered.
+func TestStatusBYOHonestyNegatives(t *testing.T) {
+	store, _ := newRunWithActiveTurn(t)
+	byo := func(caps []Capability) HonestySource {
+		return func(StatusInput) (HonestyLabels, error) {
+			return HonestyLabels{Tier: TierProtocolOnly, TierMechanism: "durable-byo-registration", Capabilities: caps}, nil
+		}
+	}
+	cases := map[string][]Capability{
+		"missing verify-fresh-session": {{Name: "repo-read-only", Status: "unavailable", Mechanism: "byo-attach"}},
+		"wrong status":                 {{Name: "verify-fresh-session", Status: "unavailable", Mechanism: "fresh-session-declared"}},
+		"wrong mechanism":              {{Name: "verify-fresh-session", Status: "enforced", Mechanism: "byo-attach"}},
+		"fresh-process on BYO":         {{Name: "verify-fresh-session", Status: "enforced", Mechanism: "fresh-process"}},
+		"laundered onto another cap": {
+			{Name: "verify-fresh-session", Status: "enforced", Mechanism: "fresh-session-declared"},
+			{Name: "other-cap", Status: "enforced", Mechanism: "fresh-session-declared"},
+		},
+	}
+	for name, caps := range cases {
+		if _, err := Status(store, byo(caps)); !errors.Is(err, ErrHonestySource) {
+			t.Fatalf("%s err = %v, want ErrHonestySource", name, err)
+		}
+	}
+	// The exact valid shape passes.
+	if _, err := Status(store, byo([]Capability{{Name: "verify-fresh-session", Status: "enforced", Mechanism: "fresh-session-declared"}})); err != nil {
+		t.Fatalf("valid BYO label rejected: %v", err)
 	}
 }
 
