@@ -1,12 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -21,19 +21,24 @@ const (
 	IDGate                     // a gate id (a paused edge)
 )
 
-// RequiredID derives, from the SAME route table Apply consumes, which identity the
-// decision issues. It fails closed on a malformed/unknown decision; in this subset
-// IDNone is unreachable from a successful Evaluate (every supported non-gate route
-// issues an assignment), so a None result is treated as an error by the adapter.
+// RequiredID derives, from the SAME route table Apply's edge guard consumes, which
+// identity the decision issues. It fails closed on a malformed decision — an unknown
+// route, an illegal from->next edge, or a gate-presence that disagrees with the route
+// — before any id is minted, so a fabricated decision cannot request the wrong id. In
+// this subset IDNone is unreachable from a successful Evaluate (every supported
+// non-gate route issues an assignment); a None result is always an error.
 func RequiredID(dec Decision) (IDKind, error) {
-	switch dec.Route {
-	case RouteGate:
-		return IDGate, nil
-	case RouteDraftAccepted, RoutePromote, RouteToRevise, RouteRetryReview,
-		RouteReviseAccepted, RouteToCheckpoint, RouteNextStep, RouteToFix:
-		return IDAssignment, nil
+	s, ok := routeTable[dec.Route]
+	if !ok {
+		return IDNone, fmt.Errorf("%w: no id kind for route %d", ErrBadDecision, dec.Route)
 	}
-	return IDNone, fmt.Errorf("%w: no id kind for route %d", ErrBadDecision, dec.Route)
+	if !s.edge(dec.FromPhase, dec.Next) {
+		return IDNone, fmt.Errorf("%w: illegal edge %s->%s for route %d", ErrBadDecision, dec.FromPhase, dec.Next, dec.Route)
+	}
+	if (s.id == IDGate) != (dec.Gate != nil) {
+		return IDNone, fmt.Errorf("%w: gate presence does not match route %d", ErrBadDecision, dec.Route)
+	}
+	return s.id, nil
 }
 
 // --- planning-history materializer ---
@@ -63,17 +68,23 @@ type AcceptedArtifact struct {
 }
 
 // CandidateRefs is the durable summary of the reconstructed candidate, which the
-// caller asserts against the locked state before use.
+// caller asserts against the locked state before use. It carries every fact the
+// coordinator cross-checks: the plan source/digest/step-count, both the check keys
+// AND the check digest, the phase the run should be in, and the outstanding finding
+// obligations (nil when none) — so a well-shaped state that carries a different
+// pending set or expected phase than the immutable history cannot pass.
 type CandidateRefs struct {
-	Source      state.EventRef
-	PlanDigest  string
-	StepCount   int
-	CheckKeys   []string
-	CheckDigest string
+	Source          state.EventRef
+	PlanDigest      string
+	StepCount       int
+	CheckKeys       []string
+	CheckDigest     string
+	ExpectedPhase   state.Phase
+	PendingFindings *state.FindingObligations // deep-copied; nil when none outstanding
 }
 
 // phaseMessageType maps a planning phase to the message type its accepted artifact
-// must declare (the provenance the fold verifies).
+// must declare (the provenance the fold verifies, and the schema it validates against).
 var phaseMessageType = map[state.Phase]string{
 	state.PhasePlanDraft:    "plan",
 	state.PhasePlanCritique: "plan_critique",
@@ -82,31 +93,53 @@ var phaseMessageType = map[state.Phase]string{
 
 // MaterializeCandidate reconstructs the current candidate plan and check set by
 // replaying the accepted PLAN_DRAFT/PLAN_CRITIQUE/PLAN_REVISE artifacts in
-// receipt-revision order. It fully projects every artifact against the running
-// materialization (validating check removes, a revision's base chain, and its exact
-// responses), classifies each with the shared gated/actionable/converged/retry rule,
-// and commits only the committed outcomes — a human-gated or reviewer-retry artifact
-// is validated but discarded. It rejects any history the real engine would reject.
+// receipt-revision order. Every artifact is fully schema-validated (exactly as
+// transport validated it at accept time) and projected through the SAME engine
+// helpers the live projector uses, then classified with the shared
+// gated/actionable/converged/retry rule; only the committed outcomes advance the
+// running facts — a human-gated or reviewer-retry artifact is validated but discarded.
+// It rejects any history the real engine would reject.
 func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRefs, error) {
 	if len(arts) > MaxPlanningArtifacts {
 		return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: %d artifacts", ErrHistoryTooLarge, len(arts))
 	}
 	var (
-		plan       CanonicalPlan
-		havePlan   bool
-		planDigest string
-		source     state.EventRef
-		checks     []MaterializedCheck
-		pending    []string
-		expected   = state.PhasePlanDraft
-		prevRcpt   uint64
-		totalBytes int
+		plan          CanonicalPlan
+		havePlan      bool
+		planDigest    string
+		source        state.EventRef
+		checks        []MaterializedCheck
+		pending       []string
+		pendingSource state.EventRef
+		expected      = state.PhasePlanDraft
+		prevRcpt      uint64
+		totalBytes    int
 	)
-	for _, a := range arts {
-		totalBytes += len(a.Canonical)
-		if totalBytes > MaxMaterializeBytes {
-			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: %d bytes", ErrHistoryTooLarge, totalBytes)
+	for i := range arts {
+		a := arts[i]
+		// Overflow-safe byte bound: never form totalBytes+len before comparing.
+		if len(a.Canonical) > MaxMaterializeBytes || totalBytes > MaxMaterializeBytes-len(a.Canonical) {
+			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: over %d bytes", ErrHistoryTooLarge, MaxMaterializeBytes)
 		}
+		totalBytes += len(a.Canonical)
+
+		msgType, ok := phaseMessageType[a.Phase]
+		if !ok {
+			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: unexpected phase %s", ErrHistory, a.Phase)
+		}
+		// Full schema validation. A real accepted artifact passed transport's
+		// protocol.Validate; the fold must too, so a digest-correct artifact with a
+		// missing/extra/invalid field (which transport could never have accepted) is
+		// rejected before it can be projected. The stored bytes must equal the
+		// canonical form.
+		canon, verr := protocol.Validate(msgType, a.Canonical)
+		if verr != nil {
+			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: schema: %v", ErrHistory, verr)
+		}
+		if !bytes.Equal(canon, a.Canonical) {
+			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: artifact bytes are not canonical", ErrHistory)
+		}
+
 		if err := verifyArtifactIdentity(a, prevRcpt); err != nil {
 			return ProjectionFacts{}, CandidateRefs{}, err
 		}
@@ -122,7 +155,7 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 
 		switch a.Phase {
 		case state.PhasePlanDraft:
-			p, d, perr := materializePlanArtifact(a.Canonical)
+			p, d, perr := materializePlan(a.Canonical)
 			if perr != nil {
 				return ProjectionFacts{}, CandidateRefs{}, perr
 			}
@@ -132,6 +165,7 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 			plan, planDigest, havePlan = p, d, true
 			checks = nil
 			pending = nil
+			pendingSource = state.EventRef{}
 			source = state.EventRef{Digest: a.Digest, TurnID: a.TurnID}
 			expected = state.PhasePlanCritique
 		case state.PhasePlanRevise:
@@ -147,23 +181,27 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 			}
 			plan, planDigest = p, d
 			pending = nil
+			pendingSource = state.EventRef{}
 			source = state.EventRef{Digest: a.Digest, TurnID: a.TurnID}
 			expected = state.PhasePlanCritique
 		case state.PhasePlanCritique:
 			if !havePlan {
 				return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: critique before a committed plan", ErrHistory)
 			}
-			resulting, actionable, converged, cerr := materializeCritiqueArtifact(a.Canonical, checks, plan)
+			proj, cerr := projectCritiqueParts(a.Canonical, checks, plan.Steps)
 			if cerr != nil {
 				return ProjectionFacts{}, CandidateRefs{}, cerr
 			}
+			actionable := len(proj.ActionableKeys) > 0
+			converged := proj.Verdict == "AGREE" && !proj.Missing && !actionable
 			switch {
 			case rhd: // human-gated critique: validated, not committed
 			case converged:
 				return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: a converged critique cannot be a pre-agreement candidate", ErrHistory)
 			case actionable:
-				checks = resulting
-				pending = actionableKeys(a.Canonical)
+				checks = proj.Resulting
+				pending = proj.ActionableKeys
+				pendingSource = state.EventRef{Digest: a.Digest, TurnID: a.TurnID}
 				expected = state.PhasePlanRevise
 			default: // reviewer retry: validated, not committed
 			}
@@ -184,16 +222,26 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 		CandidateSource: source,
 	}
 	refs := CandidateRefs{
-		Source:      source,
-		PlanDigest:  planDigest,
-		StepCount:   len(plan.Steps),
-		CheckKeys:   append([]string(nil), checkRef.Keys...),
-		CheckDigest: checkRef.Digest,
+		Source:        source,
+		PlanDigest:    planDigest,
+		StepCount:     len(plan.Steps),
+		CheckKeys:     append([]string(nil), checkRef.Keys...),
+		CheckDigest:   checkRef.Digest,
+		ExpectedPhase: expected,
+	}
+	if len(pending) > 0 {
+		refs.PendingFindings = &state.FindingObligations{
+			Source: pendingSource,
+			Keys:   append([]string(nil), pending...),
+		}
 	}
 	return facts, refs, nil
 }
 
-// verifyArtifactIdentity checks the identity-bound facts before any projection.
+// verifyArtifactIdentity checks the identity-bound facts before any projection. The
+// artifact's message type is validated against its phase by protocol.Validate (the
+// schema pass), so this checks only the receipt ordering, digest, envelope turn id,
+// and the submitted-below-receipt revision invariant.
 func verifyArtifactIdentity(a AcceptedArtifact, prevRcpt uint64) error {
 	if a.ReceiptRevision <= prevRcpt {
 		return fmt.Errorf("%w: receipt revision %d not strictly after %d", ErrHistory, a.ReceiptRevision, prevRcpt)
@@ -206,7 +254,6 @@ func verifyArtifactIdentity(a AcceptedArtifact, prevRcpt uint64) error {
 		return fmt.Errorf("%w: artifact bytes do not match the digest", ErrHistory)
 	}
 	var env struct {
-		MessageType   string `json:"message_type"`
 		TurnID        string `json:"turn_id"`
 		StateRevision uint64 `json:"state_revision"`
 	}
@@ -215,9 +262,6 @@ func verifyArtifactIdentity(a AcceptedArtifact, prevRcpt uint64) error {
 	}
 	if env.TurnID != a.TurnID {
 		return fmt.Errorf("%w: envelope turn id does not match", ErrHistory)
-	}
-	if want, ok := phaseMessageType[a.Phase]; !ok || env.MessageType != want {
-		return fmt.Errorf("%w: message type %q does not match phase %s", ErrHistory, env.MessageType, a.Phase)
 	}
 	if env.StateRevision == 0 || env.StateRevision >= a.ReceiptRevision {
 		return fmt.Errorf("%w: submitted revision %d is not before the receipt revision %d", ErrHistory, env.StateRevision, a.ReceiptRevision)
@@ -233,28 +277,9 @@ func artifactDecision(canonical []byte) (bool, error) {
 	return rhd, nil
 }
 
-// materializePlanArtifact parses a plan and returns its CanonicalPlan + doc digest.
-func materializePlanArtifact(canonical []byte) (CanonicalPlan, string, error) {
-	var a struct {
-		Markdown      string     `json:"plan_markdown"`
-		Steps         []jsonStep `json:"steps"`
-		Risks         []string   `json:"risks"`
-		OpenQuestions []string   `json:"open_questions"`
-	}
-	if err := json.Unmarshal(canonical, &a); err != nil {
-		return CanonicalPlan{}, "", semanticf("undecodable plan artifact")
-	}
-	steps := toPlanSteps(a.Steps)
-	if err := protocol.ValidateStepTitles(stepTitles(steps)); err != nil {
-		return CanonicalPlan{}, "", semanticf("plan step titles: %v", err)
-	}
-	p := CanonicalPlan{Markdown: a.Markdown, Steps: steps, Risks: a.Risks, OpenQuestions: a.OpenQuestions}
-	d, err := planDocDigest(p.Markdown, p.Steps, p.Risks, p.OpenQuestions)
-	return p, d, err
-}
-
 // materializeRevisionArtifact validates a revision against the base plan digest and
 // the exact pending findings, then returns the materialized resulting plan + digest.
+// It delegates to the shared applyRevision (the same one projectRevision uses).
 func materializeRevisionArtifact(canonical []byte, base CanonicalPlan, baseDigest string, pending []string) (CanonicalPlan, string, error) {
 	res, err := applyRevision(canonical, base, baseDigest, pending)
 	if err != nil {
@@ -262,69 +287,6 @@ func materializeRevisionArtifact(canonical []byte, base CanonicalPlan, baseDiges
 	}
 	d, derr := planDocDigest(res.Markdown, res.Steps, res.Risks, res.OpenQuestions)
 	return res, d, derr
-}
-
-// materializeCritiqueArtifact validates a critique's ops against the current checks
-// and returns the resulting set plus the actionable/converged classification.
-func materializeCritiqueArtifact(canonical []byte, current []MaterializedCheck, plan CanonicalPlan) (resulting []MaterializedCheck, actionable, converged bool, err error) {
-	var a struct {
-		Verdict  string `json:"verdict"`
-		Findings []struct {
-			Key      string `json:"key"`
-			Severity string `json:"severity"`
-		} `json:"findings"`
-		ImplementationChecks []jsonCheckOp `json:"implementation_checks"`
-		MissingEvidence      []string      `json:"missing_evidence"`
-	}
-	if err := json.Unmarshal(canonical, &a); err != nil {
-		return nil, false, false, semanticf("undecodable critique artifact")
-	}
-	findingKeys := make([]string, 0, len(a.Findings))
-	for _, f := range a.Findings {
-		findingKeys = append(findingKeys, f.Key)
-	}
-	if err := protocol.ValidateKeySet("findings", findingKeys); err != nil {
-		return nil, false, false, semanticf("%v", err)
-	}
-	opKeys := make([]string, 0, len(a.ImplementationChecks))
-	for _, op := range a.ImplementationChecks {
-		opKeys = append(opKeys, op.Key)
-	}
-	if err := protocol.ValidateKeySet("implementation_checks", opKeys); err != nil {
-		return nil, false, false, semanticf("%v", err)
-	}
-	applied, err := applyCheckOps(current, a.ImplementationChecks)
-	if err != nil {
-		return nil, false, false, err
-	}
-	if _, err := materializeChecks(applied); err != nil { // bound + grammar
-		return nil, false, false, err
-	}
-	for _, f := range a.Findings {
-		if f.Severity == "blocking" || f.Severity == "major" {
-			actionable = true
-		}
-	}
-	converged = a.Verdict == "AGREE" && len(a.MissingEvidence) == 0 && !actionable
-	return applied, actionable, converged, nil
-}
-
-func actionableKeys(canonical []byte) []string {
-	var a struct {
-		Findings []struct {
-			Key      string `json:"key"`
-			Severity string `json:"severity"`
-		} `json:"findings"`
-	}
-	_ = json.Unmarshal(canonical, &a)
-	var keys []string
-	for _, f := range a.Findings {
-		if f.Severity == "blocking" || f.Severity == "major" {
-			keys = append(keys, f.Key)
-		}
-	}
-	sort.Strings(keys) // parity with evalPlanCritiqued's sorted actionable keys
-	return keys
 }
 
 func clonePlan(p CanonicalPlan) CanonicalPlan {

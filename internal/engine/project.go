@@ -70,7 +70,10 @@ func toPlanSteps(js []jsonStep) []PlanStep {
 	return out
 }
 
-func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) {
+// materializePlan decodes a plan artifact into its CanonicalPlan and materialized
+// document digest. It is the single plan decoder the live draft projector and the
+// history materializer share (no second parser to drift).
+func materializePlan(canonical []byte) (CanonicalPlan, string, error) {
 	var a struct {
 		Markdown      string     `json:"plan_markdown"`
 		Steps         []jsonStep `json:"steps"`
@@ -78,17 +81,23 @@ func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) 
 		OpenQuestions []string   `json:"open_questions"`
 	}
 	if err := json.Unmarshal(canonical, &a); err != nil {
-		return Event{}, semanticf("undecodable plan artifact")
+		return CanonicalPlan{}, "", semanticf("undecodable plan artifact")
 	}
 	steps := toPlanSteps(a.Steps)
 	if err := protocol.ValidateStepTitles(stepTitles(steps)); err != nil {
-		return Event{}, semanticf("plan step titles: %v", err)
+		return CanonicalPlan{}, "", semanticf("plan step titles: %v", err)
 	}
-	digest, err := planDocDigest(a.Markdown, steps, a.Risks, a.OpenQuestions)
+	p := CanonicalPlan{Markdown: a.Markdown, Steps: steps, Risks: a.Risks, OpenQuestions: a.OpenQuestions}
+	d, err := planDocDigest(p.Markdown, p.Steps, p.Risks, p.OpenQuestions)
+	return p, d, err
+}
+
+func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) {
+	p, digest, err := materializePlan(canonical)
 	if err != nil {
 		return Event{}, err
 	}
-	return Event{Kind: EvPlanDrafted, Source: src, Materialized: digest, StepCount: len(steps), Decision: rhd}, nil
+	return Event{Kind: EvPlanDrafted, Source: src, Materialized: digest, StepCount: len(p.Steps), Decision: rhd}, nil
 }
 
 type jsonCheckOp struct {
@@ -99,10 +108,22 @@ type jsonCheckOp struct {
 	TargetStep  *string `json:"target_step"`
 }
 
-func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
-	if err := verifyCandidateFacts(cur, facts); err != nil {
-		return Event{}, err
-	}
+// critiqueProjection is the full materialized result of projecting a critique
+// artifact against the current check set and plan steps: the resulting materialized
+// checks (both the concrete list and the CheckSetRef), the sorted actionable finding
+// keys, and the verdict/missing/target-validity classification inputs. Both the live
+// critique projector and the history materializer derive their Event/classification
+// from this one helper — no second parser and no silent reparse of the findings.
+type critiqueProjection struct {
+	Verdict        string
+	ActionableKeys []string // sorted blocking/major finding keys
+	Missing        bool
+	Resulting      []MaterializedCheck // ops applied to the current set
+	Checks         state.CheckSetRef   // materialized resulting set
+	TargetsValid   bool
+}
+
+func projectCritiqueParts(canonical []byte, currentChecks []MaterializedCheck, planSteps []PlanStep) (critiqueProjection, error) {
 	var a struct {
 		Verdict  string `json:"verdict"`
 		Findings []struct {
@@ -113,7 +134,7 @@ func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, r
 		MissingEvidence      []string      `json:"missing_evidence"`
 	}
 	if err := json.Unmarshal(canonical, &a); err != nil {
-		return Event{}, semanticf("undecodable critique artifact")
+		return critiqueProjection{}, semanticf("undecodable critique artifact")
 	}
 	// All finding keys and all check-op keys must be canonical and unique.
 	findingKeys := make([]string, 0, len(a.Findings))
@@ -121,16 +142,15 @@ func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, r
 		findingKeys = append(findingKeys, f.Key)
 	}
 	if err := protocol.ValidateKeySet("findings", findingKeys); err != nil {
-		return Event{}, semanticf("%v", err)
+		return critiqueProjection{}, semanticf("%v", err)
 	}
 	opKeys := make([]string, 0, len(a.ImplementationChecks))
 	for _, op := range a.ImplementationChecks {
 		opKeys = append(opKeys, op.Key)
 	}
 	if err := protocol.ValidateKeySet("implementation_checks", opKeys); err != nil {
-		return Event{}, semanticf("%v", err)
+		return critiqueProjection{}, semanticf("%v", err)
 	}
-
 	var actionableKeys []string
 	for _, f := range a.Findings {
 		if f.Severity == "blocking" || f.Severity == "major" {
@@ -138,25 +158,42 @@ func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, r
 		}
 	}
 	sort.Strings(actionableKeys)
-
-	resulting, err := applyCheckOps(facts.CandidateChecks, a.ImplementationChecks)
+	resulting, err := applyCheckOps(currentChecks, a.ImplementationChecks)
 	if err != nil {
-		return Event{}, err
+		return critiqueProjection{}, err
 	}
 	checks, err := materializeChecks(resulting)
+	if err != nil {
+		return critiqueProjection{}, err
+	}
+	return critiqueProjection{
+		Verdict:        a.Verdict,
+		ActionableKeys: actionableKeys,
+		Missing:        len(a.MissingEvidence) > 0,
+		Resulting:      resulting,
+		Checks:         checks,
+		TargetsValid:   targetsValidFor(resulting, stepTitles(planSteps)),
+	}, nil
+}
+
+func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
+	if err := verifyCandidateFacts(cur, facts); err != nil {
+		return Event{}, err
+	}
+	p, err := projectCritiqueParts(canonical, facts.CandidateChecks, facts.CandidatePlan.Steps)
 	if err != nil {
 		return Event{}, err
 	}
 	return Event{
 		Kind:            EvPlanCritiqued,
 		Source:          src,
-		Verdict:         a.Verdict,
-		Actionable:      len(actionableKeys) > 0,
-		MissingEvidence: len(a.MissingEvidence) > 0,
+		Verdict:         p.Verdict,
+		Actionable:      len(p.ActionableKeys) > 0,
+		MissingEvidence: p.Missing,
 		Decision:        rhd,
-		ResultingChecks: checks,
-		TargetsValid:    targetsValidFor(resulting, stepTitles(facts.CandidatePlan.Steps)),
-		Findings:        actionableKeys,
+		ResultingChecks: p.Checks,
+		TargetsValid:    p.TargetsValid,
+		Findings:        p.ActionableKeys,
 	}, nil
 }
 

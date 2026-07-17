@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
@@ -76,13 +77,19 @@ const (
 	JournalTerminal
 )
 
-// ClassifyPairJournal classifies a resolved run's pair-attach journal head. Before
-// declaring a complete record terminal it binds the envelope to its decoded
-// pair-intent payload — version and kind, txn id, expected state revision, and run id
-// — so a corrupt or mis-bound record is never mistaken for a completed pairing. It is
-// read-only and lock-free.
-func ClassifyPairJournal(loc RunLocation) (JournalClass, error) {
-	rec, ok, err := txn.Open(loc.AttachDir, loc.RunLock).Latest()
+// ClassifyPairJournal classifies a resolved run's pair-attach journal head under a
+// held run guard. It proves g is this journal's live lock (CheckGuard) before reading
+// the head, so the classification is not a lock-free race against a concurrent
+// transaction. Every present record — pending, aborted, or complete — is first bound
+// to its decoded pair-intent payload (version and kind, txn id, expected state
+// revision, and run id); only then is a complete record reported Terminal and a
+// pending/aborted one NonTerminal. A mis-bound record is an error, never a class.
+func ClassifyPairJournal(g *genstore.Guard, loc RunLocation) (JournalClass, error) {
+	journal := txn.Open(loc.AttachDir, loc.RunLock)
+	if err := journal.CheckGuard(g); err != nil {
+		return JournalAbsent, err
+	}
+	rec, ok, err := journal.Latest()
 	if err != nil {
 		return JournalAbsent, err
 	}
@@ -93,12 +100,9 @@ func classifyPairRecord(rec txn.Record, ok bool, runID string) (JournalClass, er
 	if !ok {
 		return JournalAbsent, nil
 	}
-	if !rec.Terminal() || rec.Aborted {
-		// An in-flight transaction needs recovery; an aborted one never paired. Neither
-		// is a completed pairing the consumer may open.
-		return JournalNonTerminal, nil
-	}
-	// A complete record: bind its envelope to the decoded payload before trusting it.
+	// Bind the intent BEFORE the terminality branch: a pending pair-attach still has a
+	// valid intent envelope+payload, so a corrupt or mis-bound record must fail here
+	// whether or not it is complete.
 	if rec.Intent.Version != txn.IntentVersion || rec.Intent.Kind != pairIntentKind {
 		return JournalAbsent, fmt.Errorf("%w: pair journal kind/version mismatch", ErrJoinUnauthorized)
 	}
@@ -109,5 +113,10 @@ func classifyPairRecord(rec txn.Record, ok bool, runID string) (JournalClass, er
 	if rec.TxnID() != in.TxnID || rec.Intent.ExpectedStateRevision != in.ExpectedStateRevision || in.RunID != runID {
 		return JournalAbsent, fmt.Errorf("%w: pair journal identity mismatch", ErrJoinUnauthorized)
 	}
-	return JournalTerminal, nil
+	if rec.Complete && !rec.Aborted {
+		return JournalTerminal, nil
+	}
+	// A cleanly aborted pairing or an in-flight transaction: bound, but not a
+	// completed pairing the consumer may open.
+	return JournalNonTerminal, nil
 }

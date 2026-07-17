@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
@@ -62,7 +63,8 @@ func TestResolveRunRejectsNonCanonicalID(t *testing.T) {
 }
 
 // A lead-only run has no pair-attach journal (Absent); after a pair fills, the
-// journal is a complete, identity-bound pairing (Terminal).
+// journal is a complete, identity-bound pairing (Terminal). ClassifyPairJournal reads
+// under a held run guard.
 func TestClassifyPairJournalAbsentThenTerminal(t *testing.T) {
 	repo := t.TempDir()
 	a := bootstrapRun(t, repo)
@@ -71,18 +73,30 @@ func TestClassifyPairJournalAbsentThenTerminal(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	class, err := ClassifyPairJournal(loc)
+	g, ok, err := genstore.Acquire(loc.RunLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	class, err := ClassifyPairJournal(g, loc)
 	if err != nil {
 		t.Fatalf("classify (pre-pair): %v", err)
 	}
 	if class != JournalAbsent {
 		t.Fatalf("pre-pair class = %d, want JournalAbsent", class)
 	}
+	if err := g.Release(); err != nil { // release before JoinAttach takes the run lock
+		t.Fatalf("release: %v", err)
+	}
 
 	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err != nil {
 		t.Fatalf("join: %v", err)
 	}
-	class, err = ClassifyPairJournal(loc)
+	g2, ok, err := genstore.Acquire(loc.RunLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire2: ok=%v err=%v", ok, err)
+	}
+	defer g2.Release()
+	class, err = ClassifyPairJournal(g2, loc)
 	if err != nil {
 		t.Fatalf("classify (post-pair): %v", err)
 	}
@@ -91,7 +105,43 @@ func TestClassifyPairJournalAbsentThenTerminal(t *testing.T) {
 	}
 }
 
-// classifyPairRecord covers every branch against a real, complete pair-attach record.
+// ClassifyPairJournal proves the caller holds the live run lock before reading.
+func TestClassifyPairJournalGuardRequired(t *testing.T) {
+	repo := t.TempDir()
+	a := bootstrapRun(t, repo)
+	loc, err := ResolveRun(repo, a.RunID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	if _, err := ClassifyPairJournal(nil, loc); err == nil {
+		t.Fatal("nil guard should be rejected")
+	}
+	other, ok, err := genstore.Acquire(filepath.Join(loc.RunDir, "other.lock"))
+	if err != nil || !ok {
+		t.Fatalf("acquire other: ok=%v err=%v", ok, err)
+	}
+	if _, err := ClassifyPairJournal(other, loc); !errors.Is(err, genstore.ErrWrongLock) {
+		t.Fatalf("wrong-lock err = %v, want ErrWrongLock", err)
+	}
+	if err := other.Release(); err != nil {
+		t.Fatalf("release other: %v", err)
+	}
+	g, ok, err := genstore.Acquire(loc.RunLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	if err := g.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := ClassifyPairJournal(g, loc); err == nil {
+		t.Fatal("released guard should be rejected")
+	}
+}
+
+// classifyPairRecord covers every branch against genuine records: absent, a real
+// pending record (a crash after pair-fill, before completion), a realistic aborted
+// shape, a mis-bound intent, a run-id mismatch, and a completed pairing.
 func TestClassifyPairRecordBranches(t *testing.T) {
 	repo := t.TempDir()
 	a := bootstrapRun(t, repo)
@@ -99,42 +149,62 @@ func TestClassifyPairRecordBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err != nil {
-		t.Fatalf("join: %v", err)
-	}
-	rec, ok, err := txn.Open(loc.AttachDir, loc.RunLock).Latest()
-	if err != nil || !ok {
-		t.Fatalf("load journal: ok=%v err=%v", ok, err)
-	}
 
 	// Absent when no record is present.
 	if c, err := classifyPairRecord(txn.Record{}, false, a.RunID); err != nil || c != JournalAbsent {
 		t.Fatalf("absent: c=%d err=%v", c, err)
 	}
-	// A bound complete record is terminal.
-	if c, err := classifyPairRecord(rec, true, a.RunID); err != nil || c != JournalTerminal {
-		t.Fatalf("terminal: c=%d err=%v", c, err)
+
+	// A genuine pending record: crash after the pair-fill step, before completion.
+	fired := false
+	stepFailpoint = func(s string) error {
+		if s == "registry-pair-fill" && !fired {
+			fired = true
+			return errors.New("injected crash after pair-fill")
+		}
+		return nil
 	}
-	// A run-id the record does not name must not be treated as a completed pairing.
-	if _, err := classifyPairRecord(rec, true, "run-"+"0123456789abcdef0123456789abcdef"); !errors.Is(err, ErrJoinUnauthorized) {
-		t.Fatalf("id mismatch err = %v, want ErrJoinUnauthorized", err)
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
+		t.Fatal("expected a crash after pair-fill")
 	}
-	// A wrong intent kind fails before the payload is trusted.
-	badKind := rec
+	stepFailpoint = nil
+
+	pending, ok, err := txn.Open(loc.AttachDir, loc.RunLock).Latest()
+	if err != nil || !ok {
+		t.Fatalf("load pending: ok=%v err=%v", ok, err)
+	}
+	if pending.Complete {
+		t.Fatalf("expected a pending (incomplete) record, got a complete one")
+	}
+	if c, err := classifyPairRecord(pending, true, a.RunID); err != nil || c != JournalNonTerminal {
+		t.Fatalf("pending: c=%d err=%v", c, err)
+	}
+	// A realistic aborted shape (bound intent, not complete) is also non-terminal.
+	aborted := pending
+	aborted.Aborted = true
+	if c, err := classifyPairRecord(aborted, true, a.RunID); err != nil || c != JournalNonTerminal {
+		t.Fatalf("aborted: c=%d err=%v", c, err)
+	}
+	// A mis-bound record (wrong intent kind) is an error, never a class.
+	badKind := pending
 	badKind.Intent.Kind = "bootstrap"
 	if _, err := classifyPairRecord(badKind, true, a.RunID); !errors.Is(err, ErrJoinUnauthorized) {
 		t.Fatalf("kind mismatch err = %v, want ErrJoinUnauthorized", err)
 	}
-	// An in-flight (incomplete) record is non-terminal.
-	inflight := rec
-	inflight.Complete = false
-	if c, err := classifyPairRecord(inflight, true, a.RunID); err != nil || c != JournalNonTerminal {
-		t.Fatalf("in-flight: c=%d err=%v", c, err)
+	// A run-id the record does not name is a mismatch.
+	if _, err := classifyPairRecord(pending, true, "run-"+"0123456789abcdef0123456789abcdef"); !errors.Is(err, ErrJoinUnauthorized) {
+		t.Fatalf("id mismatch err = %v, want ErrJoinUnauthorized", err)
 	}
-	// A cleanly aborted record never paired.
-	aborted := rec
-	aborted.Aborted = true
-	if c, err := classifyPairRecord(aborted, true, a.RunID); err != nil || c != JournalNonTerminal {
-		t.Fatalf("aborted: c=%d err=%v", c, err)
+
+	// Recover forward to a completed pairing, which is terminal.
+	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err != nil {
+		t.Fatalf("recovery join: %v", err)
+	}
+	complete, ok, err := txn.Open(loc.AttachDir, loc.RunLock).Latest()
+	if err != nil || !ok {
+		t.Fatalf("load complete: ok=%v err=%v", ok, err)
+	}
+	if c, err := classifyPairRecord(complete, true, a.RunID); err != nil || c != JournalTerminal {
+		t.Fatalf("terminal: c=%d err=%v", c, err)
 	}
 }

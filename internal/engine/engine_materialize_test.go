@@ -214,6 +214,141 @@ func TestMaterializeCandidateRejectsBadHistory(t *testing.T) {
 	})
 }
 
+// rawAccepted binds a possibly schema-INVALID artifact (skips protocol.Validate), so
+// the fold's own schema pass is what must reject it.
+func rawAccepted(t *testing.T, phase state.Phase, canonical []byte, receiptRev uint64) AcceptedArtifact {
+	t.Helper()
+	sum := sha256.Sum256(canonical)
+	var env struct {
+		TurnID string `json:"turn_id"`
+	}
+	if err := json.Unmarshal(canonical, &env); err != nil {
+		t.Fatalf("decode turn id: %v", err)
+	}
+	return AcceptedArtifact{
+		TurnID:          env.TurnID,
+		Digest:          hex.EncodeToString(sum[:]),
+		Phase:           phase,
+		ReceiptRevision: receiptRev,
+		Canonical:       canonical,
+	}
+}
+
+// A digest-correct artifact that transport could never have accepted (missing a
+// required field, an unknown property, or an invalid enum) is rejected by the fold's
+// schema pass.
+func TestMaterializeCandidateSchemaValidates(t *testing.T) {
+	f := twoStepPlan()
+
+	t.Run("missing required field", func(t *testing.T) {
+		bad := mustJSON(t, map[string]any{
+			"protocol_version": 1, "message_type": "plan", "turn_id": "t-plan", "state_revision": 1,
+			"human_context": nil, "requires_human_decision": false, "decision_question": nil,
+			"plan_markdown": f.Markdown, "risks": f.Risks, "open_questions": f.OpenQ, // steps omitted
+		})
+		if _, _, err := MaterializeCandidate([]AcceptedArtifact{rawAccepted(t, state.PhasePlanDraft, bad, 10)}); !errors.Is(err, ErrHistory) {
+			t.Fatalf("err = %v, want ErrHistory", err)
+		}
+	})
+
+	t.Run("unknown property", func(t *testing.T) {
+		bad := mustJSON(t, map[string]any{
+			"protocol_version": 1, "message_type": "plan", "turn_id": "t-plan", "state_revision": 1,
+			"human_context": nil, "requires_human_decision": false, "decision_question": nil,
+			"plan_markdown": f.Markdown, "steps": stepsJSON(f.Steps), "risks": f.Risks, "open_questions": f.OpenQ,
+			"surprise": "extra",
+		})
+		if _, _, err := MaterializeCandidate([]AcceptedArtifact{rawAccepted(t, state.PhasePlanDraft, bad, 10)}); !errors.Is(err, ErrHistory) {
+			t.Fatalf("err = %v, want ErrHistory", err)
+		}
+	})
+
+	t.Run("invalid verdict enum", func(t *testing.T) {
+		draft := accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10)
+		badCrit := mustJSON(t, map[string]any{
+			"protocol_version": 1, "message_type": "plan_critique", "turn_id": "t-crit", "state_revision": 1,
+			"human_context": nil, "requires_human_decision": false, "decision_question": nil,
+			"verdict": "MAYBE", "findings": []any{}, "implementation_checks": []any{},
+			"missing_evidence": []any{}, "simpler_alternative": nil, "notes": "n",
+		})
+		h := []AcceptedArtifact{draft, rawAccepted(t, state.PhasePlanCritique, badCrit, 20)}
+		if _, _, err := MaterializeCandidate(h); !errors.Is(err, ErrHistory) {
+			t.Fatalf("err = %v, want ErrHistory", err)
+		}
+	})
+}
+
+// The refs bind the expected phase and the exact outstanding findings (source+keys),
+// so a well-shaped state carrying a different pending set cannot pass the coordinator.
+func TestMaterializeCandidateBindsPendingAndExpectedPhase(t *testing.T) {
+	f := twoStepPlan()
+
+	// Ends at an actionable critique: the run should be at PLAN_REVISE with the exact
+	// pending finding keys sourced from that critique.
+	atRevise := []AcceptedArtifact{
+		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
+	}
+	_, refs, err := MaterializeCandidate(atRevise)
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	if refs.ExpectedPhase != state.PhasePlanRevise {
+		t.Fatalf("expected phase = %s, want PLAN_REVISE", refs.ExpectedPhase)
+	}
+	if refs.PendingFindings == nil || !reflect.DeepEqual(refs.PendingFindings.Keys, []string{"finding-a"}) {
+		t.Fatalf("pending findings = %+v, want [finding-a]", refs.PendingFindings)
+	}
+	if refs.PendingFindings.Source.TurnID != "t-crit-act" {
+		t.Fatalf("pending source = %+v, want t-crit-act", refs.PendingFindings.Source)
+	}
+
+	// Ends at a committed revise: the run is back at PLAN_CRITIQUE with no pending.
+	_, refs2, err := MaterializeCandidate(cleanPlanHistory(t, f))
+	if err != nil {
+		t.Fatalf("materialize full: %v", err)
+	}
+	if refs2.ExpectedPhase != state.PhasePlanCritique {
+		t.Fatalf("expected phase = %s, want PLAN_CRITIQUE", refs2.ExpectedPhase)
+	}
+	if refs2.PendingFindings != nil {
+		t.Fatalf("pending should be nil after a committed revise: %+v", refs2.PendingFindings)
+	}
+}
+
+// Each call returns fresh deep copies: mutating one call's nested plan/check/pending
+// slices does not corrupt a subsequent reconstruction of the same history.
+func TestMaterializeCandidateReturnsDeepCopies(t *testing.T) {
+	f := twoStepPlan()
+	h := []AcceptedArtifact{
+		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
+	}
+	facts, refs, err := MaterializeCandidate(h)
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	facts.CandidatePlan.Steps[0].Title = "MUT"
+	facts.CandidatePlan.Steps[0].Files[0] = "MUT"
+	facts.CandidateChecks[0].Key = "MUT"
+	refs.CheckKeys[0] = "MUT"
+	refs.PendingFindings.Keys[0] = "MUT"
+
+	facts2, refs2, err := MaterializeCandidate(h)
+	if err != nil {
+		t.Fatalf("re-materialize: %v", err)
+	}
+	if facts2.CandidatePlan.Steps[0].Title == "MUT" || facts2.CandidatePlan.Steps[0].Files[0] == "MUT" {
+		t.Fatalf("plan slices are shared across calls")
+	}
+	if facts2.CandidateChecks[0].Key == "MUT" || refs2.CheckKeys[0] == "MUT" {
+		t.Fatalf("check slices are shared across calls")
+	}
+	if refs2.PendingFindings.Keys[0] == "MUT" {
+		t.Fatalf("pending keys are shared across calls")
+	}
+}
+
 func TestMaterializeCandidateBytesBound(t *testing.T) {
 	f := twoStepPlan()
 	a := accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10)
@@ -251,22 +386,27 @@ func TestProjectRejectsWrongCandidateSource(t *testing.T) {
 }
 
 func TestRequiredID(t *testing.T) {
+	gate := &GateSpec{Kind: state.PauseHumanDecision, OriginPhase: state.PhasePlanCritique, ResumePhase: state.PhasePlanCritique}
+	// Each route paired with a LEGAL from->next edge (and the gate for RouteGate).
 	cases := []struct {
 		route Route
+		from  state.Phase
+		next  state.Phase
+		gate  *GateSpec
 		want  IDKind
 	}{
-		{RouteGate, IDGate},
-		{RouteDraftAccepted, IDAssignment},
-		{RoutePromote, IDAssignment},
-		{RouteToRevise, IDAssignment},
-		{RouteRetryReview, IDAssignment},
-		{RouteReviseAccepted, IDAssignment},
-		{RouteToCheckpoint, IDAssignment},
-		{RouteNextStep, IDAssignment},
-		{RouteToFix, IDAssignment},
+		{RouteGate, state.PhasePlanCritique, state.PhaseAwaitGuidance, gate, IDGate},
+		{RouteDraftAccepted, state.PhasePlanDraft, state.PhasePlanCritique, nil, IDAssignment},
+		{RoutePromote, state.PhasePlanCritique, state.PhaseImplementStep, nil, IDAssignment},
+		{RouteToRevise, state.PhasePlanCritique, state.PhasePlanRevise, nil, IDAssignment},
+		{RouteRetryReview, state.PhasePlanCritique, state.PhasePlanCritique, nil, IDAssignment},
+		{RouteReviseAccepted, state.PhasePlanRevise, state.PhasePlanCritique, nil, IDAssignment},
+		{RouteToCheckpoint, state.PhaseImplementStep, state.PhaseCheckpoint, nil, IDAssignment},
+		{RouteNextStep, state.PhaseCheckpoint, state.PhaseImplementStep, nil, IDAssignment},
+		{RouteToFix, state.PhaseCheckpoint, state.PhaseFix, nil, IDAssignment},
 	}
 	for _, c := range cases {
-		got, err := RequiredID(Decision{Route: c.route})
+		got, err := RequiredID(Decision{Route: c.route, FromPhase: c.from, Next: c.next, Gate: c.gate})
 		if err != nil {
 			t.Fatalf("route %d: unexpected err %v", c.route, err)
 		}
@@ -274,8 +414,43 @@ func TestRequiredID(t *testing.T) {
 			t.Fatalf("route %d: id kind = %d, want %d", c.route, got, c.want)
 		}
 	}
-	// An unknown route fails closed.
+
+	// Negatives: an unknown route, an illegal edge, and both gate-presence mismatches.
 	if _, err := RequiredID(Decision{Route: Route(999)}); !errors.Is(err, ErrBadDecision) {
 		t.Fatalf("unknown route err = %v, want ErrBadDecision", err)
+	}
+	if _, err := RequiredID(Decision{Route: RouteDraftAccepted, FromPhase: state.PhasePlanCritique, Next: state.PhasePlanCritique}); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("illegal edge err = %v, want ErrBadDecision", err)
+	}
+	if _, err := RequiredID(Decision{Route: RouteGate, Next: state.PhaseAwaitGuidance, Gate: nil}); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("gate route without a gate err = %v, want ErrBadDecision", err)
+	}
+	if _, err := RequiredID(Decision{Route: RouteDraftAccepted, FromPhase: state.PhasePlanDraft, Next: state.PhasePlanCritique, Gate: gate}); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("non-gate route with a gate err = %v, want ErrBadDecision", err)
+	}
+}
+
+// RequiredID agrees with the id every real Evaluate-produced decision issues.
+func TestRequiredIDMatchesEvaluate(t *testing.T) {
+	cur := state.RunState{Phase: state.PhasePlanDraft, Revision: 5}
+	src := state.EventRef{TurnID: "turn-" + hex.EncodeToString(make([]byte, 16)), Digest: hex.EncodeToString(make([]byte, 32))}
+	base := Event{Kind: EvPlanDrafted, Source: src, Materialized: hex.EncodeToString(make([]byte, 32)), StepCount: 2}
+
+	accept, err := Evaluate(cur, base)
+	if err != nil {
+		t.Fatalf("evaluate accept: %v", err)
+	}
+	if k, err := RequiredID(accept); err != nil || k != IDAssignment {
+		t.Fatalf("accept id = %d err=%v, want IDAssignment", k, err)
+	}
+
+	gated := base
+	gated.Decision = true
+	dec, err := Evaluate(cur, gated)
+	if err != nil {
+		t.Fatalf("evaluate gate: %v", err)
+	}
+	if k, err := RequiredID(dec); err != nil || k != IDGate {
+		t.Fatalf("gate id = %d err=%v, want IDGate", k, err)
 	}
 }

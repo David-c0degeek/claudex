@@ -674,29 +674,45 @@ func gateBudget(used, limit int) error {
 	}
 }
 
-func routeAllowed(r Route, from, next state.Phase) bool {
-	switch r {
-	case RouteGate:
-		return next == state.PhaseAwaitGuidance
-	case RouteDraftAccepted:
+// routeSpec is the per-route metadata the engine owns exactly once: the identity a
+// route issues and whether a from->next edge is legal for it. Both Apply's edge guard
+// (routeAllowed) and RequiredID consume this single table, so the id kind and the
+// legal edge can never drift into two independent switches.
+type routeSpec struct {
+	id   IDKind
+	edge func(from, next state.Phase) bool
+}
+
+var routeTable = map[Route]routeSpec{
+	RouteGate: {IDGate, func(_, next state.Phase) bool { return next == state.PhaseAwaitGuidance }},
+	RouteDraftAccepted: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanDraft && next == state.PhasePlanCritique
-	case RoutePromote:
+	}},
+	RoutePromote: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanCritique && next == state.PhaseImplementStep
-	case RouteToRevise:
+	}},
+	RouteToRevise: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanCritique && next == state.PhasePlanRevise
-	case RouteRetryReview:
+	}},
+	RouteRetryReview: {IDAssignment, func(from, next state.Phase) bool {
 		return (from == state.PhasePlanCritique && next == state.PhasePlanCritique) ||
 			(from == state.PhaseCheckpoint && next == state.PhaseCheckpoint)
-	case RouteReviseAccepted:
+	}},
+	RouteReviseAccepted: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanRevise && next == state.PhasePlanCritique
-	case RouteToCheckpoint:
+	}},
+	RouteToCheckpoint: {IDAssignment, func(from, next state.Phase) bool {
 		return (from == state.PhaseImplementStep || from == state.PhaseFix) && next == state.PhaseCheckpoint
-	case RouteNextStep:
+	}},
+	RouteNextStep: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhaseCheckpoint && next == state.PhaseImplementStep
-	case RouteToFix:
-		return from == state.PhaseCheckpoint && next == state.PhaseFix
-	}
-	return false
+	}},
+	RouteToFix: {IDAssignment, func(from, next state.Phase) bool { return from == state.PhaseCheckpoint && next == state.PhaseFix }},
+}
+
+func routeAllowed(r Route, from, next state.Phase) bool {
+	s, ok := routeTable[r]
+	return ok && s.edge(from, next)
 }
 
 // isSubmitPhase reports whether a phase may raise a human-decision gate (every
