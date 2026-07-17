@@ -213,9 +213,12 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 
 // checkTestOutcomeShape admits ONLY the three legal TESTS outcomes and rejects every
 // other phase/lifecycle (including a forged TESTS->DONE): a pass into ownerless VERIFY
-// (counter unchanged), an assigned fail into FIX returning to TESTS (test_fixes +1
-// exactly), or the exact TESTS quality-budget gate whose pause carries the ACCEPTED
-// evidence source (so a Prepare cannot substitute a different valid digest).
+// (every counter preserved), an assigned fail into FIX returning to TESTS (test_fixes
+// +1 and every other counter preserved, only while the frozen budget still permits a
+// fix), or the exact TESTS quality-budget gate whose pause carries the ACCEPTED evidence
+// source (so a Prepare cannot substitute a different valid digest). The counter effect
+// is exact — a bare test_fixes check would let a faulty Prepare bump plan_revisions /
+// verify_fixes / step_fixes, or push test_fixes past the policy limit instead of gating.
 func checkTestOutcomeShape(rs state.RunState, next *state.RunState, prepared PreparedTestOutcome) error {
 	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrTransitionInvalid, msg) }
 	switch next.Phase {
@@ -223,15 +226,22 @@ func checkTestOutcomeShape(rs state.RunState, next *state.RunState, prepared Pre
 		if next.Assignment != nil || next.Verify == nil {
 			return bad("a TESTS pass enters ownerless VERIFY")
 		}
-		if next.Counters.TestFixes != rs.Counters.TestFixes {
-			return bad("a TESTS pass must not change test_fixes")
+		if !reflect.DeepEqual(next.Counters, rs.Counters) {
+			return bad("a TESTS pass must preserve every counter")
 		}
 	case state.PhaseFix:
 		if next.Assignment == nil || next.FixReturn != state.PhaseTests {
 			return bad("a TESTS fail assigns a FIX returning to TESTS")
 		}
-		if next.Counters.TestFixes != rs.Counters.TestFixes+1 {
-			return bad("a TESTS fail increments test_fixes exactly once")
+		// The frozen budget decides fix-vs-gate: at the limit the only legal outcome is
+		// the quality gate, so a FIX is admissible only below it.
+		if rs.Counters.TestFixes >= rs.EffectivePolicy.Budgets.TestRounds {
+			return bad("a TESTS fail at the frozen test budget must open the quality gate, not a FIX")
+		}
+		want := rs.Counters
+		want.TestFixes = rs.Counters.TestFixes + 1
+		if !reflect.DeepEqual(next.Counters, want) {
+			return bad("a TESTS fail increments only test_fixes, by exactly one")
 		}
 	case state.PhaseAwaitGuidance:
 		p := next.Pause
@@ -242,8 +252,8 @@ func checkTestOutcomeShape(rs state.RunState, next *state.RunState, prepared Pre
 		if p.Source != prepared.Source {
 			return bad("the TESTS gate source must be the accepted evidence digest")
 		}
-		if next.Counters.TestFixes != rs.Counters.TestFixes {
-			return bad("a TESTS quality gate must not change test_fixes")
+		if !reflect.DeepEqual(next.Counters, rs.Counters) {
+			return bad("a TESTS quality gate must preserve every counter")
 		}
 	default:
 		return bad("a TESTS outcome must enter VERIFY, FIX, or the TESTS quality gate")

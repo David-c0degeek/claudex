@@ -378,6 +378,20 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				return nil
 			})), rev
 		}, ErrTransitionInvalid},
+		{"forged FIX at the frozen test budget", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			// At the limit the only legal outcome is the quality gate; a FIX that pushes
+			// test_fixes to limit+1 must be rejected, not committed.
+			store, rev := runAtTestsBudget(t)
+			return testOutcomeDeps(store, failToFix()), rev
+		}, ErrTransitionInvalid},
+		{"unrelated counter bumped on a pass", func(t *testing.T) (TestOutcomeDeps, uint64) {
+			store, rev := runAtTests(t, 2)
+			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
+				passApply(next, p)
+				next.Counters.PlanRevisions++ // a TESTS pass must touch no counter
+				return nil
+			})), rev
+		}, ErrTransitionInvalid},
 		{"declared id collides with an accepted turn", func(t *testing.T) (TestOutcomeDeps, uint64) {
 			store, rev := runAtTests(t, 2)
 			return testOutcomeDeps(store, prepFn("plan-turn", "", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
