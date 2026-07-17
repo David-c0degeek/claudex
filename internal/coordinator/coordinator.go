@@ -42,11 +42,6 @@ var (
 	// ErrReplayInPrepare means Prepare was invoked for an already-accepted turn, which
 	// the locked transport resolves before Prepare — a defensive invariant.
 	ErrReplayInPrepare = errors.New("coordinator: prepare invoked for an already-accepted turn")
-	// ErrTerminalNotWired means the engine routed into an ownerless terminal-graph edge
-	// (TESTS/VERIFY/DONE, which issue no identity) that this build does not yet wire.
-	// It is a stable rejection boundary the submit fails closed on before any Put; the
-	// TESTS/VERIFY composition (checkpoint 4d) deletes it when it wires those edges.
-	ErrTerminalNotWired = errors.New("coordinator: the terminal-graph edge is not yet wired")
 )
 
 // Run is an opened run: its bound paths, the state/registry/artifact stores under the
@@ -262,7 +257,9 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 		if perr != nil {
 			return transport.PreparedTransition{}, perr
 		}
-		dec, perr := engine.Evaluate(snapshot, ev, engine.RuntimeFacts{})
+		// The locked current pair generation (from the Registry transport loaded under
+		// the run guard) feeds the FIX->VERIFY threshold; it is never a caller claim.
+		dec, perr := engine.Evaluate(snapshot, ev, engine.RuntimeFacts{CurrentPairGeneration: prepared.CurrentPairGeneration})
 		if perr != nil {
 			return transport.PreparedTransition{}, perr
 		}
@@ -277,9 +274,12 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 			ids.AssignmentTurnID, issuedTurn = turnCand, turnCand
 		case engine.IDGate:
 			ids.GateID, issuedGate = gateCand, gateCand
+		case engine.IDNone:
+			// An ownerless terminal-graph edge (CHECKPOINT->TESTS, FIX->TESTS/VERIFY,
+			// VERIFY->DONE) issues neither identity; the pre-minted candidates are
+			// discarded.
 		default:
-			// IDNone: an ownerless terminal-graph edge this build does not wire yet.
-			return transport.PreparedTransition{}, ErrTerminalNotWired
+			return transport.PreparedTransition{}, fmt.Errorf("coordinator: unknown id kind %d", idKind)
 		}
 		submitted := ev.Source
 		apply := func(gen uint64, next *state.RunState) error {

@@ -131,9 +131,12 @@ const (
 	EvVerified     // the verifier's verification artifact
 )
 
-// Event is the value-only projection of one accepted submit. Evaluate is a pure
-// function of (cur, Event). Source is the SUBMITTED event's digest+turn — it becomes
-// an accepted turn only when transport appends the receipt after Apply.
+// Event is the value-only projection of one turn's outcome. Every event but
+// EvTestsOutcome is an accepted AGENT submit; EvTestsOutcome is coordinator-authored
+// (its Source is an ownerless empty-turn evidence digest, never an accepted turn).
+// Evaluate is a pure function of (cur, Event, RuntimeFacts). For an agent submit,
+// Source is the SUBMITTED event's digest+turn — it becomes an accepted turn only when
+// transport appends the receipt after Apply.
 type Event struct {
 	Kind   EventKind
 	Source state.EventRef
@@ -160,7 +163,8 @@ type Event struct {
 
 // --- decision + apply contract ---
 
-// Route is the specific state mutation an accepted event drives.
+// Route is the specific state mutation an accepted agent submit or coordinator-
+// authored TESTS outcome drives.
 type Route int
 
 const (

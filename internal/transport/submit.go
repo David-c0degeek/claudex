@@ -45,6 +45,10 @@ var (
 	ErrTransitionInvalid = errors.New("transport: transition left the run stranded")
 	// ErrNotAccepting means the run is not in a state that can accept a submit.
 	ErrNotAccepting = errors.New("transport: run is not accepting submissions")
+	// ErrFreshSessionRequired means a VERIFY turn was submitted by a pair session whose
+	// generation does not meet the retained fresh-session threshold. It never exposes a
+	// session id.
+	ErrFreshSessionRequired = errors.New("transport: VERIFY requires a fresh pair session generation")
 )
 
 const (
@@ -116,6 +120,10 @@ type PreparedSubmit struct {
 	CanonicalJSON         string
 	RequiresHumanDecision bool
 	DecisionQuestion      string
+	// CurrentPairGeneration is the locked current pair-slot generation the Registry
+	// held under the run guard (never a caller claim). The FIX->VERIFY evaluation uses
+	// it to compute the ownerless-VERIFY threshold.
+	CurrentPairGeneration uint64
 }
 
 // PreparedTransition is the deterministic, value-only transition Prepare produced
@@ -385,6 +393,26 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		return reject(err)
 	}
 
+	// The locked current pair generation (from the validated pair slot) — the numeric
+	// fact Prepare needs and the FIX->VERIFY threshold is checked against. A missing or
+	// mismatched pair shape is a run mismatch, never a zero.
+	curPairGen, pgErr := currentPairGeneration(reg)
+	if pgErr != nil {
+		return reject(pgErr)
+	}
+
+	// Active VERIFY (an assignment issued by a qualifying replacement) authorizes the
+	// verifier only if the current pair generation meets the retained threshold; the
+	// incumbent generation is a fresh-session rejection before schema/Prepare/sink.
+	if rs.Phase == state.PhaseVerify {
+		if rs.Verify == nil {
+			return reject(fmt.Errorf("%w: a running VERIFY has no requirement", ErrTransitionInvalid))
+		}
+		if curPairGen < rs.Verify.RequiredGeneration {
+			return reject(ErrFreshSessionRequired)
+		}
+	}
+
 	// Schema-validate both the raw and the canonical-redacted bytes (value-free).
 	if _, verr := protocol.Validate(spec.ArtifactMessageType, raw); verr != nil {
 		return reject(fmt.Errorf("transport: submission fails its schema: %w", verr))
@@ -404,6 +432,7 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		CanonicalJSON:         string(canonRedacted),
 		RequiresHumanDecision: env.RequiresHumanDecision,
 		DecisionQuestion:      deref(env.DecisionQuestion),
+		CurrentPairGeneration: curPairGen,
 	}
 	snapshot, cerr := cloneRunState(rs)
 	if cerr != nil {
@@ -446,6 +475,12 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		}
 		if berr := bindIssued(pt, next); berr != nil {
 			return berr
+		}
+		// Cross-store coupling RunState alone cannot enforce: a transition that ENTERS
+		// ownerless VERIFY (a fresh phase, no assignment) must set the threshold exactly
+		// one generation past the locked current pair generation.
+		if terr := checkEnterVerifyThreshold(rs, next, curPairGen); terr != nil {
+			return terr
 		}
 		next.AcceptedTurns[env.TurnID] = state.AcceptedTurn{
 			ArtifactDigest: digest,
@@ -502,6 +537,37 @@ func releaseOutcome(accepted bool, committedRev uint64, relErr error) error {
 		return &genstore.PostCommitError{Generation: committedRev, Err: relErr}
 	}
 	return relErr
+}
+
+// currentPairGeneration is the generation of the pair slot's current session, from the
+// LOCKED validated Registry. A missing/mismatched pair shape is a run mismatch (never a
+// zero, which would corrupt the fresh-session threshold).
+func currentPairGeneration(reg state.Registry) (uint64, error) {
+	if reg.Pair == nil {
+		return 0, fmt.Errorf("%w: the run has no pair slot", ErrRunMismatch)
+	}
+	r := reg.Resolve(reg.Pair.CurrentSessionID)
+	if r.Status != state.RegCurrent || r.Role != state.SlotPair || r.CurrentGeneration == 0 {
+		return 0, fmt.Errorf("%w: the pair slot's current session is not resolvable", ErrRunMismatch)
+	}
+	return r.CurrentGeneration, nil
+}
+
+// checkEnterVerifyThreshold enforces the cross-store coupling exactly when a transition
+// ENTERS ownerless VERIFY (old phase != VERIFY, next VERIFY, no assignment) — not a
+// replacement's later same-phase verifier issuance. The requirement must be present and
+// exactly one generation past the locked current pair generation.
+func checkEnterVerifyThreshold(old state.RunState, next *state.RunState, curPairGen uint64) error {
+	if old.Phase == state.PhaseVerify || next.Phase != state.PhaseVerify || next.Assignment != nil {
+		return nil
+	}
+	if curPairGen == ^uint64(0) {
+		return fmt.Errorf("%w: the pair generation overflows the verify threshold", ErrTransitionInvalid)
+	}
+	if next.Verify == nil || next.Verify.RequiredGeneration != curPairGen+1 {
+		return fmt.Errorf("%w: entering ownerless VERIFY requires the fresh-session threshold", ErrTransitionInvalid)
+	}
+	return nil
 }
 
 // slotForRole is the exact, closed conversion from a turn-spec role to a registry
@@ -610,6 +676,18 @@ func requireLiveOwner(next *state.RunState, turnID string, gen uint64) error {
 		return nil
 	}
 
+	// Ownerless VERIFY is the deliberate fresh-session wait: a running agent phase with
+	// no assignment, holding the required-generation threshold until a replacement
+	// issues the verifier turn.
+	if next.Phase == state.PhaseVerify {
+		if lc != state.LifecycleRunning {
+			return fmt.Errorf("%w: ownerless VERIFY must be running, got %s", ErrTransitionInvalid, lc)
+		}
+		if next.Verify == nil {
+			return fmt.Errorf("%w: ownerless VERIFY requires a fresh-session requirement", ErrTransitionInvalid)
+		}
+		return nil
+	}
 	if agentPhase {
 		return fmt.Errorf("%w: the assignment was cleared but phase %s still expects an agent turn", ErrTransitionInvalid, next.Phase)
 	}
