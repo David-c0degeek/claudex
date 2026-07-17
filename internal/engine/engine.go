@@ -684,7 +684,7 @@ type routeSpec struct {
 }
 
 var routeTable = map[Route]routeSpec{
-	RouteGate: {IDGate, func(_, next state.Phase) bool { return next == state.PhaseAwaitGuidance }},
+	RouteGate: {IDGate, func(from, next state.Phase) bool { return isSubmitPhase(from) && next == state.PhaseAwaitGuidance }},
 	RouteDraftAccepted: {IDAssignment, func(from, next state.Phase) bool {
 		return from == state.PhasePlanDraft && next == state.PhasePlanCritique
 	}},

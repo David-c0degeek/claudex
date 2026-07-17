@@ -48,10 +48,13 @@ func accepted(t *testing.T, phase state.Phase, canonical []byte, receiptRev uint
 // PLAN_REVISE-answered/PLAN_CRITIQUE with the plan unchanged and one materialized check.
 func cleanPlanHistory(t *testing.T, f planFixture) []AcceptedArtifact {
 	t.Helper()
+	// Realistic revision chain: each submitted state_revision sits in
+	// [prior receipt, own receipt) — a turn is submitted at or after the prior
+	// receipt and always before its own.
 	return []AcceptedArtifact{
 		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
-		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
-		accepted(t, state.PhasePlanRevise, revisionArtifact(t, "t-rev", 1, f.digest(t), []string{"finding-a"}), 30),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 11, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
+		accepted(t, state.PhasePlanRevise, revisionArtifact(t, "t-rev", 21, f.digest(t), []string{"finding-a"}), 30),
 	}
 }
 
@@ -99,18 +102,21 @@ func TestMaterializeCandidateIgnoresGatedAndRetryTurns(t *testing.T) {
 	// ids, state revisions, and content), so an unchanged reconstruction is provable by
 	// deep-equality — only the interspersed non-committing turns and receipt revisions
 	// differ.
-	draft := planArtifact(t, "t-plan", 1, false, f)
-	critAct := critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")})
-	revise := revisionArtifact(t, "t-rev", 1, f.digest(t), []string{"finding-a"})
+	// The three committed artifacts carry fixed submitted revisions (5/15/25) high
+	// enough to satisfy the realistic revision chain in BOTH histories, so their bytes
+	// are byte-identical and an unchanged reconstruction is provable by deep-equality.
+	draft := planArtifact(t, "t-plan", 5, false, f)
+	critAct := critiqueArtifact(t, "t-crit-act", 15, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")})
+	revise := revisionArtifact(t, "t-rev", 25, f.digest(t), []string{"finding-a"})
 
 	noisy := []AcceptedArtifact{
 		// Human-gated draft: validated, discarded; the run resumes to PLAN_DRAFT.
-		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan-gated", 1, true, f), 5),
+		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan-gated", 1, true, f), 3),
 		accepted(t, state.PhasePlanDraft, draft, 10),
 		// Human-gated critique carrying a check op that must never leak into the set.
-		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-gated", 1, "REVISE", true, []string{"blocking"}, nil, []map[string]any{addCheck("chk-ignored", "")}), 12),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-gated", 10, "REVISE", true, []string{"blocking"}, nil, []map[string]any{addCheck("chk-ignored", "")}), 11),
 		// Reviewer retry (REVISE, only a nit) also carrying a discarded check op.
-		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-retry", 1, "REVISE", false, []string{"nit"}, nil, []map[string]any{addCheck("chk-ignored-2", "")}), 14),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-retry", 11, "REVISE", false, []string{"nit"}, nil, []map[string]any{addCheck("chk-ignored-2", "")}), 12),
 		accepted(t, state.PhasePlanCritique, critAct, 20),
 		accepted(t, state.PhasePlanRevise, revise, 30),
 	}
@@ -199,10 +205,29 @@ func TestMaterializeCandidateRejectsBadHistory(t *testing.T) {
 
 	t.Run("revision responses not exact", func(t *testing.T) {
 		h := cleanPlanHistory(t, f)
-		// Rebuild the revise answering the wrong finding key.
-		h[2] = accepted(t, state.PhasePlanRevise, revisionArtifact(t, "t-rev", 1, f.digest(t), []string{"finding-z"}), 30)
+		// Rebuild the revise answering the wrong finding key (keep the realistic revision).
+		h[2] = accepted(t, state.PhasePlanRevise, revisionArtifact(t, "t-rev", 21, f.digest(t), []string{"finding-z"}), 30)
 		if _, _, err := MaterializeCandidate(h); !errors.Is(err, ErrSemantic) {
 			t.Fatalf("err = %v, want ErrSemantic", err)
+		}
+	})
+
+	t.Run("stale submitted revision", func(t *testing.T) {
+		// A critique submitted against a revision below the draft's receipt: a turn
+		// accepted after receipt 10 cannot have been submitted at revision 5.
+		h := []AcceptedArtifact{
+			accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
+			accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit", 5, "REVISE", false, []string{"blocking"}, nil, nil), 20),
+		}
+		if _, _, err := MaterializeCandidate(h); !errors.Is(err, ErrHistory) {
+			t.Fatalf("stale err = %v, want ErrHistory", err)
+		}
+	})
+
+	t.Run("duplicate turn id", func(t *testing.T) {
+		dup := accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10)
+		if _, _, err := MaterializeCandidate([]AcceptedArtifact{dup, dup}); !errors.Is(err, ErrHistory) {
+			t.Fatalf("dup err = %v, want ErrHistory", err)
 		}
 	})
 
@@ -212,6 +237,34 @@ func TestMaterializeCandidateRejectsBadHistory(t *testing.T) {
 			t.Fatalf("err = %v, want ErrHistoryTooLarge", err)
 		}
 	})
+}
+
+// A bare committed draft leaves the run at PLAN_CRITIQUE with a canonical-empty check
+// set: the refs must carry a NON-NIL empty key slice and the empty digest, and the
+// facts must round-trip so the first PLAN_CRITIQUE submit verifies.
+func TestMaterializeCandidateDraftOnlyEmptyChecks(t *testing.T) {
+	f := twoStepPlan()
+	h := []AcceptedArtifact{accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10)}
+	facts, refs, err := MaterializeCandidate(h)
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	if refs.CheckKeys == nil || len(refs.CheckKeys) != 0 {
+		t.Fatalf("check keys must be a non-nil empty slice, got %#v", refs.CheckKeys)
+	}
+	empty, _ := materializeChecks(nil)
+	if refs.CheckDigest != empty.Digest {
+		t.Fatalf("check digest = %s, want the empty-array digest %s", refs.CheckDigest, empty.Digest)
+	}
+	if refs.ExpectedPhase != state.PhasePlanCritique {
+		t.Fatalf("expected phase = %s, want PLAN_CRITIQUE", refs.ExpectedPhase)
+	}
+	if refs.PendingFindings != nil {
+		t.Fatalf("no pending after a bare draft: %+v", refs.PendingFindings)
+	}
+	if err := verifyCandidateFacts(candidateState(refs), facts); err != nil {
+		t.Fatalf("first-critique round-trip failed: %v", err)
+	}
 }
 
 // rawAccepted binds a possibly schema-INVALID artifact (skips protocol.Validate), so
@@ -287,7 +340,7 @@ func TestMaterializeCandidateBindsPendingAndExpectedPhase(t *testing.T) {
 	// pending finding keys sourced from that critique.
 	atRevise := []AcceptedArtifact{
 		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
-		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 11, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
 	}
 	_, refs, err := MaterializeCandidate(atRevise)
 	if err != nil {
@@ -322,7 +375,7 @@ func TestMaterializeCandidateReturnsDeepCopies(t *testing.T) {
 	f := twoStepPlan()
 	h := []AcceptedArtifact{
 		accepted(t, state.PhasePlanDraft, planArtifact(t, "t-plan", 1, false, f), 10),
-		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 1, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
+		accepted(t, state.PhasePlanCritique, critiqueArtifact(t, "t-crit-act", 11, "REVISE", false, []string{"blocking"}, nil, []map[string]any{addCheck("chk-1", "step one")}), 20),
 	}
 	facts, refs, err := MaterializeCandidate(h)
 	if err != nil {

@@ -114,9 +114,14 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 		expected      = state.PhasePlanDraft
 		prevRcpt      uint64
 		totalBytes    int
+		seen          = make(map[string]bool, len(arts))
 	)
 	for i := range arts {
 		a := arts[i]
+		if seen[a.TurnID] {
+			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: duplicate turn id %q", ErrHistory, a.TurnID)
+		}
+		seen[a.TurnID] = true
 		// Overflow-safe byte bound: never form totalBytes+len before comparing.
 		if len(a.Canonical) > MaxMaterializeBytes || totalBytes > MaxMaterializeBytes-len(a.Canonical) {
 			return ProjectionFacts{}, CandidateRefs{}, fmt.Errorf("%w: over %d bytes", ErrHistoryTooLarge, MaxMaterializeBytes)
@@ -222,10 +227,13 @@ func MaterializeCandidate(arts []AcceptedArtifact) (ProjectionFacts, CandidateRe
 		CandidateSource: source,
 	}
 	refs := CandidateRefs{
-		Source:        source,
-		PlanDigest:    planDigest,
-		StepCount:     len(plan.Steps),
-		CheckKeys:     append([]string(nil), checkRef.Keys...),
+		Source:     source,
+		PlanDigest: planDigest,
+		StepCount:  len(plan.Steps),
+		// Copy into a non-nil slice: the canonical empty check set is a non-nil empty
+		// array (state.CheckSetRef.Keys), so an exact refs cross-check after the first
+		// committed draft must not receive nil here.
+		CheckKeys:     append([]string{}, checkRef.Keys...),
 		CheckDigest:   checkRef.Digest,
 		ExpectedPhase: expected,
 	}
@@ -263,8 +271,11 @@ func verifyArtifactIdentity(a AcceptedArtifact, prevRcpt uint64) error {
 	if env.TurnID != a.TurnID {
 		return fmt.Errorf("%w: envelope turn id does not match", ErrHistory)
 	}
-	if env.StateRevision == 0 || env.StateRevision >= a.ReceiptRevision {
-		return fmt.Errorf("%w: submitted revision %d is not before the receipt revision %d", ErrHistory, env.StateRevision, a.ReceiptRevision)
+	// The submitted revision must sit in [prevReceipt, thisReceipt): a turn accepted
+	// after receipt R was necessarily submitted against a revision at or after R (only
+	// gaps/resume mutations raise it), and always strictly before its own receipt.
+	if env.StateRevision == 0 || env.StateRevision < prevRcpt || env.StateRevision >= a.ReceiptRevision {
+		return fmt.Errorf("%w: submitted revision %d not in [%d, %d)", ErrHistory, env.StateRevision, prevRcpt, a.ReceiptRevision)
 	}
 	return nil
 }

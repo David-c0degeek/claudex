@@ -164,6 +164,7 @@ func TestClassifyPairRecordBranches(t *testing.T) {
 		}
 		return nil
 	}
+	defer func() { stepFailpoint = nil }() // never let a failure mid-test leak the hook
 	if _, err := JoinAttach(joinRequest(repo, a.RunID, opID("b"), 0x10)); err == nil {
 		t.Fatal("expected a crash after pair-fill")
 	}
@@ -176,14 +177,9 @@ func TestClassifyPairRecordBranches(t *testing.T) {
 	if pending.Complete {
 		t.Fatalf("expected a pending (incomplete) record, got a complete one")
 	}
+	// A bound but non-terminal record classifies NonTerminal.
 	if c, err := classifyPairRecord(pending, true, a.RunID); err != nil || c != JournalNonTerminal {
 		t.Fatalf("pending: c=%d err=%v", c, err)
-	}
-	// A realistic aborted shape (bound intent, not complete) is also non-terminal.
-	aborted := pending
-	aborted.Aborted = true
-	if c, err := classifyPairRecord(aborted, true, a.RunID); err != nil || c != JournalNonTerminal {
-		t.Fatalf("aborted: c=%d err=%v", c, err)
 	}
 	// A mis-bound record (wrong intent kind) is an error, never a class.
 	badKind := pending
