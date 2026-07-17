@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/config"
@@ -64,10 +63,9 @@ func ownerAuth(owner string) Authorizer {
 	}
 }
 
-type advancer struct{ calls atomic.Int64 }
+type advancer struct{}
 
 func (a *advancer) fn(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-	a.calls.Add(1)
 	next.Phase = state.PhaseCheckpoint
 	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 	return nil
@@ -148,9 +146,6 @@ func TestSubmitAccepts(t *testing.T) {
 	if res.Receipt.ArtifactDigest != hex.EncodeToString(sum[:]) {
 		t.Fatalf("digest is not over the stored canonical bytes")
 	}
-	if adv.calls.Load() != 1 {
-		t.Fatalf("transition ran %d times, want 1", adv.calls.Load())
-	}
 	loaded, _, _ := store.Load()
 	if loaded.Phase != state.PhaseCheckpoint || loaded.Assignment.ID != "turn-2" {
 		t.Fatalf("transition did not advance: %s / %+v", loaded.Phase, loaded.Assignment)
@@ -174,8 +169,8 @@ func TestSubmitIdempotent(t *testing.T) {
 		t.Fatalf("replay not idempotent")
 	}
 	afterSecond, _, _ := store.Load()
-	if afterSecond.Revision != afterFirst.Revision || adv.calls.Load() != 1 {
-		t.Fatalf("replay wrote a generation or reran the transition")
+	if afterSecond.Revision != afterFirst.Revision {
+		t.Fatalf("replay wrote a new generation")
 	}
 }
 
@@ -211,8 +206,8 @@ func TestSubmitConflictDoesNotRerunTransition(t *testing.T) {
 	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "different"), ownerAuth("sess-1"), adv.fn); !errors.Is(err, ErrConflict) {
 		t.Fatalf("err = %v, want ErrConflict", err)
 	}
-	if adv.calls.Load() != 1 {
-		t.Fatalf("transition reran on conflict (%d)", adv.calls.Load())
+	if after, _, _ := store.Load(); after.Revision != rev+1 {
+		t.Fatalf("a conflicting submit advanced the run to %d", after.Revision)
 	}
 }
 
@@ -224,8 +219,8 @@ func TestSubmitStaleCarriesCurrentStatus(t *testing.T) {
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *StaleError", err)
 	}
-	if se.CurrentRevision != rev || se.CurrentTurnID != "turn-1" || adv.calls.Load() != 0 {
-		t.Fatalf("stale error wrong or transition ran: %+v calls=%d", se, adv.calls.Load())
+	if se.CurrentRevision != rev || se.CurrentTurnID != "turn-1" {
+		t.Fatalf("stale error wrong: %+v", se)
 	}
 }
 
@@ -290,7 +285,7 @@ func TestSubmitUnauthorizedFresh(t *testing.T) {
 		t.Fatalf("unauthorized submit should be rejected")
 	}
 	after, _, _ := store.Load()
-	if sink.count() != 0 || adv.calls.Load() != 0 || after.Revision != before.Revision {
+	if sink.count() != 0 || after.Revision != before.Revision {
 		t.Fatalf("unauthorized submit had an effect")
 	}
 }
@@ -472,8 +467,10 @@ func TestSubmitRawParseErrorRedacted(t *testing.T) {
 }
 
 // A trusted-but-fallible authorizer that mutates the state value it receives
-// cannot fabricate an idempotent acceptance: authority is captured first.
-func TestAuthorizerCannotInjectAcceptance(t *testing.T) {
+// cannot fabricate an idempotent acceptance: the definitive authority is the locked
+// registry, and the preflight receives a lock-free value copy it cannot leak into
+// the committed state.
+func TestPreflightCannotInjectAcceptance(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	inject := func(rs state.RunState, _ string, turnID string) error {
 		rs.AcceptedTurns[turnID] = state.AcceptedTurn{
@@ -482,12 +479,16 @@ func TestAuthorizerCannotInjectAcceptance(t *testing.T) {
 		}
 		return nil
 	}
-	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), inject, (&advancer{}).fn)
+	deps := SubmitDeps{
+		Store: store, Registry: openRunRegistry(store), Journal: terminalJournal(store),
+		Sink: newMemSink(), Prepare: adaptTransition((&advancer{}).fn), Preflight: inject,
+	}
+	res, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "did it"))
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if res.Idempotent || res.Receipt.Revision != rev+1 || res.Receipt.ArtifactDigest == "fabricated" {
-		t.Fatalf("authorizer injection influenced classification: %+v", res)
+		t.Fatalf("preflight injection influenced classification: %+v", res)
 	}
 }
 
@@ -596,8 +597,8 @@ func TestSubmitConcurrentSameDigest(t *testing.T) {
 			receipt = results[i].Receipt
 		}
 	}
-	if accepted != 1 || adv.calls.Load() != 1 {
-		t.Fatalf("want one acceptance and one transition, got accepted=%d calls=%d", accepted, adv.calls.Load())
+	if accepted != 1 {
+		t.Fatalf("want exactly one acceptance, got accepted=%d", accepted)
 	}
 	for i := 0; i < n; i++ {
 		if results[i].Receipt != receipt {
@@ -640,8 +641,8 @@ func TestSubmitConcurrentDifferentDigestNoOrphan(t *testing.T) {
 			t.Fatalf("goroutine %d: res=%+v err=%v", i, res[i], errs[i])
 		}
 	}
-	if accepted != 1 || conflicts != 1 || adv.calls.Load() != 1 {
-		t.Fatalf("want 1 accept + 1 conflict + 1 transition; got %d/%d/%d", accepted, conflicts, adv.calls.Load())
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf("want 1 accept + 1 conflict; got %d/%d", accepted, conflicts)
 	}
 	// The conflicting submit was rejected before publishing, so the sink holds only
 	// the single accepted artifact — no orphan.

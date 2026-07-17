@@ -32,12 +32,23 @@ func canonSess(name string) string {
 	}
 }
 
-// adaptTransition wraps a legacy Transition as a Prepare that declares no issued
-// identities; requireLiveOwner remains the authority on the resulting shape, and the
-// new tests exercise the issued-id recheck explicitly.
+// adaptTransition wraps a legacy Transition as a Prepare that declares the exact
+// identities the transition issues (discovered by a probe run on the snapshot, a
+// deep copy), so the declared ids honestly match what apply produces.
 func adaptTransition(adv Transition) Prepare {
-	return func(_ state.RunState, p PreparedSubmit) (PreparedTransition, error) {
-		return NewPreparedTransition("", "", func(gen uint64, next *state.RunState) error { return adv(p, gen, next) }), nil
+	return func(snap state.RunState, p PreparedSubmit) (PreparedTransition, error) {
+		probe := snap
+		if err := adv(p, snap.Revision+1, &probe); err != nil {
+			return PreparedTransition{}, err
+		}
+		turnID, gateID := "", ""
+		if probe.Assignment != nil {
+			turnID = probe.Assignment.ID
+		}
+		if probe.Gate != nil {
+			gateID = probe.Gate.ID
+		}
+		return NewPreparedTransition(turnID, gateID, func(gen uint64, next *state.RunState) error { return adv(p, gen, next) }), nil
 	}
 }
 

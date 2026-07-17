@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/redact"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -264,5 +265,135 @@ func TestSubmitCancellationAfterPutIgnored(t *testing.T) {
 	loaded, _, _ := store.Load()
 	if at, ok := loaded.AcceptedTurns["turn-1"]; !ok || at.Receipt != res.Receipt {
 		t.Fatalf("acceptance did not complete after a post-Put cancellation")
+	}
+}
+
+// --- role authorization (fresh + replay) ---
+
+// The current pair session cannot submit the lead's IMPLEMENT_STEP turn.
+func TestSubmitWrongRoleFresh(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	sink := newMemSink()
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), adaptTransition(advTransition))
+	if _, err := Submit(context.Background(), deps, pairSess, report("turn-1", rev, "x")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("wrong-role fresh err = %v, want ErrUnauthorized", err)
+	}
+	if sink.count() != 0 {
+		t.Fatalf("a wrong-role fresh submit wrote to the sink")
+	}
+}
+
+// After the lead accepts and the run advances to the pair-owned CHECKPOINT, the
+// current pair session cannot replay the lead's accepted turn to steal its receipt.
+func TestSubmitWrongRoleReplay(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	sink := newMemSink()
+	raw := report("turn-1", rev, "did it")
+	if _, err := submit(store, sink, "sess-1", raw, ownerAuth("sess-1"), advTransition); err != nil {
+		t.Fatalf("lead accept: %v", err)
+	}
+	// The run is now at CHECKPOINT (pair's turn); the pair replays the lead's turn-1.
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), adaptTransition(advTransition))
+	if _, err := Submit(context.Background(), deps, pairSess, raw); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("wrong-role replay err = %v, want ErrUnauthorized", err)
+	}
+	if sink.count() != 1 {
+		t.Fatalf("a wrong-role replay re-confirmed the sink, count = %d", sink.count())
+	}
+}
+
+// --- journal fail-closed on zero / invalid enum ---
+
+func TestSubmitJournalZeroAndInvalidRecoveryRequired(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	for _, head := range []JournalHead{JournalUnknown, JournalHead(99)} {
+		sink := newMemSink()
+		deps := depsWith(store, sink, fakeJournal{lockPath: store.LockPath(), head: head}, openRunRegistry(store), adaptTransition(advTransition))
+		if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("journal head %d err = %v, want ErrRecoveryRequired", head, err)
+		}
+		if sink.count() != 0 {
+			t.Fatalf("journal head %d wrote to the sink", head)
+		}
+	}
+}
+
+// --- cancellation between Prepare and Put ---
+
+func TestSubmitCancelBeforePut(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newMemSink()
+	// Prepare cancels the context just before returning; the pre-Put recheck catches it.
+	prep := func(state.RunState, PreparedSubmit) (PreparedTransition, error) {
+		cancel()
+		return NewPreparedTransition("turn-2", "", advApply), nil
+	}
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), prep)
+	if _, err := Submit(ctx, deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel-before-put err = %v, want context.Canceled", err)
+	}
+	if sink.count() != 0 {
+		t.Fatalf("a cancelled-before-put submit published, count = %d", sink.count())
+	}
+	if loaded, _, _ := store.Load(); loaded.Revision != rev {
+		t.Fatalf("a cancelled-before-put submit advanced the run")
+	}
+}
+
+// --- submit-wins linearization ---
+
+type blockingSink struct {
+	inner   *memSink
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSink) Put(turnID, digest string, canonical []byte) error {
+	close(s.entered)
+	<-s.release
+	return s.inner.Put(turnID, digest, canonical)
+}
+
+// While a submit holds the run guard (blocked inside Put), a concurrent registry
+// replacement cannot acquire the lock; once the submit completes and releases, the
+// replacement proceeds — the two are totally ordered by the run guard.
+func TestSubmitWinsThenReplacementProceeds(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	reg := openRunRegistry(store)
+	sink := &blockingSink{inner: newMemSink(), entered: make(chan struct{}), release: make(chan struct{})}
+	deps := depsWith(store, sink, terminalJournal(store), reg, adaptTransition(advTransition))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x"))
+		done <- err
+	}()
+	<-sink.entered // the submit is inside Put, holding the run guard
+
+	regBefore, _, _ := reg.Load()
+	newLead := "sess-" + strings.Repeat("d", 32)
+	replace := func(gen uint64, n *state.Registry) error {
+		n.Lead.Sessions = append(n.Lead.Sessions, state.SessionRecord{SessionID: newLead, Generation: 2, IssuedRegistryRevision: gen})
+		n.Lead.CurrentSessionID = newLead
+		return nil
+	}
+	if _, err := reg.Mutate(regBefore.Revision, replace); !errors.Is(err, genstore.ErrBusy) {
+		t.Fatalf("replacement while the submit holds the guard err = %v, want ErrBusy", err)
+	}
+	if after, _, _ := reg.Load(); after.Revision != regBefore.Revision {
+		t.Fatalf("a busy replacement still mutated the registry")
+	}
+
+	close(sink.release) // let the submit publish + accept
+	if err := <-done; err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if loaded, _, _ := store.Load(); loaded.Revision != rev+1 {
+		t.Fatalf("the submit did not accept")
+	}
+	// The replacement now succeeds after the submit released the guard.
+	if _, err := reg.Mutate(regBefore.Revision, replace); err != nil {
+		t.Fatalf("replacement after the submit released: %v", err)
 	}
 }

@@ -80,11 +80,15 @@ type ArtifactSink interface {
 type Authorizer func(rs state.RunState, sessionID, turnID string) error
 
 // JournalHead is the attach journal's head status observed under the run guard.
+// The zero value is JournalUnknown so an uninitialized or out-of-range status fails
+// closed rather than proceeding.
 type JournalHead int
 
 const (
+	// JournalUnknown is the zero value: an uninitialized/unrecognized status.
+	JournalUnknown JournalHead = iota
 	// JournalTerminal is a valid completed/aborted record bound to the run.
-	JournalTerminal JournalHead = iota
+	JournalTerminal
 	// JournalNonterminal is a pending record: the run is mid-attach.
 	JournalNonterminal
 	// JournalAbsent means no journal generation exists — never an open/decode failure.
@@ -228,14 +232,14 @@ func Submit(ctx context.Context, deps SubmitDeps, sessionID string, raw []byte) 
 			time.Sleep(submitBackoff)
 			continue
 		}
-		return lockedSubmit(deps, g, sessionID, raw, canonRedacted, digest, env)
+		return lockedSubmit(ctx, deps, g, sessionID, raw, canonRedacted, digest, env)
 	}
 	return SubmitResult{}, fmt.Errorf("transport: submit did not acquire the run lock after %d attempts: %w", submitMaxAttempts, genstore.ErrBusy)
 }
 
 // lockedSubmit runs the whole authorize -> publish -> accept sequence under the held
 // guard g, which it releases exactly once on every path.
-func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, canonRedacted []byte, digest string, env submitEnvelope) (SubmitResult, error) {
+func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessionID string, raw, canonRedacted []byte, digest string, env submitEnvelope) (SubmitResult, error) {
 	released := false
 	release := func() error {
 		if released {
@@ -264,12 +268,16 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 		return reject(ErrRunMismatch)
 	}
 
-	// Attach-journal policy: fail closed on a nonterminal or unreadable journal.
+	// Attach-journal policy: only a terminal or truly-absent journal proceeds; a
+	// nonterminal, unknown, out-of-range, or unreadable journal fails closed.
 	head, jerr := deps.Journal.Head(g, rs.RunID)
 	if jerr != nil {
 		return reject(fmt.Errorf("%w: %v", ErrRecoveryRequired, jerr))
 	}
-	if head == JournalNonterminal {
+	switch head {
+	case JournalTerminal, JournalAbsent:
+		// proceed
+	default: // JournalNonterminal, JournalUnknown, or any out-of-range value
 		return reject(ErrRecoveryRequired)
 	}
 	// Run identity: the registry must belong to this run.
@@ -285,9 +293,14 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 	// Accept-once replay (after authorization). A same-digest replay re-confirms the
 	// sink and returns the durable receipt even if the run is now terminal; a
 	// different digest conflicts without touching the sink. No transition/mutation.
+	// The replaying session must currently own the role of the phase the turn was
+	// accepted in, so a later different-role owner cannot claim another's receipt.
 	if acc, seen := rs.AcceptedTurns[env.TurnID]; seen {
 		if acc.ArtifactDigest != digest {
 			return reject(ErrConflict)
+		}
+		if err := requireCurrentRole(registration, acc.Phase); err != nil {
+			return reject(err)
 		}
 		if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
 			return reject(perr)
@@ -313,17 +326,13 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 		return reject(ErrNotAccepting)
 	}
 
-	// The phase's role must be the session's current role.
+	// The current phase's role must be the session's current role.
 	spec, ok := TurnSpec(rs.Phase)
 	if !ok {
 		return reject(fmt.Errorf("%w: %s", ErrPhaseNotActionable, rs.Phase))
 	}
-	wantSlot, ok := slotForRole(spec.Role)
-	if !ok {
-		return reject(ErrUnauthorized)
-	}
-	if registration.Role != wantSlot {
-		return reject(ErrUnauthorized)
+	if err := requireCurrentRole(registration, rs.Phase); err != nil {
+		return reject(err)
 	}
 
 	// Schema-validate both the raw and the canonical-redacted bytes (value-free).
@@ -346,13 +355,24 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 		RequiresHumanDecision: env.RequiresHumanDecision,
 		DecisionQuestion:      deref(env.DecisionQuestion),
 	}
-	pt, perr := deps.Prepare(cloneRunState(rs), prepared)
+	snapshot, cerr := cloneRunState(rs)
+	if cerr != nil {
+		return reject(fmt.Errorf("transport: could not snapshot the run state: %w", cerr))
+	}
+	pt, perr := deps.Prepare(snapshot, prepared)
 	if perr != nil {
 		return reject(perr)
+	}
+	if pt.apply == nil {
+		return reject(fmt.Errorf("%w: prepared transition has no apply", ErrTransitionInvalid))
 	}
 	// Recheck the issued identities against the locked state before publishing.
 	if idErr := recheckIssuedIDs(pt, rs, env.TurnID); idErr != nil {
 		return reject(idErr)
+	}
+	// Recheck cancellation immediately before publishing; after Put the append runs.
+	if err := ctx.Err(); err != nil {
+		return reject(err)
 	}
 
 	// PUBLISH the immutable artifact before recording acceptance.
@@ -363,11 +383,17 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 	// ACCEPT: from here the append completes regardless of context cancellation, and
 	// runs exactly once. A failure leaves an orphan artifact for an identical retry.
 	committed, merr := deps.Store.MutateLocked(g, rs.Revision, func(gen uint64, next *state.RunState) error {
+		if next.AcceptedTurns == nil {
+			return fmt.Errorf("%w: accepted-turns map is missing", ErrTransitionInvalid)
+		}
 		if aerr := pt.apply(gen, next); aerr != nil {
 			return aerr
 		}
 		if lerr := requireLiveOwner(next, env.TurnID, gen); lerr != nil {
 			return lerr
+		}
+		if berr := bindIssued(pt, next); berr != nil {
+			return berr
 		}
 		next.AcceptedTurns[env.TurnID] = state.AcceptedTurn{
 			ArtifactDigest: digest,
@@ -377,23 +403,39 @@ func lockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID string, raw, can
 		return nil
 	})
 	if merr != nil {
-		// The transition is deterministic and was id-rechecked, so a MutateLocked
-		// failure is a transition/store error to return, not a lost race to retry.
-		// The published artifact is an unaccepted orphan; an identical later submit
-		// re-confirms it (idempotent Put) before accepting. A conflict/busy here is an
-		// invariant (the guard is held), not a CAS retry.
-		_ = release()
+		// The transition is deterministic and id-rechecked, so a MutateLocked failure
+		// is a transition/store error to return, not a lost race to retry. The
+		// published artifact is an unaccepted orphan an identical later submit
+		// re-confirms. A conflict/busy here is an invariant (the guard is held). Every
+		// exit joins the release error (nothing was accepted).
 		if errors.Is(merr, state.ErrRevisionConflict) || errors.Is(merr, genstore.ErrBusy) {
-			return SubmitResult{}, fmt.Errorf("transport: unexpected lock/revision state under the run guard: %w", merr)
+			return reject(fmt.Errorf("transport: unexpected lock/revision state under the run guard: %w", merr))
 		}
-		return SubmitResult{}, merr
+		return reject(merr)
 	}
 	acc, ok := committed.AcceptedTurns[env.TurnID]
 	if !ok || acc.ArtifactDigest != digest {
-		_ = release()
-		return SubmitResult{}, fmt.Errorf("transport: committed submit could not be reconciled")
+		// A committed-but-unreconcilable append: preserve both the invariant error and
+		// the post-commit release classification.
+		return SubmitResult{}, errors.Join(
+			fmt.Errorf("transport: committed submit could not be reconciled"),
+			releaseOutcome(true, committed.Revision, release()))
 	}
 	return SubmitResult{Receipt: acc.Receipt, ReleaseWarning: releaseOutcome(true, committed.Revision, release())}, nil
+}
+
+// requireCurrentRole requires the registration to be the current session of the
+// role the given phase's turn spec names.
+func requireCurrentRole(registration state.Registration, phase state.Phase) error {
+	spec, ok := TurnSpec(phase)
+	if !ok {
+		return ErrUnauthorized
+	}
+	want, ok := slotForRole(spec.Role)
+	if !ok || registration.Role != want {
+		return ErrUnauthorized
+	}
+	return nil
 }
 
 // releaseOutcome classifies a lock-release result: before acceptance a release error
@@ -448,18 +490,39 @@ func recheckIssuedIDs(pt PreparedTransition, rs state.RunState, submittedTurn st
 	return nil
 }
 
-// cloneRunState deep-copies a run state via a canonical round-trip, so Prepare
-// receives an independent snapshot it cannot use to mutate transport's state.
-func cloneRunState(rs state.RunState) state.RunState {
+// cloneRunState deep-copies a run state via a round-trip, so Prepare receives an
+// independent snapshot it cannot use to mutate transport's state. A marshal/unmarshal
+// failure is returned so the submit fails before publishing rather than handing
+// Prepare a zero state.
+func cloneRunState(rs state.RunState) (state.RunState, error) {
 	b, err := json.Marshal(rs)
 	if err != nil {
-		return state.RunState{}
+		return state.RunState{}, err
 	}
 	var c state.RunState
 	if err := json.Unmarshal(b, &c); err != nil {
-		return state.RunState{}
+		return state.RunState{}, err
 	}
-	return c
+	return c, nil
+}
+
+// bindIssued requires the transition to have issued exactly the identities it
+// declared (so a callback cannot declare a collision-free id and issue another).
+func bindIssued(pt PreparedTransition, next *state.RunState) error {
+	gotTurn, gotGate := "", ""
+	if next.Assignment != nil {
+		gotTurn = next.Assignment.ID
+	}
+	if next.Gate != nil {
+		gotGate = next.Gate.ID
+	}
+	if gotTurn != pt.issuedTurnID {
+		return fmt.Errorf("%w: issued assignment %q does not match the declared %q", ErrTransitionInvalid, gotTurn, pt.issuedTurnID)
+	}
+	if gotGate != pt.issuedGateID {
+		return fmt.Errorf("%w: issued gate %q does not match the declared %q", ErrTransitionInvalid, gotGate, pt.issuedGateID)
+	}
+	return nil
 }
 
 func staleErr(rs state.RunState, submitted uint64) *StaleError {
