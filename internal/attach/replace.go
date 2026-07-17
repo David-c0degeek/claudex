@@ -50,8 +50,12 @@ type ReplaceRequest struct {
 	Agent              state.Agent
 	ExpectedGeneration uint64
 	// OperationID is a mandatory, caller-stable idempotency key ("op-" + 32 lower-hex).
-	// A lost response is safely retried with the SAME id: it returns the same result
-	// and never re-mints or double-applies. A different id is a distinct replacement.
+	// Idempotency is head-scoped: while this operation is the latest journalled
+	// replacement (pending or complete), a retry with the SAME id reconciles to the
+	// same result without re-minting or double-applying. AFTER a later replacement
+	// supersedes it, an old retry is stale, not a historical current result — the
+	// journal does not scan history. Preventing global reuse of an id across distinct
+	// replacements is the caller's obligation. A different id is a distinct replacement.
 	OperationID string
 	RNG         io.Reader
 }
@@ -182,20 +186,43 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, rerr), releaseAll())
 	}
 
-	// 2. The head is now terminal or absent. A same-operation head is an idempotent
-	//    retry (identical bindings) or a conflict (a different replacement's bindings).
+	// 2. Bind and classify the journal head. Every present head — pending or terminal —
+	//    must bind to the exact replacement envelope/payload/run/steps, or it is
+	//    recovery-required (never history a new operation can silently step over). A
+	//    non-terminal head should not survive Recover, and an aborted head is not a
+	//    completed replacement; both are recovery-required.
 	head, hasHead, herr := journal.Latest()
 	if herr != nil {
 		return ReplaceResult{}, errors.Join(herr, releaseAll())
 	}
 	if hasHead {
-		hin, derr := decodeReplaceIntent(head.Intent.Payload)
-		if derr != nil {
-			return ReplaceResult{}, errors.Join(derr, releaseAll())
+		hin, berr := bindReplaceHead(head, req.RunID)
+		if berr != nil {
+			return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, berr), releaseAll())
+		}
+		if !head.Complete || head.Aborted {
+			return ReplaceResult{}, errors.Join(fmt.Errorf("%w: replacement head is not a completed transaction", ErrReplaceRecoveryRequired), releaseAll())
 		}
 		if hin.OperationID == req.OperationID {
 			res, serr := sameReplaceResult(registry, req, hin)
-			return res, errors.Join(serr, releaseAll())
+			if serr != nil {
+				return ReplaceResult{}, errors.Join(serr, releaseAll())
+			}
+			// Proven committed (a completed transaction): a release failure is a
+			// post-commit warning over the terminal journal revision, not an op error.
+			if relErr := releaseAll(); relErr != nil {
+				res.CommitWarning = &genstore.PostCommitError{Generation: head.Revision, Err: relErr}
+			}
+			return res, nil
+		}
+		// A different, completed operation may be stepped over only once its durable
+		// Registry effect is exactly Applied; a rolled-back or missing effect is
+		// recovery-required, never silently overwritten.
+		switch st, sterr := replaceStepStatus(registry, hin); {
+		case sterr != nil:
+			return ReplaceResult{}, errors.Join(sterr, releaseAll())
+		case st != txn.StatusApplied:
+			return ReplaceResult{}, errors.Join(fmt.Errorf("%w: the latest replacement's Registry effect is missing", ErrReplaceRecoveryRequired), releaseAll())
 		}
 	}
 

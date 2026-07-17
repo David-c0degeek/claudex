@@ -76,10 +76,10 @@ func (in ReplaceIntent) validate() error {
 	if !state.IsSessionID(in.NewSessionID) {
 		return fmt.Errorf("attach: replace intent new_session_id is not a canonical minted id")
 	}
-	if in.SupersededGeneration == 0 {
-		return fmt.Errorf("attach: replace intent superseded_generation must be > 0")
+	if in.SupersededGeneration == 0 || in.SupersededGeneration == ^uint64(0) {
+		return fmt.Errorf("attach: replace intent superseded_generation is out of range")
 	}
-	if in.NewGeneration != in.SupersededGeneration+1 {
+	if in.NewGeneration == 0 || in.NewGeneration != in.SupersededGeneration+1 {
 		return fmt.Errorf("attach: replace intent new_generation must be superseded_generation + 1")
 	}
 	if in.ExpectedRegistryRevision == 0 {
@@ -98,6 +98,38 @@ func (in ReplaceIntent) txnIntent() txn.Intent {
 		ExpectedStateRevision: 0,
 		Payload:               mustMarshalReplace(in),
 	}
+}
+
+// replaceStepNames is the exact ordered plan step list a replacement journal records,
+// so a forged step list is rejected before a head is trusted or stepped over.
+var replaceStepNames = []string{"registry-replace"}
+
+// bindReplaceHead binds a present replacement-journal head to the exact replacement
+// envelope, payload, run, and plan step list, returning the frozen intent. It does NOT
+// judge terminality or effect presence (the caller does), but a mis-bound head — wrong
+// kind/version/txn/state-revision/run, or a forged step list — can never be trusted or
+// silently stepped over by a new operation.
+func bindReplaceHead(head txn.Record, runID string) (ReplaceIntent, error) {
+	if head.Intent.Version != txn.IntentVersion || head.Intent.Kind != replaceIntentKind {
+		return ReplaceIntent{}, fmt.Errorf("attach: replacement head kind/version mismatch")
+	}
+	in, err := decodeReplaceIntent(head.Intent.Payload)
+	if err != nil {
+		return ReplaceIntent{}, err
+	}
+	// The ordinary replacement binds no RunState revision (ExpectedStateRevision == 0).
+	if head.TxnID() != in.TxnID || head.Intent.ExpectedStateRevision != 0 || in.RunID != runID {
+		return ReplaceIntent{}, fmt.Errorf("attach: replacement head identity mismatch")
+	}
+	if len(head.StepIDs) != len(replaceStepNames) {
+		return ReplaceIntent{}, fmt.Errorf("attach: replacement head step list mismatch")
+	}
+	for i := range replaceStepNames {
+		if head.StepIDs[i] != replaceStepNames[i] {
+			return ReplaceIntent{}, fmt.Errorf("attach: replacement head step list mismatch")
+		}
+	}
+	return in, nil
 }
 
 // replacePlanFor builds the ordinary replacement plan: one idempotent, observable

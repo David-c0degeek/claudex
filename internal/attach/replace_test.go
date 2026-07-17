@@ -15,6 +15,7 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
+	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
 // replaceOp derives a canonical operation id from a seed byte, so distinct-seed
@@ -394,6 +395,203 @@ func TestReplaceAttachConcurrent(t *testing.T) {
 func ambiguousMutate() registryMutate {
 	return func(*state.RegistryStore, *genstore.Guard, uint64, func(uint64, *state.Registry) error) (state.Registry, error) {
 		return state.Registry{}, fmt.Errorf("%w: injected", genstore.ErrAmbiguous)
+	}
+}
+
+// sampleReplaceIntent is a valid frozen replacement intent for a paired run's pair slot.
+func sampleReplaceIntent(runID string, regRev uint64) ReplaceIntent {
+	return ReplaceIntent{
+		RunID: runID, TxnID: "run-" + strings.Repeat("c", 32), OperationID: opID("d"),
+		Role: state.SlotPair, Agent: state.AgentCodex,
+		SupersededGeneration: 1, NewSessionID: "sess-" + strings.Repeat("7", 32), NewGeneration: 2,
+		ExpectedRegistryRevision: regRev,
+	}
+}
+
+// The frozen intent validator rejects a generation overflow a forged journal could
+// otherwise use to accept new_generation == 0.
+func TestReplaceIntentValidation(t *testing.T) {
+	base := sampleReplaceIntent("run-"+strings.Repeat("a", 32), 3)
+	if err := base.validate(); err != nil {
+		t.Fatalf("valid intent rejected: %v", err)
+	}
+	for name, mut := range map[string]func(*ReplaceIntent){
+		"max superseded generation":  func(in *ReplaceIntent) { in.SupersededGeneration = ^uint64(0); in.NewGeneration = 0 },
+		"new not superseded+1":       func(in *ReplaceIntent) { in.NewGeneration = in.SupersededGeneration + 2 },
+		"zero superseded":            func(in *ReplaceIntent) { in.SupersededGeneration = 0; in.NewGeneration = 1 },
+		"zero expected registry rev": func(in *ReplaceIntent) { in.ExpectedRegistryRevision = 0 },
+		"bad operation id":           func(in *ReplaceIntent) { in.OperationID = "op-nope" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			mut(&in)
+			if err := in.validate(); err == nil {
+				t.Fatalf("%s should be rejected", name)
+			}
+		})
+	}
+}
+
+// A present replacement head is bound to the exact envelope/payload/run/steps before it
+// is trusted or stepped over.
+func TestBindReplaceHead(t *testing.T) {
+	runID := "run-" + strings.Repeat("a", 32)
+	in := sampleReplaceIntent(runID, 3)
+	valid := txn.Record{
+		SchemaVersion: txn.RecordVersion, Revision: 1, Intent: in.txnIntent(),
+		StepIDs: []string{"registry-replace"}, StepsDone: 1, Complete: true,
+	}
+	if got, err := bindReplaceHead(valid, runID); err != nil || got.OperationID != in.OperationID {
+		t.Fatalf("valid head: got=%+v err=%v", got, err)
+	}
+	if _, err := bindReplaceHead(valid, "run-"+strings.Repeat("b", 32)); err == nil {
+		t.Fatalf("wrong run should be rejected")
+	}
+	for name, mut := range map[string]func(*txn.Record){
+		"wrong kind":         func(r *txn.Record) { r.Intent.Kind = "pair-attach" },
+		"wrong version":      func(r *txn.Record) { r.Intent.Version = txn.IntentVersion + 1 },
+		"wrong txn id":       func(r *txn.Record) { r.Intent.TxnID = "run-" + strings.Repeat("f", 32) },
+		"non-zero state rev": func(r *txn.Record) { r.Intent.ExpectedStateRevision = 5 },
+		"forged extra step":  func(r *txn.Record) { r.StepIDs = []string{"registry-replace", "extra"} },
+		"forged wrong step":  func(r *txn.Record) { r.StepIDs = []string{"registry-forge"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := valid
+			mut(&rec)
+			if _, err := bindReplaceHead(rec, runID); err == nil {
+				t.Fatalf("%s should be rejected", name)
+			}
+		})
+	}
+}
+
+// The replacement step's participant statuses are the authority recovery depends on:
+// NotApplied at the exact pre-state, Applied after the append, Indeterminate on drift.
+func TestReplaceStepStatus(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	loc := runLocationFor(layoutFor(repo), a.RunID)
+	registry := state.OpenRegistry(loc.RegistryDir, loc.RunLock)
+	reg := loadReg(t, repo, a.RunID) // pair at generation 1
+	in := sampleReplaceIntent(a.RunID, reg.Revision)
+
+	if st, err := replaceStepStatus(registry, in); err != nil || st != txn.StatusNotApplied {
+		t.Fatalf("pre-state status = %q err = %v, want not-applied", st, err)
+	}
+	// A binding that does not match the actual pre-state generation is Indeterminate.
+	drift := in
+	drift.SupersededGeneration, drift.NewGeneration = 2, 3
+	if st, _ := replaceStepStatus(registry, drift); st != txn.StatusIndeterminate {
+		t.Fatalf("drifted binding status = %q, want indeterminate", st)
+	}
+
+	// Apply the exact supersession, then it observes Applied.
+	g, ok, err := genstore.Acquire(loc.RunLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	_, merr := registry.MutateLocked(g, reg.Revision, func(nextRev uint64, next *state.Registry) error {
+		next.Pair.Sessions = append(next.Pair.Sessions, state.SessionRecord{SessionID: in.NewSessionID, Generation: 2, IssuedRegistryRevision: nextRev})
+		next.Pair.CurrentSessionID = in.NewSessionID
+		return nil
+	})
+	_ = g.Release()
+	if merr != nil {
+		t.Fatalf("apply supersession: %v", merr)
+	}
+	if st, err := replaceStepStatus(registry, in); err != nil || st != txn.StatusApplied {
+		t.Fatalf("post-apply status = %q err = %v, want applied", st, err)
+	}
+}
+
+// A crash that leaves the Registry append durable but the journal at zero progress is
+// recovered by OBSERVING the applied effect: a same-op retry advances/completes without
+// a second append or any RNG use.
+func TestReplaceAttachRecoversAppliedButUnrecorded(t *testing.T) {
+	repo := t.TempDir()
+	a, oldPair := pairedRun(t, repo)
+
+	real := defaultReplaceSeams()
+	seams := real
+	seams.mutate = func(rs *state.RegistryStore, g *genstore.Guard, rev uint64, fn func(uint64, *state.Registry) error) (state.Registry, error) {
+		reg, err := real.mutate(rs, g, rev, fn) // the append commits durably
+		if err != nil {
+			return reg, err
+		}
+		return reg, fmt.Errorf("%w: injected after a durable apply", genstore.ErrAmbiguous)
+	}
+	req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+	res1, err1 := replaceAttach(req, seams)
+	if !errors.Is(err1, ErrReplaceOutcomeUnknown) {
+		t.Fatalf("attempt 1 err = %v, want ErrReplaceOutcomeUnknown", err1)
+	}
+	// The effect DID land, but the journal is still pending.
+	if reg := loadReg(t, repo, a.RunID); reg.Pair.CurrentSessionID != res1.SessionID {
+		t.Fatalf("the append was not durable: %+v", reg.Pair)
+	}
+
+	// Same-op retry, RNG that errors if minted: recovery observes the applied effect.
+	retry := req
+	retry.RNG = errReader{}
+	res2, err2 := ReplaceAttach(retry)
+	if err2 != nil {
+		t.Fatalf("retry: %v", err2)
+	}
+	if res2.SessionID != res1.SessionID || res2.Generation != 2 {
+		t.Fatalf("retry did not reconcile: res1=%+v res2=%+v", res1, res2)
+	}
+	reg := loadReg(t, repo, a.RunID)
+	if len(reg.Pair.Sessions) != 2 {
+		t.Fatalf("recovery appended a second session: %+v", reg.Pair)
+	}
+	if r := reg.Resolve(oldPair); r.Status != state.RegReplaced {
+		t.Fatalf("old pair not replaced: %+v", r)
+	}
+}
+
+// A completed replacement head whose durable Registry effect is missing cannot be
+// silently stepped over by a different operation.
+func TestReplaceAttachTerminalReplaceEffectMissing(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)); err != nil {
+		t.Fatalf("op-A: %v", err)
+	}
+	// The completed replacement's Registry effect vanishes.
+	loc := runLocationFor(layoutFor(repo), a.RunID)
+	if err := os.RemoveAll(loc.RegistryDir); err != nil {
+		t.Fatalf("remove registry: %v", err)
+	}
+	if _, err := ReplaceAttach(replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 2, 0x21)); err == nil {
+		t.Fatal("a different op stepped over a completed head with a missing effect")
+	}
+}
+
+// A committed idempotent retry whose guard release fails returns the authoritative
+// result with a post-commit warning, not a plain operation error.
+func TestReplaceAttachIdempotentReleaseWarning(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+	first, err := ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	// Retry the same op with a failing run-guard release.
+	seams := defaultReplaceSeams()
+	seams.releaseRun = failRelease(errors.New("run-drop-x"))
+	retry := req
+	retry.RNG = errReader{}
+	res, err := replaceAttach(retry, seams)
+	if err != nil {
+		t.Fatalf("an idempotent committed retry must not be an operation error: %v", err)
+	}
+	if res.SessionID != first.SessionID {
+		t.Fatalf("retry differs: %s vs %s", res.SessionID, first.SessionID)
+	}
+	var pce *genstore.PostCommitError
+	if !errors.As(res.CommitWarning, &pce) {
+		t.Fatalf("CommitWarning = %v, want *genstore.PostCommitError", res.CommitWarning)
 	}
 }
 
