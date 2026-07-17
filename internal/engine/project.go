@@ -81,6 +81,9 @@ func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) 
 		return Event{}, semanticf("undecodable plan artifact")
 	}
 	steps := toPlanSteps(a.Steps)
+	if err := protocol.ValidateStepTitles(stepTitles(steps)); err != nil {
+		return Event{}, semanticf("plan step titles: %v", err)
+	}
 	digest, err := planDocDigest(a.Markdown, steps, a.Risks, a.OpenQuestions)
 	if err != nil {
 		return Event{}, err
@@ -89,9 +92,11 @@ func projectPlan(canonical []byte, src state.EventRef, rhd bool) (Event, error) 
 }
 
 type jsonCheckOp struct {
-	Key        string  `json:"key"`
-	Action     string  `json:"action"`
-	TargetStep *string `json:"target_step"`
+	Key         string  `json:"key"`
+	Description string  `json:"description"`
+	Evidence    string  `json:"evidence"`
+	Action      string  `json:"action"`
+	TargetStep  *string `json:"target_step"`
 }
 
 func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
@@ -110,6 +115,22 @@ func projectCritique(cur state.RunState, canonical []byte, src state.EventRef, r
 	if err := json.Unmarshal(canonical, &a); err != nil {
 		return Event{}, semanticf("undecodable critique artifact")
 	}
+	// All finding keys and all check-op keys must be canonical and unique.
+	findingKeys := make([]string, 0, len(a.Findings))
+	for _, f := range a.Findings {
+		findingKeys = append(findingKeys, f.Key)
+	}
+	if err := protocol.ValidateKeySet("findings", findingKeys); err != nil {
+		return Event{}, semanticf("%v", err)
+	}
+	opKeys := make([]string, 0, len(a.ImplementationChecks))
+	for _, op := range a.ImplementationChecks {
+		opKeys = append(opKeys, op.Key)
+	}
+	if err := protocol.ValidateKeySet("implementation_checks", opKeys); err != nil {
+		return Event{}, semanticf("%v", err)
+	}
+
 	var actionableKeys []string
 	for _, f := range a.Findings {
 		if f.Severity == "blocking" || f.Severity == "major" {
@@ -205,13 +226,11 @@ func projectRevision(cur state.RunState, canonical []byte, src state.EventRef, r
 		return Event{}, semanticf("a revision arrived with no outstanding findings")
 	}
 	respKeys := make([]string, 0, len(a.Responses))
-	seen := map[string]bool{}
 	for _, r := range a.Responses {
-		if seen[r.FindingKey] {
-			return Event{}, semanticf("duplicate revision response key")
-		}
-		seen[r.FindingKey] = true
 		respKeys = append(respKeys, r.FindingKey)
+	}
+	if err := protocol.ValidateKeySet("responses", respKeys); err != nil {
+		return Event{}, semanticf("%v", err)
 	}
 	sort.Strings(respKeys)
 	want := append([]string(nil), cur.PendingFindings.Keys...)
@@ -259,6 +278,12 @@ func verifyCandidateFacts(cur state.RunState, facts ProjectionFacts) error {
 	if cur.CandidatePlan == nil || cur.CandidateChecks == nil {
 		return semanticf("no candidate plan in state for this phase")
 	}
+	if err := protocol.ValidateStepTitles(stepTitles(facts.CandidatePlan.Steps)); err != nil {
+		return semanticf("candidate step titles: %v", err)
+	}
+	if len(facts.CandidatePlan.Steps) != cur.CandidatePlan.StepCount {
+		return semanticf("the supplied candidate step count does not match the durable count")
+	}
 	digest, err := planDocDigest(facts.CandidatePlan.Markdown, facts.CandidatePlan.Steps, facts.CandidatePlan.Risks, facts.CandidatePlan.OpenQuestions)
 	if err != nil {
 		return err
@@ -293,7 +318,7 @@ func applyCheckOps(current []MaterializedCheck, ops []jsonCheckOp) ([]Materializ
 			if _, ok := m[op.Key]; !ok {
 				order = append(order, op.Key)
 			}
-			m[op.Key] = MaterializedCheck{Key: op.Key, TargetStep: op.TargetStep}
+			m[op.Key] = MaterializedCheck{Key: op.Key, Description: op.Description, Evidence: op.Evidence, TargetStep: op.TargetStep}
 		case "remove":
 			if _, ok := m[op.Key]; !ok {
 				return nil, semanticf("remove of a check key that is not present")

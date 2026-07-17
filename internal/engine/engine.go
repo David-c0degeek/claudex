@@ -19,6 +19,7 @@ import (
 	"sort"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -36,6 +37,26 @@ var ErrSemantic = errors.New("engine: semantic projection error")
 // limit — an impossible state under the current no-grants model, failed closed
 // rather than routed to a reviewer retry.
 var ErrBudgetCorrupt = errors.New("engine: counter exceeds the frozen budget")
+
+// ErrPhaseMismatch is returned by Evaluate when the event kind is not the one the
+// current phase accepts — an exported-boundary guard so a fabricated event cannot
+// drive a wrong-phase edge.
+var ErrPhaseMismatch = errors.New("engine: event kind does not match the current phase")
+
+// ErrBadDecision is returned by Apply when a Decision is malformed for its route
+// (wrong edge, missing/extra payload, or an impossible precondition) before any
+// mutation, so a rejected Apply never partially writes.
+var ErrBadDecision = errors.New("engine: malformed decision")
+
+// phaseEvent is the closed map from a phase to the one event kind it accepts.
+var phaseEvent = map[state.Phase]EventKind{
+	state.PhasePlanDraft:     EvPlanDrafted,
+	state.PhasePlanCritique:  EvPlanCritiqued,
+	state.PhasePlanRevise:    EvPlanRevised,
+	state.PhaseImplementStep: EvStepImplemented,
+	state.PhaseCheckpoint:    EvStepCheckpointed,
+	state.PhaseFix:           EvFixImplemented,
+}
 
 func semanticf(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrSemantic, fmt.Sprintf(format, a...))
@@ -61,9 +82,13 @@ type CanonicalPlan struct {
 }
 
 // MaterializedCheck is one established implementation-check obligation (no action).
+// Its full content is carried into the durable digest so two obligations that
+// differ only in description or evidence are distinct durable sets.
 type MaterializedCheck struct {
-	Key        string
-	TargetStep *string // nil = cross-cutting
+	Key         string
+	Description string
+	Evidence    string
+	TargetStep  *string // nil = cross-cutting
 }
 
 // ProjectionFacts are the materialized artifacts the loader read and revalidated.
@@ -164,6 +189,9 @@ type Ids struct {
 // Evaluate returns the Decision for the current state and a projected event, or
 // ErrPhaseUnsupported for the deferred final edge. Pure; mints nothing.
 func Evaluate(cur state.RunState, ev Event) (Decision, error) {
+	if want, ok := phaseEvent[cur.Phase]; !ok || want != ev.Kind {
+		return Decision{}, fmt.Errorf("%w: phase %s, kind %d", ErrPhaseMismatch, cur.Phase, ev.Kind)
+	}
 	base := Decision{FromPhase: cur.Phase, ExpectedStateRevision: cur.Revision, Source: ev.Source}
 	switch ev.Kind {
 	case EvPlanDrafted:
@@ -236,10 +264,16 @@ func evalPlanCritiqued(cur state.RunState, ev Event, base Decision) (Decision, e
 			base.Checks = &checks
 			base.Findings = &state.FindingObligations{Source: ev.Source, Keys: ev.Findings}
 			return base, nil
-		default: // at limit
+		default: // at limit: park at a plan quality gate that resumes to PLAN_REVISE,
+			// carrying the same actionable projection the revise edge would (v5 requires
+			// PendingFindings + the updated checks at the suspended PLAN_REVISE), but
+			// without charging the counter.
+			checks := ev.ResultingChecks
 			base.Next = state.PhaseAwaitGuidance
 			base.Route = RouteGate
 			base.Gate = &GateSpec{Kind: state.PauseQualityBudget, OriginPhase: state.PhasePlanCritique, ResumePhase: state.PhasePlanRevise, Budget: state.BudgetPlan}
+			base.Checks = &checks
+			base.Findings = &state.FindingObligations{Source: ev.Source, Keys: ev.Findings}
 			return base, nil
 		}
 	}
@@ -281,7 +315,9 @@ func evalStepCheckpointed(cur state.RunState, ev Event, base Decision) (Decision
 	}
 	cursor := *cur.StepIndex
 	stepCount := cur.AgreedPlan.Plan.StepCount
-	converged := ev.Verdict == "AGREE" && !ev.MissingEvidence && !ev.Actionable
+	// Inadequate tests are lead work even if a direct event left Actionable false.
+	needsFix := ev.Actionable || !ev.TestsAdequate
+	converged := ev.Verdict == "AGREE" && !ev.MissingEvidence && !ev.Actionable && ev.TestsAdequate
 	if converged {
 		if cursor >= stepCount-1 {
 			// The final step converged: the edge into TESTS is deferred.
@@ -291,7 +327,7 @@ func evalStepCheckpointed(cur state.RunState, ev Event, base Decision) (Decision
 		base.Route = RouteNextStep
 		return base, nil
 	}
-	if ev.Actionable {
+	if needsFix {
 		limit := cur.EffectivePolicy.Budgets.CheckpointRounds
 		if cursor >= len(cur.Counters.StepFixes) {
 			return Decision{}, semanticf("cursor past the step-fix vector")
@@ -351,33 +387,14 @@ func cmpBudget(used, limit int) budgetCmp {
 // --- apply: realize a decision into an already-cloned next state ---
 
 // Apply mutates next to realize dec, consuming the prepared ids and the independent
-// submitted event. It proves the decision is bound to this exact turn before any
-// mutation. next.Revision must already be the resulting generation gen. It never
-// appends the accepted turn — transport records the receipt after Apply.
+// submitted event. It fully validates the decision's binding, ids, route/edge, and
+// payload BEFORE any write, so a rejected Apply never panics or partially mutates.
+// next.Revision must already be the resulting generation gen. Apply never appends
+// the accepted turn — transport records the receipt after Apply. Decision slices and
+// pointers are copied into state, never aliased.
 func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *state.RunState) error {
-	if submitted != dec.Source {
-		return fmt.Errorf("engine: submitted event does not match the decision source")
-	}
-	if next.Revision != gen {
-		return fmt.Errorf("engine: next revision %d does not match the resulting generation %d", next.Revision, gen)
-	}
-	if next.Phase != dec.FromPhase {
-		return fmt.Errorf("engine: decision from-phase %s does not match the current phase %s", dec.FromPhase, next.Phase)
-	}
-	if next.Assignment == nil || next.Assignment.ID != submitted.TurnID {
-		return fmt.Errorf("engine: the submitted turn is not the outstanding assignment")
-	}
-	if next.Assignment.IssuedRevision != dec.ExpectedStateRevision {
-		return fmt.Errorf("engine: the consumed assignment was not issued at the expected revision %d", dec.ExpectedStateRevision)
-	}
-	// Id exactness: a gate issues only a gate id; every running edge issues only an
-	// assignment id.
-	if dec.Gate != nil {
-		if ids.GateID == "" || ids.AssignmentTurnID != "" {
-			return fmt.Errorf("engine: a gate decision requires exactly a gate id")
-		}
-	} else if ids.AssignmentTurnID == "" || ids.GateID != "" {
-		return fmt.Errorf("engine: a running decision requires exactly an assignment id")
+	if err := validateApply(dec, submitted, ids, gen, next); err != nil {
+		return err
 	}
 
 	next.Assignment = nil // consume the submitted turn
@@ -385,16 +402,22 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 
 	switch dec.Route {
 	case RouteGate:
+		if dec.Checks != nil { // plan quality gate carries the actionable projection
+			next.CandidateChecks = copyCheckSet(dec.Checks)
+		}
+		if dec.Findings != nil {
+			next.PendingFindings = copyFindings(dec.Findings)
+		}
 		applyGate(dec.Gate, submitted, ids.GateID, gen, next)
 	case RouteDraftAccepted:
-		next.CandidatePlan = dec.Plan
-		next.CandidateChecks = dec.Checks
+		next.CandidatePlan = copyPlanRef(dec.Plan)
+		next.CandidateChecks = copyCheckSet(dec.Checks)
 		issue(next, ids, gen)
 	case RoutePromote:
 		next.AgreedPlan = &state.PlanAgreement{
 			Plan:           *next.CandidatePlan,
 			Critique:       submitted,
-			Checks:         *dec.Checks,
+			Checks:         *copyCheckSet(dec.Checks),
 			AgreedRevision: gen,
 		}
 		next.CandidatePlan = nil
@@ -405,14 +428,14 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		next.StepIndex = &idx
 		issue(next, ids, gen)
 	case RouteToRevise:
-		next.CandidateChecks = dec.Checks
-		next.PendingFindings = dec.Findings
+		next.CandidateChecks = copyCheckSet(dec.Checks)
+		next.PendingFindings = copyFindings(dec.Findings)
 		next.Counters.PlanRevisions++
 		issue(next, ids, gen)
 	case RouteRetryReview:
 		issue(next, ids, gen)
 	case RouteReviseAccepted:
-		next.CandidatePlan = dec.Plan
+		next.CandidatePlan = copyPlanRef(dec.Plan)
 		next.PendingFindings = nil // preserve checks, clear findings
 		issue(next, ids, gen)
 	case RouteToCheckpoint:
@@ -425,10 +448,162 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		next.Counters.StepFixes[*next.StepIndex]++
 		next.FixReturn = state.PhaseCheckpoint
 		issue(next, ids, gen)
-	default:
-		return fmt.Errorf("engine: unknown route %d", dec.Route)
 	}
 	return nil
+}
+
+// validateApply proves the decision is well-formed and bound to this exact turn,
+// reading only — it performs no mutation, so a failure leaves next untouched.
+func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *state.RunState) error {
+	// Source binding.
+	if submitted != dec.Source {
+		return fmt.Errorf("%w: submitted event does not match the decision source", ErrBadDecision)
+	}
+	if next.Revision != gen {
+		return fmt.Errorf("%w: next revision %d != resulting generation %d", ErrBadDecision, next.Revision, gen)
+	}
+	if next.Phase != dec.FromPhase {
+		return fmt.Errorf("%w: from-phase %s != current phase %s", ErrBadDecision, dec.FromPhase, next.Phase)
+	}
+	// The pre-state must be a live run with the bound assignment outstanding.
+	if next.Lifecycle != state.LifecycleRunning || next.Pause != nil || next.Gate != nil || next.Recovery != nil {
+		return fmt.Errorf("%w: the run is not live", ErrBadDecision)
+	}
+	if next.Assignment == nil || next.Assignment.ID != submitted.TurnID {
+		return fmt.Errorf("%w: the submitted turn is not the outstanding assignment", ErrBadDecision)
+	}
+	if next.Assignment.IssuedRevision != dec.ExpectedStateRevision {
+		return fmt.Errorf("%w: the assignment was not issued at the expected revision %d", ErrBadDecision, dec.ExpectedStateRevision)
+	}
+	// Route/edge table.
+	if !routeAllowed(dec.Route, dec.FromPhase, dec.Next) {
+		return fmt.Errorf("%w: route %d is not legal for %s->%s", ErrBadDecision, dec.Route, dec.FromPhase, dec.Next)
+	}
+	// Gate is the sole paused discriminant.
+	if (dec.Route == RouteGate) != (dec.Gate != nil) {
+		return fmt.Errorf("%w: gate presence must match the gate route", ErrBadDecision)
+	}
+	// Id exactness (canonical + not the consumed or an already-accepted turn).
+	if dec.Gate != nil {
+		if !validID(ids.GateID) || ids.AssignmentTurnID != "" {
+			return fmt.Errorf("%w: a gate requires exactly a canonical gate id", ErrBadDecision)
+		}
+	} else {
+		if !validID(ids.AssignmentTurnID) || ids.GateID != "" {
+			return fmt.Errorf("%w: a running edge requires exactly a canonical assignment id", ErrBadDecision)
+		}
+		if ids.AssignmentTurnID == submitted.TurnID {
+			return fmt.Errorf("%w: the next assignment reuses the consumed turn", ErrBadDecision)
+		}
+		if _, ok := next.AcceptedTurns[ids.AssignmentTurnID]; ok {
+			return fmt.Errorf("%w: the next assignment reuses an accepted turn", ErrBadDecision)
+		}
+	}
+	return validateRoutePayload(dec, next)
+}
+
+func validateRoutePayload(dec Decision, next *state.RunState) error {
+	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrBadDecision, msg) }
+	switch dec.Route {
+	case RouteGate:
+		if dec.Gate.OriginPhase != dec.FromPhase {
+			return bad("gate origin must be the from-phase")
+		}
+		planGate := dec.Gate.Kind == state.PauseQualityBudget && dec.Gate.Budget == state.BudgetPlan
+		if planGate {
+			if dec.Checks == nil || dec.Findings == nil {
+				return bad("a plan quality gate must carry checks and findings")
+			}
+		} else if dec.Checks != nil || dec.Findings != nil {
+			return bad("this gate must carry no checks or findings")
+		}
+		if dec.Plan != nil {
+			return bad("a gate carries no plan")
+		}
+	case RouteDraftAccepted:
+		if dec.Plan == nil || dec.Checks == nil || dec.Findings != nil {
+			return bad("draft-accept requires a plan and checks and no findings")
+		}
+	case RoutePromote:
+		if dec.Checks == nil || dec.Plan != nil || dec.Findings != nil {
+			return bad("promote requires frozen checks and no plan/findings")
+		}
+		if next.CandidatePlan == nil {
+			return bad("promote requires a candidate plan to freeze")
+		}
+	case RouteToRevise:
+		if dec.Checks == nil || dec.Findings == nil || dec.Plan != nil {
+			return bad("revise requires checks and findings and no plan")
+		}
+	case RouteReviseAccepted:
+		if dec.Plan == nil || dec.Checks != nil || dec.Findings != nil {
+			return bad("revise-accept requires a plan and no checks/findings")
+		}
+	case RouteRetryReview, RouteToCheckpoint:
+		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
+			return bad("this route carries no payload")
+		}
+	case RouteNextStep:
+		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
+			return bad("next-step carries no payload")
+		}
+		if next.StepIndex == nil || next.AgreedPlan == nil || *next.StepIndex+1 > next.AgreedPlan.Plan.StepCount {
+			return bad("next-step requires an advanceable cursor")
+		}
+	case RouteToFix:
+		if dec.Plan != nil || dec.Checks != nil || dec.Findings != nil {
+			return bad("to-fix carries no payload")
+		}
+		if next.StepIndex == nil || *next.StepIndex < 0 || *next.StepIndex >= len(next.Counters.StepFixes) {
+			return bad("to-fix requires a valid step cursor")
+		}
+	default:
+		return bad("unknown route")
+	}
+	return nil
+}
+
+func routeAllowed(r Route, from, next state.Phase) bool {
+	switch r {
+	case RouteGate:
+		return next == state.PhaseAwaitGuidance
+	case RouteDraftAccepted:
+		return from == state.PhasePlanDraft && next == state.PhasePlanCritique
+	case RoutePromote:
+		return from == state.PhasePlanCritique && next == state.PhaseImplementStep
+	case RouteToRevise:
+		return from == state.PhasePlanCritique && next == state.PhasePlanRevise
+	case RouteRetryReview:
+		return (from == state.PhasePlanCritique && next == state.PhasePlanCritique) ||
+			(from == state.PhaseCheckpoint && next == state.PhaseCheckpoint)
+	case RouteReviseAccepted:
+		return from == state.PhasePlanRevise && next == state.PhasePlanCritique
+	case RouteToCheckpoint:
+		return (from == state.PhaseImplementStep || from == state.PhaseFix) && next == state.PhaseCheckpoint
+	case RouteNextStep:
+		return from == state.PhaseCheckpoint && next == state.PhaseImplementStep
+	case RouteToFix:
+		return from == state.PhaseCheckpoint && next == state.PhaseFix
+	}
+	return false
+}
+
+// validID is a minimal non-empty check; the canonical id grammar is enforced by the
+// state layer's transition validation, which is the authoritative backstop.
+func validID(s string) bool { return s != "" }
+
+func copyPlanRef(p *state.PlanRef) *state.PlanRef { c := *p; return &c }
+
+func copyCheckSet(c *state.CheckSetRef) *state.CheckSetRef {
+	out := *c
+	out.Keys = append([]string{}, c.Keys...)
+	return &out
+}
+
+func copyFindings(f *state.FindingObligations) *state.FindingObligations {
+	out := *f
+	out.Keys = append([]string{}, f.Keys...)
+	return &out
 }
 
 func issue(next *state.RunState, ids Ids, gen uint64) {
@@ -456,8 +631,10 @@ func applyGate(g *GateSpec, source state.EventRef, gateID string, gen uint64, ne
 // --- pure materialization helpers ---
 
 // materializeChecks sorts checks by key and produces the CheckSetRef state stores:
-// the sorted key list plus the digest of the canonical materialized check array
-// (the empty array yields the canonical empty digest state pins).
+// the sorted key list plus the digest of the canonical materialized check array,
+// which carries every established field (key, description, evidence, target_step;
+// action is an operation and is not retained). The empty array yields the canonical
+// empty digest state pins. The resulting key set is grammar/count validated.
 func materializeChecks(checks []MaterializedCheck) (state.CheckSetRef, error) {
 	sorted := append([]MaterializedCheck(nil), checks...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
@@ -469,7 +646,10 @@ func materializeChecks(checks []MaterializedCheck) (state.CheckSetRef, error) {
 		if c.TargetStep != nil {
 			target = *c.TargetStep
 		}
-		arr = append(arr, map[string]any{"key": c.Key, "target_step": target})
+		arr = append(arr, map[string]any{"key": c.Key, "description": c.Description, "evidence": c.Evidence, "target_step": target})
+	}
+	if err := protocol.ValidateKeySet("checks", keys); err != nil {
+		return state.CheckSetRef{}, fmt.Errorf("%w: %v", ErrSemantic, err)
 	}
 	dig, err := canonjson.DigestValue(arr)
 	if err != nil {

@@ -122,7 +122,7 @@ func TestEvaluateHumanGateFirst(t *testing.T) {
 // --- Apply binding + id exactness (pure Apply) ---
 
 func baseNext(rev uint64) *state.RunState {
-	return &state.RunState{Phase: state.PhasePlanCritique, Revision: rev, Assignment: &state.Ref{ID: "t", IssuedRevision: 5}, Counters: state.Counters{StepFixes: []int{}}, AcceptedTurns: map[string]state.AcceptedTurn{}}
+	return &state.RunState{Phase: state.PhasePlanCritique, Revision: rev, Lifecycle: state.LifecycleRunning, Assignment: &state.Ref{ID: "t", IssuedRevision: 5}, Counters: state.Counters{StepFixes: []int{}}, AcceptedTurns: map[string]state.AcceptedTurn{}}
 }
 
 func retryDecision() Decision {
@@ -176,7 +176,7 @@ func TestApplyBindingChecks(t *testing.T) {
 }
 
 func TestApplyGateIdExactness(t *testing.T) {
-	next := &state.RunState{Phase: state.PhaseImplementStep, Revision: 6, Assignment: &state.Ref{ID: "t", IssuedRevision: 5}, Counters: state.Counters{StepFixes: []int{}}, AcceptedTurns: map[string]state.AcceptedTurn{}}
+	next := &state.RunState{Phase: state.PhaseImplementStep, Revision: 6, Lifecycle: state.LifecycleRunning, Assignment: &state.Ref{ID: "t", IssuedRevision: 5}, Counters: state.Counters{StepFixes: []int{}}, AcceptedTurns: map[string]state.AcceptedTurn{}}
 	dec := Decision{FromPhase: state.PhaseImplementStep, ExpectedStateRevision: 5, Source: src(), Next: state.PhaseAwaitGuidance, Route: RouteGate,
 		Gate: &GateSpec{Kind: state.PauseHumanDecision, OriginPhase: state.PhaseImplementStep, ResumePhase: state.PhaseImplementStep}}
 	// A gate requires a gate id and no assignment id.
@@ -196,27 +196,29 @@ func TestApplyGateIdExactness(t *testing.T) {
 func TestProjectRevisionSemanticRejects(t *testing.T) {
 	store := newStore(t)
 	f := twoStepPlan()
-	bootstrapPlanDraft(t, store, "t-plan")
-	step(t, store, ProjectionFacts{}, planArtifact(t, "t-plan", false, f), assign("t-crit1"))
+	draft := bootstrapPlanDraft(t, store, "t-plan")
+	mustStep(t, store, ProjectionFacts{}, planArtifact(t, "t-plan", draft.Revision, false, f), assign("t-crit1"))
 	critFacts := ProjectionFacts{CandidatePlan: f.canonicalPlan()}
-	rs, err := step(t, store, critFacts, critiqueArtifact(t, "t-crit1", "REVISE", false, []string{"blocking"}, nil, nil), assign("t-rev1"))
+	crs, _, _ := store.Load()
+	rs, err := step(t, store, critFacts, critiqueArtifact(t, "t-crit1", crs.Revision, "REVISE", false, []string{"blocking"}, nil, nil), assign("t-rev1"))
 	if err != nil {
 		t.Fatalf("to revise: %v", err)
 	}
 	reviseFacts := ProjectionFacts{CandidatePlan: f.canonicalPlan()}
+	rev := rs.Revision
 
 	// Wrong base digest -> semantic reject, no acceptance.
-	bad := revisionArtifact(t, "t-rev1", strings.Repeat("f", 64), rs.PendingFindings.Keys)
+	bad := revisionArtifact(t, "t-rev1", rev, strings.Repeat("f", 64), rs.PendingFindings.Keys)
 	if _, err := step(t, store, reviseFacts, bad, assign("x")); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("wrong base err = %v, want ErrSemantic", err)
 	}
 	// Extra (unbound) response key -> semantic reject.
-	extra := revisionArtifact(t, "t-rev1", f.digest(t), append(append([]string{}, rs.PendingFindings.Keys...), "finding-z"))
+	extra := revisionArtifact(t, "t-rev1", rev, f.digest(t), append(append([]string{}, rs.PendingFindings.Keys...), "finding-z"))
 	if _, err := step(t, store, reviseFacts, extra, assign("x")); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("extra response err = %v, want ErrSemantic", err)
 	}
 	// Missing response key -> semantic reject.
-	missing := revisionArtifact(t, "t-rev1", f.digest(t), nil)
+	missing := revisionArtifact(t, "t-rev1", rev, f.digest(t), nil)
 	if _, err := step(t, store, reviseFacts, missing, assign("x")); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("missing response err = %v, want ErrSemantic", err)
 	}
@@ -230,11 +232,12 @@ func TestProjectRevisionSemanticRejects(t *testing.T) {
 func TestProjectCritiqueRemoveMissingRejected(t *testing.T) {
 	store := newStore(t)
 	f := twoStepPlan()
-	bootstrapPlanDraft(t, store, "t-plan")
-	step(t, store, ProjectionFacts{}, planArtifact(t, "t-plan", false, f), assign("t-crit1"))
+	draft := bootstrapPlanDraft(t, store, "t-plan")
+	mustStep(t, store, ProjectionFacts{}, planArtifact(t, "t-plan", draft.Revision, false, f), assign("t-crit1"))
 	critFacts := ProjectionFacts{CandidatePlan: f.canonicalPlan()}
-	remove := []map[string]any{{"key": "ghost", "action": "remove", "target_step": nil}}
-	if _, err := step(t, store, critFacts, critiqueArtifact(t, "t-crit1", "REVISE", false, []string{"blocking"}, nil, remove), assign("x")); !errors.Is(err, ErrSemantic) {
+	crs, _, _ := store.Load()
+	remove := []map[string]any{{"key": "ghost", "description": "d", "evidence": "e", "action": "remove", "target_step": nil}}
+	if _, err := step(t, store, critFacts, critiqueArtifact(t, "t-crit1", crs.Revision, "REVISE", false, []string{"blocking"}, nil, remove), assign("x")); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("remove-missing err = %v, want ErrSemantic", err)
 	}
 }
