@@ -455,9 +455,13 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 // validateApply proves the decision is well-formed and bound to this exact turn,
 // reading only — it performs no mutation, so a failure leaves next untouched.
 func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *state.RunState) error {
-	// Source binding.
+	// Source binding — and the independent submitted event must be well-formed on its
+	// own (a canonical turn id and a sha256 digest), not merely equal to dec.Source.
 	if submitted != dec.Source {
 		return fmt.Errorf("%w: submitted event does not match the decision source", ErrBadDecision)
+	}
+	if !state.IsRunID(submitted.TurnID) || !state.IsHex64(submitted.Digest) {
+		return fmt.Errorf("%w: the submitted event is not well-formed", ErrBadDecision)
 	}
 	if next.Revision != gen {
 		return fmt.Errorf("%w: next revision %d != resulting generation %d", ErrBadDecision, next.Revision, gen)
@@ -565,7 +569,7 @@ func validateRoute(dec Decision, submitted state.EventRef, next *state.RunState)
 		if anyPayload(dec) {
 			return badDecision("next-step carries no payload")
 		}
-		if next.StepIndex == nil || next.AgreedPlan == nil || *next.StepIndex >= next.AgreedPlan.Plan.StepCount-1 {
+		if next.StepIndex == nil || next.AgreedPlan == nil || *next.StepIndex < 0 || *next.StepIndex >= next.AgreedPlan.Plan.StepCount-1 {
 			return badDecision("next-step requires a cursor before the final step")
 		}
 	case RouteToFix:
@@ -588,6 +592,10 @@ func validateGate(dec Decision, submitted state.EventRef, next *state.RunState) 
 		return badDecision("a gate carries no plan")
 	}
 	g := dec.Gate
+	// Every gate — human or quality — pauses out of the submit's own phase.
+	if g.OriginPhase != dec.FromPhase {
+		return badDecision("a gate origin must be the from-phase")
+	}
 	b := next.EffectivePolicy.Budgets
 	switch g.Kind {
 	case state.PauseHumanDecision:
@@ -705,7 +713,7 @@ func checkPlanRef(p *state.PlanRef, submitted state.EventRef) error {
 	if p.Source != submitted {
 		return badDecision("plan source is not the submitted event")
 	}
-	if !isHex64(p.Digest) {
+	if !state.IsHex64(p.Digest) {
 		return badDecision("plan digest is not a 64-char lower-hex sha256")
 	}
 	if p.StepCount < protocol.MinPlanSteps || p.StepCount > protocol.MaxPlanSteps {
@@ -724,10 +732,26 @@ func checkCheckSet(c *state.CheckSetRef) error {
 	if !sortedStrings(c.Keys) {
 		return badDecision("check keys must be strictly sorted")
 	}
-	if !isHex64(c.Digest) {
+	if !state.IsHex64(c.Digest) {
 		return badDecision("check digest is not a 64-char lower-hex sha256")
 	}
+	// The same canonical empty law state pins: empty keys iff the empty-array digest.
+	if (len(c.Keys) == 0) != (c.Digest == emptyChecksDigest) {
+		return badDecision("check keys are empty iff the digest is the canonical empty-array digest")
+	}
 	return nil
+}
+
+// emptyChecksDigest is the canonical digest of the empty materialized check array,
+// used to enforce the empty-set biconditional a Decision's check payload must obey.
+var emptyChecksDigest = mustEmptyChecksDigest()
+
+func mustEmptyChecksDigest() string {
+	d, err := canonjson.DigestValue([]any{})
+	if err != nil {
+		panic("engine: empty check digest: " + err.Error())
+	}
+	return d
 }
 
 func checkFindings(f *state.FindingObligations, submitted state.EventRef) error {
@@ -749,18 +773,6 @@ func checkFindings(f *state.FindingObligations, submitted state.EventRef) error 
 func sortedStrings(ss []string) bool {
 	for i := 1; i < len(ss); i++ {
 		if ss[i-1] >= ss[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func isHex64(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
 			return false
 		}
 	}

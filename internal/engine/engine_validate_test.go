@@ -50,6 +50,11 @@ func TestApplyNoPartialWriteOnReject(t *testing.T) {
 			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview}, assign("bad/id")},
 		"non-canonical assignment id (reserved)": {baseNext(6),
 			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview}, assign("..")},
+		"quality gate origin != from-phase": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhaseAwaitGuidance, Route: RouteGate,
+				Gate: &GateSpec{Kind: state.PauseQualityBudget, OriginPhase: state.PhaseCheckpoint, ResumePhase: state.PhaseFix, FixReturn: state.PhaseCheckpoint, Budget: state.BudgetCheckpoint}}, gate("g")},
+		"non-hex submitted digest": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: state.EventRef{TurnID: "t", Digest: "not-hex"}, Next: state.PhasePlanCritique, Route: RouteRetryReview}, assign("n")},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -143,6 +148,46 @@ func TestForgedOverLimitEdgeRejected(t *testing.T) {
 	}
 	if after, _, _ := store.Load(); after.Revision != cur.Revision || after.Counters.PlanRevisions != 1 {
 		t.Fatalf("forged edge advanced the run: rev %d revs %d", after.Revision, after.Counters.PlanRevisions)
+	}
+}
+
+// checkpointNext builds a CHECKPOINT run with StepFixes[0]==fixes and CheckpointRounds==limit.
+func checkpointNext(fixes, limit int) *state.RunState {
+	pol := config.DefaultRunPolicy()
+	pol.Budgets.CheckpointRounds = limit
+	idx := 0
+	return &state.RunState{
+		Phase: state.PhaseCheckpoint, Revision: 6, Lifecycle: state.LifecycleRunning, EffectivePolicy: pol,
+		Assignment: &state.Ref{ID: "t", IssuedRevision: 5}, StepIndex: &idx,
+		AgreedPlan: &state.PlanAgreement{Plan: state.PlanRef{StepCount: 2}},
+		Counters:   state.Counters{StepFixes: []int{fixes, 0}}, AcceptedTurns: map[string]state.AcceptedTurn{},
+	}
+}
+
+// A forged RouteToFix at the checkpoint budget limit is rejected with no write.
+func TestForgedCheckpointFixOverLimit(t *testing.T) {
+	next := checkpointNext(2, 2) // StepFixes[0]==2==CheckpointRounds
+	dec := Decision{FromPhase: state.PhaseCheckpoint, ExpectedStateRevision: 5, Source: src(), Next: state.PhaseFix, Route: RouteToFix}
+	before := mustJSON(t, next)
+	if err := Apply(dec, src(), assign("n"), 6, next); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("forged fix at limit err = %v, want ErrBadDecision", err)
+	}
+	if !bytes.Equal(before, mustJSON(t, next)) {
+		t.Fatal("rejected fix mutated next")
+	}
+}
+
+// A checkpoint quality gate raised below the budget limit is rejected with no write.
+func TestQualityGateUnderLimitRejected(t *testing.T) {
+	next := checkpointNext(0, 2) // StepFixes[0]==0 < CheckpointRounds==2
+	dec := Decision{FromPhase: state.PhaseCheckpoint, ExpectedStateRevision: 5, Source: src(), Next: state.PhaseAwaitGuidance, Route: RouteGate,
+		Gate: &GateSpec{Kind: state.PauseQualityBudget, OriginPhase: state.PhaseCheckpoint, ResumePhase: state.PhaseFix, FixReturn: state.PhaseCheckpoint, Budget: state.BudgetCheckpoint}}
+	before := mustJSON(t, next)
+	if err := Apply(dec, src(), gate("g"), 6, next); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("under-limit gate err = %v, want ErrBadDecision", err)
+	}
+	if !bytes.Equal(before, mustJSON(t, next)) {
+		t.Fatal("rejected gate mutated next")
 	}
 }
 
