@@ -189,11 +189,7 @@ func TestStatusHonestyValueFree(t *testing.T) {
 // Status reflects a real Submit: the resulting revision and newly issued owner.
 func TestStatusAfterSubmit(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t) // IMPLEMENT_STEP, lead turn-1
-	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-		next.Phase = state.PhaseCheckpoint
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-		return nil
-	}
+	adv := checkpointPrep()
 	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "done"), ownerAuth("sess-1"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)

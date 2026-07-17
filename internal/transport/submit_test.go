@@ -63,14 +63,6 @@ func ownerAuth(owner string) Authorizer {
 	}
 }
 
-type advancer struct{}
-
-func (a *advancer) fn(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-	next.Phase = state.PhaseCheckpoint
-	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-	return nil
-}
-
 // --- state fixture ---
 
 func initValid(n *state.RunState) {
@@ -115,15 +107,11 @@ func report(turnID string, rev uint64, notes string) []byte {
 }
 
 // submit is a legacy-shaped shim: it builds the locked-Submit dependencies (the
-// fixture registry + a terminal journal) and adapts the transition, so existing
-// tests keep their call shape. Authorization is definitive via the registry, so the
-// passed Authorizer is dropped (it was never definitive); a nil sink or transition
-// still surfaces ErrMissingSeam.
-func submit(store *state.Store, sink ArtifactSink, sess string, raw []byte, _ Authorizer, adv Transition) (SubmitResult, error) {
-	var prep Prepare
-	if adv != nil {
-		prep = adaptTransition(adv)
-	}
+// fixture registry + a terminal journal) so existing tests keep their call shape.
+// The transition is supplied as a Prepare (with honest declared ids). Authorization
+// is definitive via the registry, so the passed Authorizer is dropped (it was never
+// definitive); a nil sink or prepare still surfaces ErrMissingSeam.
+func submit(store *state.Store, sink ArtifactSink, sess string, raw []byte, _ Authorizer, prep Prepare) (SubmitResult, error) {
 	return Submit(context.Background(), submitDeps(store, sink, prep), canonSess(sess), raw)
 }
 
@@ -131,7 +119,7 @@ func TestSubmitAccepts(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	adv := &advancer{}
-	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.fn)
+	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -150,18 +138,21 @@ func TestSubmitAccepts(t *testing.T) {
 	if loaded.Phase != state.PhaseCheckpoint || loaded.Assignment.ID != "turn-2" {
 		t.Fatalf("transition did not advance: %s / %+v", loaded.Phase, loaded.Assignment)
 	}
+	if adv.calls.Load() != 1 {
+		t.Fatalf("transition applied %d times, want exactly 1", adv.calls.Load())
+	}
 }
 
 func TestSubmitIdempotent(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	adv := &advancer{}
-	first, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.fn)
+	first, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	afterFirst, _, _ := store.Load()
-	second, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.fn)
+	second, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -172,6 +163,9 @@ func TestSubmitIdempotent(t *testing.T) {
 	if afterSecond.Revision != afterFirst.Revision {
 		t.Fatalf("replay wrote a new generation")
 	}
+	if adv.calls.Load() != 1 {
+		t.Fatalf("replay re-ran the transition (%d)", adv.calls.Load())
+	}
 }
 
 func TestSubmitSecretOnlyDifferenceCollapses(t *testing.T) {
@@ -180,14 +174,14 @@ func TestSubmitSecretOnlyDifferenceCollapses(t *testing.T) {
 	adv := &advancer{}
 	a := report("turn-1", rev, "used token=sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa here")
 	b := report("turn-1", rev, "used token=sk-ant-bbbbbbbbbbbbbbbbbbbbbbbb here")
-	ra, err := submit(store, sink, "sess-1", a, ownerAuth("sess-1"), adv.fn)
+	ra, err := submit(store, sink, "sess-1", a, ownerAuth("sess-1"), adv.prep())
 	if err != nil {
 		t.Fatalf("submit a: %v", err)
 	}
 	if strings.Contains(string(sink.get("turn-1", ra.Receipt.ArtifactDigest)), "sk-ant-") {
 		t.Fatalf("secret survived redaction in the sink")
 	}
-	rb, err := submit(store, sink, "sess-1", b, ownerAuth("sess-1"), adv.fn)
+	rb, err := submit(store, sink, "sess-1", b, ownerAuth("sess-1"), adv.prep())
 	if err != nil {
 		t.Fatalf("submit b: %v", err)
 	}
@@ -200,21 +194,24 @@ func TestSubmitConflictDoesNotRerunTransition(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	adv := &advancer{}
-	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "first"), ownerAuth("sess-1"), adv.fn); err != nil {
+	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "first"), ownerAuth("sess-1"), adv.prep()); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "different"), ownerAuth("sess-1"), adv.fn); !errors.Is(err, ErrConflict) {
+	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "different"), ownerAuth("sess-1"), adv.prep()); !errors.Is(err, ErrConflict) {
 		t.Fatalf("err = %v, want ErrConflict", err)
 	}
 	if after, _, _ := store.Load(); after.Revision != rev+1 {
 		t.Fatalf("a conflicting submit advanced the run to %d", after.Revision)
+	}
+	if adv.calls.Load() != 1 {
+		t.Fatalf("a conflicting submit re-ran the transition (%d)", adv.calls.Load())
 	}
 }
 
 func TestSubmitStaleCarriesCurrentStatus(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	adv := &advancer{}
-	_, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev-1, "x"), ownerAuth("sess-1"), adv.fn)
+	_, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev-1, "x"), ownerAuth("sess-1"), adv.prep())
 	var se *StaleError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *StaleError", err)
@@ -235,7 +232,7 @@ func TestStaleBeatsWrongTurnOnReissue(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reissue: %v", err)
 	}
-	_, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), (&advancer{}).fn)
+	_, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), checkpointPrep())
 	var se *StaleError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *StaleError (revision must be checked before turn)", err)
@@ -247,7 +244,7 @@ func TestStaleBeatsWrongTurnOnReissue(t *testing.T) {
 
 func TestSubmitWrongTurn(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	if _, err := submit(store, newMemSink(), "sess-1", report("turn-999", rev, "x"), ownerAuth("sess-1"), (&advancer{}).fn); !errors.Is(err, ErrWrongTurn) {
+	if _, err := submit(store, newMemSink(), "sess-1", report("turn-999", rev, "x"), ownerAuth("sess-1"), checkpointPrep()); !errors.Is(err, ErrWrongTurn) {
 		t.Fatalf("err = %v, want ErrWrongTurn", err)
 	}
 }
@@ -255,11 +252,11 @@ func TestSubmitWrongTurn(t *testing.T) {
 func TestSubmitSchemaInvalid(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	bad := fmt.Sprintf(`{"protocol_version":1,"message_type":"implementation_report","turn_id":"turn-1","state_revision":%d,"human_context":null,"requires_human_decision":false,"decision_question":null,"deviations_from_plan":[],"notes":"n"}`, rev)
-	if _, err := submit(store, newMemSink(), "sess-1", []byte(bad), ownerAuth("sess-1"), (&advancer{}).fn); err == nil {
+	if _, err := submit(store, newMemSink(), "sess-1", []byte(bad), ownerAuth("sess-1"), checkpointPrep()); err == nil {
 		t.Fatalf("schema-invalid submission should be rejected")
 	}
 	wrong := fmt.Sprintf(`{"protocol_version":1,"message_type":"plan","turn_id":"turn-1","state_revision":%d,"human_context":null,"requires_human_decision":false,"decision_question":null,"plan_markdown":"x","steps":[],"risks":[],"open_questions":[]}`, rev)
-	if _, err := submit(store, newMemSink(), "sess-1", []byte(wrong), ownerAuth("sess-1"), (&advancer{}).fn); err == nil {
+	if _, err := submit(store, newMemSink(), "sess-1", []byte(wrong), ownerAuth("sess-1"), checkpointPrep()); err == nil {
 		t.Fatalf("wrong message_type should be rejected")
 	}
 }
@@ -267,11 +264,11 @@ func TestSubmitSchemaInvalid(t *testing.T) {
 func TestSubmitDecisionInconsistent(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	trueNull := fmt.Sprintf(`{"protocol_version":1,"message_type":"implementation_report","turn_id":"turn-1","state_revision":%d,"human_context":null,"requires_human_decision":true,"decision_question":null,"files_changed":["a.go"],"deviations_from_plan":[],"notes":"n"}`, rev)
-	if _, err := submit(store, newMemSink(), "sess-1", []byte(trueNull), ownerAuth("sess-1"), (&advancer{}).fn); !errors.Is(err, ErrDecisionInconsistent) {
+	if _, err := submit(store, newMemSink(), "sess-1", []byte(trueNull), ownerAuth("sess-1"), checkpointPrep()); !errors.Is(err, ErrDecisionInconsistent) {
 		t.Fatalf("true+null want ErrDecisionInconsistent, got %v", err)
 	}
 	falseEmpty := fmt.Sprintf(`{"protocol_version":1,"message_type":"implementation_report","turn_id":"turn-1","state_revision":%d,"human_context":null,"requires_human_decision":false,"decision_question":"","files_changed":["a.go"],"deviations_from_plan":[],"notes":"n"}`, rev)
-	if _, err := submit(store, newMemSink(), "sess-1", []byte(falseEmpty), ownerAuth("sess-1"), (&advancer{}).fn); !errors.Is(err, ErrDecisionInconsistent) {
+	if _, err := submit(store, newMemSink(), "sess-1", []byte(falseEmpty), ownerAuth("sess-1"), checkpointPrep()); !errors.Is(err, ErrDecisionInconsistent) {
 		t.Fatalf("false+empty want ErrDecisionInconsistent, got %v", err)
 	}
 }
@@ -281,7 +278,7 @@ func TestSubmitUnauthorizedFresh(t *testing.T) {
 	sink := newMemSink()
 	adv := &advancer{}
 	before, _, _ := store.Load()
-	if _, err := submit(store, sink, "intruder", report("turn-1", rev, "x"), ownerAuth("sess-1"), adv.fn); err == nil {
+	if _, err := submit(store, sink, "intruder", report("turn-1", rev, "x"), ownerAuth("sess-1"), adv.prep()); err == nil {
 		t.Fatalf("unauthorized submit should be rejected")
 	}
 	after, _, _ := store.Load()
@@ -294,11 +291,11 @@ func TestSubmitUnauthorizedFresh(t *testing.T) {
 func TestSubmitUnauthorizedIdempotent(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
-	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), (&advancer{}).fn); err != nil {
+	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), checkpointPrep()); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 	// An intruder who knows the accepted bytes must not get a receipt.
-	if _, err := submit(store, sink, "intruder", report("turn-1", rev, "did it"), ownerAuth("sess-1"), (&advancer{}).fn); err == nil {
+	if _, err := submit(store, sink, "intruder", report("turn-1", rev, "did it"), ownerAuth("sess-1"), checkpointPrep()); err == nil {
 		t.Fatalf("unauthorized replay should be rejected")
 	}
 }
@@ -306,7 +303,7 @@ func TestSubmitUnauthorizedIdempotent(t *testing.T) {
 func TestNoOpTransitionRejected(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
-	noop := func(_ PreparedSubmit, _ uint64, _ *state.RunState) error { return nil }
+	noop := prepareIssuing("", "", func(_ uint64, _ *state.RunState) error { return nil })
 	if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), noop); !errors.Is(err, ErrTransitionInvalid) {
 		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
 	}
@@ -318,10 +315,10 @@ func TestNoOpTransitionRejected(t *testing.T) {
 
 func TestTransitionReissuingSameTurnRejected(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	sameTurn := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+	sameTurn := prepareIssuing("turn-1", "", func(gen uint64, next *state.RunState) error {
 		next.Assignment = &state.Ref{ID: "turn-1", IssuedRevision: gen}
 		return nil
-	}
+	})
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), sameTurn); !errors.Is(err, ErrTransitionInvalid) {
 		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
 	}
@@ -331,12 +328,12 @@ func TestTransitionReissuingSameTurnRejected(t *testing.T) {
 func TestTransitionCannotEraseAcceptance(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
-	malicious := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+	malicious := prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
 		delete(next.AcceptedTurns, "turn-1")
 		next.Phase = state.PhaseCheckpoint
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 		return nil
-	}
+	})
 	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), malicious)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
@@ -350,11 +347,13 @@ func TestTransitionCannotEraseAcceptance(t *testing.T) {
 func TestTransitionReceivesPreparedSubmit(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	var got PreparedSubmit
-	capture := func(p PreparedSubmit, gen uint64, next *state.RunState) error {
+	capture := func(_ state.RunState, p PreparedSubmit) (PreparedTransition, error) {
 		got = p
-		next.Phase = state.PhaseCheckpoint
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-		return nil
+		return NewPreparedTransition("turn-2", "", func(gen uint64, next *state.RunState) error {
+			next.Phase = state.PhaseCheckpoint
+			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			return nil
+		}), nil
 	}
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), capture); err != nil {
 		t.Fatalf("submit: %v", err)
@@ -373,10 +372,10 @@ func TestTransitionReceivesPreparedSubmit(t *testing.T) {
 // must be rejected.
 func TestClearWithoutAdvanceRejected(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	clearOnly := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+	clearOnly := prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
 		next.Assignment = nil // phase stays IMPLEMENT_STEP (actionable)
 		return nil
-	}
+	})
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), clearOnly); !errors.Is(err, ErrTransitionInvalid) {
 		t.Fatalf("err = %v, want ErrTransitionInvalid", err)
 	}
@@ -385,11 +384,13 @@ func TestClearWithoutAdvanceRejected(t *testing.T) {
 // Parking at a human gate requires a paused lifecycle and a gate issued now.
 func TestClearToHumanGateAccepted(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	toGate := func(p PreparedSubmit, gen uint64, next *state.RunState) error {
+	toGate := func(_ state.RunState, p PreparedSubmit) (PreparedTransition, error) {
 		// The just-accepted turn-1 is the event that requested the decision; Submit
 		// records it after this callback, so the source references it by digest.
-		humanGate(next, gen, state.PhaseImplementStep, p.TurnID, p.Digest, "gate-1")
-		return nil
+		return NewPreparedTransition("", "gate-1", func(gen uint64, next *state.RunState) error {
+			humanGate(next, gen, state.PhaseImplementStep, p.TurnID, p.Digest, "gate-1")
+			return nil
+		}), nil
 	}
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toGate); err != nil {
 		t.Fatalf("parking at a valid human gate should be accepted: %v", err)
@@ -403,14 +404,14 @@ func TestClearToHumanGateAccepted(t *testing.T) {
 // A terminal (DONE/completed) shape with no assignment is a valid live owner.
 func TestClearToTerminalAccepted(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	toDone := func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+	toDone := prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
 		next.Phase = state.PhaseDone
 		next.Lifecycle = state.LifecycleCompleted
 		idx := 1 // the single step is done
 		next.StepIndex = &idx
 		next.Assignment = nil
 		return nil
-	}
+	})
 	if _, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), toDone); err != nil {
 		t.Fatalf("completing the run should be accepted: %v", err)
 	}
@@ -419,28 +420,28 @@ func TestClearToTerminalAccepted(t *testing.T) {
 // Ownerless and inconsistent shapes are rejected.
 func TestOwnerlessShapesRejected(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	cases := map[string]Transition{
-		"init + nil": func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+	cases := map[string]Prepare{
+		"init + nil": prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
 			next.Phase = state.PhaseInit
 			next.Assignment = nil
 			return nil
-		},
-		"await-guidance without a gate": func(_ PreparedSubmit, _ uint64, next *state.RunState) error {
+		}),
+		"await-guidance without a gate": prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
 			next.Phase = state.PhaseAwaitGuidance
 			next.Assignment = nil // no gate, lifecycle still running
 			return nil
-		},
-		"assignment under a terminal lifecycle": func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		}),
+		"assignment under a terminal lifecycle": prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
 			next.Phase = state.PhaseCheckpoint
 			next.Lifecycle = state.LifecycleCompleted
 			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 			return nil
-		},
-		"assignment in a non-agent phase": func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
+		}),
+		"assignment in a non-agent phase": prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
 			next.Phase = state.PhaseDone
 			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 			return nil
-		},
+		}),
 	}
 	for name, adv := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -457,7 +458,7 @@ func TestSubmitRawParseErrorRedacted(t *testing.T) {
 	secretKey := "sk-ant-abcdefghijklmnopqrstuvwx"
 	// A duplicate key (canonjson rejects it) whose name is a secret.
 	dup := fmt.Sprintf(`{"%s":1,"%s":2,"turn_id":"turn-1","state_revision":%d}`, secretKey, secretKey, rev)
-	_, err := submit(store, newMemSink(), "sess-1", []byte(dup), ownerAuth("sess-1"), (&advancer{}).fn)
+	_, err := submit(store, newMemSink(), "sess-1", []byte(dup), ownerAuth("sess-1"), checkpointPrep())
 	if err == nil {
 		t.Fatalf("a duplicate-key submission should be rejected")
 	}
@@ -481,7 +482,7 @@ func TestPreflightCannotInjectAcceptance(t *testing.T) {
 	}
 	deps := SubmitDeps{
 		Store: store, Registry: openRunRegistry(store), Journal: terminalJournal(store),
-		Sink: newMemSink(), Prepare: adaptTransition((&advancer{}).fn), Preflight: inject,
+		Sink: newMemSink(), Prepare: checkpointPrep(), Preflight: inject,
 	}
 	res, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "did it"))
 	if err != nil {
@@ -497,14 +498,14 @@ func TestSubmitRequiresSeams(t *testing.T) {
 	r := report("turn-1", rev, "x")
 	// The store/registry/journal/sink/prepare are all required; the preflight
 	// Authorizer is optional (never definitive), so a nil authorizer is not an error.
-	if _, err := submit(store, nil, "s", r, ownerAuth("s"), (&advancer{}).fn); !errors.Is(err, ErrMissingSeam) {
+	if _, err := submit(store, nil, "s", r, ownerAuth("s"), checkpointPrep()); !errors.Is(err, ErrMissingSeam) {
 		t.Fatalf("nil sink")
 	}
 	if _, err := submit(store, newMemSink(), "s", r, ownerAuth("s"), nil); !errors.Is(err, ErrMissingSeam) {
 		t.Fatalf("nil transition")
 	}
 	// A lock-path mismatch across the dependencies fails closed.
-	bad := SubmitDeps{Store: store, Registry: openRunRegistry(store), Journal: fakeJournal{lockPath: "/somewhere/else"}, Sink: newMemSink(), Prepare: adaptTransition((&advancer{}).fn)}
+	bad := SubmitDeps{Store: store, Registry: openRunRegistry(store), Journal: fakeJournal{lockPath: "/somewhere/else"}, Sink: newMemSink(), Prepare: checkpointPrep()}
 	if _, err := Submit(context.Background(), bad, leadSess, r); !errors.Is(err, ErrLockMismatch) {
 		t.Fatalf("lock mismatch err = %v, want ErrLockMismatch", err)
 	}
@@ -513,7 +514,7 @@ func TestSubmitRequiresSeams(t *testing.T) {
 func TestSubmitNoRun(t *testing.T) {
 	dir := t.TempDir()
 	store := state.Open(filepath.Join(dir, "state"), filepath.Join(dir, "run.lock"))
-	if _, err := submit(store, newMemSink(), "s", report("turn-1", 1, "x"), ownerAuth("s"), (&advancer{}).fn); !errors.Is(err, ErrNoRun) {
+	if _, err := submit(store, newMemSink(), "s", report("turn-1", 1, "x"), ownerAuth("s"), checkpointPrep()); !errors.Is(err, ErrNoRun) {
 		t.Fatalf("err = %v, want ErrNoRun", err)
 	}
 }
@@ -526,7 +527,7 @@ func TestSubmitBusyExhaustionNotStale(t *testing.T) {
 		t.Fatalf("acquire lock: ok=%v err=%v", ok, err)
 	}
 	defer g.Release()
-	_, serr := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), (&advancer{}).fn)
+	_, serr := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), checkpointPrep())
 	if !errors.Is(serr, genstore.ErrBusy) {
 		t.Fatalf("err = %v, want genstore.ErrBusy", serr)
 	}
@@ -540,7 +541,7 @@ func TestSubmitContextCancelled(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	deps := submitDeps(store, newMemSink(), adaptTransition((&advancer{}).fn))
+	deps := submitDeps(store, newMemSink(), checkpointPrep())
 	if _, err := Submit(ctx, deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -581,7 +582,7 @@ func TestSubmitConcurrentSameDigest(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.fn)
+			results[i], errs[i] = submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
 		}(i)
 	}
 	wg.Wait()
@@ -597,8 +598,8 @@ func TestSubmitConcurrentSameDigest(t *testing.T) {
 			receipt = results[i].Receipt
 		}
 	}
-	if accepted != 1 {
-		t.Fatalf("want exactly one acceptance, got accepted=%d", accepted)
+	if accepted != 1 || adv.calls.Load() != 1 {
+		t.Fatalf("want exactly one acceptance and one transition, got accepted=%d calls=%d", accepted, adv.calls.Load())
 	}
 	for i := 0; i < n; i++ {
 		if results[i].Receipt != receipt {
@@ -625,7 +626,7 @@ func TestSubmitConcurrentDifferentDigestNoOrphan(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			res[i], errs[i] = submit(store, sink, "sess-1", report("turn-1", rev, bodies[i]), ownerAuth("sess-1"), adv.fn)
+			res[i], errs[i] = submit(store, sink, "sess-1", report("turn-1", rev, bodies[i]), ownerAuth("sess-1"), adv.prep())
 		}(i)
 	}
 	wg.Wait()
@@ -641,8 +642,8 @@ func TestSubmitConcurrentDifferentDigestNoOrphan(t *testing.T) {
 			t.Fatalf("goroutine %d: res=%+v err=%v", i, res[i], errs[i])
 		}
 	}
-	if accepted != 1 || conflicts != 1 {
-		t.Fatalf("want 1 accept + 1 conflict; got %d/%d", accepted, conflicts)
+	if accepted != 1 || conflicts != 1 || adv.calls.Load() != 1 {
+		t.Fatalf("want 1 accept + 1 conflict + 1 transition; got %d/%d/%d", accepted, conflicts, adv.calls.Load())
 	}
 	// The conflicting submit was rejected before publishing, so the sink holds only
 	// the single accepted artifact — no orphan.

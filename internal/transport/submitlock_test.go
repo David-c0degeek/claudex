@@ -17,26 +17,12 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// advApply is the standard running transition body: advance to CHECKPOINT, issue
-// turn-2. advTransition is the legacy-Transition-shaped wrapper for the shim.
+// advApply is a running transition body that issues turn-2 (used by the id-collision
+// and prepare-isolation tests, which declare the id explicitly).
 func advApply(gen uint64, next *state.RunState) error {
 	next.Phase = state.PhaseCheckpoint
 	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 	return nil
-}
-
-func advTransition(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-	return advApply(gen, next)
-}
-
-func prepareIssuing(turnID, gateID string, apply func(gen uint64, next *state.RunState) error) Prepare {
-	return func(state.RunState, PreparedSubmit) (PreparedTransition, error) {
-		return NewPreparedTransition(turnID, gateID, apply), nil
-	}
-}
-
-func prepareErr(err error) Prepare {
-	return func(state.RunState, PreparedSubmit) (PreparedTransition, error) { return PreparedTransition{}, err }
 }
 
 func depsWith(store *state.Store, sink ArtifactSink, journal JournalReader, reg *state.RegistryStore, prepare Prepare) SubmitDeps {
@@ -78,7 +64,7 @@ func TestSubmitNonterminalJournalRecoveryRequired(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	journal := fakeJournal{lockPath: store.LockPath(), head: JournalNonterminal}
-	deps := depsWith(store, sink, journal, openRunRegistry(store), adaptTransition(advTransition))
+	deps := depsWith(store, sink, journal, openRunRegistry(store), checkpointPrep())
 	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("nonterminal journal err = %v, want ErrRecoveryRequired", err)
 	}
@@ -91,7 +77,7 @@ func TestSubmitJournalReadErrorRecoveryRequired(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	journal := fakeJournal{lockPath: store.LockPath(), err: errors.New("corrupt journal")}
-	deps := depsWith(store, sink, journal, openRunRegistry(store), adaptTransition(advTransition))
+	deps := depsWith(store, sink, journal, openRunRegistry(store), checkpointPrep())
 	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("journal read error = %v, want ErrRecoveryRequired", err)
 	}
@@ -106,7 +92,7 @@ func TestSubmitRunIDMismatch(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	reg := registryWithRunID(t, store, "run-b") // state is run-a
-	deps := depsWith(store, sink, terminalJournal(store), reg, adaptTransition(advTransition))
+	deps := depsWith(store, sink, terminalJournal(store), reg, checkpointPrep())
 	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRunMismatch) {
 		t.Fatalf("run id mismatch err = %v, want ErrRunMismatch", err)
 	}
@@ -131,7 +117,7 @@ func TestSubmitReplacedSessionRejected(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("replace lead: %v", err)
 	}
-	deps := depsWith(store, sink, terminalJournal(store), reg, adaptTransition(advTransition))
+	deps := depsWith(store, sink, terminalJournal(store), reg, checkpointPrep())
 	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("replaced session err = %v, want ErrUnauthorized", err)
 	}
@@ -203,7 +189,7 @@ func TestSubmitReconfirmsOrphanArtifact(t *testing.T) {
 		t.Fatalf("orphan put: %v", err)
 	}
 	// A fresh submit re-confirms the durable artifact (idempotent Put) and accepts.
-	res, err := submit(store, sink, "sess-1", raw, ownerAuth("sess-1"), advTransition)
+	res, err := submit(store, sink, "sess-1", raw, ownerAuth("sess-1"), checkpointPrep())
 	if err != nil {
 		t.Fatalf("resubmit: %v", err)
 	}
@@ -227,7 +213,7 @@ func TestSubmitGapGenerationBinding(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateDir, fmt.Sprintf("%012d.gen", rev+1)), []byte("garbage"), 0o600); err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}
-	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), advTransition)
+	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), checkpointPrep())
 	if err != nil {
 		t.Fatalf("submit across gap: %v", err)
 	}
@@ -256,7 +242,7 @@ func TestSubmitCancellationAfterPutIgnored(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := &cancelOnPutSink{inner: newMemSink(), cancel: cancel}
-	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), adaptTransition(advTransition))
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), checkpointPrep())
 	// The context is cancelled during Put, but the append completes exactly once.
 	res, err := Submit(ctx, deps, leadSess, report("turn-1", rev, "x"))
 	if err != nil {
@@ -274,7 +260,7 @@ func TestSubmitCancellationAfterPutIgnored(t *testing.T) {
 func TestSubmitWrongRoleFresh(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
-	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), adaptTransition(advTransition))
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), checkpointPrep())
 	if _, err := Submit(context.Background(), deps, pairSess, report("turn-1", rev, "x")); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("wrong-role fresh err = %v, want ErrUnauthorized", err)
 	}
@@ -285,20 +271,69 @@ func TestSubmitWrongRoleFresh(t *testing.T) {
 
 // After the lead accepts and the run advances to the pair-owned CHECKPOINT, the
 // current pair session cannot replay the lead's accepted turn to steal its receipt.
+// spySink counts Put CALLS (memSink.count() cannot distinguish an idempotent
+// re-confirm from an untouched sink).
+type spySink struct {
+	puts  int
+	inner *memSink
+}
+
+func (s *spySink) Put(turnID, digest string, canonical []byte) error {
+	s.puts++
+	return s.inner.Put(turnID, digest, canonical)
+}
+
 func TestSubmitWrongRoleReplay(t *testing.T) {
+	// Role authorization precedes both same-digest replay and different-digest
+	// conflict, so a wrong-slot session never touches the sink either way.
+	for _, tc := range []struct{ name, body string }{
+		{"same digest", "did it"},
+		{"different digest", "tampered"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, rev := newRunWithActiveTurn(t)
+			sink := &spySink{inner: newMemSink()}
+			if _, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), checkpointPrep()); err != nil {
+				t.Fatalf("lead accept: %v", err)
+			}
+			putsAfterAccept := sink.puts
+			deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), checkpointPrep())
+			if _, err := Submit(context.Background(), deps, pairSess, report("turn-1", rev, tc.body)); !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("wrong-role replay err = %v, want ErrUnauthorized", err)
+			}
+			if sink.puts != putsAfterAccept {
+				t.Fatalf("a wrong-role replay touched the sink (%d -> %d)", putsAfterAccept, sink.puts)
+			}
+		})
+	}
+}
+
+// A transition that nils the accepted-turns map and returns nil must be rejected
+// before the receipt insertion (no panic), leave an orphan publication, and release
+// the guard so a subsequent valid submit re-confirms and accepts.
+func TestSubmitTransitionNilsAcceptedMap(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
-	raw := report("turn-1", rev, "did it")
-	if _, err := submit(store, sink, "sess-1", raw, ownerAuth("sess-1"), advTransition); err != nil {
-		t.Fatalf("lead accept: %v", err)
+	nilMap := prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
+		next.AcceptedTurns = nil
+		next.Phase = state.PhaseCheckpoint
+		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		return nil
+	})
+	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), nilMap)
+	if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrTransitionInvalid) {
+		t.Fatalf("nil-map transition err = %v, want ErrTransitionInvalid", err)
 	}
-	// The run is now at CHECKPOINT (pair's turn); the pair replays the lead's turn-1.
-	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), adaptTransition(advTransition))
-	if _, err := Submit(context.Background(), deps, pairSess, raw); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("wrong-role replay err = %v, want ErrUnauthorized", err)
+	if loaded, _, _ := store.Load(); loaded.Revision != rev {
+		t.Fatalf("a rejected nil-map transition still advanced the run")
 	}
-	if sink.count() != 1 {
-		t.Fatalf("a wrong-role replay re-confirmed the sink, count = %d", sink.count())
+	// The guard was released: a fresh valid submit re-confirms the orphan and accepts.
+	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "x"), ownerAuth("sess-1"), checkpointPrep())
+	if err != nil {
+		t.Fatalf("fresh submit after the nil-map orphan: %v", err)
+	}
+	if res.Receipt.Revision != rev+1 {
+		t.Fatalf("the fresh submit did not accept at rev+1: %+v", res.Receipt)
 	}
 }
 
@@ -308,7 +343,7 @@ func TestSubmitJournalZeroAndInvalidRecoveryRequired(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	for _, head := range []JournalHead{JournalUnknown, JournalHead(99)} {
 		sink := newMemSink()
-		deps := depsWith(store, sink, fakeJournal{lockPath: store.LockPath(), head: head}, openRunRegistry(store), adaptTransition(advTransition))
+		deps := depsWith(store, sink, fakeJournal{lockPath: store.LockPath(), head: head}, openRunRegistry(store), checkpointPrep())
 		if _, err := Submit(context.Background(), deps, leadSess, report("turn-1", rev, "x")); !errors.Is(err, ErrRecoveryRequired) {
 			t.Fatalf("journal head %d err = %v, want ErrRecoveryRequired", head, err)
 		}
@@ -362,7 +397,7 @@ func TestSubmitWinsThenReplacementProceeds(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	reg := openRunRegistry(store)
 	sink := &blockingSink{inner: newMemSink(), entered: make(chan struct{}), release: make(chan struct{})}
-	deps := depsWith(store, sink, terminalJournal(store), reg, adaptTransition(advTransition))
+	deps := depsWith(store, sink, terminalJournal(store), reg, checkpointPrep())
 
 	done := make(chan error, 1)
 	go func() {

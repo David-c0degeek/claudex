@@ -3,15 +3,49 @@ package transport
 import (
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// Transition is the legacy value-only transition shape; the test shim adapts it to
-// a Prepare. The production Submit takes Prepare directly.
-type Transition = func(PreparedSubmit, uint64, *state.RunState) error
+// prepareIssuing builds a Prepare that declares the identities it will issue and
+// applies the given (deterministic) body exactly once inside the state CAS — never a
+// discovery probe.
+func prepareIssuing(turnID, gateID string, apply func(gen uint64, next *state.RunState) error) Prepare {
+	return func(state.RunState, PreparedSubmit) (PreparedTransition, error) {
+		return NewPreparedTransition(turnID, gateID, apply), nil
+	}
+}
+
+func prepareErr(err error) Prepare {
+	return func(state.RunState, PreparedSubmit) (PreparedTransition, error) { return PreparedTransition{}, err }
+}
+
+// checkpointApply is the standard running transition body: advance to CHECKPOINT and
+// issue turn-2. checkpointPrep declares that turn; countingPrep additionally counts
+// each real apply so exact-once is observable.
+func checkpointApply(gen uint64, next *state.RunState) error {
+	next.Phase = state.PhaseCheckpoint
+	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+	return nil
+}
+
+func checkpointPrep() Prepare { return prepareIssuing("turn-2", "", checkpointApply) }
+
+func countingPrep(calls *atomic.Int64) Prepare {
+	return prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
+		calls.Add(1)
+		return checkpointApply(gen, next)
+	})
+}
+
+// advancer counts how many times its transition actually applies (never a probe),
+// so tests can prove a transition runs exactly once and never on replay/conflict.
+type advancer struct{ calls atomic.Int64 }
+
+func (a *advancer) prep() Prepare { return countingPrep(&a.calls) }
 
 var (
 	leadSess    = "sess-" + strings.Repeat("a", 32)
@@ -29,26 +63,6 @@ func canonSess(name string) string {
 		return pairSess
 	default:
 		return unknownSess
-	}
-}
-
-// adaptTransition wraps a legacy Transition as a Prepare that declares the exact
-// identities the transition issues (discovered by a probe run on the snapshot, a
-// deep copy), so the declared ids honestly match what apply produces.
-func adaptTransition(adv Transition) Prepare {
-	return func(snap state.RunState, p PreparedSubmit) (PreparedTransition, error) {
-		probe := snap
-		if err := adv(p, snap.Revision+1, &probe); err != nil {
-			return PreparedTransition{}, err
-		}
-		turnID, gateID := "", ""
-		if probe.Assignment != nil {
-			turnID = probe.Assignment.ID
-		}
-		if probe.Gate != nil {
-			gateID = probe.Gate.ID
-		}
-		return NewPreparedTransition(turnID, gateID, func(gen uint64, next *state.RunState) error { return adv(p, gen, next) }), nil
 	}
 }
 

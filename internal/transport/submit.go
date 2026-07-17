@@ -296,11 +296,14 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 	// The replaying session must currently own the role of the phase the turn was
 	// accepted in, so a later different-role owner cannot claim another's receipt.
 	if acc, seen := rs.AcceptedTurns[env.TurnID]; seen {
-		if acc.ArtifactDigest != digest {
-			return reject(ErrConflict)
-		}
+		// Role authorization precedes both same-digest replay and different-digest
+		// conflict, so a wrong-slot session never learns a conflict for another role's
+		// turn and never re-confirms the sink.
 		if err := requireCurrentRole(registration, acc.Phase); err != nil {
 			return reject(err)
+		}
+		if acc.ArtifactDigest != digest {
+			return reject(ErrConflict)
 		}
 		if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
 			return reject(perr)
@@ -383,11 +386,13 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 	// ACCEPT: from here the append completes regardless of context cancellation, and
 	// runs exactly once. A failure leaves an orphan artifact for an identical retry.
 	committed, merr := deps.Store.MutateLocked(g, rs.Revision, func(gen uint64, next *state.RunState) error {
-		if next.AcceptedTurns == nil {
-			return fmt.Errorf("%w: accepted-turns map is missing", ErrTransitionInvalid)
-		}
 		if aerr := pt.apply(gen, next); aerr != nil {
 			return aerr
+		}
+		// Recheck AFTER apply: a transition that nils the map must be rejected before
+		// the receipt insertion, not panic post-Put.
+		if next.AcceptedTurns == nil {
+			return fmt.Errorf("%w: the transition cleared the accepted-turns map", ErrTransitionInvalid)
 		}
 		if lerr := requireLiveOwner(next, env.TurnID, gen); lerr != nil {
 			return lerr
@@ -466,26 +471,28 @@ func slotForRole(r Role) (state.SlotRole, bool) {
 
 // recheckIssuedIDs re-validates the identities a transition will issue against the
 // locked state before publishing: exactly one of an assignment or a gate id (or
-// neither for a terminal edge), each canonical, and a new assignment that is neither
-// the consumed turn nor an already-accepted turn.
+// neither for a terminal edge). Turn and gate ids share one canonical id namespace
+// (both are state run-id-grammar ids that become durable refs), so the same
+// canonicality and non-reuse checks — not the consumed turn, not an already-accepted
+// turn — apply to whichever is issued.
 func recheckIssuedIDs(pt PreparedTransition, rs state.RunState, submittedTurn string) error {
 	turn, gate := pt.issuedTurnID, pt.issuedGateID
 	if turn != "" && gate != "" {
 		return fmt.Errorf("%w: a transition issues an assignment or a gate, not both", ErrTransitionInvalid)
 	}
-	if turn != "" {
-		if !state.IsRunID(turn) {
-			return fmt.Errorf("%w: the issued assignment id is not canonical", ErrTransitionInvalid)
+	for _, id := range []string{turn, gate} {
+		if id == "" {
+			continue
 		}
-		if turn == submittedTurn {
-			return fmt.Errorf("%w: the issued assignment reuses the consumed turn", ErrTransitionInvalid)
+		if !state.IsRunID(id) {
+			return fmt.Errorf("%w: an issued id is not canonical", ErrTransitionInvalid)
 		}
-		if _, ok := rs.AcceptedTurns[turn]; ok {
-			return fmt.Errorf("%w: the issued assignment reuses an accepted turn", ErrTransitionInvalid)
+		if id == submittedTurn {
+			return fmt.Errorf("%w: an issued id reuses the consumed turn", ErrTransitionInvalid)
 		}
-	}
-	if gate != "" && !state.IsRunID(gate) {
-		return fmt.Errorf("%w: the issued gate id is not canonical", ErrTransitionInvalid)
+		if _, ok := rs.AcceptedTurns[id]; ok {
+			return fmt.Errorf("%w: an issued id reuses an accepted turn", ErrTransitionInvalid)
+		}
 	}
 	return nil
 }

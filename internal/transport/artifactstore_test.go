@@ -34,11 +34,7 @@ func (s *countingSink) Put(_, _ string, _ []byte) error { s.calls++; return nil 
 // A run that is not live (terminal, or recovering) refuses a submit BEFORE the
 // sink is touched, so terminal/recovery state never writes an orphan artifact.
 func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
-	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-		next.Phase = state.PhaseCheckpoint
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-		return nil
-	}
+	adv := checkpointPrep()
 
 	t.Run("cancelled", func(t *testing.T) {
 		store, rev := newRunWithActiveTurn(t)
@@ -151,11 +147,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 func TestSubmitDoesNotAdvanceOnSinkSyncFailure(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := &syncFailSink{}
-	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-		next.Phase = state.PhaseCheckpoint
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-		return nil
-	}
+	adv := checkpointPrep()
 	_, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
 	var pce *atomicfile.PostCommitSyncError
 	if !errors.As(err, &pce) {
@@ -351,11 +343,7 @@ func TestArtifactStoreConcurrentReadsNeverTorn(t *testing.T) {
 func TestArtifactStoreAsSubmitSink(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newStore(t)
-	adv := func(_ PreparedSubmit, gen uint64, next *state.RunState) error {
-		next.Phase = state.PhaseCheckpoint
-		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
-		return nil
-	}
+	adv := checkpointPrep()
 	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
