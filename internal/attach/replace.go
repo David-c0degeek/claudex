@@ -69,18 +69,26 @@ type ReplaceResult struct {
 	Role       state.SlotRole
 	Agent      state.Agent
 	Generation uint64
+	// VerifierTurnID is the issued verifier assignment id, set ONLY when a qualifying
+	// pair replacement activated a running ownerless VERIFY. Empty otherwise.
+	VerifierTurnID string
 	// CommitWarning is non-nil ONLY when the append is PROVEN committed but the
 	// run-guard release then failed; the new session is durable and authoritative.
 	CommitWarning error
 }
 
 // replaceSeams are per-call injectable release/mutation points; production uses the
-// real guard releases and Registry mutation. Tests inject failing releases and an
-// ambiguous mutation without any global state.
+// real guard releases and store mutations. Tests inject failing releases and an
+// ambiguous/failing append on either store without any global state.
 type replaceSeams struct {
 	releaseRepo func(*genstore.Guard) error
 	releaseRun  func(*genstore.Guard) error
-	mutate      func(*state.RegistryStore, *genstore.Guard, uint64, func(uint64, *state.Registry) error) (state.Registry, error)
+	mutate      registryMutate
+	stateMutate stateMutate
+}
+
+func (s replaceSeams) seamSet() replaceSeamSet {
+	return replaceSeamSet{reg: s.mutate, state: s.stateMutate}
 }
 
 func defaultReplaceSeams() replaceSeams {
@@ -88,6 +96,7 @@ func defaultReplaceSeams() replaceSeams {
 		releaseRepo: (*genstore.Guard).Release,
 		releaseRun:  (*genstore.Guard).Release,
 		mutate:      (*state.RegistryStore).MutateLocked,
+		stateMutate: (*state.Store).MutateLocked,
 	}
 }
 
@@ -121,9 +130,11 @@ func ReplaceAttach(req ReplaceRequest) (ReplaceResult, error) {
 // replaceAttach authorizes the exact active bootstrap allocation under the repo guard
 // (no lock-free TOCTOU), then under the run guard RECOVERS any pending replacement,
 // reconciles an idempotent same-operation retry, and otherwise journals a NEW same-role
-// session replacement whose sole 4c-1 effect is appending ONE new session to the
-// Registry (RunState untouched). The dedicated replacement journal makes the Registry
-// append crash-recoverable and backs the mandatory operation id's lost-response
+// session replacement. An ordinary replacement's sole effect is appending ONE new
+// session to the Registry (RunState untouched); a qualifying pair replacement at a
+// running ownerless VERIFY additionally issues the verifier assignment as a second
+// RunState step under the same guard. The dedicated replacement journal makes both
+// store effects crash-recoverable and backs the mandatory operation id's lost-response
 // idempotency. Both guards are released exactly once, reverse order, with joined errors.
 func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error) {
 	if err := req.validate(); err != nil {
@@ -132,6 +143,7 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	lay := layoutFor(req.RepoDir)
 	loc := runLocationFor(lay, req.RunID)
 	registry := state.OpenRegistry(loc.RegistryDir, loc.RunLock)
+	runState := state.Open(loc.StateDir, loc.RunLock)
 	journal := txn.Open(loc.ReplaceDir, loc.RunLock)
 
 	repoGuard, ok, err := genstore.Acquire(lay.repoLock)
@@ -181,7 +193,7 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 		if derr != nil {
 			return txn.Plan{}, derr
 		}
-		return replacePlanFor(registry, runGuard, in, seams.mutate)
+		return replacePlanFor(registry, runState, runGuard, in, seams.seamSet())
 	}); rerr != nil {
 		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, rerr), releaseAll())
 	}
@@ -224,6 +236,19 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 		case st != txn.StatusApplied:
 			return ReplaceResult{}, errors.Join(fmt.Errorf("%w: the latest replacement's Registry effect is missing", ErrReplaceRecoveryRequired), releaseAll())
 		}
+		// An activation head's RunState effect must also be intact: either the verifier
+		// assignment is still current, or its VERIFY turn was accepted (legally consumed
+		// by a verifier submit that advanced the run). A vanished, never-issued effect is
+		// recovery-required — but a legal post-activation transition is NOT false recovery.
+		if hin.activated() {
+			okLineage, lerr := activationLineageOK(runState, hin)
+			if lerr != nil {
+				return ReplaceResult{}, errors.Join(lerr, releaseAll())
+			}
+			if !okLineage {
+				return ReplaceResult{}, errors.Join(fmt.Errorf("%w: the latest activation's RunState effect is missing", ErrReplaceRecoveryRequired), releaseAll())
+			}
+		}
 	}
 
 	// 3. A genuinely new replacement. Authorize the replaceable shape and the exact
@@ -252,11 +277,11 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 		return ReplaceResult{}, errors.Join(err, releaseRun())
 	}
 
-	in, err := prepareReplace(req, reg, currentGen)
+	in, err := prepareReplace(req, runState, reg, currentGen)
 	if err != nil {
 		return ReplaceResult{}, errors.Join(err, releaseRun())
 	}
-	plan, err := replacePlanFor(registry, runGuard, in, seams.mutate)
+	plan, err := replacePlanFor(registry, runState, runGuard, in, seams.seamSet())
 	if err != nil {
 		return ReplaceResult{}, errors.Join(err, releaseRun())
 	}
@@ -280,10 +305,13 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	return candidate, nil
 }
 
-// prepareReplace freezes the replacement intent read-only under the run guard: it
-// mints the new session id (avoiding every registered id) and a txn id, and binds the
-// superseded/new generations and the Registry revision the append compares against.
-func prepareReplace(req ReplaceRequest, reg state.Registry, currentGen uint64) (ReplaceIntent, error) {
+// prepareReplace freezes the replacement intent read-only under the run guard: it mints
+// the new session id (avoiding every registered id) and a txn id, binds the
+// superseded/new generations and the Registry revision, and — for a qualifying PAIR
+// replacement at a running ownerless VERIFY whose new generation meets the retained
+// threshold — mints the verifier turn id and freezes the exact ownerless baseline so the
+// second RunState step issues the verifier assignment.
+func prepareReplace(req ReplaceRequest, runState *state.Store, reg state.Registry, currentGen uint64) (ReplaceIntent, error) {
 	taken := func(id string) bool { return reg.Resolve(id).Status != state.RegUnknown }
 	newSess, err := state.MintSessionID(req.RNG, taken)
 	if err != nil {
@@ -293,6 +321,7 @@ func prepareReplace(req ReplaceRequest, reg state.Registry, currentGen uint64) (
 	if err != nil {
 		return ReplaceIntent{}, err
 	}
+	newGen := currentGen + 1
 	in := ReplaceIntent{
 		RunID:                    req.RunID,
 		TxnID:                    txnID,
@@ -301,8 +330,33 @@ func prepareReplace(req ReplaceRequest, reg state.Registry, currentGen uint64) (
 		Agent:                    req.Agent,
 		SupersededGeneration:     currentGen,
 		NewSessionID:             newSess,
-		NewGeneration:            currentGen + 1,
+		NewGeneration:            newGen,
 		ExpectedRegistryRevision: reg.Revision,
+	}
+	if req.Role == state.SlotPair {
+		rs, ok, lerr := runState.Load()
+		if lerr != nil {
+			return ReplaceIntent{}, lerr
+		}
+		// Activate ONLY when the run is a running ownerless VERIFY and the fresh generation
+		// reaches the retained threshold; a below-threshold pair replacement is an ordinary
+		// Registry-only supersession that leaves the run waiting.
+		if ok && rs.RunID == req.RunID && isOwnerlessVerify(rs) && newGen >= rs.Verify.RequiredGeneration {
+			baseline, derr := canonDigest(rs)
+			if derr != nil {
+				return ReplaceIntent{}, derr
+			}
+			verifierTurn, terr := state.MintTurnID(req.RNG, acceptedTurnSet(rs))
+			if terr != nil {
+				return ReplaceIntent{}, terr
+			}
+			in.Activation = &ReplaceActivation{
+				ExpectedStateRevision: rs.Revision,
+				StateBaselineDigest:   baseline,
+				VerifierTurnID:        verifierTurn,
+				RequiredGeneration:    rs.Verify.RequiredGeneration,
+			}
+		}
 	}
 	if err := in.validate(); err != nil {
 		return ReplaceIntent{}, err
@@ -310,8 +364,27 @@ func prepareReplace(req ReplaceRequest, reg state.Registry, currentGen uint64) (
 	return in, nil
 }
 
+// acceptedTurnSet is the read-only set of turn ids the verifier mint must avoid.
+func acceptedTurnSet(rs state.RunState) map[string]bool {
+	taken := make(map[string]bool, len(rs.AcceptedTurns)+1)
+	for id := range rs.AcceptedTurns {
+		taken[id] = true
+	}
+	if rs.Assignment != nil {
+		taken[rs.Assignment.ID] = true
+	}
+	if rs.FirstTurn != nil {
+		taken[rs.FirstTurn.ID] = true
+	}
+	return taken
+}
+
 func replaceCandidate(in ReplaceIntent) ReplaceResult {
-	return ReplaceResult{RunID: in.RunID, SessionID: in.NewSessionID, Role: in.Role, Agent: in.Agent, Generation: in.NewGeneration}
+	res := ReplaceResult{RunID: in.RunID, SessionID: in.NewSessionID, Role: in.Role, Agent: in.Agent, Generation: in.NewGeneration}
+	if in.activated() {
+		res.VerifierTurnID = in.Activation.VerifierTurnID
+	}
+	return res
 }
 
 // sameReplaceResult is the identity-bound idempotent return for a completed
