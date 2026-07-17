@@ -18,7 +18,11 @@ func byoHonesty() HonestySource {
 		return HonestyLabels{
 			Tier:          TierProtocolOnly,
 			TierMechanism: "durable-byo-registration",
-			Capabilities:  []Capability{{Name: "repo-read-only", Status: "unavailable", Mechanism: "byo-attach"}},
+			Capabilities: []Capability{
+				{Name: "repo-read-only", Status: "unavailable", Mechanism: "byo-attach"},
+				// A BYO run must positively declare the VERIFY generation enforcement.
+				{Name: "verify-fresh-session", Status: "enforced", Mechanism: "fresh-session-declared"},
+			},
 		}, nil
 	}
 }
@@ -35,7 +39,7 @@ func TestStatusProjectsLiveTurn(t *testing.T) {
 	if s.WhoseTurn == nil || *s.WhoseTurn != RoleLead || s.TurnID == nil || *s.TurnID != "turn-1" {
 		t.Fatalf("whose_turn/turn_id wrong: %+v", s)
 	}
-	if s.Honesty.Tier != TierProtocolOnly || len(s.Honesty.Capabilities) != 1 {
+	if s.Honesty.Tier != TierProtocolOnly || len(s.Honesty.Capabilities) != 2 {
 		t.Fatalf("honesty wrong: %+v", s.Honesty)
 	}
 	pol := config.DefaultRunPolicy()

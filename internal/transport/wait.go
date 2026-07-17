@@ -321,6 +321,13 @@ func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (W
 		return ev, true, nil
 	}
 	if v.OwnsActiveTurn {
+		// An ACTIVE VERIFY turn is owned only by the current pair session that meets the
+		// fresh-session threshold — the same boundary pull and submit enforce. A stale or
+		// unqualified owner claim (not the current pair, or below the threshold) is a
+		// seam/state contradiction, never a handed-out assignment notification.
+		if f.phase == state.PhaseVerify && (!v.IsCurrentPair || v.PairGeneration < f.verifyGen) {
+			return WaitEvent{}, false, fmt.Errorf("%w: an active VERIFY turn requires the current pair session at the fresh-session threshold", ErrSessionView)
+		}
 		ev := newEvent(WaitAssignment, f)
 		id := f.assignmentID
 		ev.TurnID = &id

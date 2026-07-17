@@ -24,6 +24,10 @@ const (
 	// for a fresh pair-session generation.
 	waitingFreshSession = "fresh_session"
 
+	// capNameVerifyFreshSession is the stable capability name for the VERIFY
+	// fresh-generation enforcement, so its honesty label is not a free-text claim.
+	capNameVerifyFreshSession = "verify-fresh-session"
+
 	// capMechFreshProcess is the managed-only mechanism for a real new-process launch.
 	// A protocol-only/BYO run enforces the session GENERATION, not process freshness,
 	// and reports capMechFreshSessionDeclared instead; it must never claim fresh-process.
@@ -333,6 +337,7 @@ func validateHonesty(l HonestyLabels) error {
 		return fmt.Errorf("%w: too many capabilities", ErrHonestySource)
 	}
 	seen := map[string]bool{}
+	freshCount := 0
 	for _, c := range l.Capabilities {
 		if !isCanonicalID(c.Name) || !isCanonicalID(c.Mechanism) {
 			return fmt.Errorf("%w: a capability name and mechanism must be canonical identifiers", ErrHonestySource)
@@ -347,10 +352,31 @@ func validateHonesty(l HonestyLabels) error {
 		if c.Mechanism == capMechFreshProcess && l.Tier != TierManaged {
 			return fmt.Errorf("%w: fresh-process is reserved for the managed tier", ErrHonestySource)
 		}
+		// The fresh-session-declared mechanism belongs ONLY to the verify-fresh-session
+		// capability; it cannot be laundered onto an unrelated capability to imply the
+		// enforcement is present elsewhere.
+		if c.Mechanism == capMechFreshSessionDeclared && c.Name != capNameVerifyFreshSession {
+			return fmt.Errorf("%w: fresh-session-declared may back only the verify-fresh-session capability", ErrHonestySource)
+		}
+		if c.Name == capNameVerifyFreshSession {
+			freshCount++
+			// On a BYO run the generation enforcement must be reported exactly: enforced,
+			// backed by fresh-session-declared. Managed-tier exactness is deferred to the
+			// managed launch record (subject 07) and is constrained here only by the
+			// fresh-process reservation and the anti-laundering rule above.
+			if l.Tier == TierProtocolOnly && (c.Status != "enforced" || c.Mechanism != capMechFreshSessionDeclared) {
+				return fmt.Errorf("%w: a protocol-only verify-fresh-session must be enforced via fresh-session-declared", ErrHonestySource)
+			}
+		}
 		if seen[c.Name] {
 			return fmt.Errorf("%w: a duplicate capability", ErrHonestySource)
 		}
 		seen[c.Name] = true
+	}
+	// A BYO run must positively declare the generation enforcement (the dup check above
+	// bounds freshCount to 0 or 1), so it cannot silently omit or downgrade it.
+	if l.Tier == TierProtocolOnly && freshCount != 1 {
+		return fmt.Errorf("%w: a protocol-only run must declare exactly one verify-fresh-session capability", ErrHonestySource)
 	}
 	return nil
 }

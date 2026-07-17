@@ -41,6 +41,18 @@ func viewNotPair() SessionViewer {
 	return func(SessionInput, string) (SessionView, error) { return SessionView{}, nil }
 }
 
+// viewCurrentPairOwner is the current pair session; it owns the active turn when one
+// is assigned (an active VERIFY).
+func viewCurrentPairOwner(gen uint64) SessionViewer {
+	return func(in SessionInput, _ string) (SessionView, error) {
+		v := SessionView{IsCurrentPair: true, PairGeneration: gen}
+		if in.ActiveTurnID != "" {
+			v.OwnsActiveTurn = true
+		}
+		return v, nil
+	}
+}
+
 // --- wait: the fresh-generation boundary ---
 
 // The incumbent pair session (below threshold) is told to bring a fresh generation,
@@ -105,15 +117,30 @@ func TestWaitFreshSessionQualifyingContradiction(t *testing.T) {
 	}
 }
 
-// An ACTIVE VERIFY is an ordinary pair-owned turn, not a fresh-session wait.
+// An ACTIVE VERIFY is an ordinary pair-owned turn for the current qualifying pair.
 func TestWaitActiveVerifyIsAssignment(t *testing.T) {
 	store, rev := runAtActiveVerify(t, 3)
-	ev, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewForRole(RolePair, nil))
+	ev, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewCurrentPairOwner(3))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
 	if ev.Kind != WaitAssignment || ev.TurnID == nil || *ev.TurnID != "verify-turn" {
 		t.Fatalf("active VERIFY ev = %+v, want assignment", ev)
+	}
+}
+
+// Wait must not hand the active VERIFY turn to a stale/unqualified owner: the same
+// fresh-session boundary pull and submit enforce.
+func TestWaitActiveVerifyStaleOwnerRejected(t *testing.T) {
+	store, rev := runAtActiveVerify(t, 3)
+	// The current pair owns the turn but is below the threshold.
+	if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewCurrentPairOwner(2)); !errors.Is(err, ErrSessionView) {
+		t.Fatalf("below-threshold owner err = %v, want ErrSessionView", err)
+	}
+	// A claimed owner that is not the current pair (no pair-generation facts) is a
+	// contradiction, not a handed-out assignment.
+	if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrSessionView) {
+		t.Fatalf("owner without pair facts err = %v, want ErrSessionView", err)
 	}
 }
 
@@ -350,13 +377,19 @@ func TestPullOwnerlessVerifyNoTurn(t *testing.T) {
 	}
 }
 
-// A VERIFY assignment with no retained requirement fails closed.
+// A VERIFY assignment with no retained requirement — nil or a zero threshold — fails
+// closed, so a zero+zero pair cannot bypass the below-threshold comparison.
 func TestPullVerifyMissingRequirement(t *testing.T) {
-	rs := runStateAt(state.PhaseVerify)
-	rs.Verify = nil
-	in := evidenceInputs(RolePair)
-	in.CurrentPairGeneration = 4
-	if _, err := BuildAssignment(rs, in); !errors.Is(err, ErrAssignmentInvalid) {
-		t.Fatalf("VERIFY without requirement err = %v, want ErrAssignmentInvalid", err)
+	for name, verify := range map[string]*state.VerifyRequirement{
+		"nil requirement":  nil,
+		"zero requirement": {RequiredGeneration: 0},
+	} {
+		rs := runStateAt(state.PhaseVerify)
+		rs.Verify = verify
+		in := evidenceInputs(RolePair)
+		in.CurrentPairGeneration = 0
+		if _, err := BuildAssignment(rs, in); !errors.Is(err, ErrAssignmentInvalid) {
+			t.Fatalf("%s err = %v, want ErrAssignmentInvalid", name, err)
+		}
 	}
 }

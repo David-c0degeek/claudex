@@ -164,8 +164,8 @@ func BuildAssignment(rs state.RunState, in PullInputs) (Assignment, error) {
 	// fails closed with the same typed refusal submit uses, so the stale incumbent is
 	// never handed the verifier turn.
 	if rs.Phase == state.PhaseVerify {
-		if rs.Verify == nil {
-			return Assignment{}, fmt.Errorf("%w: a VERIFY assignment has no fresh-session requirement", ErrAssignmentInvalid)
+		if rs.Verify == nil || rs.Verify.RequiredGeneration == 0 {
+			return Assignment{}, fmt.Errorf("%w: a VERIFY assignment has no valid fresh-session requirement", ErrAssignmentInvalid)
 		}
 		if in.CurrentPairGeneration < rs.Verify.RequiredGeneration {
 			return Assignment{}, ErrFreshSessionRequired
