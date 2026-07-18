@@ -231,3 +231,64 @@ func TestWritePermission(t *testing.T) {
 		t.Fatalf("perm = %o, want 600", perm)
 	}
 }
+
+// MkdirAllDurable must be re-runnable: if a directory is created but its durability
+// confirmation fails, a retry RE-CONFIRMS the existing directory rather than blessing a
+// visible-but-unconfirmed one (Blocking: the exists branch must re-confirm). Seam-driven
+// so it is platform-independent.
+func TestMkdirAllDurableReconfirmsOnRetryAfterConfirmFailure(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sub", "store")
+
+	calls := map[string]int{}
+	failOnce := map[string]bool{dir: true}
+	ensure := func(d string, perm os.FileMode) error {
+		_ = os.MkdirAll(d, perm) // the directory IS created (create succeeds)...
+		calls[d]++
+		if failOnce[d] && calls[d] == 1 {
+			return errors.New("parent sync failed") // ...but its confirmation fails once
+		}
+		return nil
+	}
+
+	if err := mkdirAllDurable(dir, 0o700, ensure); err == nil {
+		t.Fatal("first attempt must fail when the durability confirmation fails")
+	}
+	// The directory now exists but was left unconfirmed. A retry must RE-CONFIRM it.
+	if err := mkdirAllDurable(dir, 0o700, ensure); err != nil {
+		t.Fatalf("retry must re-confirm the existing directory and succeed: %v", err)
+	}
+	if calls[dir] != 2 {
+		t.Fatalf("ensure(%s) called %d times, want 2 (retry re-confirmed, did not bless)", dir, calls[dir])
+	}
+}
+
+// A mid-chain confirmation failure is re-confirmed on retry too: the recursion for the
+// still-missing leaf descends into the ancestor it created and re-confirms it.
+func TestMkdirAllDurableReconfirmsAncestorOnRetry(t *testing.T) {
+	root := t.TempDir()
+	mid := filepath.Join(root, "a")
+	leaf := filepath.Join(mid, "b")
+
+	calls := map[string]int{}
+	failOnce := map[string]bool{mid: true}
+	ensure := func(d string, perm os.FileMode) error {
+		calls[d]++
+		if failOnce[d] && calls[d] == 1 {
+			_ = os.MkdirAll(d, perm) // created, but confirmation fails once
+			return errors.New("mid-chain sync failed")
+		}
+		_ = os.MkdirAll(d, perm)
+		return nil
+	}
+
+	if err := mkdirAllDurable(leaf, 0o700, ensure); err == nil {
+		t.Fatal("first attempt must fail at the mid-chain confirmation")
+	}
+	if err := mkdirAllDurable(leaf, 0o700, ensure); err != nil {
+		t.Fatalf("retry must re-confirm the ancestor and the leaf: %v", err)
+	}
+	if calls[mid] != 2 {
+		t.Fatalf("ensure(%s) called %d times, want 2 (ancestor re-confirmed on retry)", mid, calls[mid])
+	}
+}

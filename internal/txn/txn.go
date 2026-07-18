@@ -322,6 +322,14 @@ func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, er
 			// effect already durable (crash after apply, before progress)
 		case StatusNotApplied:
 			if err := steps[i].Apply(); err != nil {
+				// Any Apply error halts with no progress. A participant whose effect is
+				// visible but durability-unconfirmed (state.MutateLocked decode-and-pair)
+				// returns a *genstore.PostCommitSyncError; wrap it so the value carries
+				// ErrDurabilityUnconfirmed too — control flow is unchanged (still a halt),
+				// and errors.As to the genstore type is preserved. Any other error stays raw.
+				if genstore.IsDurabilityUnconfirmed(err) {
+					return Record{}, fmt.Errorf("%w: step %d (%s) apply: %w", ErrDurabilityUnconfirmed, i, steps[i].Name, err)
+				}
 				return Record{}, err
 			}
 			// Terminality is based on observed durable state, not the callback.
@@ -369,6 +377,12 @@ func (j *Journal) advance(g *genstore.Guard, stepsDone int, complete bool) (Reco
 	})
 }
 
+// append writes the next journal record. On a visible-but-unconfirmed durability append
+// it returns the DECODED record with a nil error (the record IS visible): EVERY caller of
+// append MUST run confirmJournal immediately after — that is the re-runnable, seam-tested
+// barrier (ConfirmDurable uses the store's syncDir seam; AppendLocked's internal atomicfile
+// sync does not) that establishes durability or halts with ErrDurabilityUnconfirmed. Run
+// (prepare), drive (advance), and Abort all satisfy this.
 func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Record, error) {
 	built, err := j.gs.AppendLocked(g, head, func(gen uint64, _ string) ([]byte, error) {
 		next.SchemaVersion = RecordVersion
@@ -392,6 +406,11 @@ func (j *Journal) append(g *genstore.Guard, head genstore.Head, next Record) (Re
 		return json.Marshal(next)
 	})
 	if err != nil {
+		// The record is VISIBLE but its durability is unconfirmed: do not discard it. The
+		// mandatory confirmJournal the caller runs next establishes durability or halts.
+		if genstore.IsDurabilityUnconfirmed(err) {
+			return decode(built)
+		}
 		return Record{}, err
 	}
 	return decode(built)

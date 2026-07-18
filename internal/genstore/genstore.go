@@ -252,6 +252,14 @@ func (s *Store) LockPath() string { return s.lockPath }
 // atomicfile.SyncDir in Open; this exists only to inject failures.
 func (s *Store) WithSyncDir(fn func(dir string) error) *Store { s.syncDir = fn; return s }
 
+// WithWrite overrides the file-write seam and returns the store, so a test can inject a
+// real post-rename *atomicfile.PostCommitSyncError (visible record, unconfirmed
+// durability). Production wires atomicfile.Write in Open; this exists only for tests.
+func (s *Store) WithWrite(fn func(path string, data []byte, perm os.FileMode) error) *Store {
+	s.write = fn
+	return s
+}
+
 func (s *Store) genPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%0*d%s", genFileDigits, gen, genFileExt))
 }

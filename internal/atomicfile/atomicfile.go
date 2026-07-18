@@ -2,19 +2,25 @@
 // rename, so that a failure before the rename leaves the previous file
 // byte-identical and the target is never written in place.
 //
-// Consistency guarantee, stated honestly per platform:
+// Consistency and durability, stated honestly per platform:
 //   - POSIX: rename(2) is an atomic replace — a concurrent reader sees either the
 //     old bytes or the complete new bytes, never a torn intermediate. A directory
-//     fsync makes the replacement durable across power loss.
-//   - Windows: os.Rename uses MoveFileEx(REPLACE_EXISTING), which Go's own
-//     contract explicitly does NOT guarantee to be atomic. This package therefore
-//     makes NO old-or-new promise on Windows and does NOT implement recovery. A
-//     caller that needs crash-consistency on Windows must NOT overwrite its root
-//     of trust through Write; it must use the immutable-generation protocol:
-//     write each new state as a fresh, checksummed
-//     generation file (never overwriting the last valid one) and, on recovery,
-//     enumerate and select the highest valid generation. A torn new generation is
-//     detected by its checksum and ignored, leaving the previous one intact.
+//     fsync (SyncDir) makes the replacement durable across power loss, and
+//     MkdirAllDurable fsyncs each new directory's parent to make its entry durable.
+//   - Windows: os.Rename's default MoveFileEx(REPLACE_EXISTING) is NOT guaranteed
+//     atomic and is not power-loss durable. This package therefore does NOT use it:
+//     file moves force durability with MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH)
+//     and fresh directories are published durably with a WRITE_THROUGH directory
+//     rename (MkdirAllDurable), both of which flush the parent's metadata to disk
+//     before returning. There is no directory-handle fsync on Windows (it returns
+//     ERROR_ACCESS_DENIED), so re-confirmation relies on durability having been
+//     forced at write/publish time, not on a later flush. This package still makes
+//     no old-or-new atomicity promise on Windows and does not implement recovery of
+//     an overwritten authoritative file: crash-consistency there uses the
+//     immutable-generation protocol (write each new state as a fresh, checksummed
+//     generation file, never overwriting the last valid one; on recovery enumerate
+//     and select the highest valid generation; a torn new generation fails its
+//     checksum and is ignored, leaving the previous one intact).
 //
 // So this is a low-level write primitive, not a crash-safe store: it is safe to
 // use directly for POSIX-atomic replaces and for writing new immutable
@@ -22,8 +28,7 @@
 // must not be used to overwrite the single authoritative state/journal file on
 // Windows.
 //
-// Neither platform's default path guarantees power-loss durability on Windows
-// (that would need MOVEFILE_WRITE_THROUGH). Local filesystems only.
+// Local filesystems only.
 //
 // This package never sweeps its directory: a crash can leave a `.claudex-tmp-*`
 // file, and only the state/recovery layer — holding the exclusive run lock — may
@@ -103,31 +108,48 @@ func Write(path string, data []byte, perm os.FileMode) error {
 // re-confirm durability after a prior sync failure or across a process restart.
 func SyncDir(dir string) error { return syncDir(dir) }
 
-// MkdirAllDurable creates dir and every missing ancestor, fsyncing each created
-// level's PARENT so the new directory entry itself is durable (not just entries
-// later written inside it). An existing path that is not a directory is an error.
-// It never fsyncs a level it did not create, so an already-durable tree costs one
-// Stat.
+// ensureDirDurable makes dir exist with its entry DURABLE in its (already-durable)
+// parent, idempotently and re-runnably: a missing dir is created and its entry forced to
+// disk; an existing dir's entry is RE-confirmed durable without recreating. It is a
+// package var so a test can inject a fail-once-then-succeed confirmer. Production wires
+// the platform primitive (POSIX: create then fsync the parent; Windows: publish a fresh
+// directory via a write-through rename — there is no directory-handle fsync).
+var ensureDirDurable = ensureDirDurableImpl
+
+// MkdirAllDurable creates dir and every missing ancestor, durably publishing each new
+// directory entry, and RE-CONFIRMS an existing directory's entry durability on every call
+// — so a retry after a prior partial (created-but-confirm-failed) attempt re-forces the
+// entry rather than blessing a visible-but-unconfirmed directory. It never recreates an
+// existing directory, and it does not recurse into a pre-existing ancestor (that was made
+// durable when it was created); a retry after a mid-chain failure still re-confirms the
+// directories it created, because the recursion for the missing leaf descends into them.
+// An existing non-directory path is an error.
 func MkdirAllDurable(dir string, perm os.FileMode) error {
-	if fi, err := os.Stat(dir); err == nil {
+	return mkdirAllDurable(dir, perm, ensureDirDurable)
+}
+
+func mkdirAllDurable(dir string, perm os.FileMode, ensure func(string, os.FileMode) error) error {
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return nil // filesystem/volume root: assumed durable, nothing to publish
+	}
+	fi, err := os.Lstat(dir)
+	switch {
+	case err == nil:
 		if !fi.IsDir() {
 			return fmt.Errorf("%w: %s", ErrNotDirectory, dir)
 		}
-		return nil // already exists; its entry was made durable when it was created
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	parent := filepath.Dir(dir)
-	if parent != dir {
-		if err := MkdirAllDurable(parent, perm); err != nil {
-			return err
+		// Exists: re-confirm its entry durable (re-runnable), without recreating and
+		// without recursing into a pre-existing ancestor.
+		return ensure(dir, perm)
+	case os.IsNotExist(err):
+		if e := mkdirAllDurable(parent, perm, ensure); e != nil {
+			return e
 		}
-	}
-	if err := os.Mkdir(dir, perm); err != nil && !os.IsExist(err) {
+		return ensure(dir, perm)
+	default:
 		return err
 	}
-	// Persist dir's own entry in its parent.
-	return syncDir(parent)
 }
 
 func write(path string, data []byte, perm os.FileMode, o ops) (err error) {

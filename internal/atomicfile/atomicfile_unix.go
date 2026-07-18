@@ -5,6 +5,7 @@ package atomicfile
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -39,6 +40,17 @@ func syncRootDir(root *os.Root, name string) error {
 	serr := d.Sync()
 	_ = d.Close()
 	return serr
+}
+
+// ensureDirDurableImpl creates dir if missing and forces its entry durable in its parent
+// by fsyncing the parent. It is idempotent and re-runnable: a create-then-fsync where the
+// fsync failed is repaired on a retry (os.Mkdir returns EEXIST, ignored, and the parent
+// fsync runs again).
+func ensureDirDurableImpl(dir string, perm os.FileMode) error {
+	if err := os.Mkdir(dir, perm); err != nil && !os.IsExist(err) {
+		return err
+	}
+	return syncDir(filepath.Dir(dir))
 }
 
 // syncDir fsyncs the directory so the rename is durable across a power loss.

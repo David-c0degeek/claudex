@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 )
 
@@ -25,6 +27,7 @@ type fakeStep struct {
 	confirmErr          error // when set, ConfirmDurable fails
 	confirmFailUntil    int   // fail the first N ConfirmDurable calls with confirmErr, then succeed (0 = persistent)
 	confirmCalls        int
+	applyDurErr         error // Apply marks the effect visible (applied), then returns this durability error
 }
 
 func (s *fakeStep) toStep() Step {
@@ -52,6 +55,9 @@ func (s *fakeStep) toStep() Step {
 			}
 			if !s.noObserveAfterApply {
 				s.applied = true
+			}
+			if s.applyDurErr != nil {
+				return s.applyDurErr // the effect IS visible (applied) but durability is unconfirmed
 			}
 			return nil
 		},
@@ -467,6 +473,108 @@ func TestDurabilityTerminalJournalConfirmNoCleanSuccess(t *testing.T) {
 	})
 	if step.applyCalls != 1 {
 		t.Fatalf("apply calls = %d, want 1", step.applyCalls)
+	}
+}
+
+// realWriteThenSyncError writes the record for real (so it is VISIBLE), then returns a
+// real *atomicfile.PostCommitSyncError — the genuine post-rename durability-unconfirmed
+// path, so reconcile emits a real *genstore.PostCommitSyncError.
+func realWriteThenSyncError() func(string, []byte, os.FileMode) error {
+	return func(path string, data []byte, perm os.FileMode) error {
+		if werr := atomicfile.Write(path, data, perm); werr != nil {
+			return werr
+		}
+		return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync")}
+	}
+}
+
+// Real *genstore.PostCommitSyncError on the PREPARE append: the record is visible (not
+// discarded by append) and the mandatory confirmJournal, unable to confirm, halts before
+// any step Apply.
+func TestDurabilityRealPreparePostCommitSyncErrorHalts(t *testing.T) {
+	j, lock := newJournal(t)
+	j.gs.WithWrite(realWriteThenSyncError()).WithSyncDir(failCountingSyncDir(1))
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed", err)
+		}
+	})
+	if step.applyCalls != 0 {
+		t.Fatalf("apply calls = %d, want 0 (halt at the prepare confirm)", step.applyCalls)
+	}
+	if rec, ok, err := j.Latest(); err != nil || !ok || rec.StepsDone != 0 {
+		t.Fatalf("prepare record head = %+v ok=%v err=%v, want visible StepsDone=0 (not discarded)", rec, ok, err)
+	}
+}
+
+// The same real prepare durability error, but confirmJournal CAN confirm (real syncDir):
+// the record is not discarded and Run completes.
+func TestDurabilityRealPrepareCompletesWhenConfirmSucceeds(t *testing.T) {
+	j, lock := newJournal(t)
+	j.gs.WithWrite(realWriteThenSyncError()) // syncDir seam stays real → ConfirmDurable succeeds
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		out, err := j.Run(g, planFrom("t1", []*fakeStep{step}))
+		if err != nil || !out.Complete {
+			t.Fatalf("Run out=%+v err=%v, want complete (visible record not discarded)", out, err)
+		}
+	})
+}
+
+// Real *genstore.PostCommitSyncError on the PROGRESS/terminal append whose confirm cannot
+// succeed: not clean success.
+func TestDurabilityRealProgressPostCommitSyncErrorHalts(t *testing.T) {
+	j, lock := newJournal(t)
+	writes := 0
+	j.gs.WithWrite(func(path string, data []byte, perm os.FileMode) error {
+		writes++
+		if werr := atomicfile.Write(path, data, perm); werr != nil {
+			return werr
+		}
+		if writes >= 2 { // the progress/terminal append (the prepare is the first write)
+			return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync")}
+		}
+		return nil
+	}).WithSyncDir(failCountingSyncDir(3)) // prepare confirm (calls 1-2) ok; terminal confirm (3+) fails
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed (terminal record not confirmed)", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", step.applyCalls)
+	}
+}
+
+// A participant Apply that returns a real *genstore.PostCommitSyncError (via a store's
+// decode-and-pair) halts wrapping ErrDurabilityUnconfirmed WHILE preserving errors.As to
+// the genstore type; Recover then completes with the effect applied exactly once.
+func TestDurabilityParticipantApplyRealGenstoreErrorWraps(t *testing.T) {
+	j, lock := newJournal(t)
+	step := &fakeStep{name: "a", applyDurErr: &genstore.PostCommitSyncError{Generation: 1, Err: errors.New("participant sync")}}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		_, err := j.Run(g, planFrom("t1", []*fakeStep{step}))
+		if !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want errors.Is ErrDurabilityUnconfirmed", err)
+		}
+		var pse *genstore.PostCommitSyncError
+		if !errors.As(err, &pse) {
+			t.Fatalf("Run err = %v, want errors.As *genstore.PostCommitSyncError preserved", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", step.applyCalls)
+	}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		out, recovered, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", []*fakeStep{step}), nil })
+		if err != nil || !recovered || !out.Complete {
+			t.Fatalf("recover out=%+v recovered=%v err=%v, want complete", out, recovered, err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls after recover = %d, want 1 (no reapply)", step.applyCalls)
 	}
 }
 

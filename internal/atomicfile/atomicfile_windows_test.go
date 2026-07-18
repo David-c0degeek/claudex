@@ -135,6 +135,61 @@ func TestMkdirAllDurableCreatesTree(t *testing.T) {
 	}
 }
 
+// The file replace path invokes MoveFileEx with EXACTLY
+// MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH — pinned via the seam so a regression
+// to os.Rename or a dropped flag is caught (the integration test above cannot see flags).
+func TestReplaceInvokesMoveFileExWithWriteThroughFlags(t *testing.T) {
+	var gotFlags uint32
+	called := false
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		called, gotFlags = true, flags
+		return orig(from, to, flags)
+	}
+	defer func() { moveFileEx = orig }()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := os.WriteFile(dst, []byte("y"), 0o600); err != nil {
+		t.Fatalf("write dst: %v", err)
+	}
+	if err := moveFileWriteThrough(src, dst); err != nil {
+		t.Fatalf("moveFileWriteThrough: %v", err)
+	}
+	want := uint32(windows.MOVEFILE_REPLACE_EXISTING | windows.MOVEFILE_WRITE_THROUGH)
+	if !called || gotFlags != want {
+		t.Fatalf("file replace flags = %#x (called=%v), want %#x", gotFlags, called, want)
+	}
+}
+
+// The directory publish path invokes MoveFileEx with EXACTLY MOVEFILE_WRITE_THROUGH
+// (REPLACE_EXISTING is invalid for directories and the target does not exist).
+func TestDirPublishInvokesMoveFileExWithWriteThroughFlag(t *testing.T) {
+	var gotFlags uint32
+	called := false
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		called, gotFlags = true, flags
+		return orig(from, to, flags)
+	}
+	defer func() { moveFileEx = orig }()
+
+	dir := filepath.Join(t.TempDir(), "newdir")
+	if err := ensureDirDurableImpl(dir, 0o700); err != nil {
+		t.Fatalf("ensureDirDurableImpl: %v", err)
+	}
+	if !called || gotFlags != uint32(windows.MOVEFILE_WRITE_THROUGH) {
+		t.Fatalf("dir publish flags = %#x (called=%v), want %#x", gotFlags, called, uint32(windows.MOVEFILE_WRITE_THROUGH))
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("directory not published: fi=%v err=%v", fi, err)
+	}
+}
+
 // swallowDirFlush treats only the Windows directory-flush refusal as satisfied; a real
 // error propagates.
 func TestSwallowDirFlush(t *testing.T) {
