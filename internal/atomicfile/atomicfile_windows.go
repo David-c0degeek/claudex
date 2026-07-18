@@ -227,14 +227,23 @@ func publishFileInRoot(root *os.Root, tmp, name, dir string) (bool, error) {
 	if _, serr := root.Lstat(name); serr != nil {
 		return false, merr // target not visible → uncommitted; our source not consumed
 	}
-	// Target visible: decide consumption from OUR unique source temp, not target visibility.
-	if _, serr := root.Lstat(tmp); serr == nil {
+	// Target visible: decide consumption from OUR unique source temp, never target
+	// visibility. Only a GENUINE not-exist proves our source was consumed; a present source
+	// is a foreign winner; ANY OTHER observation error (sharing/access/I/O) fails closed —
+	// we cannot claim consumption or clean success without knowing the source's state.
+	_, serr := root.Lstat(tmp)
+	switch {
+	case serr == nil:
 		// Source still present → the visible target is a conflict/foreign winner, not ours;
-		// report a no-clobber conflict WITHOUT leaking our temp (caller removes it).
+		// report a no-clobber conflict WITHOUT leaking our temp (the caller removes it).
 		return false, fs.ErrExist
+	case !errors.Is(serr, fs.ErrNotExist):
+		// The source's state cannot be observed → fail closed, claiming neither consumption
+		// nor clean success (the caller still removes the temp).
+		return false, fmt.Errorf("atomicfile: publish of %q could not classify its source temp: %w", name, serr)
 	}
-	// Source absent + target visible → OUR move consumed it; durability unconfirmed, so force
-	// the parent metadata durable with the real barrier.
+	// Source genuinely absent + target visible → OUR move consumed it; durability unconfirmed,
+	// so force the parent metadata durable with the real barrier.
 	if berr := confirmParentInRoot(root, name); berr != nil {
 		return true, &PostCommitSyncError{Path: name, Err: berr}
 	}
@@ -245,8 +254,10 @@ func publishFileInRoot(root *os.Root, tmp, name, dir string) (bool, error) {
 // drive-letter path. x/sys/windows does not export these zero-valued flags, so named here.
 const finalPathFlags = 0
 
-// finalPathByHandle returns the validated real DOS path of an open handle, keeping the
-// caller's handle open so the resolution cannot be swapped out from under it.
+// finalPathByHandle returns the handle's CURRENT resolved real DOS path. It does not pin the
+// object: the os.Root handle is opened with FILE_SHARE_DELETE, so the resolved directory can
+// still be renamed/replaced. Callers that must operate on that path prove identity
+// (openDirNoDelete) rather than trusting the open handle to prevent a swap.
 func finalPathByHandle(h windows.Handle) (string, error) {
 	return finalPathByHandleBuf(h, make([]uint16, 260))
 }
