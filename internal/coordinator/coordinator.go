@@ -110,8 +110,14 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}
 	// A pending session replacement means the run is mid-supersession: fail fast here (the
 	// per-submit journal seam re-checks under the submit guard) rather than open for submits.
-	if repl == attach.ReplaceJournalNonTerminal {
+	// Total switch: Absent/Terminal open, NonTerminal is pending, any unknown class fails closed.
+	switch repl {
+	case attach.ReplaceJournalAbsent, attach.ReplaceJournalTerminal:
+		// No pending replacement — open the run.
+	case attach.ReplaceJournalNonTerminal:
 		return nil, fmt.Errorf("%w: session replacement pending", ErrNotReady)
+	default:
+		return nil, fmt.Errorf("%w: unknown replace journal class %d", ErrNotReady, repl)
 	}
 
 	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
@@ -203,8 +209,15 @@ func (r runJournalReader) Head(g *genstore.Guard, runID string) (transport.Journ
 		// authorize off a Registry a replacement may be mid-superseding.
 		return transport.JournalUnknown, err
 	}
-	if repl == attach.ReplaceJournalNonTerminal {
+	// Total switch: only Absent/Terminal fall through to the pair-journal decision; a pending
+	// replacement blocks, and any unknown class fails closed rather than silently proceeding.
+	switch repl {
+	case attach.ReplaceJournalAbsent, attach.ReplaceJournalTerminal:
+		// No pending replacement — the pair-journal decision below governs.
+	case attach.ReplaceJournalNonTerminal:
 		return transport.JournalNonterminal, nil
+	default:
+		return transport.JournalUnknown, fmt.Errorf("coordinator: unknown replace journal class %d", repl)
 	}
 	switch pair {
 	case attach.JournalTerminal:

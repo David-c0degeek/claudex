@@ -820,9 +820,16 @@ func TestSubmitBlockedByPendingReplacement(t *testing.T) {
 	defer rn.Close()
 
 	rs := cur(t, rn) // the lead owns the PLAN_DRAFT first turn
+	before := cur(t, rn)
 	plantPendingReplace(t, repo, runID)
-	if _, err := rn.Submit(context.Background(), lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)); err == nil {
-		t.Fatal("submit should fail closed while a replacement is pending")
+	if _, err := rn.Submit(context.Background(), lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)); !errors.Is(err, transport.ErrRecoveryRequired) {
+		t.Fatalf("blocked submit err = %v, want transport.ErrRecoveryRequired", err)
+	}
+	// No durable effect: a submit refused at the journal gate never appends state (so no
+	// accepted turn, hence no published artifact — transport refuses before the Sink).
+	if after := cur(t, rn); after.Revision != before.Revision || len(after.AcceptedTurns) != len(before.AcceptedTurns) {
+		t.Fatalf("state advanced despite a blocked submit: rev %d->%d, accepted %d->%d",
+			before.Revision, after.Revision, len(before.AcceptedTurns), len(after.AcceptedTurns))
 	}
 }
 
