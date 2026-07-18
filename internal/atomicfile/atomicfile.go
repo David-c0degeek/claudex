@@ -94,6 +94,42 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	return write(path, data, perm, defaultOps)
 }
 
+// SyncDir fsyncs the directory dir so that entries created or renamed inside it are
+// durable across power loss. On POSIX this is a real directory fsync; on Windows it
+// attempts a FlushFileBuffers on the directory handle and treats the OS's
+// no-directory-flush limitation as satisfied (durability there rests on
+// MOVEFILE_WRITE_THROUGH renames plus NTFS metadata journaling — see the package
+// doc). It is idempotent and re-runnable under a caller-held lock, so a store can
+// re-confirm durability after a prior sync failure or across a process restart.
+func SyncDir(dir string) error { return syncDir(dir) }
+
+// MkdirAllDurable creates dir and every missing ancestor, fsyncing each created
+// level's PARENT so the new directory entry itself is durable (not just entries
+// later written inside it). An existing path that is not a directory is an error.
+// It never fsyncs a level it did not create, so an already-durable tree costs one
+// Stat.
+func MkdirAllDurable(dir string, perm os.FileMode) error {
+	if fi, err := os.Stat(dir); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("%w: %s", ErrNotDirectory, dir)
+		}
+		return nil // already exists; its entry was made durable when it was created
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := MkdirAllDurable(parent, perm); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(dir, perm); err != nil && !os.IsExist(err) {
+		return err
+	}
+	// Persist dir's own entry in its parent.
+	return syncDir(parent)
+}
+
 func write(path string, data []byte, perm os.FileMode, o ops) (err error) {
 	dir := filepath.Dir(path)
 

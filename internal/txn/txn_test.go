@@ -22,6 +22,9 @@ type fakeStep struct {
 	applyCalls          int
 	doubleApply         bool
 	noObserveAfterApply bool
+	confirmErr          error // when set, ConfirmDurable fails
+	confirmFailUntil    int   // fail the first N ConfirmDurable calls with confirmErr, then succeed (0 = persistent)
+	confirmCalls        int
 }
 
 func (s *fakeStep) toStep() Step {
@@ -49,6 +52,13 @@ func (s *fakeStep) toStep() Step {
 			}
 			if !s.noObserveAfterApply {
 				s.applied = true
+			}
+			return nil
+		},
+		ConfirmDurable: func() error {
+			s.confirmCalls++
+			if s.confirmErr != nil && (s.confirmFailUntil == 0 || s.confirmCalls <= s.confirmFailUntil) {
+				return s.confirmErr
 			}
 			return nil
 		},
@@ -327,9 +337,10 @@ func TestAbortIntentMismatchStaysPending(t *testing.T) {
 func TestGuardValidatedBeforeAnyEffect(t *testing.T) {
 	poison := func() Step {
 		return Step{
-			Name:   "p",
-			Status: func() (StepStatus, error) { t.Fatal("Status called under an invalid guard"); return "", nil },
-			Apply:  func() error { t.Fatal("Apply called under an invalid guard"); return nil },
+			Name:           "p",
+			Status:         func() (StepStatus, error) { t.Fatal("Status called under an invalid guard"); return "", nil },
+			Apply:          func() error { t.Fatal("Apply called under an invalid guard"); return nil },
+			ConfirmDurable: func() error { t.Fatal("ConfirmDurable called under an invalid guard"); return nil },
 		}
 	}
 
@@ -363,6 +374,99 @@ func TestGuardValidatedBeforeAnyEffect(t *testing.T) {
 		return Plan{Intent: intent("t1"), Steps: []Step{poison()}}, nil
 	}); err == nil {
 		t.Fatalf("Recover with a wrong-lock guard should error")
+	}
+}
+
+// --- M1 durability crash-cut witnesses (seam-driven, platform-independent) ---
+
+// failCountingSyncDir returns a directory-sync seam that succeeds for the first
+// (failFrom-1) calls and fails from the failFrom-th call onward.
+func failCountingSyncDir(failFrom int) func(string) error {
+	calls := 0
+	return func(string) error {
+		calls++
+		if calls >= failFrom {
+			return errors.New("injected dir sync failure")
+		}
+		return nil
+	}
+}
+
+// 1. A prepare-journal durability failure halts before any step Apply.
+func TestDurabilityPrepareJournalHaltsBeforeApply(t *testing.T) {
+	j, lock := newJournal(t)
+	j.gs.WithSyncDir(failCountingSyncDir(1)) // every journal dir-sync fails
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		_, err := j.Run(g, planFrom("t1", []*fakeStep{step}))
+		if !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed", err)
+		}
+	})
+	if step.applyCalls != 0 {
+		t.Fatalf("step applied %d times, want 0 (halt before any effect)", step.applyCalls)
+	}
+}
+
+// 2. A participant durability failure halts with no progress append, effect not repeated.
+func TestDurabilityParticipantConfirmHaltsNoProgress(t *testing.T) {
+	j, lock := newJournal(t)
+	step := &fakeStep{name: "a", confirmErr: errors.New("participant dir sync")} // persistent
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1 (effect applied once, not repeated)", step.applyCalls)
+	}
+	rec, ok, err := j.Latest()
+	if err != nil || !ok || rec.StepsDone != 0 || rec.Terminal() {
+		t.Fatalf("head = %+v ok=%v err=%v, want the non-terminal prepare record (StepsDone=0)", rec, ok, err)
+	}
+}
+
+// 3 + 6. After a participant confirm halt, Recover re-confirms the participant directory
+// and completes WITHOUT reapplying the effect (safe resume, apply count still one).
+func TestDurabilityRetrySucceedsOnRecoverWithoutReapply(t *testing.T) {
+	j, lock := newJournal(t)
+	step := &fakeStep{name: "a", confirmErr: errors.New("transient"), confirmFailUntil: 1} // confirm fails once
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls after halt = %d, want 1", step.applyCalls)
+	}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		out, recovered, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", []*fakeStep{step}), nil })
+		if err != nil || !recovered || !out.Complete {
+			t.Fatalf("recover out=%+v recovered=%v err=%v, want complete", out, recovered, err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls after recover = %d, want 1 (no reapply)", step.applyCalls)
+	}
+	if step.confirmCalls < 2 {
+		t.Fatalf("confirm calls = %d, want >= 2 (recovery re-confirmed the participant)", step.confirmCalls)
+	}
+}
+
+// 4. A terminal/progress journal durability failure is not clean success: Run reports the
+// typed durability error even though the effect applied and the record is visible.
+func TestDurabilityTerminalJournalConfirmNoCleanSuccess(t *testing.T) {
+	j, lock := newJournal(t)
+	// The prepare confirm (calls 1-2) succeeds; the terminal progress confirm (calls 3+) fails.
+	j.gs.WithSyncDir(failCountingSyncDir(3))
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want ErrDurabilityUnconfirmed (terminal record not confirmed durable)", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", step.applyCalls)
 	}
 }
 

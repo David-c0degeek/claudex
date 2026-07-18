@@ -78,6 +78,11 @@ func planFor(lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan,
 			Name:   "worktree",
 			Status: func() (txn.StepStatus, error) { return sm.worktree.ObserveWorktree(lay.repoDir, in) },
 			Apply:  func() error { return sm.worktree.ApplyWorktree(lay.repoDir, in) },
+			// The worktree is an EXTERNAL git participant (subject 04, a no-op seam today):
+			// its Status query against the real repository is itself the durability proof,
+			// so a documented no-op confirmer is correct here. When 04 lands its provisioner
+			// it will carry a real confirmer covering any directory entries it creates.
+			ConfirmDurable: func() error { return nil },
 		},
 		registryInitStep(registry, g, in),
 		stateInitStep(runState, g, in),
@@ -155,6 +160,25 @@ func snapshotStep(name, repoDir, repoRel string, canonical []byte, digest string
 			}
 			return atomicfile.InstallInRoot(root, repoRel, canonical, snapshotPerm)
 		},
+		// Re-confirm durability of EVERY directory entry the Apply may have created (the
+		// root for the outermost ancestor, each created ancestor dir for the next-deeper
+		// entry) plus the published file — not just the file's immediate parent.
+		ConfirmDurable: func() error {
+			root, err := os.OpenRoot(repoDir)
+			if err != nil {
+				return err
+			}
+			defer root.Close()
+			if err := atomicfile.SyncDirInRoot(root, ""); err != nil {
+				return err
+			}
+			for _, dir := range ancestorDirs(repoRel) {
+				if err := atomicfile.SyncDirInRoot(root, dir); err != nil {
+					return err
+				}
+			}
+			return atomicfile.SyncInRoot(root, repoRel)
+		},
 	}
 }
 
@@ -222,6 +246,7 @@ func registryInitStep(store *state.RegistryStore, g *genstore.Guard, in Bootstra
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 
@@ -266,6 +291,7 @@ func stateInitStep(store *state.Store, g *genstore.Guard, in BootstrapIntent) tx
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 
@@ -308,6 +334,7 @@ func catalogStep(store *state.CatalogStore, g *genstore.Guard, in BootstrapInten
 			_, err := store.AllocateLocked(g, in.CatalogExpectedRevision, want)
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 
@@ -345,6 +372,7 @@ func currentClearStep(store *state.CurrentRunStore, g *genstore.Guard, in Bootst
 			_, err := store.Clear(g, in.ClearPriorRevision, in.ClearPriorRunID)
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 
@@ -380,6 +408,7 @@ func currentRunStep(store *state.CurrentRunStore, g *genstore.Guard, in Bootstra
 			_, err = store.Activate(g, expRev, in.RunID, in.RelDir, in.OperationID)
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 

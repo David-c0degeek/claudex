@@ -372,11 +372,26 @@ func (s *Store) MutateLocked(g *genstore.Guard, expectedRevision uint64, fn func
 		return json.Marshal(next)
 	})
 	if err != nil {
+		// A visible-but-durability-unconfirmed append yields a valid record: preserve it
+		// paired with the typed error so a direct caller has the value but must confirm
+		// durability (never treat it as durable success).
+		if genstore.IsDurabilityUnconfirmed(err) {
+			rs, derr := decodeRunState(built)
+			if derr != nil {
+				return RunState{}, derr
+			}
+			return rs, err
+		}
 		return RunState{}, err
 	}
 	// Return the authoritative state decoded from the exact persisted bytes.
 	return decodeRunState(built)
 }
+
+// ConfirmDurable re-confirms this store's directory is power-safe under the held
+// guard (see genstore.Store.ConfirmDurable). A step whose effect is a run-state
+// append confirms durability here before its transaction records progress.
+func (s *Store) ConfirmDurable(g *genstore.Guard) error { return s.gs.ConfirmDurable(g) }
 
 // cloneForNext deep-copies prev (or returns a normalized fresh state) so the
 // mutator always sees usable collections and transition validation can compare

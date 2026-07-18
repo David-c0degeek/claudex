@@ -154,6 +154,7 @@ func pairFillStep(store *state.RegistryStore, g *genstore.Guard, in PairAttachIn
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 
@@ -211,6 +212,7 @@ func planDraftStep(store *state.Store, g *genstore.Guard, in PairAttachIntent) t
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return store.ConfirmDurable(g) },
 	}
 }
 

@@ -214,7 +214,10 @@ func TestWritePrecommitFailurePreservesHead(t *testing.T) {
 	}
 }
 
-func TestWriteCommittedDespitePostCommitSyncError(t *testing.T) {
+// A write whose data is visible but whose directory sync failed is reported as a
+// typed durability-unconfirmed error over the visible record — NOT as clean success.
+// The caller must confirm durability before depending on it.
+func TestWriteVisibleButDurabilityUnconfirmed(t *testing.T) {
 	s := newStore(t)
 	r1 := appendConst(t, s, Head{}, "one")
 	s.write = func(path string, data []byte, perm os.FileMode) error {
@@ -222,14 +225,93 @@ func TestWriteCommittedDespitePostCommitSyncError(t *testing.T) {
 		return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync")}
 	}
 	rec, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil })
-	if err != nil {
-		t.Fatalf("committed write reported error: %v", err)
+	if !IsDurabilityUnconfirmed(err) {
+		t.Fatalf("committed-but-unsynced write err = %v, want IsDurabilityUnconfirmed", err)
 	}
+	var pse *PostCommitSyncError
+	if !errors.As(err, &pse) || pse.Generation != 2 {
+		t.Fatalf("want *PostCommitSyncError at generation 2, got %v", err)
+	}
+	// The record is nonetheless the visible head — a caller must not rewrite it.
 	if rec.Generation != 2 {
 		t.Fatalf("committed rec gen = %d, want 2", rec.Generation)
 	}
 	if got, _, _ := s.Latest(); got.Generation != 2 {
 		t.Fatalf("head = %d after committed write, want 2", got.Generation)
+	}
+}
+
+// An ambiguous write that merely wraps an atomicfile durability error must NOT be
+// classified as the proven-visible durability-unconfirmed condition.
+func TestAmbiguousIsNotDurabilityUnconfirmed(t *testing.T) {
+	amb := fmt.Errorf("%w: %w", ErrAmbiguous, &atomicfile.PostCommitSyncError{Path: "x", Err: errors.New("sync")})
+	if IsDurabilityUnconfirmed(amb) {
+		t.Fatal("an ambiguous outcome must not be reported as visible-but-unconfirmed durability")
+	}
+}
+
+// A lock-release PostCommitError is durable success (the record is durably committed;
+// only the lock release failed), distinct from the visible-but-unconfirmed durability
+// condition — so it must not be classified as durability-unconfirmed.
+func TestPostCommitErrorIsDurableNotUnconfirmed(t *testing.T) {
+	pce := &PostCommitError{Generation: 5, Err: errors.New("release")}
+	if IsDurabilityUnconfirmed(pce) {
+		t.Fatal("a lock-release PostCommitError is durable success, not durability-unconfirmed")
+	}
+	if !pce.Committed() {
+		t.Fatal("PostCommitError must report Committed")
+	}
+}
+
+// ConfirmDurable retries a transient directory-sync failure and succeeds; a
+// persistent failure is an error; a missing store is a failure, never a create.
+func TestConfirmDurableRetriesThenSucceeds(t *testing.T) {
+	s := newStore(t)
+	appendConst(t, s, Head{}, "one")
+	g, ok, err := Acquire(s.lockPath)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	defer g.Release()
+	calls := 0
+	s.syncDir = func(string) error {
+		calls++
+		if calls <= 2 {
+			return errors.New("transient dir sync")
+		}
+		return nil
+	}
+	if err := s.ConfirmDurable(g); err != nil {
+		t.Fatalf("confirm should succeed after transient retries: %v", err)
+	}
+}
+
+func TestConfirmDurablePersistentFailure(t *testing.T) {
+	s := newStore(t)
+	appendConst(t, s, Head{}, "one")
+	g, ok, err := Acquire(s.lockPath)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	defer g.Release()
+	s.syncDir = func(string) error { return errors.New("persistent EIO") }
+	if err := s.ConfirmDurable(g); err == nil {
+		t.Fatal("confirm must fail when the directory sync never succeeds")
+	}
+}
+
+func TestConfirmDurableMissingStoreIsFailureNotCreate(t *testing.T) {
+	s := newStore(t)
+	g, ok, err := Acquire(s.lockPath) // no append yet: the store dir does not exist
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	defer g.Release()
+	if err := s.ConfirmDurable(g); err == nil {
+		t.Fatal("confirm must fail (never create) when the store dir is missing")
+	}
+	if _, serr := os.Stat(s.dir); !os.IsNotExist(serr) {
+		t.Fatalf("confirm created the store dir: stat err = %v", serr)
 	}
 }
 

@@ -206,6 +206,18 @@ func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error 
 	return nil
 }
 
+// SyncDirInRoot fsyncs the directory name within the confined root (name "" is the
+// root itself), so a directory entry created inside `name` is durable. It is used to
+// re-confirm the durability of every ancestor directory a rooted publish may have
+// created, not just the published file's immediate parent. Idempotent and
+// re-runnable under a caller-held lock.
+func SyncDirInRoot(root *os.Root, name string) error {
+	if name == "." {
+		name = ""
+	}
+	return syncRootDir(root, name)
+}
+
 // ReadInRoot reads name after confirming it is a regular file and bounding its
 // size, retrying briefly on transient Windows sharing/access errors. A symlink,
 // directory, FIFO, device, or over-limit file is an ErrNotRegular corruption

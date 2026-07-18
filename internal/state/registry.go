@@ -243,10 +243,21 @@ func (s *RegistryStore) MutateLocked(g *genstore.Guard, expectedRevision uint64,
 		return json.Marshal(next)
 	})
 	if err != nil {
+		if genstore.IsDurabilityUnconfirmed(err) {
+			reg, derr := decodeRegistry(built)
+			if derr != nil {
+				return Registry{}, derr
+			}
+			return reg, err
+		}
 		return Registry{}, err
 	}
 	return decodeRegistry(built)
 }
+
+// ConfirmDurable re-confirms this store's directory is power-safe under the held
+// guard (see genstore.Store.ConfirmDurable).
+func (s *RegistryStore) ConfirmDurable(g *genstore.Guard) error { return s.gs.ConfirmDurable(g) }
 
 // cloneRegistryForNext deep-copies prev (or a fresh registry) so the mutator sees
 // usable slices and transition validation can compare without aliasing.

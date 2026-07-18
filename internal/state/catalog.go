@@ -135,10 +135,21 @@ func (c *CatalogStore) AllocateLocked(g *genstore.Guard, expectedRevision uint64
 		return raw, nil
 	})
 	if err != nil {
+		if genstore.IsDurabilityUnconfirmed(err) {
+			cat, derr := decodeCatalog(built)
+			if derr != nil {
+				return Catalog{}, derr
+			}
+			return cat, err
+		}
 		return Catalog{}, err
 	}
 	return decodeCatalog(built)
 }
+
+// ConfirmDurable re-confirms this store's directory is power-safe under the held
+// guard (see genstore.Store.ConfirmDurable).
+func (c *CatalogStore) ConfirmDurable(g *genstore.Guard) error { return c.gs.ConfirmDurable(g) }
 
 // Lookup returns the run ref for run_id, if allocated.
 func (cat Catalog) Lookup(runID string) (RunRef, bool) {

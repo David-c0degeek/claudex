@@ -135,10 +135,21 @@ func (s *CurrentRunStore) mutate(g *genstore.Guard, expectedRevision uint64, fn 
 		return json.Marshal(next)
 	})
 	if err != nil {
+		if genstore.IsDurabilityUnconfirmed(err) {
+			cr, derr := decodeCurrentRun(built)
+			if derr != nil {
+				return CurrentRun{}, derr
+			}
+			return cr, err
+		}
 		return CurrentRun{}, err
 	}
 	return decodeCurrentRun(built)
 }
+
+// ConfirmDurable re-confirms this store's directory is power-safe under the held
+// guard (see genstore.Store.ConfirmDurable).
+func (s *CurrentRunStore) ConfirmDurable(g *genstore.Guard) error { return s.gs.ConfirmDurable(g) }
 
 func decodeCurrentRun(rec genstore.Record) (CurrentRun, error) {
 	var probe struct {

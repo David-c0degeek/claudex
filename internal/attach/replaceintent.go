@@ -229,6 +229,7 @@ func replacePlanFor(registry *state.RegistryStore, runState *state.Store, runGua
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return registry.ConfirmDurable(runGuard) },
 	}
 	if !in.activated() {
 		return txn.Plan{Intent: in.txnIntent(), Steps: []txn.Step{regStep}}, nil
@@ -243,6 +244,7 @@ func replacePlanFor(registry *state.RegistryStore, runState *state.Store, runGua
 			})
 			return err
 		},
+		ConfirmDurable: func() error { return runState.ConfirmDurable(runGuard) },
 	}
 	return txn.Plan{Intent: in.txnIntent(), Steps: []txn.Step{regStep, actStep}}, nil
 }

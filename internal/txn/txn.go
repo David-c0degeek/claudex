@@ -45,6 +45,11 @@ var (
 	ErrCannotAbort      = errors.New("txn: cannot abort; a step effect is present or applied")
 	ErrRecoveryRequired = errors.New("txn: transaction is in an indeterminate state; recovery required")
 	ErrPlanMismatch     = errors.New("txn: recovery plan does not match the journalled transaction")
+	// ErrDurabilityUnconfirmed means a journal or step effect is VISIBLE but its
+	// durability could not be confirmed (a directory sync failed and did not recover).
+	// The transaction halts without recording dependent progress; a later Recover
+	// re-confirms under the guard and, on success, resumes without reapplying the effect.
+	ErrDurabilityUnconfirmed = errors.New("txn: an effect is visible but its durability could not be confirmed")
 )
 
 // StepStatus reports whether a step's durable effect is already present.
@@ -61,6 +66,15 @@ type Step struct {
 	Name   string
 	Status func() (StepStatus, error)
 	Apply  func() error
+	// ConfirmDurable re-confirms that this step's participant store directory is
+	// power-safe, re-runnably under the held guard. The transaction confirms it before
+	// recording the step's progress edge, and recovery re-confirms it before trusting a
+	// visible effect — a committed-but-unsynced append leaves an effect visible but
+	// durability unconfirmed, and that provenance does not survive a crash. REQUIRED:
+	// validatePlan rejects a nil confirmer. A documented no-op is acceptable only where
+	// Status/Apply already denote a durable external primitive (e.g. an external
+	// participant whose Status is itself the durability proof).
+	ConfirmDurable func() error
 }
 
 // Intent is the typed, versioned transaction envelope. The payload is a bounded,
@@ -167,7 +181,22 @@ func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	// The prepare record must be durable BEFORE any step effect: a power loss that
+	// keeps an effect but loses this record would orphan the effect.
+	if err := j.confirmJournal(g); err != nil {
+		return Record{}, err
+	}
 	return j.drive(g, rec, plan.Steps)
+}
+
+// confirmJournal re-confirms the journal store's directory is durable under the held
+// guard, mapping a durability failure to the typed sentinel. Called after every
+// journal append (prepare, progress, terminal) and before trusting a recovered head.
+func (j *Journal) confirmJournal(g *genstore.Guard) error {
+	if err := j.gs.ConfirmDurable(g); err != nil {
+		return fmt.Errorf("%w: journal: %v", ErrDurabilityUnconfirmed, err)
+	}
+	return nil
 }
 
 // Recover resumes a pending transaction under a held guard. It reconstructs the
@@ -185,7 +214,16 @@ func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error))
 	if err != nil {
 		return Record{}, false, err
 	}
-	if !ok || cur.Terminal() {
+	if !ok {
+		return cur, false, nil
+	}
+	if cur.Terminal() {
+		// A visible terminal record may itself be unconfirmed after a crash: confirm the
+		// journal durable before declaring the transaction complete, so a lost terminal
+		// entry is not mistaken for clean success.
+		if cerr := j.confirmJournal(g); cerr != nil {
+			return Record{}, false, cerr
+		}
 		return cur, false, nil
 	}
 	plan, err := planFor(cur.Intent)
@@ -199,7 +237,14 @@ func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error))
 	if !reflect.DeepEqual(plan.Intent, cur.Intent) || !slicesEqual(names, cur.StepIDs) {
 		return Record{}, false, ErrPlanMismatch
 	}
-	// The durable prefix must still be observably applied.
+	// The visible journal head may itself be unconfirmed after a crash (in-memory
+	// provenance is lost): re-confirm the journal durable before trusting the recorded
+	// prefix, unconditionally.
+	if err := j.confirmJournal(g); err != nil {
+		return Record{}, false, err
+	}
+	// The durable prefix must still be observably applied AND re-confirmed durable — a
+	// prior halt may have left an effect visible but unconfirmed.
 	for i := 0; i < cur.StepsDone; i++ {
 		st, serr := plan.Steps[i].Status()
 		if serr != nil {
@@ -207,6 +252,9 @@ func (j *Journal) Recover(g *genstore.Guard, planFor func(Intent) (Plan, error))
 		}
 		if st != StatusApplied {
 			return Record{}, false, fmt.Errorf("%w: prefix step %d (%s) is %q", ErrRecoveryRequired, i, plan.Steps[i].Name, st)
+		}
+		if cerr := plan.Steps[i].ConfirmDurable(); cerr != nil {
+			return Record{}, false, fmt.Errorf("%w: prefix step %d (%s): %v", ErrDurabilityUnconfirmed, i, plan.Steps[i].Name, cerr)
 		}
 	}
 	out, err := j.drive(g, cur, plan.Steps)
@@ -251,7 +299,14 @@ func (j *Journal) Abort(g *genstore.Guard, plan Plan) (Record, error) {
 	default:
 		return Record{}, fmt.Errorf("%w: step 0 is indeterminate", ErrRecoveryRequired)
 	}
-	return j.append(g, gsRec.Head(), Record{Intent: cur.Intent, StepIDs: cur.StepIDs, Aborted: true})
+	aborted, err := j.append(g, gsRec.Head(), Record{Intent: cur.Intent, StepIDs: cur.StepIDs, Aborted: true})
+	if err != nil {
+		return Record{}, err
+	}
+	if err := j.confirmJournal(g); err != nil {
+		return Record{}, err
+	}
+	return aborted, nil
 }
 
 // drive applies steps from rec.StepsDone onward, re-observing each applied step
@@ -280,8 +335,17 @@ func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, er
 		default:
 			return Record{}, fmt.Errorf("%w: step %d (%s) is %q", ErrRecoveryRequired, i, steps[i].Name, st)
 		}
+		// Confirm the participant effect is durable BEFORE recording its progress edge,
+		// so a recorded StepsDone always denotes a durable effect.
+		if cerr := steps[i].ConfirmDurable(); cerr != nil {
+			return Record{}, fmt.Errorf("%w: step %d (%s): %v", ErrDurabilityUnconfirmed, i, steps[i].Name, cerr)
+		}
 		rec, err = j.advance(g, i+1, i+1 == len(steps))
 		if err != nil {
+			return Record{}, err
+		}
+		// Confirm the progress record itself is durable before it counts as progress.
+		if err := j.confirmJournal(g); err != nil {
 			return Record{}, err
 		}
 	}
@@ -406,8 +470,8 @@ func validatePlan(plan Plan) ([]string, error) {
 	}
 	names := make([]string, len(plan.Steps))
 	for i, s := range plan.Steps {
-		if s.Status == nil || s.Apply == nil {
-			return nil, fmt.Errorf("txn: step %d (%q) has a nil Status or Apply", i, s.Name)
+		if s.Status == nil || s.Apply == nil || s.ConfirmDurable == nil {
+			return nil, fmt.Errorf("txn: step %d (%q) has a nil Status, Apply, or ConfirmDurable", i, s.Name)
 		}
 		names[i] = s.Name
 	}

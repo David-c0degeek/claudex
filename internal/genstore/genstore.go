@@ -78,6 +78,38 @@ func (e *PostCommitError) Error() string {
 func (e *PostCommitError) Unwrap() error   { return e.Err }
 func (e *PostCommitError) Committed() bool { return true }
 
+// PostCommitSyncError reports that a generation was written and is VISIBLE as the
+// head, but its durability is UNCONFIRMED: the directory sync that makes the entry
+// power-safe failed. It is DISTINCT from PostCommitError (which reports an
+// already-durable record whose only failure was releasing the lock). A caller must
+// NOT rewrite the visible record and must NOT treat it as durable success: it must
+// re-confirm durability (ConfirmDurable, re-runnable across a restart) before
+// depending on the record or advancing a transaction past it. Only the
+// proven-candidate reconcile branch produces this; an ambiguous outcome stays
+// ErrAmbiguous.
+type PostCommitSyncError struct {
+	Generation uint64
+	Err        error
+}
+
+func (e *PostCommitSyncError) Error() string {
+	return fmt.Sprintf("genstore: generation %d committed but durability is unconfirmed: %v", e.Generation, e.Err)
+}
+func (e *PostCommitSyncError) Unwrap() error { return e.Err }
+
+// IsDurabilityUnconfirmed reports whether err is the genstore visible-but-unconfirmed
+// durability condition. It matches ONLY *genstore.PostCommitSyncError — never an
+// ErrAmbiguous outcome that merely wraps a lower-level *atomicfile.PostCommitSyncError,
+// since an ambiguous write is not a proven-visible record. Direct atomicfile callers
+// classify the atomicfile type themselves.
+func IsDurabilityUnconfirmed(err error) bool {
+	if errors.Is(err, ErrAmbiguous) {
+		return false
+	}
+	var pce *PostCommitSyncError
+	return errors.As(err, &pce)
+}
+
 // Guard is a held per-run mutation lock. One guard can serialize appends across
 // several stores that share the same lock path (the run's transaction).
 type Guard struct {
@@ -136,6 +168,7 @@ type Store struct {
 	dir      string
 	lockPath string
 	write    func(path string, data []byte, perm os.FileMode) error
+	syncDir  func(dir string) error
 	release  func(*Guard) error
 }
 
@@ -147,13 +180,17 @@ func Open(dir, lockPath string) *Store {
 		dir:      dir,
 		lockPath: lockPath,
 		write:    atomicfile.Write,
+		syncDir:  atomicfile.SyncDir,
 		release:  func(g *Guard) error { return g.Release() },
 	}
 }
 
-// ensureDir creates the store directory private and tightens an existing one.
+// ensureDir creates the store directory private and durable, and tightens an
+// existing one. The store directory's own entry is made durable in its parent
+// (atomicfile.MkdirAllDurable fsyncs each created level's parent), so a power loss
+// after the first append cannot remove the whole store while leaving its parent.
 func (s *Store) ensureDir() error {
-	if err := os.MkdirAll(s.dir, dirPerm); err != nil {
+	if err := atomicfile.MkdirAllDurable(s.dir, dirPerm); err != nil {
 		return err
 	}
 	fi, err := os.Lstat(s.dir)
@@ -172,8 +209,48 @@ func (s *Store) ensureDir() error {
 	return nil
 }
 
+// confirmAttempts bounds ConfirmDurable's retry of a transient directory-sync
+// failure under the held guard.
+const confirmAttempts = 3
+
+// ConfirmDurable re-confirms that this store's visible records are power-safe: it
+// fsyncs the store directory (its generation entries) AND the store directory's own
+// entry in its parent, retrying a transient failure a bounded number of times. It is
+// idempotent and re-runnable — recovery calls it before trusting a visible record,
+// since a PostCommitSyncError leaves the entry visible but unconfirmed and that
+// provenance does not survive a crash. It MUST NOT create a missing store: a missing
+// directory while confirming an applied effect is a durability failure, never a
+// silent create.
+func (s *Store) ConfirmDurable(g *Guard) error {
+	if err := s.checkGuard(g); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(s.dir)
+	if err != nil {
+		return fmt.Errorf("genstore: confirm durable %q: %w", s.dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("genstore: store path %q is not a directory", s.dir)
+	}
+	parent := filepath.Dir(s.dir)
+	var last error
+	for i := 0; i < confirmAttempts; i++ {
+		if last = s.syncDir(s.dir); last == nil {
+			if last = s.syncDir(parent); last == nil {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("genstore: confirm durable %q: %w", s.dir, last)
+}
+
 // LockPath is the mutation lock this store's guard must hold.
 func (s *Store) LockPath() string { return s.lockPath }
+
+// WithSyncDir overrides the directory-sync seam and returns the store, so a test can
+// drive ConfirmDurable / durability failures deterministically. Production wires
+// atomicfile.SyncDir in Open; this exists only to inject failures.
+func (s *Store) WithSyncDir(fn func(dir string) error) *Store { s.syncDir = fn; return s }
 
 func (s *Store) genPath(gen uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%0*d%s", genFileDigits, gen, genFileExt))
@@ -294,7 +371,15 @@ func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, e
 			}
 			switch {
 			case hasHead && head.Digest == candidate.Digest:
-				return candidate, nil // committed: candidate is the validated head
+				// Committed: the candidate is the validated head. If the write's failure
+				// was a committed-but-unsynced directory sync (visible, durability
+				// unconfirmed), surface it as a durability error the caller must confirm
+				// before depending on the record — never as clean success.
+				var pse *atomicfile.PostCommitSyncError
+				if errors.As(werr, &pse) {
+					return candidate, &PostCommitSyncError{Generation: candidate.Generation, Err: werr}
+				}
+				return candidate, nil
 			case head == oldHead:
 				// Old head intact (including an empty store, where both are the
 				// zero Head): the write did not commit — return the original error.
