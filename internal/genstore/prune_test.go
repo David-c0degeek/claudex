@@ -40,25 +40,52 @@ func TestRetentionHysteresisBoundsChain(t *testing.T) {
 	}
 }
 
-// A pre-append prune failure is genuinely pre-commit: the append returns an error, the head is
-// unchanged, and generation head+1 is not written.
+// A pre-append prune failure is genuinely pre-commit (append errors, head unchanged, no new
+// generation), AND the retry FINISHES the prior prune's straggler cleanup before the semantic
+// append — even though the failed prune had already published the floor certificate (which
+// bounds the certified chain to keep, so a naive trigger check would skip cleanup).
 func TestRetentionPreAppendFailureLeavesHead(t *testing.T) {
 	s := newStore(t).WithRetention(2, 4)
 	var head Head
 	for i := 1; i <= 4; i++ { // reach the trigger
 		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
 	}
-	s.WithSyncDir(func(string) error { return errors.New("prune barrier fail") })
+	// Fail the failed prune's ConfirmDurable (which retries the directory sync confirmAttempts
+	// times) AFTER the floor certificate is published, BEFORE deletion; later syncs succeed so
+	// the retry converges.
+	calls := 0
+	s.WithSyncDir(func(string) error {
+		calls++
+		if calls <= confirmAttempts {
+			return errors.New("prune barrier fail")
+		}
+		return nil
+	})
 	if _, err := s.Append(head, func(uint64, string) ([]byte, error) { return []byte("g5"), nil }); err == nil {
 		t.Fatal("append with a failing pre-append prune should error")
 	}
-	// Latest is read-only (no sync), so it works despite the injected sync failure.
-	got, ok, err := s.Latest()
-	if err != nil || !ok || got.Generation != head.Generation {
-		t.Fatalf("Latest = %+v ok=%v err=%v, want unchanged head generation %d", got, ok, err, head.Generation)
+	// The head is unchanged and generation head+1 was not written (Latest is read-only).
+	if got, ok, err := s.Latest(); err != nil || !ok || got.Generation != head.Generation {
+		t.Fatalf("after failure Latest = %+v ok=%v err=%v, want unchanged head generation %d", got, ok, err, head.Generation)
 	}
 	if _, serr := os.Stat(genFile(s, head.Generation+1)); !os.IsNotExist(serr) {
 		t.Fatalf("generation %d was written despite the pre-append prune failure", head.Generation+1)
+	}
+
+	// Retry: the pre-append reconcile finishes the prior prune's deletion of the below-root
+	// stragglers BEFORE the (single) semantic append, so the physical generation count stays
+	// bounded and only one new generation is written.
+	head = appendConst(t, s, head, "g5").Head()
+	if n := countGenFiles(t, s); n > 4 {
+		t.Fatalf("after retry: %d generation files, want <= trigger 4 (stragglers not reconciled)", n)
+	}
+	for _, straggler := range []uint64{1, 2} {
+		if _, serr := os.Stat(genFile(s, straggler)); !os.IsNotExist(serr) {
+			t.Fatalf("below-root straggler generation %d was not removed on retry", straggler)
+		}
+	}
+	if got, ok, err := s.Latest(); err != nil || !ok || got.Generation != head.Generation {
+		t.Fatalf("after retry Latest = %+v ok=%v err=%v, want head generation %d", got, ok, err, head.Generation)
 	}
 }
 

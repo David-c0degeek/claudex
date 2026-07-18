@@ -363,19 +363,16 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 			ErrConflict, expected.Generation, shortDigest(expected.Digest), head.Generation, shortDigest(head.Digest))
 	}
 
-	// Pre-append hysteresis compaction: when the retained chain has reached the trigger,
-	// prune to keep FIRST. A prune failure here is genuinely PRE-COMMIT — the head is
-	// unchanged and no new generation is written, so the append error contract is preserved.
-	// PruneKeep only certifies a floor and deletes generations strictly below it, never the
-	// head, so the CAS just validated stays valid and next = head.Generation+1 still holds
-	// (the pre-prune occupied set is unaffected above the head).
+	// Pre-append hysteresis compaction: reconcile any prior prune's stragglers and, at the
+	// trigger, advance a new floor BEFORE writing the new generation. A failure here is
+	// genuinely PRE-COMMIT — the head is unchanged and no generation is written, so the append
+	// error contract is preserved. Compaction never moves the head or touches slots above it
+	// (it only certifies a floor and deletes generations strictly below the root), so the CAS
+	// just validated stays valid and next = head.Generation+1 still holds against the pre-prune
+	// occupied set.
 	if s.retentionTrigger > 0 {
-		if chain, cerr := certifiedChainSlice(valid, present, hasCert, cert); cerr != nil {
-			return Record{}, cerr
-		} else if len(chain) >= s.retentionTrigger {
-			if perr := s.PruneKeep(g, s.retentionKeep); perr != nil {
-				return Record{}, perr
-			}
+		if perr := s.PruneKeepIf(g, s.retentionKeep, s.retentionTrigger); perr != nil {
+			return Record{}, perr
 		}
 	}
 

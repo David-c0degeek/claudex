@@ -608,10 +608,32 @@ func TestDurabilityParticipantApplyRawAtomicfileErrorWraps(t *testing.T) {
 	}
 }
 
-// The next-transaction preflight prune keeps the journal bounded across many transactions
-// without breaking recovery: every transaction completes and the last terminal recovers.
-func TestJournalPreflightPruneManyTransactions(t *testing.T) {
-	j, lock := newJournal(t)
+func countJournalFiles(t *testing.T, jdir string) (gens, anchors int) {
+	t.Helper()
+	entries, err := os.ReadDir(jdir)
+	if err != nil {
+		t.Fatalf("readdir %s: %v", jdir, err)
+	}
+	for _, e := range entries {
+		switch filepath.Ext(e.Name()) {
+		case ".gen":
+			gens++
+		case ".anchor":
+			anchors++
+		}
+	}
+	return
+}
+
+// The next-transaction preflight prune BOUNDS the journal across many transactions: the
+// physical .gen count never exceeds the trigger, obsolete .anchor certificates never
+// accumulate, and every transaction completes and the last terminal recovers. (This fails if
+// the PruneKeepIf call is removed.)
+func TestJournalPreflightPruneBoundsAndRecovers(t *testing.T) {
+	dir := t.TempDir()
+	jdir := filepath.Join(dir, "txn")
+	lock := filepath.Join(dir, "run.lock")
+	j := Open(jdir, lock)
 	for i := 0; i < 20; i++ {
 		id := fmt.Sprintf("t%02d", i)
 		withGuard(t, lock, func(g *genstore.Guard) {
@@ -620,10 +642,62 @@ func TestJournalPreflightPruneManyTransactions(t *testing.T) {
 				t.Fatalf("run %s: out=%+v err=%v", id, out, err)
 			}
 		})
+		if gens, anchors := countJournalFiles(t, jdir); gens > journalRetentionTrigger {
+			t.Fatalf("after %s: %d journal generations, want <= trigger %d", id, gens, journalRetentionTrigger)
+		} else if anchors > 1 {
+			t.Fatalf("after %s: %d anchor certificates, want <= 1 (obsolete not accumulating)", id, anchors)
+		}
 	}
 	rec, ok, err := j.Latest()
 	if err != nil || !ok || !rec.Complete || rec.TxnID() != "t19" {
 		t.Fatalf("Latest = %+v ok=%v err=%v, want terminal of t19", rec, ok, err)
+	}
+}
+
+// A preflight-prune failure aborts before the new transaction's step is applied; the retry
+// finishes the cleanup and then applies the step exactly once.
+func TestJournalPreflightPruneFailureThenRetry(t *testing.T) {
+	dir := t.TempDir()
+	jdir := filepath.Join(dir, "txn")
+	lock := filepath.Join(dir, "run.lock")
+	j := Open(jdir, lock)
+	for i := 0; i < 4; i++ { // fill the journal past the trigger so the next Run's preflight prunes
+		id := fmt.Sprintf("f%02d", i)
+		withGuard(t, lock, func(g *genstore.Guard) {
+			if _, err := j.Run(g, planFrom(id, []*fakeStep{{name: "a"}})); err != nil {
+				t.Fatalf("fill %s: %v", id, err)
+			}
+		})
+	}
+	// Installed AFTER the fill (whose confirmJournal syncs used the real seam): fail the next
+	// Run's preflight-prune ConfirmDurable (it retries the sync a bounded number of times), then
+	// succeed so the retry converges. The preflight runs before the prepare append, so Run
+	// returns before confirmJournal — the seam only fails the prune.
+	calls := 0
+	j.gs.WithSyncDir(func(string) error {
+		calls++
+		if calls <= 3 {
+			return errors.New("preflight prune sync fail")
+		}
+		return nil
+	})
+	step := &fakeStep{name: "a"}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		if _, err := j.Run(g, planFrom("x", []*fakeStep{step})); err == nil {
+			t.Fatal("Run with a failing preflight prune should error")
+		}
+	})
+	if step.applyCalls != 0 {
+		t.Fatalf("step applied %d times on the failing preflight call, want 0 (no new-transaction effect)", step.applyCalls)
+	}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		out, err := j.Run(g, planFrom("x", []*fakeStep{step}))
+		if err != nil || !out.Complete {
+			t.Fatalf("retry Run: out=%+v err=%v", out, err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("step applied %d times after retry, want 1 (cleanup finished, then applied once)", step.applyCalls)
 	}
 }
 

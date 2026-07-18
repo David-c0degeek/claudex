@@ -515,6 +515,14 @@ func (s *Store) PruneKeepIf(g *Guard, keep, trigger int) error {
 	if err := s.ensureDir(); err != nil {
 		return err
 	}
+	// ALWAYS finish any prior prune's partial cleanup FIRST (idempotent; cheap when already
+	// reconciled). A prior prune can publish a floor certificate then fail before/during
+	// deletion, which bounds the CERTIFIED chain to keep — so without this the hysteresis gate
+	// below would skip and leave the below-root stragglers forever. Reconciling first restores
+	// the pinned "retry finishes maintenance before any semantic write" property.
+	if err := s.pruneReconcile(g); err != nil {
+		return err
+	}
 	valid, _, present, cert, hasCert, err := s.loadGuarded()
 	if err != nil {
 		return err
@@ -524,7 +532,7 @@ func (s *Store) PruneKeepIf(g *Guard, keep, trigger int) error {
 		return cerr
 	}
 	if len(chain) < trigger {
-		return nil // below the trigger: nothing to compact yet
+		return nil // below the trigger: no new floor needed (any stragglers already reconciled)
 	}
 	return s.PruneKeep(g, keep)
 }
@@ -601,9 +609,27 @@ func (s *Store) pruneReconcile(g *Guard) error {
 	if !hasCert {
 		return nil // never pruned: nothing to reconcile
 	}
-	// Pin 4: confirm the selected certificate is DURABLE before deleting anything, and that
-	// its EXACT identity is the one being reconciled (never delete against a visible-but-
-	// durability-unconfirmed certificate).
+	entries, e := os.ReadDir(s.dir)
+	if e != nil {
+		return e
+	}
+	// Collect the stragglers a prior prune may have left below the durable certificate:
+	// generations strictly below the root, and obsolete (lower-sequence) certificates.
+	var belowRoot, obsoleteCerts []uint64
+	for _, ent := range entries {
+		if gen, ok := parseCanonicalGen(ent.Name()); ok && gen < cert.Root {
+			belowRoot = append(belowRoot, gen)
+		}
+		if seq, ok := parseCanonicalCert(ent.Name()); ok && seq < cert.Seq {
+			obsoleteCerts = append(obsoleteCerts, seq)
+		}
+	}
+	if len(belowRoot) == 0 && len(obsoleteCerts) == 0 {
+		return nil // already reconciled — no confirm/sync needed, so compaction stays amortized
+	}
+	// Pin 4: confirm the selected certificate is DURABLE and its EXACT identity is the one being
+	// reconciled BEFORE deleting anything (never delete against a visible-but-durability-
+	// unconfirmed certificate).
 	if err := s.ConfirmDurable(g); err != nil {
 		return err
 	}
@@ -615,25 +641,16 @@ func (s *Store) pruneReconcile(g *Guard) error {
 	if class != certSupportedValid || rec != cert {
 		return fmt.Errorf("genstore: certificate %d changed during reconcile: %w", cert.Seq, ErrCorrupt)
 	}
-
-	entries, e := os.ReadDir(s.dir)
-	if e != nil {
-		return e
-	}
-	// Delete every generation strictly below the certified root.
-	for _, ent := range entries {
-		if gen, ok := parseCanonicalGen(ent.Name()); ok && gen < cert.Root {
-			if derr := os.Remove(s.genPath(gen)); derr != nil && !os.IsNotExist(derr) {
-				return derr
-			}
+	// Delete every generation strictly below the certified root, then every obsolete
+	// (lower-sequence) certificate; the selected certificate is retained.
+	for _, gen := range belowRoot {
+		if derr := os.Remove(s.genPath(gen)); derr != nil && !os.IsNotExist(derr) {
+			return derr
 		}
 	}
-	// Then delete every obsolete (lower) certificate; the selected one is retained.
-	for _, ent := range entries {
-		if seq, ok := parseCanonicalCert(ent.Name()); ok && seq < cert.Seq {
-			if derr := os.Remove(s.certPath(seq)); derr != nil && !os.IsNotExist(derr) {
-				return derr
-			}
+	for _, seq := range obsoleteCerts {
+		if derr := os.Remove(s.certPath(seq)); derr != nil && !os.IsNotExist(derr) {
+			return derr
 		}
 	}
 	// Finally sync the store directory so the deletions are durable (retryable, converges).
