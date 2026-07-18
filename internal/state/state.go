@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/genstore"
@@ -403,6 +404,19 @@ func (s *Store) MutateLocked(g *genstore.Guard, expectedRevision uint64, fn func
 // guard (see genstore.Store.ConfirmDurable). A step whose effect is a run-state
 // append confirms durability here before its transaction records progress.
 func (s *Store) ConfirmDurable(g *genstore.Guard) error { return s.gs.ConfirmDurable(g) }
+
+// WithSyncDir overrides the underlying store's directory-sync barrier. It is a test seam
+// for injecting a durability-confirmation failure (a visible-but-unconfirmed append); it
+// passes through to genstore.Store.WithSyncDir and returns the receiver for chaining.
+func (s *Store) WithSyncDir(fn func(dir string) error) *Store { s.gs.WithSyncDir(fn); return s }
+
+// WithWrite overrides the underlying store's record writer. It is a test seam for
+// injecting a visible-but-durability-unconfirmed append (a write that publishes the record
+// then reports a post-commit sync failure); it passes through to genstore.Store.WithWrite.
+func (s *Store) WithWrite(fn func(path string, data []byte, perm os.FileMode) error) *Store {
+	s.gs.WithWrite(fn)
+	return s
+}
 
 // cloneForNext deep-copies prev (or returns a normalized fresh state) so the
 // mutator always sees usable collections and transition validation can compare

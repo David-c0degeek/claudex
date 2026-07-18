@@ -363,6 +363,13 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
 			return reject(perr)
 		}
+		// Re-confirm the STATE store durable too, not only the sink: the original accepting
+		// append may have been visible-but-durability-unconfirmed, so an idempotent replay
+		// must not report a durable receipt whose run-state entry was never confirmed
+		// power-safe. A persistent failure preserves the receipt + the durability error.
+		if cerr := deps.Store.ConfirmDurable(g); cerr != nil {
+			return SubmitResult{Receipt: acc.Receipt, Idempotent: true}, errors.Join(cerr, release())
+		}
 		return SubmitResult{Receipt: acc.Receipt, Idempotent: true, ReleaseWarning: releaseOutcome(true, acc.Receipt.Revision, release())}, nil
 	}
 
@@ -498,7 +505,21 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		if errors.Is(merr, state.ErrRevisionConflict) || errors.Is(merr, genstore.ErrBusy) {
 			return reject(fmt.Errorf("transport: unexpected lock/revision state under the run guard: %w", merr))
 		}
-		return reject(merr)
+		if !genstore.IsDurabilityUnconfirmed(merr) {
+			return reject(merr)
+		}
+		// Visible-but-durability-unconfirmed: the acceptance IS committed (committed.Revision
+		// is authoritative) but its directory entry is not power-safe. Re-confirm inline
+		// before treating it as accepted. A persistent failure preserves the committed
+		// acceptance + the durability error, never a proven-uncommitted reject (which would
+		// orphan the artifact and let an identical retry double-apply).
+		if cerr := deps.Store.ConfirmDurable(g); cerr != nil {
+			if acc, ok := committed.AcceptedTurns[env.TurnID]; ok && acc.ArtifactDigest == digest {
+				return SubmitResult{Receipt: acc.Receipt}, errors.Join(merr, cerr, release())
+			}
+			return SubmitResult{}, errors.Join(fmt.Errorf("transport: committed submit could not be reconciled"), merr, cerr, release())
+		}
+		// Re-confirmed durable: fall through to the normal success reconcile.
 	}
 	acc, ok := committed.AcceptedTurns[env.TurnID]
 	if !ok || acc.ArtifactDigest != digest {
