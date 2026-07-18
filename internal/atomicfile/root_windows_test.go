@@ -50,7 +50,7 @@ func TestSyncInRootRecoversAndExhaustsTransientOpen(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	calls := 0
-	recover := rootOps{syncDir: syncRootDir, openRW: func(root *os.Root, name string) (*os.File, error) {
+	recover := rootOps{syncDir: syncRootDir, confirmParent: confirmParentInRoot, openRW: func(root *os.Root, name string) (*os.File, error) {
 		calls++
 		if calls < 3 {
 			return nil, windows.ERROR_SHARING_VIOLATION
@@ -64,7 +64,7 @@ func TestSyncInRootRecoversAndExhaustsTransientOpen(t *testing.T) {
 		t.Fatalf("open calls = %d, want 3", calls)
 	}
 
-	exhaust := rootOps{syncDir: syncRootDir, openRW: func(*os.Root, string) (*os.File, error) {
+	exhaust := rootOps{syncDir: syncRootDir, confirmParent: confirmParentInRoot, openRW: func(*os.Root, string) (*os.File, error) {
 		return nil, windows.ERROR_SHARING_VIOLATION
 	}}
 	var pce *PostCommitSyncError

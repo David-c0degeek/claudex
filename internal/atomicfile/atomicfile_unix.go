@@ -113,7 +113,7 @@ func ensureDirDurableImpl(dir string, perm os.FileMode) error {
 
 // parentBarrier forces the immediate parent of dir (and thus dir's entry) durable by
 // fsyncing the parent. Re-runnable and idempotent; the path-based analogue of
-// parentBarrierInRoot.
+// confirmParentInRoot.
 func parentBarrier(dir string) error {
 	return syncDir(filepath.Dir(dir))
 }

@@ -45,16 +45,19 @@ func TestInstallInRootPublishesViaWriteThroughNoClobber(t *testing.T) {
 	}
 }
 
-// The own-move-visible cut: a moveFileEx that renames the directory into place THEN returns
-// a (non-already-exists) error is our own visible-but-unconfirmed move — MkdirInRoot must
-// return *PostCommitSyncError (durability unconfirmed), NEVER clean success.
+// The own-move-visible cut: a moveFileEx that renames the directory into place THEN errors
+// (non-already-exists) is our own visible move; if the REAL parent flush then also fails,
+// MkdirInRoot must return *PostCommitSyncError (durability unconfirmed), NEVER clean success.
 func TestMkdirInRootOwnMoveVisibleFlushErrorIsUnconfirmed(t *testing.T) {
-	orig := moveFileEx
+	origMove := moveFileEx
 	moveFileEx = func(from, to *uint16, flags uint32) error {
-		_ = orig(from, to, flags) // perform the real rename (target becomes visible)...
-		return errors.New("simulated write-through flush failure")
+		_ = origMove(from, to, flags) // perform the real rename (target becomes visible)...
+		return errors.New("simulated move error")
 	}
-	defer func() { moveFileEx = orig }()
+	defer func() { moveFileEx = origMove }()
+	origFlush := flushDirMetadata
+	flushDirMetadata = func(string) error { return errors.New("parent flush failed") }
+	defer func() { flushDirMetadata = origFlush }()
 
 	base := t.TempDir()
 	root, err := os.OpenRoot(base)
@@ -65,7 +68,7 @@ func TestMkdirInRootOwnMoveVisibleFlushErrorIsUnconfirmed(t *testing.T) {
 	err = MkdirInRoot(root, "d", 0o700)
 	var pce *PostCommitSyncError
 	if !errors.As(err, &pce) {
-		t.Fatalf("own-move-visible flush error = %v, want *PostCommitSyncError (not clean success)", err)
+		t.Fatalf("own-move-visible + flush-failed = %v, want *PostCommitSyncError (not clean success)", err)
 	}
 	if fi, serr := os.Stat(filepath.Join(base, "d")); serr != nil || !fi.IsDir() {
 		t.Fatalf("directory should be visible after the own move: %v", serr)
@@ -307,43 +310,46 @@ func TestMkdirInRootPublishesViaWriteThrough(t *testing.T) {
 }
 
 // Site 1: the PATH-based directory publish own-move-visible cut — a moveFileEx that renames
-// the dir into place THEN errors is our visible-but-unconfirmed move: *PostCommitSyncError,
-// never clean success.
+// the dir into place THEN errors is our visible move; if the REAL parent flush also fails it
+// is *PostCommitSyncError, never clean success.
 func TestPublishDirWriteThroughOwnMoveVisibleIsUnconfirmed(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
-	orig := moveFileEx
+	origMove := moveFileEx
 	moveFileEx = func(from, to *uint16, flags uint32) error {
-		_ = orig(from, to, flags) // rename into place (visible)...
-		return errors.New("simulated write-through flush failure")
+		_ = origMove(from, to, flags) // rename into place (visible)...
+		return errors.New("simulated move error")
 	}
-	defer func() { moveFileEx = orig }()
+	defer func() { moveFileEx = origMove }()
+	origFlush := flushDirMetadata
+	flushDirMetadata = func(string) error { return errors.New("parent flush failed") }
+	defer func() { flushDirMetadata = origFlush }()
 	err := publishDirWriteThrough(dir, 0o700)
 	var pce *PostCommitSyncError
 	if !errors.As(err, &pce) {
-		t.Fatalf("own-move-visible flush error = %v, want *PostCommitSyncError (not clean success)", err)
+		t.Fatalf("own-move-visible + flush-failed = %v, want *PostCommitSyncError (not clean success)", err)
 	}
 	if fi, serr := os.Stat(dir); serr != nil || !fi.IsDir() {
 		t.Fatalf("directory should be visible after the own move: %v", serr)
 	}
 }
 
-// Site 2: the PATH-based exists/recovery re-confirm uses the REAL barrier (moveFileEx),
-// never a swallowed no-op, and is re-runnable after a barrier failure.
+// Site 2: the PATH-based exists/recovery re-confirm uses the REAL directory flush barrier,
+// never a swallowed no-op, and is re-runnable after a transient barrier failure.
 func TestEnsureDirDurableExistsUsesRealBarrier(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	calls := 0
-	orig := moveFileEx
-	moveFileEx = func(from, to *uint16, flags uint32) error {
+	orig := flushDirMetadata
+	flushDirMetadata = func(p string) error {
 		calls++
 		if calls == 1 {
 			return errors.New("barrier failed once")
 		}
-		return orig(from, to, flags)
+		return orig(p)
 	}
-	defer func() { moveFileEx = orig }()
+	defer func() { flushDirMetadata = orig }()
 	if err := ensureDirDurableImpl(dir, 0o700); err == nil {
 		t.Fatal("exists-branch re-confirm must surface the barrier failure, not swallow it")
 	}
@@ -351,7 +357,125 @@ func TestEnsureDirDurableExistsUsesRealBarrier(t *testing.T) {
 		t.Fatalf("retry must re-confirm via the real barrier: %v", err)
 	}
 	if calls < 2 {
-		t.Fatalf("moveFileEx invoked %d times, want >= 2 (exists-branch used the real barrier)", calls)
+		t.Fatalf("flushDirMetadata invoked %d times, want >= 2 (exists-branch used the real barrier)", calls)
+	}
+}
+
+// The rooted re-confirm retries after a transient barrier failure (fail-once-then-succeed).
+func TestConfirmParentInRootRetriesAfterTransientBarrierFailure(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	if err := MkdirInRoot(root, "d", 0o700); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	calls := 0
+	orig := flushDirMetadata
+	flushDirMetadata = func(p string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("barrier failed once")
+		}
+		return orig(p)
+	}
+	defer func() { flushDirMetadata = orig }()
+	if err := MkdirInRoot(root, "d", 0o700); err == nil {
+		t.Fatal("first re-confirm must surface the transient barrier failure")
+	}
+	if err := MkdirInRoot(root, "d", 0o700); err != nil {
+		t.Fatalf("retry re-confirm via the real barrier: %v", err)
+	}
+}
+
+// Task 2 (Blocking 1): SyncInRoot re-confirms the file ENTRY via the REAL barrier, so the
+// artifact store's idempotent ErrExist path never blesses an unconfirmed entry.
+func TestSyncInRootReconfirmUsesRealBarrier(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	if err := InstallInRoot(root, "f.txt", []byte("x"), 0o600); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	orig := flushDirMetadata
+	flushDirMetadata = func(string) error { return errors.New("barrier failed") }
+	defer func() { flushDirMetadata = orig }()
+	var pce *PostCommitSyncError
+	if err := SyncInRoot(root, "f.txt"); !errors.As(err, &pce) {
+		t.Fatalf("SyncInRoot must re-confirm the entry via the real barrier, got %v", err)
+	}
+}
+
+// The full artifact idempotent retry cut: a first InstallInRoot whose own-move parent flush
+// fails is *PostCommitSyncError with the file visible (no acceptance); the retry sees the
+// no-clobber ErrExist and the exact bytes, and SyncInRoot then runs the REAL barrier durably.
+func TestArtifactInstallThenIdempotentReconfirm(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+
+	origMove := moveFileEx
+	origFlush := flushDirMetadata
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		_ = origMove(from, to, flags) // publish the file (visible), consuming our temp...
+		return errors.New("simulated flush-boundary error")
+	}
+	flushDirMetadata = func(string) error { return errors.New("barrier failed on the first publish") }
+	var pce *PostCommitSyncError
+	if err := InstallInRoot(root, "f.txt", []byte("data"), 0o600); !errors.As(err, &pce) {
+		t.Fatalf("first install = %v, want *PostCommitSyncError (visible, unconfirmed)", err)
+	}
+	moveFileEx = origMove
+	flushDirMetadata = origFlush
+	defer func() { moveFileEx = origMove; flushDirMetadata = origFlush }()
+
+	if err := InstallInRoot(root, "f.txt", []byte("data"), 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("retry install = %v, want fs.ErrExist (no-clobber)", err)
+	}
+	got, rerr := ReadInRoot(root, "f.txt", 1<<20)
+	if rerr != nil || string(got) != "data" {
+		t.Fatalf("bytes = %q err = %v, want \"data\"", got, rerr)
+	}
+	if err := SyncInRoot(root, "f.txt"); err != nil {
+		t.Fatalf("idempotent re-confirm via the real barrier: %v", err)
+	}
+}
+
+// Task 3: a foreign winner that creates the target while OUR unique source temp remains is a
+// no-clobber conflict, and our temp is not leaked (consumption is decided by the source, not
+// target visibility).
+func TestPublishFileForeignWinnerNoTempLeak(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		_ = os.WriteFile(filepath.Join(base, "f.txt"), []byte("foreign"), 0o600) // a foreign winner...
+		return errors.New("our move failed while the target raced in")           // ...and OUR move fails (non-EEXIST)
+	}
+	defer func() { moveFileEx = orig }()
+	if err := InstallInRoot(root, "f.txt", []byte("ours"), 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("foreign-winner install = %v, want fs.ErrExist", err)
+	}
+	entries, _ := os.ReadDir(base)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".claudex-tmp-") {
+			t.Fatalf("leaked temp after a foreign-winner conflict: %s", e.Name())
+		}
+	}
+	if got, _ := os.ReadFile(filepath.Join(base, "f.txt")); string(got) != "foreign" {
+		t.Fatalf("target = %q, want \"foreign\" (ours must not overwrite)", got)
 	}
 }
 

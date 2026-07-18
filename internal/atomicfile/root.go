@@ -226,13 +226,12 @@ func syncInRoot(root *os.Root, name string, o rootOps) error {
 	serr := f.Sync()
 	_ = f.Close()
 	if serr != nil {
-		return &PostCommitSyncError{Path: name, Err: serr} // file already visible
+		return &PostCommitSyncError{Path: name, Err: serr} // file already visible (content re-synced)
 	}
-	dir := path.Dir(name)
-	if dir == "." {
-		dir = ""
-	}
-	if derr := syncRootAndDir(root, dir, o); derr != nil {
+	// Re-confirm the file's ENTRY durable via the REAL parent barrier (not the swallowed
+	// directory-handle flush), so the artifact store's idempotent ErrExist path never
+	// blesses an unconfirmed entry.
+	if derr := o.confirmParent(root, name); derr != nil {
 		return &PostCommitSyncError{Path: name, Err: derr}
 	}
 	return nil
