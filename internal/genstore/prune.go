@@ -614,22 +614,31 @@ func (s *Store) pruneReconcile(g *Guard) error {
 		return e
 	}
 	// Scan for the stragglers a prior prune may have left below the durable certificate,
-	// VALIDATING the generation/certificate namespace BEFORE any removal: a canonical-named but
-	// irregular (symlink/non-regular) entry is fail-closed corruption (ErrCorrupt), never a
-	// straggler to delete — reconcile runs before loadGuarded, so this must catch it here.
+	// validating the COMPLETE generation/certificate namespace BEFORE any removal. Reconcile
+	// runs before loadGuarded, so it must itself fail closed here — mirroring loadChain's
+	// ordering: a name in a namespace (by suffix) must be canonical, then regular, or it is
+	// ErrCorrupt. A non-canonical `bad.gen` must abort the scan before any deletion, not slip
+	// through to a later validation after the store has been mutated.
 	var belowRoot, obsoleteCerts []uint64
 	for _, ent := range entries {
 		name := ent.Name()
-		if gen, ok := parseCanonicalGen(name); ok {
+		switch {
+		case strings.HasSuffix(name, genFileExt):
+			gen, ok := parseCanonicalGen(name)
+			if !ok {
+				return fmt.Errorf("non-canonical generation file %q: %w", name, ErrCorrupt)
+			}
 			if verr := requireRegular(ent, name, "generation"); verr != nil {
 				return verr
 			}
 			if gen < cert.Root {
 				belowRoot = append(belowRoot, gen)
 			}
-			continue
-		}
-		if seq, ok := parseCanonicalCert(name); ok {
+		case strings.HasSuffix(name, certFileExt):
+			seq, ok := parseCanonicalCert(name)
+			if !ok {
+				return fmt.Errorf("non-canonical certificate file %q: %w", name, ErrCorrupt)
+			}
 			if verr := requireRegular(ent, name, "certificate"); verr != nil {
 				return verr
 			}

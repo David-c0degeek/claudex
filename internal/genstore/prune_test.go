@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -147,6 +148,39 @@ func TestReconcileIrregularBelowRootFailsClosedNotDeleted(t *testing.T) {
 	}
 	if _, serr := os.Stat(irregular); serr != nil {
 		t.Fatalf("the irregular below-root entry was deleted (want fail-closed, not deleted): %v", serr)
+	}
+}
+
+// A non-canonical name in the generation namespace (a `.gen` suffix that parseCanonicalGen
+// rejects) must abort reconcile BEFORE any deletion — validating the complete namespace up
+// front, not leaving it for a post-mutation loadGuarded. A canonical below-root straggler
+// present alongside it must survive.
+func TestReconcileNonCanonicalGenerationFailsClosedBeforeMutation(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 5; i++ { // append 5 prunes, rooting a certificate above generation 1
+		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
+	}
+	_ = head
+	// A canonical below-root straggler that reconcile would otherwise delete...
+	straggler := genFile(s, 2)
+	if err := os.WriteFile(straggler, []byte("straggler"), 0o600); err != nil {
+		t.Fatalf("plant canonical straggler: %v", err)
+	}
+	// ...alongside a non-canonical name in the generation namespace.
+	bad := filepath.Join(s.dir, "bad"+genFileExt)
+	if err := os.WriteFile(bad, []byte("x"), 0o600); err != nil {
+		t.Fatalf("plant non-canonical generation: %v", err)
+	}
+	var perr error
+	withGuard(t, s, func(g *Guard) {
+		perr = s.PruneKeepIf(g, 2, 4) // reconcile-first path
+	})
+	if !errors.Is(perr, ErrCorrupt) {
+		t.Fatalf("PruneKeepIf with a non-canonical generation = %v, want ErrCorrupt", perr)
+	}
+	if _, serr := os.Stat(straggler); serr != nil {
+		t.Fatalf("canonical below-root straggler was deleted before the fail-closed error: %v", serr)
 	}
 }
 
