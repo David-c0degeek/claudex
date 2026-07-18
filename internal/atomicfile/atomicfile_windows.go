@@ -5,6 +5,7 @@ package atomicfile
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,57 +14,157 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// publishDirInRoot durably creates a fresh directory within the confined root on Windows,
-// where a directory handle cannot be flushed. It opens the immediate rooted parent (os.Root
-// refuses symlink traversal) and keeps that handle OPEN to pin the resolved directory, reads
-// its validated real DOS path, then creates a temp sibling and renames it to the target with
-// MOVEFILE_WRITE_THROUGH — operating on LEAF names under the validated real parent (no path
-// traversal, so no symlink escape), which forces the parent's metadata to disk.
-func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
+// openRealParent opens the immediate rooted parent of `name` (os.Root refuses symlink
+// traversal) and returns its validated real DOS path plus a close func that KEEPS the
+// handle pinned until called — so the resolved directory cannot be swapped between
+// resolution and the leaf-name operations performed under it.
+func openRealParent(root *os.Root, name string) (realParent string, closeFn func() error, err error) {
 	openName := rootParent(name)
 	if openName == "" {
 		openName = "."
 	}
 	pf, err := root.Open(openName)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	defer pf.Close()
-	realParent, err := finalPathByHandle(windows.Handle(pf.Fd()))
+	realParent, err = finalPathByHandle(windows.Handle(pf.Fd()))
+	if err != nil {
+		_ = pf.Close()
+		return "", nil, err
+	}
+	return realParent, pf.Close, nil
+}
+
+// moveFileExPath is moveFileEx over string paths.
+func moveFileExPath(from, to string, flags uint32) error {
+	f, err := windows.UTF16PtrFromString(from)
 	if err != nil {
 		return err
 	}
+	t, err := windows.UTF16PtrFromString(to)
+	if err != nil {
+		return err
+	}
+	return moveFileEx(f, t, flags)
+}
+
+// isAlreadyExists reports a no-replace move that failed because the destination ALREADY
+// EXISTED before the move — a genuine concurrent/no-clobber conflict, distinct from our own
+// move becoming visible before a later flush error.
+func isAlreadyExists(err error) bool {
+	return errors.Is(err, windows.ERROR_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_FILE_EXISTS)
+}
+
+// parentBarrierInRoot forces the immediate rooted parent of `name` (and thus `name`'s
+// already-present entry) durable to disk by performing a real MOVEFILE_WRITE_THROUGH rename
+// of a throwaway temp directory WITHIN the validated real parent — a directory-handle flush
+// is refused by Windows, so the write-through rename is the metadata barrier. Re-runnable
+// and idempotent.
+func parentBarrierInRoot(root *os.Root, name string) error {
+	realParent, closeParent, err := openRealParent(root, name)
+	if err != nil {
+		return err
+	}
+	defer closeParent()
+	a, err := os.MkdirTemp(realParent, tmpPrefix)
+	if err != nil {
+		return err
+	}
+	b := a + "b" // a is unique, so a+"b" does not exist
+	defer func() {
+		_ = os.RemoveAll(a)
+		_ = os.RemoveAll(b)
+	}()
+	return moveFileExPath(a, b, dirPublishFlags)
+}
+
+// confirmParentInRoot re-confirms an existing directory's entry durable via the real parent
+// barrier (used by mkdirInRoot's exists/recovery branch).
+func confirmParentInRoot(root *os.Root, name string) error {
+	return parentBarrierInRoot(root, name)
+}
+
+// resolveWriteThroughFailure classifies a failed no-clobber write-through publish of `name`.
+// isFile selects the conflict semantics: a directory publish is idempotent (a pre-existing
+// directory is a durable concurrent winner), a file publish is strict no-clobber (a
+// pre-existing target is an fs.ErrExist conflict). Only a GENUINE already-exists error is a
+// concurrent winner; any other failure with the target nonetheless visible is OUR own move
+// whose durability is unconfirmed, forced durable by the parent barrier (else committed
+// *PostCommitSyncError); a target not visible is uncommitted (raw error).
+func resolveWriteThroughFailure(root *os.Root, name string, merr error, isFile bool) error {
+	if isAlreadyExists(merr) {
+		if isFile {
+			return fs.ErrExist // no-clobber conflict
+		}
+		if info, serr := root.Lstat(name); serr == nil && info.IsDir() {
+			return nil // a concurrent winner via this same write-through path is durable
+		}
+		return &PostCommitSyncError{Path: name, Err: merr}
+	}
+	if _, serr := root.Lstat(name); serr != nil {
+		return merr // not visible → the move did not commit (uncommitted, raw error)
+	}
+	if berr := parentBarrierInRoot(root, name); berr != nil {
+		return &PostCommitSyncError{Path: name, Err: berr}
+	}
+	return nil
+}
+
+// publishDirInRoot durably creates a fresh directory within the confined root. It creates a
+// temp sibling under the validated real parent and renames it to the target leaf with
+// MOVEFILE_WRITE_THROUGH (no REPLACE_EXISTING → no-clobber), which forces the parent's
+// metadata to disk. A failed move is classified by resolveWriteThroughFailure.
+func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
+	realParent, closeParent, err := openRealParent(root, name)
+	if err != nil {
+		return err
+	}
+	defer closeParent()
 	tmp, err := os.MkdirTemp(realParent, tmpPrefix)
 	if err != nil {
 		return err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(tmp)
-		}
-	}()
+	defer os.RemoveAll(tmp) // a no-op once tmp is renamed to the target
 	_ = os.Chmod(tmp, perm)
-	from, err := windows.UTF16PtrFromString(tmp)
-	if err != nil {
-		return err
+	if merr := moveFileExPath(tmp, realParent+`\`+path.Base(name), dirPublishFlags); merr != nil {
+		return resolveWriteThroughFailure(root, name, merr, false)
 	}
-	to, err := windows.UTF16PtrFromString(realParent + `\` + path.Base(name))
-	if err != nil {
-		return err
-	}
-	if err := moveFileEx(from, to, dirPublishFlags); err != nil {
-		// A concurrent publisher may have created the target first (the write-through rename
-		// fails when the destination already exists). If it now exists as a directory it was
-		// durably published by that writer — all creates use this same write-through path —
-		// so treat it as done (our temp is cleaned up by the defer).
-		if info, serr := root.Lstat(name); serr == nil && info.IsDir() {
-			return nil
-		}
-		return &PostCommitSyncError{Path: name, Err: err}
-	}
-	cleanup = false // the temp directory was renamed to its final name
 	return nil
+}
+
+// publishFileInRoot durably publishes an already-written temp file to `name` within the
+// confined root via a MOVEFILE_WRITE_THROUGH no-clobber rename (no REPLACE_EXISTING), so the
+// file's directory ENTRY is power-safe. Returns whether the temp was consumed (renamed into
+// place). A pre-existing target is an fs.ErrExist no-clobber conflict; transient
+// sharing/access errors are retried.
+func publishFileInRoot(root *os.Root, tmp, name, dir string) (bool, error) {
+	realParent, closeParent, err := openRealParent(root, name)
+	if err != nil {
+		return false, err
+	}
+	defer closeParent()
+	tmpAbs := realParent + `\` + path.Base(tmp)
+	target := realParent + `\` + path.Base(name)
+	merr := replaceWith(
+		func() error { return moveFileExPath(tmpAbs, target, dirPublishFlags) },
+		func() { time.Sleep(renameBackoff) },
+		isTransientRename,
+	)
+	if merr == nil {
+		return true, nil // renamed durably (temp consumed)
+	}
+	if isAlreadyExists(merr) {
+		return false, fs.ErrExist // no-clobber conflict; temp not consumed
+	}
+	if _, serr := root.Lstat(name); serr != nil {
+		return false, merr // not visible → uncommitted; temp not consumed
+	}
+	// Own move visible but flush unconfirmed: the temp is now the target (consumed). Force
+	// durability via the barrier.
+	if berr := parentBarrierInRoot(root, name); berr != nil {
+		return true, &PostCommitSyncError{Path: name, Err: berr}
+	}
+	return true, nil
 }
 
 // finalPathFlags is VOLUME_NAME_DOS (0x0) | FILE_NAME_NORMALIZED (0x0): a normalized DOS
@@ -73,13 +174,21 @@ const finalPathFlags = 0
 // finalPathByHandle returns the validated real DOS path of an open handle, keeping the
 // caller's handle open so the resolution cannot be swapped out from under it.
 func finalPathByHandle(h windows.Handle) (string, error) {
-	buf := make([]uint16, 260)
+	return finalPathByHandleBuf(h, make([]uint16, 260))
+}
+
+// finalPathByHandleBuf is the growable core (buf injectable so a test can force the grow
+// path with a tiny initial buffer).
+func finalPathByHandleBuf(h windows.Handle, buf []uint16) (string, error) {
 	for {
 		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), finalPathFlags)
 		if err != nil {
 			return "", err
 		}
-		if n > uint32(len(buf)) {
+		// The insufficient-buffer return INCLUDES the terminating NUL; the success return
+		// EXCLUDES it. So n >= len(buf) is the insufficient case (grow to n and retry);
+		// success is n < len(buf).
+		if n >= uint32(len(buf)) {
 			buf = make([]uint16, n)
 			continue
 		}
@@ -133,20 +242,37 @@ func moveFileWriteThrough(oldpath, newpath string) error {
 }
 
 // ensureDirDurableImpl durably publishes a fresh directory on Windows, where a directory
-// handle cannot be flushed. A missing dir is created as a temporary sibling in its parent
-// and then renamed to its final name with MOVEFILE_WRITE_THROUGH, so the rename forces the
-// parent's metadata (the new entry) to disk. An existing directory was already published
-// durably by this same path, so re-confirmation is a verified no-op.
+// handle cannot be flushed. A missing dir is published via a write-through rename; an
+// EXISTING dir is RE-confirmed durable via the real parent barrier (never a swallowed
+// no-op), so a retry after a prior partial failure re-forces the entry.
 func ensureDirDurableImpl(dir string, perm os.FileMode) error {
 	if fi, err := os.Lstat(dir); err == nil {
 		if !fi.IsDir() {
 			return fmt.Errorf("%w: %s", ErrNotDirectory, dir)
 		}
-		return nil // durably published at creation via the write-through rename
+		return parentBarrier(dir)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 	return publishDirWriteThrough(dir, perm)
+}
+
+// parentBarrier forces the immediate parent of dir (and thus dir's already-present entry)
+// durable: a real MOVEFILE_WRITE_THROUGH rename of a throwaway temp directory WITHIN the
+// parent flushes the parent's directory metadata. The path-based analogue of
+// parentBarrierInRoot. Re-runnable and idempotent.
+func parentBarrier(dir string) error {
+	parent := filepath.Dir(dir)
+	a, err := os.MkdirTemp(parent, tmpPrefix)
+	if err != nil {
+		return err
+	}
+	b := a + "b" // a is unique, so a+"b" does not exist
+	defer func() {
+		_ = os.RemoveAll(a)
+		_ = os.RemoveAll(b)
+	}()
+	return moveFileExPath(a, b, dirPublishFlags)
 }
 
 func publishDirWriteThrough(dir string, perm os.FileMode) error {
@@ -155,25 +281,27 @@ func publishDirWriteThrough(dir string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(tmp)
-		}
-	}()
+	defer os.RemoveAll(tmp) // a no-op once tmp is renamed to the target
 	_ = os.Chmod(tmp, perm)
-	from, err := windows.UTF16PtrFromString(tmp)
-	if err != nil {
-		return err
+	if merr := moveFileExPath(tmp, dir, dirPublishFlags); merr != nil {
+		// Genuine already-exists → concurrent winner (durable if a directory). Any other
+		// error with the target visible → our own visible-but-unconfirmed move: force
+		// durability via the real parent barrier, *PostCommitSyncError if it fails. Target
+		// not visible → uncommitted (raw error). Never bless a visible-but-unconfirmed dir.
+		if isAlreadyExists(merr) {
+			if fi, serr := os.Lstat(dir); serr == nil && fi.IsDir() {
+				return nil
+			}
+			return &PostCommitSyncError{Path: dir, Err: merr}
+		}
+		if _, serr := os.Lstat(dir); serr != nil {
+			return merr
+		}
+		if berr := parentBarrier(dir); berr != nil {
+			return &PostCommitSyncError{Path: dir, Err: berr}
+		}
+		return nil
 	}
-	to, err := windows.UTF16PtrFromString(dir)
-	if err != nil {
-		return err
-	}
-	if err := moveFileEx(from, to, dirPublishFlags); err != nil {
-		return err
-	}
-	cleanup = false // the temp directory was renamed to its final name
 	return nil
 }
 

@@ -464,7 +464,7 @@ func TestDurabilityRetrySucceedsOnRecoverWithoutReapply(t *testing.T) {
 func TestDurabilityTerminalJournalConfirmNoCleanSuccess(t *testing.T) {
 	j, lock := newJournal(t)
 	// The prepare confirm (calls 1-2) succeeds; the terminal progress confirm (calls 3+) fails.
-	j.gs.WithSyncDir(failCountingSyncDir(3))
+	j.gs.WithSyncDir(failCountingSyncDir(2)) // ConfirmDurable now syncs s.dir once per confirm: prepare = call 1, terminal = call 2+
 	step := &fakeStep{name: "a"}
 	withGuard(t, lock, func(g *genstore.Guard) {
 		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {
@@ -536,7 +536,7 @@ func TestDurabilityRealProgressPostCommitSyncErrorHalts(t *testing.T) {
 			return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync")}
 		}
 		return nil
-	}).WithSyncDir(failCountingSyncDir(3)) // prepare confirm (calls 1-2) ok; terminal confirm (3+) fails
+	}).WithSyncDir(failCountingSyncDir(2)) // prepare confirm = syncDir call 1 (ok); terminal confirm = call 2+ (fails)
 	step := &fakeStep{name: "a"}
 	withGuard(t, lock, func(g *genstore.Guard) {
 		if _, err := j.Run(g, planFrom("t1", []*fakeStep{step})); !errors.Is(err, ErrDurabilityUnconfirmed) {

@@ -117,12 +117,18 @@ func TestSyncInRootReconfirms(t *testing.T) {
 func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 	errInject := errors.New("injected dir sync failure")
 	bad := rootOps{
-		syncDir: func(*os.Root, string) error { return errInject },
-		openRW:  defaultRootOps.openRW,
+		syncDir:       func(*os.Root, string) error { return errInject },
+		openRW:        defaultRootOps.openRW,
+		confirmParent: func(*os.Root, string) error { return errInject },
 		// A fresh directory is created (visible) but its durability publish fails.
 		publishDir: func(root *os.Root, name string, perm os.FileMode) error {
 			_ = root.Mkdir(name, perm)
 			return &PostCommitSyncError{Path: name, Err: errInject}
+		},
+		// A file is linked into place (visible) but its durability publish fails.
+		publishFile: func(root *os.Root, tmp, name, dir string) (bool, error) {
+			_ = root.Link(tmp, name)
+			return false, &PostCommitSyncError{Path: name, Err: errInject}
 		},
 	}
 	asCommitted := func(t *testing.T, err error) {
@@ -138,7 +144,7 @@ func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 
 	t.Run("install", func(t *testing.T) {
 		r, dir := openRoot(t)
-		err := publishInRoot(r, "a.json", []byte("x"), 0o600, r.Link, false, bad)
+		err := installInRoot(r, "a.json", []byte("x"), 0o600, bad)
 		asCommitted(t, err)
 		if got, _ := os.ReadFile(filepath.Join(dir, "a.json")); string(got) != "x" {
 			t.Fatalf("install bytes not visible after committed sync failure: %q", got)
@@ -195,8 +201,9 @@ func TestMkdirInRootPublishesAndReconfirms(t *testing.T) {
 			published = append(published, name)
 			return root.Mkdir(name, perm)
 		},
-		syncDir: func(root *os.Root, name string) error {
-			confirmed = append(confirmed, name)
+		// The exists/recovery branch re-confirms via the REAL parent-metadata barrier.
+		confirmParent: func(root *os.Root, name string) error {
+			confirmed = append(confirmed, rootParent(name))
 			if failConfirmOnce {
 				failConfirmOnce = false
 				return errors.New("parent confirm failed once")

@@ -12,15 +12,51 @@ import (
 
 // publishDirInRoot creates a fresh directory within the confined root and forces its entry
 // durable by fsyncing the immediate rooted parent. Re-runnable: os.Root.Mkdir's EEXIST is
-// ignored and the parent fsync re-confirms on a retry.
+// tolerated (and the parent fsync re-confirms on a retry), but a name occupied by a
+// non-directory (a file/symlink that raced in) is refused as ErrNotDirectory.
 func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
-	if err := root.Mkdir(name, perm); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
+	if err := root.Mkdir(name, perm); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		// Lstat (not Stat): an in-root symlink to a directory must not be accepted, and a
+		// file/symlink that occupied the name between the missing-check and here is refused.
+		info, serr := root.Lstat(name)
+		if serr != nil {
+			return serr
+		}
+		if !info.IsDir() {
+			return ErrNotDirectory
+		}
 	}
 	if serr := syncRootDir(root, rootParent(name)); serr != nil {
 		return &PostCommitSyncError{Path: name, Err: serr}
 	}
 	return nil
+}
+
+// confirmParentInRoot forces the immediate rooted parent of `name` durable by fsyncing it,
+// so an already-present entry becomes power-safe. Re-runnable and idempotent.
+func confirmParentInRoot(root *os.Root, name string) error {
+	return syncRootDir(root, rootParent(name))
+}
+
+// publishFileInRoot hard-links the already-written temp into place (no-clobber) and forces
+// the file's directory and the root durable. The link leaves the temp behind (not
+// consumed), so the caller removes it.
+func publishFileInRoot(root *os.Root, tmp, name, dir string) (bool, error) {
+	if err := moveWithRetry(root.Link, tmp, name); err != nil {
+		return false, err // fs.ErrExist for a no-clobber conflict, else a real error
+	}
+	if dir != "" {
+		if serr := syncRootDir(root, dir); serr != nil {
+			return false, &PostCommitSyncError{Path: name, Err: serr}
+		}
+	}
+	if serr := syncRootDir(root, ""); serr != nil {
+		return false, &PostCommitSyncError{Path: name, Err: serr}
+	}
+	return false, nil
 }
 
 // replace renames oldpath onto newpath. POSIX rename(2) is an atomic replace.
@@ -57,13 +93,28 @@ func syncRootDir(root *os.Root, name string) error {
 }
 
 // ensureDirDurableImpl creates dir if missing and forces its entry durable in its parent
-// by fsyncing the parent. It is idempotent and re-runnable: a create-then-fsync where the
-// fsync failed is repaired on a retry (os.Mkdir returns EEXIST, ignored, and the parent
-// fsync runs again).
+// (parentBarrier = fsync the parent on POSIX). Idempotent and re-runnable: a create-then-
+// barrier where the barrier failed is repaired on a retry (Mkdir's EEXIST is tolerated for
+// a real directory, and the parent barrier re-runs); a name occupied by a non-directory is
+// refused.
 func ensureDirDurableImpl(dir string, perm os.FileMode) error {
-	if err := os.Mkdir(dir, perm); err != nil && !os.IsExist(err) {
-		return err
+	if err := os.Mkdir(dir, perm); err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+		if fi, serr := os.Lstat(dir); serr != nil {
+			return serr
+		} else if !fi.IsDir() {
+			return ErrNotDirectory
+		}
 	}
+	return parentBarrier(dir)
+}
+
+// parentBarrier forces the immediate parent of dir (and thus dir's entry) durable by
+// fsyncing the parent. Re-runnable and idempotent; the path-based analogue of
+// parentBarrierInRoot.
+func parentBarrier(dir string) error {
 	return syncDir(filepath.Dir(dir))
 }
 

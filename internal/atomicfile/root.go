@@ -30,15 +30,26 @@ var (
 // publication, so tests can force a post-visibility sync/open failure and prove
 // the committed-error and re-confirm semantics.
 type rootOps struct {
-	syncDir    func(root *os.Root, name string) error
-	openRW     func(root *os.Root, name string) (*os.File, error)
+	syncDir func(root *os.Root, name string) error
+	openRW  func(root *os.Root, name string) (*os.File, error)
+	// publishDir durably creates a fresh directory `name` within the confined root.
 	publishDir func(root *os.Root, name string, perm os.FileMode) error
+	// confirmParent is a REAL, re-runnable barrier that forces the immediate rooted parent
+	// of `name` (and thus `name`'s already-present entry) durable to disk. POSIX fsyncs the
+	// parent; Windows performs a write-through rename within the parent.
+	confirmParent func(root *os.Root, name string) error
+	// publishFile durably publishes an already-written temp `tmp` to `name` (in `dir`) with
+	// NO-CLOBBER semantics, returning whether tmp was consumed by the publish. A no-clobber
+	// conflict is an error satisfying errors.Is(err, fs.ErrExist).
+	publishFile func(root *os.Root, tmp, name, dir string) (consumed bool, err error)
 }
 
 var defaultRootOps = rootOps{
-	syncDir:    syncRootDir,
-	openRW:     func(root *os.Root, name string) (*os.File, error) { return root.OpenFile(name, os.O_RDWR, 0) },
-	publishDir: publishDirInRoot,
+	syncDir:       syncRootDir,
+	openRW:        func(root *os.Root, name string) (*os.File, error) { return root.OpenFile(name, os.O_RDWR, 0) },
+	publishDir:    publishDirInRoot,
+	confirmParent: confirmParentInRoot,
+	publishFile:   publishFileInRoot,
 }
 
 // rootParent is the rooted parent of a rooted-relative name; "" denotes the root itself.
@@ -64,14 +75,55 @@ func randName(dir string) (string, error) {
 	return dir + "/" + n, nil
 }
 
-// InstallInRoot publishes name (a root-relative slash path) as a NEW immutable
-// file: it writes a temp, fsyncs it, hard-links it into place (no-clobber), then
-// fsyncs the file's directory and the root. If name already exists it returns an
-// error satisfying errors.Is(err, fs.ErrExist); a concurrent reader sees the
-// complete file or nothing. A committed-but-unsynced result is a
+// InstallInRoot publishes name (a root-relative slash path) as a NEW immutable file: it
+// writes a temp, fsyncs it, then DURABLY publishes it into place with no-clobber semantics
+// so the file's directory ENTRY is power-safe (POSIX: hard-link + fsync the parent and
+// root; Windows: a confined MOVEFILE_WRITE_THROUGH no-clobber rename). If name already
+// exists it returns an error satisfying errors.Is(err, fs.ErrExist); a concurrent reader
+// sees the complete file or nothing. A committed-but-unsynced result is a
 // *PostCommitSyncError.
 func InstallInRoot(root *os.Root, name string, data []byte, perm os.FileMode) error {
-	return publishInRoot(root, name, data, perm, root.Link, false, defaultRootOps)
+	return installInRoot(root, name, data, perm, defaultRootOps)
+}
+
+func installInRoot(root *os.Root, name string, data []byte, perm os.FileMode, o rootOps) (err error) {
+	dir := path.Dir(name)
+	if dir == "." {
+		dir = ""
+	}
+	tmp, err := randName(dir)
+	if err != nil {
+		return err
+	}
+	if werr := writeTempInRoot(root, tmp, data, perm); werr != nil {
+		return werr
+	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			_ = root.Remove(tmp)
+		}
+	}()
+	consumed, err = o.publishFile(root, tmp, name, dir)
+	return err
+}
+
+// writeTempInRoot writes data to a fresh temp within the confined root and fsyncs its
+// contents (O_EXCL, so it never clobbers an existing temp).
+func writeTempInRoot(root *os.Root, tmp string, data []byte, perm os.FileMode) error {
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // ReplaceInRoot atomically replaces name with data (a mutable, rebuildable
@@ -204,8 +256,9 @@ func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error 
 		if !info.IsDir() {
 			return ErrNotDirectory
 		}
-		// Exists: re-confirm the entry durable in its immediate parent, without recreating.
-		if serr := o.syncDir(root, rootParent(name)); serr != nil {
+		// Exists: re-confirm the entry durable via the REAL parent-metadata barrier
+		// (re-runnable), without recreating — never a swallowed no-op.
+		if serr := o.confirmParent(root, name); serr != nil {
 			return &PostCommitSyncError{Path: name, Err: serr}
 		}
 		return nil
@@ -216,16 +269,12 @@ func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error 
 	return o.publishDir(root, name, perm)
 }
 
-// SyncDirInRoot fsyncs the directory name within the confined root (name "" is the
-// root itself), so a directory entry created inside `name` is durable. It is used to
-// re-confirm the durability of every ancestor directory a rooted publish may have
-// created, not just the published file's immediate parent. Idempotent and
-// re-runnable under a caller-held lock.
-func SyncDirInRoot(root *os.Root, name string) error {
-	if name == "." {
-		name = ""
-	}
-	return syncRootDir(root, name)
+// ConfirmParentInRoot forces the immediate rooted parent of `name` (and thus `name`'s own
+// entry) durable to disk with the REAL re-runnable barrier (POSIX: fsync the parent;
+// Windows: a MOVEFILE_WRITE_THROUGH rename within the parent). Use it to re-confirm each
+// created directory entry (and a published file's entry) durable — never a swallowed no-op.
+func ConfirmParentInRoot(root *os.Root, name string) error {
+	return confirmParentInRoot(root, name)
 }
 
 // ReadInRoot reads name after confirming it is a regular file and bounding its

@@ -160,22 +160,24 @@ func snapshotStep(name, repoDir, repoRel string, canonical []byte, digest string
 			}
 			return atomicfile.InstallInRoot(root, repoRel, canonical, snapshotPerm)
 		},
-		// Re-confirm durability of EVERY directory entry the Apply may have created (the
-		// root for the outermost ancestor, each created ancestor dir for the next-deeper
-		// entry) plus the published file — not just the file's immediate parent.
+		// Re-confirm durability of EVERY directory entry the Apply may have created — each
+		// created ancestor dir AND the published file — by forcing each entry's parent
+		// metadata through the REAL barrier (never a swallowed no-op); then re-confirm the
+		// file CONTENT. ConfirmParentInRoot(root, x) forces x's entry in ITS parent, so the
+		// outermost ancestor's call covers the root.
 		ConfirmDurable: func() error {
 			root, err := os.OpenRoot(repoDir)
 			if err != nil {
 				return err
 			}
 			defer root.Close()
-			if err := atomicfile.SyncDirInRoot(root, ""); err != nil {
-				return err
-			}
 			for _, dir := range ancestorDirs(repoRel) {
-				if err := atomicfile.SyncDirInRoot(root, dir); err != nil {
+				if err := atomicfile.ConfirmParentInRoot(root, dir); err != nil {
 					return err
 				}
+			}
+			if err := atomicfile.ConfirmParentInRoot(root, repoRel); err != nil {
+				return err
 			}
 			return atomicfile.SyncInRoot(root, repoRel)
 		},

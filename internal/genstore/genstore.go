@@ -165,11 +165,12 @@ type header struct {
 
 // Store persists generations under dir, guarded by the lock at lockPath.
 type Store struct {
-	dir      string
-	lockPath string
-	write    func(path string, data []byte, perm os.FileMode) error
-	syncDir  func(dir string) error
-	release  func(*Guard) error
+	dir           string
+	lockPath      string
+	write         func(path string, data []byte, perm os.FileMode) error
+	syncDir       func(dir string) error
+	parentBarrier func(dir string) error
+	release       func(*Guard) error
 }
 
 // Open returns a store handle. It performs no I/O: the directory is created
@@ -177,11 +178,12 @@ type Store struct {
 // mutates disk.
 func Open(dir, lockPath string) *Store {
 	return &Store{
-		dir:      dir,
-		lockPath: lockPath,
-		write:    atomicfile.Write,
-		syncDir:  atomicfile.SyncDir,
-		release:  func(g *Guard) error { return g.Release() },
+		dir:           dir,
+		lockPath:      lockPath,
+		write:         atomicfile.Write,
+		syncDir:       atomicfile.SyncDir,
+		parentBarrier: atomicfile.ParentBarrier,
+		release:       func(g *Guard) error { return g.Release() },
 	}
 }
 
@@ -232,11 +234,13 @@ func (s *Store) ConfirmDurable(g *Guard) error {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("genstore: store path %q is not a directory", s.dir)
 	}
-	parent := filepath.Dir(s.dir)
+	// Force durability of the generation entries INSIDE s.dir (POSIX fsync; on Windows the
+	// files are already write-through-durable, so this is a safe no-op) AND of s.dir's OWN
+	// entry in its parent via the REAL barrier (never the swallowed Windows handle-flush).
 	var last error
 	for i := 0; i < confirmAttempts; i++ {
 		if last = s.syncDir(s.dir); last == nil {
-			if last = s.syncDir(parent); last == nil {
+			if last = s.parentBarrier(s.dir); last == nil {
 				return nil
 			}
 		}
@@ -251,6 +255,11 @@ func (s *Store) LockPath() string { return s.lockPath }
 // drive ConfirmDurable / durability failures deterministically. Production wires
 // atomicfile.SyncDir in Open; this exists only to inject failures.
 func (s *Store) WithSyncDir(fn func(dir string) error) *Store { s.syncDir = fn; return s }
+
+// WithParentBarrier overrides the parent-metadata barrier seam and returns the store, so a
+// test can prove ConfirmDurable relies on a REAL barrier (not a swallowed no-op) and drive
+// its failure. Production wires atomicfile.ParentBarrier in Open.
+func (s *Store) WithParentBarrier(fn func(dir string) error) *Store { s.parentBarrier = fn; return s }
 
 // WithWrite overrides the file-write seam and returns the store, so a test can inject a
 // real post-rename *atomicfile.PostCommitSyncError (visible record, unconfirmed

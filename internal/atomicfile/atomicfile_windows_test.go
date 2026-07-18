@@ -4,12 +4,92 @@ package atomicfile
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
 )
+
+// The rooted immutable FILE publish (InstallInRoot) goes through the confined write-through
+// no-clobber rename with EXACTLY MOVEFILE_WRITE_THROUGH (no REPLACE_EXISTING) — pinned via
+// the seam — and a second install of the same name is a no-clobber fs.ErrExist conflict.
+func TestInstallInRootPublishesViaWriteThroughNoClobber(t *testing.T) {
+	var gotFlags []uint32
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		gotFlags = append(gotFlags, flags)
+		return orig(from, to, flags)
+	}
+	defer func() { moveFileEx = orig }()
+
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	if err := InstallInRoot(root, "f.txt", []byte("data"), 0o600); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if len(gotFlags) != 1 || gotFlags[0] != uint32(windows.MOVEFILE_WRITE_THROUGH) {
+		t.Fatalf("install flags = %v, want [%#x] (write-through, no REPLACE_EXISTING)", gotFlags, uint32(windows.MOVEFILE_WRITE_THROUGH))
+	}
+	if got, _ := os.ReadFile(filepath.Join(base, "f.txt")); string(got) != "data" {
+		t.Fatalf("installed content = %q", got)
+	}
+	if err := InstallInRoot(root, "f.txt", []byte("other"), 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("second install err = %v, want fs.ErrExist (no-clobber)", err)
+	}
+}
+
+// The own-move-visible cut: a moveFileEx that renames the directory into place THEN returns
+// a (non-already-exists) error is our own visible-but-unconfirmed move — MkdirInRoot must
+// return *PostCommitSyncError (durability unconfirmed), NEVER clean success.
+func TestMkdirInRootOwnMoveVisibleFlushErrorIsUnconfirmed(t *testing.T) {
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		_ = orig(from, to, flags) // perform the real rename (target becomes visible)...
+		return errors.New("simulated write-through flush failure")
+	}
+	defer func() { moveFileEx = orig }()
+
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	err = MkdirInRoot(root, "d", 0o700)
+	var pce *PostCommitSyncError
+	if !errors.As(err, &pce) {
+		t.Fatalf("own-move-visible flush error = %v, want *PostCommitSyncError (not clean success)", err)
+	}
+	if fi, serr := os.Stat(filepath.Join(base, "d")); serr != nil || !fi.IsDir() {
+		t.Fatalf("directory should be visible after the own move: %v", serr)
+	}
+}
+
+// finalPathByHandle grows its buffer when GetFinalPathNameByHandle reports insufficient
+// space (n >= len(buf), which INCLUDES the NUL) rather than blessing the boundary as
+// success. A one-element initial buffer forces the grow path.
+func TestFinalPathByHandleGrowsBuffer(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	defer f.Close()
+	got, err := finalPathByHandleBuf(windows.Handle(f.Fd()), make([]uint16, 1))
+	if err != nil {
+		t.Fatalf("finalPathByHandleBuf (grow path): %v", err)
+	}
+	if !strings.HasSuffix(strings.ToLower(got), strings.ToLower(filepath.Base(dir))) {
+		t.Fatalf("resolved path %q does not end with %q", got, filepath.Base(dir))
+	}
+}
 
 func TestReplaceWithPermanentErrorDoesNotRetry(t *testing.T) {
 	permanent := errors.New("permanent: invalid path")
@@ -223,6 +303,55 @@ func TestMkdirInRootPublishesViaWriteThrough(t *testing.T) {
 	}
 	if fi, err := os.Stat(filepath.Join(base, "a", "b", "c")); err != nil || !fi.IsDir() {
 		t.Fatalf("rooted directory tree not published: fi=%v err=%v", fi, err)
+	}
+}
+
+// Site 1: the PATH-based directory publish own-move-visible cut — a moveFileEx that renames
+// the dir into place THEN errors is our visible-but-unconfirmed move: *PostCommitSyncError,
+// never clean success.
+func TestPublishDirWriteThroughOwnMoveVisibleIsUnconfirmed(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		_ = orig(from, to, flags) // rename into place (visible)...
+		return errors.New("simulated write-through flush failure")
+	}
+	defer func() { moveFileEx = orig }()
+	err := publishDirWriteThrough(dir, 0o700)
+	var pce *PostCommitSyncError
+	if !errors.As(err, &pce) {
+		t.Fatalf("own-move-visible flush error = %v, want *PostCommitSyncError (not clean success)", err)
+	}
+	if fi, serr := os.Stat(dir); serr != nil || !fi.IsDir() {
+		t.Fatalf("directory should be visible after the own move: %v", serr)
+	}
+}
+
+// Site 2: the PATH-based exists/recovery re-confirm uses the REAL barrier (moveFileEx),
+// never a swallowed no-op, and is re-runnable after a barrier failure.
+func TestEnsureDirDurableExistsUsesRealBarrier(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	calls := 0
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		calls++
+		if calls == 1 {
+			return errors.New("barrier failed once")
+		}
+		return orig(from, to, flags)
+	}
+	defer func() { moveFileEx = orig }()
+	if err := ensureDirDurableImpl(dir, 0o700); err == nil {
+		t.Fatal("exists-branch re-confirm must surface the barrier failure, not swallow it")
+	}
+	if err := ensureDirDurableImpl(dir, 0o700); err != nil {
+		t.Fatalf("retry must re-confirm via the real barrier: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("moveFileEx invoked %d times, want >= 2 (exists-branch used the real barrier)", calls)
 	}
 }
 

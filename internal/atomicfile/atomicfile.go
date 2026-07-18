@@ -108,6 +108,13 @@ func Write(path string, data []byte, perm os.FileMode) error {
 // durability after a prior sync failure or across a process restart.
 func SyncDir(dir string) error { return syncDir(dir) }
 
+// ParentBarrier forces the immediate parent directory of `dir` (and thus `dir`'s own entry)
+// durable to disk with a REAL re-runnable barrier: on POSIX it fsyncs the parent; on Windows
+// it performs a MOVEFILE_WRITE_THROUGH rename of a throwaway temp directory within the parent
+// (a directory-handle flush is refused by Windows). It is idempotent — used to re-confirm an
+// existing directory's entry durable without a swallowed no-op.
+func ParentBarrier(dir string) error { return parentBarrier(dir) }
+
 // ensureDirDurable makes dir exist with its entry DURABLE in its (already-durable)
 // parent, idempotently and re-runnably: a missing dir is created and its entry forced to
 // disk; an existing dir's entry is RE-confirmed durable without recreating. It is a

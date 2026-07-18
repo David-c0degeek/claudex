@@ -305,6 +305,23 @@ func TestConfirmDurableRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+// ConfirmDurable forces s.dir's OWN entry durable via the REAL parent barrier, not a
+// swallowed no-op: if the parent barrier fails, ConfirmDurable fails (even though the inner
+// s.dir sync succeeds). This is the Windows-relevant assertion driven via the seam.
+func TestConfirmDurableRequiresParentBarrier(t *testing.T) {
+	s := newStore(t)
+	appendConst(t, s, Head{}, "one")
+	s.WithParentBarrier(func(string) error { return errors.New("parent barrier failed") })
+	g, ok, err := Acquire(s.lockPath)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	defer g.Release()
+	if err := s.ConfirmDurable(g); err == nil {
+		t.Fatal("ConfirmDurable must fail when the real parent barrier fails (not a swallowed no-op)")
+	}
+}
+
 func TestConfirmDurablePersistentFailure(t *testing.T) {
 	s := newStore(t)
 	appendConst(t, s, Head{}, "one")
