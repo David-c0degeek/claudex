@@ -52,15 +52,33 @@ type certBody struct {
 	RootDigest          string `json:"root_digest"`
 }
 
-// certRecord is a self-intact certificate. For a supported version, Root/RootDigest are the
-// strict-decoded binding; for an unsupported version they are zero (only Seq/Version/Digest
-// are meaningful, so the selection can fail closed rather than silently ignore it).
+// certRecord is a self-intact certificate. For a supported valid version, Root/RootDigest
+// are the strict-decoded binding; otherwise they are zero (only Seq/Version/Digest are
+// meaningful, so the selection can fail closed rather than silently ignore it).
 type certRecord struct {
 	Seq        uint64
 	Version    int
 	Root       uint64
 	RootDigest string
 	Digest     string // the certificate file's trailer digest
+}
+
+// certClass classifies a certificate file. A checksum-INTACT file is a self-intact CANDIDATE
+// (never skipped) — only a checksum-torn/oversize file is skipped. This is what stops a
+// checksum-intact-but-malformed HIGHEST certificate from silently rolling back to a lower one.
+type certClass int
+
+const (
+	certTorn             certClass = iota // checksum/framing invalid or oversize → skip (reserve the sequence)
+	certUnsupported                       // self-intact, unknown anchor_format_version → fail closed if highest
+	certSupportedValid                    // self-intact, version 1, valid body → usable
+	certSupportedCorrupt                  // self-intact, version 1, INVALID body → ErrCorrupt if highest
+)
+
+// certCandidate is a self-intact certificate plus its classification.
+type certCandidate struct {
+	rec   certRecord
+	class certClass
 }
 
 func (s *Store) certPath(seq uint64) string {
@@ -97,25 +115,34 @@ func encodeCert(cb certBody) ([]byte, string) {
 	return file, hex.EncodeToString(trailer[:])
 }
 
-// decodeCert validates a certificate file at expectSeq. ok=true means self-intact (checksum
-// + framing valid). A supported version is strict-decoded and its sequence must match the
-// filename; an unsupported version is returned with only Seq/Version/Digest so the selection
-// can fail closed. A torn/oversize/malformed file is ok=false (skipped, its slot reserved).
-func decodeCert(expectSeq uint64, file []byte) (certRecord, bool) {
+// decodeCert classifies a certificate file at expectSeq. A checksum/framing-invalid or
+// oversize file is certTorn (skipped). A checksum-INTACT file is a self-intact candidate:
+// certUnsupported (unknown version), certSupportedValid (version 1, valid body), or
+// certSupportedCorrupt (version 1 but a body that is unparseable, fails strict decode,
+// disagrees with the filename sequence, has a zero root, or a malformed root digest — or any
+// checksum-intact body that is not a supported version's valid JSON). A supportedCorrupt
+// candidate is authoritative corruption, NEVER skipped/rolled-back.
+func decodeCert(expectSeq uint64, file []byte) (certRecord, certClass) {
 	if len(file) < 8+trailerLen || len(file) > maxCertSize {
-		return certRecord{}, false
+		return certRecord{}, certTorn
 	}
 	body := file[:len(file)-trailerLen]
 	trailer := file[len(file)-trailerLen:]
 	if sum := sha256.Sum256(body); !bytes.Equal(sum[:], trailer) {
-		return certRecord{}, false
+		return certRecord{}, certTorn
 	}
 	lenJ := binary.BigEndian.Uint64(body[:8])
+	// The JSON must consume the WHOLE pre-trailer body: this format has no payload, so any
+	// trailing bytes after the JSON are corruption. A length that overflows the body is torn.
 	if lenJ > uint64(len(body)-8) || lenJ > maxCertSize {
-		return certRecord{}, false
+		return certRecord{}, certTorn
+	}
+	digest := hex.EncodeToString(trailer)
+	if lenJ != uint64(len(body)-8) {
+		// Checksum-intact but with trailing bytes after the JSON → self-intact corruption.
+		return certRecord{Seq: expectSeq, Digest: digest}, certSupportedCorrupt
 	}
 	jb := body[8 : 8+lenJ]
-	digest := hex.EncodeToString(trailer)
 
 	// Loose version probe first: a FUTURE body shape must fail closed as unsupported, not be
 	// skipped as torn by the strict decoder's unknown-field rejection.
@@ -123,23 +150,24 @@ func decodeCert(expectSeq uint64, file []byte) (certRecord, bool) {
 		AnchorFormatVersion int `json:"anchor_format_version"`
 	}
 	if json.Unmarshal(jb, &probe) != nil {
-		return certRecord{}, false // not a JSON object → torn
+		// Checksum-intact but not a JSON object → not a legitimate certificate of any version.
+		return certRecord{Seq: expectSeq, Digest: digest}, certSupportedCorrupt
 	}
 	if probe.AnchorFormatVersion != anchorFormatVersion {
-		return certRecord{Seq: expectSeq, Version: probe.AnchorFormatVersion, Digest: digest}, true
+		return certRecord{Seq: expectSeq, Version: probe.AnchorFormatVersion, Digest: digest}, certUnsupported
 	}
 
 	var cb certBody
 	if !strictCertBody(jb, &cb) {
-		return certRecord{}, false
+		return certRecord{Seq: expectSeq, Version: anchorFormatVersion, Digest: digest}, certSupportedCorrupt
 	}
 	if cb.AnchorFormatVersion != anchorFormatVersion || cb.CertificateSequence != expectSeq {
-		return certRecord{}, false // a mislabeled certificate (name/body sequence disagree)
+		return certRecord{Seq: expectSeq, Version: anchorFormatVersion, Digest: digest}, certSupportedCorrupt // mislabeled (name/body sequence disagree)
 	}
 	if cb.RootGeneration == 0 || !isHexDigest(cb.RootDigest) {
-		return certRecord{}, false
+		return certRecord{Seq: expectSeq, Version: anchorFormatVersion, Digest: digest}, certSupportedCorrupt
 	}
-	return certRecord{Seq: expectSeq, Version: anchorFormatVersion, Root: cb.RootGeneration, RootDigest: cb.RootDigest, Digest: digest}, true
+	return certRecord{Seq: expectSeq, Version: anchorFormatVersion, Root: cb.RootGeneration, RootDigest: cb.RootDigest, Digest: digest}, certSupportedValid
 }
 
 func strictCertBody(jb []byte, cb *certBody) bool {
@@ -165,14 +193,16 @@ func isHexDigest(s string) bool {
 	return true
 }
 
-// enumerateCerts lists the certificate files, returning the self-intact records (ascending
-// by sequence), the set of occupied sequences, and whether any canonical certificate files
-// were present. It MIRRORS enumerate's taxonomy: a non-canonical name / symlink / non-regular
-// entry / unreadable namespace observation fails closed (ErrCorrupt-class); a torn or oversize
-// certificate is SKIPPED (its sequence stays reserved). A file that vanishes mid-scan is a
+// enumerateCerts lists the certificate files, returning the SELF-INTACT candidates
+// (ascending by sequence) with their class, the set of occupied sequences, and whether any
+// canonical certificate files were present. It MIRRORS enumerate's taxonomy: a non-canonical
+// name / symlink / non-regular entry / unreadable namespace observation fails closed
+// (ErrCorrupt-class); only a checksum-TORN or oversize certificate is SKIPPED (its sequence
+// stays reserved) — a checksum-intact certificate is always a candidate (so a malformed
+// highest one fails closed rather than rolling back). A file that vanishes mid-scan is a
 // concurrent prune deleting an OBSOLETE (lower) certificate — the highest is never deleted —
 // so a not-exist is skipped.
-func (s *Store) enumerateCerts() (certs []certRecord, occupied map[uint64]bool, present bool, err error) {
+func (s *Store) enumerateCerts() (candidates []certCandidate, occupied map[uint64]bool, present bool, err error) {
 	entries, e := os.ReadDir(s.dir)
 	if e != nil {
 		if os.IsNotExist(e) {
@@ -221,30 +251,38 @@ func (s *Store) enumerateCerts() (certs []certRecord, occupied map[uint64]bool, 
 			}
 			return nil, nil, true, rerr
 		}
-		if rec, ok := decodeCert(seq, data); ok {
-			certs = append(certs, rec)
+		rec, class := decodeCert(seq, data)
+		if class == certTorn {
+			continue // skip torn, but the sequence stays reserved (occupied)
 		}
+		candidates = append(candidates, certCandidate{rec: rec, class: class})
 	}
-	return certs, occupied, true, nil
+	return candidates, occupied, true, nil
 }
 
-// selectCert returns the HIGHEST self-intact certificate by sequence. If it is unsupported,
-// selection fails closed (ErrUnsupportedAnchor) rather than falling back to a lower one. No
-// self-intact certificate → (no certificate), so recovery uses the gen-1 base case.
+// selectCert returns the HIGHEST self-intact certificate by sequence. supportedValid → return
+// it; unsupported → ErrUnsupportedAnchor; supportedCorrupt → ErrCorrupt. In no case does it
+// roll back to a LOWER certificate. No self-intact candidate → (no certificate), so recovery
+// uses the gen-1 base case.
 func (s *Store) selectCert() (certRecord, bool, error) {
-	certs, _, _, err := s.enumerateCerts()
+	candidates, _, _, err := s.enumerateCerts()
 	if err != nil {
 		return certRecord{}, false, err
 	}
-	if len(certs) == 0 {
+	if len(candidates) == 0 {
 		return certRecord{}, false, nil
 	}
-	highest := certs[len(certs)-1] // enumerateCerts is ascending by sequence
-	if highest.Version != anchorFormatVersion {
+	highest := candidates[len(candidates)-1] // enumerateCerts is ascending by sequence
+	switch highest.class {
+	case certSupportedValid:
+		return highest.rec, true, nil
+	case certUnsupported:
 		return certRecord{}, false, fmt.Errorf("%w: certificate sequence %d has anchor_format_version %d (need %d)",
-			ErrUnsupportedAnchor, highest.Seq, highest.Version, anchorFormatVersion)
+			ErrUnsupportedAnchor, highest.rec.Seq, highest.rec.Version, anchorFormatVersion)
+	default: // certSupportedCorrupt
+		return certRecord{}, false, fmt.Errorf("certificate sequence %d is checksum-intact but its body is invalid: %w",
+			highest.rec.Seq, ErrCorrupt)
 	}
-	return highest, true, nil
 }
 
 // loadChain scans the generation files (mirroring the original enumerate), returning the
@@ -330,10 +368,15 @@ func (s *Store) WithReadPause(fn func(phase string)) *Store { s.readPause = fn; 
 
 // certifiedChainSlice returns the contiguous validated chain from the certified root (or
 // generation 1 when there is no certificate) to the head. Records BELOW the certified root
-// are not required. A missing/mismatched certified root is ErrCorrupt with NO fallback.
+// are not required. A missing/mismatched certified root is ErrCorrupt with NO fallback — this
+// INCLUDES a store with a surviving certificate but ZERO generations (the certified root
+// cannot be present), which must fail closed rather than be reported as an empty store.
 func certifiedChainSlice(valid []Record, present bool, hasCert bool, cert certRecord) ([]Record, error) {
 	if !present {
-		return nil, nil
+		if hasCert {
+			return nil, fmt.Errorf("certified root generation %d is not present (no generations remain): %w", cert.Root, ErrCorrupt)
+		}
+		return nil, nil // genuinely empty: no certificate and no generations
 	}
 	if len(valid) == 0 {
 		return nil, fmt.Errorf("records present but none valid: %w", ErrCorrupt)
@@ -463,12 +506,14 @@ func (s *Store) pruneAdvance(g *Guard, K int) error {
 	if err != nil {
 		return err
 	}
-	if !present {
-		return nil // empty store: nothing to prune
-	}
+	// certifiedChainSlice fails closed on a certificate whose root is not present (including a
+	// store with a cert but zero generations), rather than treating it as empty.
 	chain, cerr := certifiedChainSlice(valid, present, hasCert, cert)
 	if cerr != nil {
 		return cerr
+	}
+	if len(chain) == 0 {
+		return nil // genuinely empty store (no cert, no generations): nothing to prune
 	}
 	if len(chain) <= K {
 		return nil // <= K members: no certificate needed
@@ -537,8 +582,8 @@ func (s *Store) pruneReconcile(g *Guard) error {
 	if rerr != nil {
 		return rerr
 	}
-	rec, ok := decodeCert(cert.Seq, data)
-	if !ok || rec != cert {
+	rec, class := decodeCert(cert.Seq, data)
+	if class != certSupportedValid || rec != cert {
 		return fmt.Errorf("genstore: certificate %d changed during reconcile: %w", cert.Seq, ErrCorrupt)
 	}
 

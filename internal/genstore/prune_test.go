@@ -283,6 +283,76 @@ func TestReaderRaceConcurrentPruneWhileOpeningFloor(t *testing.T) {
 	}
 }
 
+// A surviving certificate with NO generations remaining is CORRUPT (the certified root cannot
+// be present), never silently an empty store — on the bracketed read, the guarded append path,
+// and the PruneKeep guarded path. It flows to ErrCorrupt, not a transient retry loop (the
+// scan finds zero generations and the certificate is stable, so nothing "vanished mid-scan").
+func TestCertWithNoGenerationsIsCorrupt(t *testing.T) {
+	s := newStore(t)
+	buildChain(t, s, 4)
+	pruneKeep(t, s, 2) // root = gen 3; gens 3,4 remain
+	if err := os.Remove(genFile(s, 3)); err != nil {
+		t.Fatalf("remove gen 3: %v", err)
+	}
+	if err := os.Remove(genFile(s, 4)); err != nil {
+		t.Fatalf("remove gen 4: %v", err)
+	}
+	if _, ok, err := s.Latest(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Latest with a cert but no generations = (ok=%v, err=%v), want ErrCorrupt", ok, err)
+	}
+	withGuard(t, s, func(g *Guard) {
+		if _, err := s.AppendLocked(g, Head{}, func(uint64, string) ([]byte, error) { return []byte("x"), nil }); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("AppendLocked with a cert but no generations err = %v, want ErrCorrupt", err)
+		}
+		if err := s.PruneKeep(g, 2); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("PruneKeep with a cert but no generations err = %v, want ErrCorrupt", err)
+		}
+	})
+}
+
+// A HIGHEST certificate that is checksum-intact but has an INVALID body is authoritative
+// corruption: selection fails closed, NEVER rolling back to a lower valid certificate.
+func TestHighestMalformedCertFailsClosedNoFallback(t *testing.T) {
+	s := newStore(t)
+	recs := buildChain(t, s, 5)
+	lo, _ := encodeCert(certBody{AnchorFormatVersion: anchorFormatVersion, CertificateSequence: 1, RootGeneration: 4, RootDigest: recs[3].Digest})
+	writeRaw(t, s.certPath(1), lo)
+	// A checksum-intact seq-2 certificate whose body is version 1 but has a zero root
+	// generation (invalid) → supportedCorrupt.
+	bad, _ := encodeCert(certBody{AnchorFormatVersion: anchorFormatVersion, CertificateSequence: 2, RootGeneration: 0, RootDigest: strings.Repeat("a", 64)})
+	writeRaw(t, s.certPath(2), bad)
+
+	if _, _, err := s.selectCert(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("selectCert with a malformed highest cert err = %v, want ErrCorrupt (no fallback)", err)
+	}
+	if _, ok, err := s.Latest(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Latest = (ok=%v, err=%v), want ErrCorrupt", ok, err)
+	}
+}
+
+// A lock-free reader observing a PARTIAL below-root deletion (a crashed prune left some
+// below-root files) roots at the new certificate and succeeds — no corruption, no spurious
+// transient — and a subsequent reconcile converges.
+func TestReaderAcrossPartialBelowRootDeletion(t *testing.T) {
+	s := newStore(t)
+	recs := buildChain(t, s, 6)
+	file, _ := encodeCert(certBody{AnchorFormatVersion: anchorFormatVersion, CertificateSequence: 1, RootGeneration: 5, RootDigest: recs[4].Digest})
+	writeRaw(t, s.certPath(1), file)
+	_ = os.Remove(genFile(s, 1))
+	_ = os.Remove(genFile(s, 3)) // gens 2, 4 still remain below the root
+
+	head, ok, err := s.Latest()
+	if err != nil || !ok || head.Generation != 6 {
+		t.Fatalf("Latest across a partial below-root deletion = (%+v, ok=%v, err=%v), want gen 6", head, ok, err)
+	}
+	pruneKeep(t, s, 2) // reconcile converges: finishes the below-root deletion
+	for g := uint64(1); g <= 4; g++ {
+		if _, serr := os.Stat(genFile(s, g)); !os.IsNotExist(serr) {
+			t.Fatalf("below-root generation %d should be cleaned up on reconcile", g)
+		}
+	}
+}
+
 // When the bracket cannot converge (a prune advances the certificate on every attempt), the
 // lock-free reader returns the TYPED TRANSIENT ErrConcurrentPrune — NEVER ErrCorrupt.
 func TestReaderRaceExhaustsToTransient(t *testing.T) {
