@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/engine"
@@ -1129,6 +1130,93 @@ func TestE2EActivationAtOwnerlessVerify(t *testing.T) {
 	}
 	if after.Assignment.IssuedRevision != after.Revision {
 		t.Fatalf("verifier assignment not bound to the current revision: %+v", after.Assignment)
+	}
+}
+
+// unconfirmedWrite publishes the record then reports a post-commit sync failure, so the
+// append is committed-but-durability-unconfirmed.
+func unconfirmedWrite(path string, data []byte, perm os.FileMode) error {
+	if werr := atomicfile.Write(path, data, perm); werr != nil {
+		return werr
+	}
+	return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync failed")}
+}
+
+// After a TESTS outcome whose durability confirmation persistently fails, the transition is
+// VISIBLE (the run advanced to VERIFY) but durability-unconfirmed. The outcome primitive is
+// non-idempotent: a re-invocation (a restarted runner) observes the advanced phase and
+// refuses rather than re-applying — outcome identity belongs to the external evidence
+// journal, so recovery is a caller reload, not a silent re-apply.
+func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+
+	// The outcome append is visible but its durability confirmation persistently fails.
+	rn.state.WithWrite(unconfirmedWrite).WithSyncDir(func(string) error { return errors.New("sync down") })
+	res, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision)
+	if !genstore.IsDurabilityUnconfirmed(err) {
+		t.Fatalf("persistent-confirm-fail err = %v, want IsDurabilityUnconfirmed", err)
+	}
+	if res.Revision != tests.Revision+1 {
+		t.Fatalf("committed revision not preserved: %d, want %d", res.Revision, tests.Revision+1)
+	}
+	// The outcome IS visible: the run advanced to VERIFY (a caller must not treat it as lost).
+	if v := cur(t, rn); v.Phase != state.PhaseVerify {
+		t.Fatalf("outcome not visible after a durability-unconfirmed commit: %s", v.Phase)
+	}
+	// Recovery: a re-invocation of the SAME round sees the advanced phase and refuses (the
+	// primitive is non-idempotent). It reads no RNG and appends nothing (rejected before the
+	// phase-guarded append), so the injected write seam is never re-hit.
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); !errors.Is(err, transport.ErrNotTestsPhase) {
+		t.Fatalf("re-invoke err = %v, want transport.ErrNotTestsPhase (non-idempotent, advanced past TESTS)", err)
+	}
+}
+
+// A same-operation activation retry is idempotent: it reconciles to the SAME verifier turn
+// without re-minting or re-issuing, honoring the completed activation's lineage.
+func TestActivationIdempotentRetry(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	req := attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	}
+	rep1, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	// Retry the SAME operation with an RNG that ERRORS if minted — proving no re-mint.
+	req.RNG = errReader{}
+	rep2, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	if rep2.VerifierTurnID != rep1.VerifierTurnID || rep2.SessionID != rep1.SessionID || rep2.Generation != rep1.Generation {
+		t.Fatalf("retry did not reconcile to the frozen activation: %+v vs %+v", rep1, rep2)
+	}
+	// The run state still shows the single verifier assignment (no double-issue).
+	if after := cur(t, rn); after.Assignment == nil || after.Assignment.ID != rep1.VerifierTurnID {
+		t.Fatalf("verifier assignment drifted after the retry: %+v", after.Assignment)
 	}
 }
 
