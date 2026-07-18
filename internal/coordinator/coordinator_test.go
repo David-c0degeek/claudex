@@ -215,14 +215,11 @@ func submitOK(t *testing.T, rn *Run, sess string, raw []byte) transport.SubmitRe
 // The full non-gated chain through the real stores, exercising a plan reviewer retry,
 // a revise cycle, a checkpoint reviewer retry, CHECKPOINT->FIX, FIX->CHECKPOINT, a
 // next-step advance, and the deferred final TESTS edge.
-func TestE2ENonGatedChain(t *testing.T) {
-	repo := t.TempDir()
-	runID, lead, pair := newPairedRun(t, repo)
-	rn, err := OpenRun(repo, runID, rand.Reader)
-	if err != nil {
-		t.Fatalf("open run: %v", err)
-	}
-	defer rn.Close()
+// driveToTests drives a freshly-opened paired run through the full non-gated agent chain
+// (plan draft/critique/revise, implement/checkpoint over two steps with one FIX round) to
+// ownerless TESTS, asserting the path, and returns the RunState at TESTS.
+func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
+	t.Helper()
 
 	// PLAN_DRAFT (lead).
 	rs := cur(t, rn)
@@ -316,6 +313,101 @@ func TestE2ENonGatedChain(t *testing.T) {
 	// The checkpoint artifact was published and accepted.
 	if _, gerr := rn.store.Get(fn.TurnID, fn.Digest); gerr != nil {
 		t.Fatalf("the accepted checkpoint artifact was not published: %v", gerr)
+	}
+	return rs
+}
+
+// The full non-gated chain reaches ownerless TESTS, and a coordinator-authored TESTS pass
+// leaves it for ownerless VERIFY with a fresh threshold one generation past the pair.
+func TestE2ENonGatedChain(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	driveToTests(t, rn, lead, pair)
+
+	// The coordinator authors the TESTS pass (ownerless: no agent, no artifact, no id).
+	next, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64))
+	if err != nil {
+		t.Fatalf("submit tests pass: %v", err)
+	}
+	// Ownerless VERIFY: no assignment, and the fresh threshold is one past the pair
+	// session (freshly paired at generation 1, never replaced, so 2).
+	if next.Phase != state.PhaseVerify || next.Assignment != nil || next.Verify == nil {
+		t.Fatalf("TESTS pass did not enter ownerless VERIFY: %+v", next)
+	}
+	if next.Verify.RequiredGeneration != 2 {
+		t.Fatalf("verify threshold = %d, want 2", next.Verify.RequiredGeneration)
+	}
+}
+
+// A TESTS fail is applied and leaves the ownerless TESTS phase (the engine routes it to the
+// lead's FIX or the test-budget gate).
+func TestSubmitTestOutcomeFailLeavesTests(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	driveToTests(t, rn, lead, pair)
+
+	next, err := rn.SubmitTestOutcome(context.Background(), false, strings.Repeat("f", 64))
+	if err != nil {
+		t.Fatalf("submit tests fail: %v", err)
+	}
+	if next.Phase == state.PhaseTests {
+		t.Fatalf("a TESTS fail should leave the TESTS phase: %+v", next)
+	}
+}
+
+// SubmitTestOutcome fails closed for a run that is not a live TESTS phase.
+func TestSubmitTestOutcomeWrongPhase(t *testing.T) {
+	repo := t.TempDir()
+	runID, _, _ := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader) // fresh run at PLAN_DRAFT
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64)); !errors.Is(err, ErrNotTestsPhase) {
+		t.Fatalf("wrong-phase err = %v, want ErrNotTestsPhase", err)
+	}
+}
+
+// SubmitTestOutcome rejects a malformed (non hex64) evidence digest before touching the run.
+func TestSubmitTestOutcomeBadEvidenceDigest(t *testing.T) {
+	rn := openPaired(t)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, "not-a-digest"); !errors.Is(err, ErrNotTestsPhase) {
+		t.Fatalf("bad digest err = %v, want ErrNotTestsPhase", err)
+	}
+}
+
+// A pending replacement blocks a coordinator-authored TESTS outcome under the same guard,
+// before any state mutation.
+func TestSubmitTestOutcomeBlockedByPendingReplacement(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	before := driveToTests(t, rn, lead, pair)
+
+	plantPendingReplace(t, repo, runID)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64)); !errors.Is(err, transport.ErrRecoveryRequired) {
+		t.Fatalf("blocked TESTS outcome err = %v, want transport.ErrRecoveryRequired", err)
+	}
+	// No durable effect: the run is still at TESTS at the same revision.
+	if after := cur(t, rn); after.Revision != before.Revision || after.Phase != state.PhaseTests {
+		t.Fatalf("state advanced despite a blocked TESTS outcome: rev %d->%d phase %s",
+			before.Revision, after.Revision, after.Phase)
 	}
 }
 
