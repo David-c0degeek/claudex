@@ -45,7 +45,7 @@ type CatalogStore struct {
 // OpenCatalog returns a catalog store handle (side-effect-free). lockPath must be
 // the repository-level allocation lock, distinct from any per-run lock.
 func OpenCatalog(dir, lockPath string) *CatalogStore {
-	return &CatalogStore{gs: genstore.Open(dir, lockPath)}
+	return &CatalogStore{gs: genstore.Open(dir, lockPath).WithRetention(stateRetentionKeep, stateRetentionTrigger)}
 }
 
 // LockPath is the repository lock guarding this catalog.

@@ -142,7 +142,7 @@ type RegistryStore struct {
 // OpenRegistry returns a registration store handle (side-effect-free). lockPath
 // MUST be the same lock the run-state store uses.
 func OpenRegistry(dir, lockPath string) *RegistryStore {
-	return &RegistryStore{gs: genstore.Open(dir, lockPath)}
+	return &RegistryStore{gs: genstore.Open(dir, lockPath).WithRetention(stateRetentionKeep, stateRetentionTrigger)}
 }
 
 // LockPath is the mutation lock guarding this store.

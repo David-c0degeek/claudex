@@ -39,6 +39,17 @@ import (
 // fails with version remediation, not a vague error (see checkSchemaVersion).
 const RunStateVersion = 5
 
+// stateRetention{Keep,Trigger} configure the state stores' pre-append hysteresis compaction
+// (genstore.WithRetention): each generation is a full self-sufficient snapshot, so recovery
+// needs only the head, and a bounded tail is kept for a torn-head fallback (up to keep-1
+// generations back). Compaction is storage maintenance, not an operator protocol (and
+// catalog/current-run are repository-scoped), so it is an internal constant, not a
+// config.RunPolicy field. Applies to RunState, Registry, Catalog, and CurrentRun stores.
+const (
+	stateRetentionKeep    = 8
+	stateRetentionTrigger = 16
+)
+
 // ErrRevisionConflict is returned when a mutation's expected revision does not
 // match the current head.
 var ErrRevisionConflict = errors.New("state: revision conflict")
@@ -271,7 +282,7 @@ type Store struct {
 
 // Open returns a state store handle (side-effect-free).
 func Open(dir, lockPath string) *Store {
-	return &Store{gs: genstore.Open(dir, lockPath)}
+	return &Store{gs: genstore.Open(dir, lockPath).WithRetention(stateRetentionKeep, stateRetentionTrigger)}
 }
 
 // LockPath is the mutation lock guarding this store.

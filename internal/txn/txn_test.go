@@ -608,6 +608,25 @@ func TestDurabilityParticipantApplyRawAtomicfileErrorWraps(t *testing.T) {
 	}
 }
 
+// The next-transaction preflight prune keeps the journal bounded across many transactions
+// without breaking recovery: every transaction completes and the last terminal recovers.
+func TestJournalPreflightPruneManyTransactions(t *testing.T) {
+	j, lock := newJournal(t)
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("t%02d", i)
+		withGuard(t, lock, func(g *genstore.Guard) {
+			out, err := j.Run(g, planFrom(id, []*fakeStep{{name: "a"}}))
+			if err != nil || !out.Complete {
+				t.Fatalf("run %s: out=%+v err=%v", id, out, err)
+			}
+		})
+	}
+	rec, ok, err := j.Latest()
+	if err != nil || !ok || !rec.Complete || rec.TxnID() != "t19" {
+		t.Fatalf("Latest = %+v ok=%v err=%v, want terminal of t19", rec, ok, err)
+	}
+}
+
 func TestNilCallbackRejected(t *testing.T) {
 	j, lock := newJournal(t)
 	withGuard(t, lock, func(g *genstore.Guard) {

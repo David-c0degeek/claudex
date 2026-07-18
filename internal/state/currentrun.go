@@ -44,7 +44,7 @@ type CurrentRunStore struct {
 
 // OpenCurrentRun returns an active-run pointer store handle.
 func OpenCurrentRun(dir, lockPath string) *CurrentRunStore {
-	return &CurrentRunStore{gs: genstore.Open(dir, lockPath)}
+	return &CurrentRunStore{gs: genstore.Open(dir, lockPath).WithRetention(stateRetentionKeep, stateRetentionTrigger)}
 }
 
 // LockPath is the mutation lock guarding this store.

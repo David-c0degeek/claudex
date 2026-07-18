@@ -50,6 +50,14 @@ const (
 	IntentVersion = 1
 	maxPayload    = 64 * 1024
 	maxSteps      = 64
+
+	// journalRetention{Keep,Trigger} bound the journal at the next-transaction preflight: once
+	// the journal has accumulated journalRetentionTrigger records across transactions, Run
+	// compacts to journalRetentionKeep before appending the next prepare, so the journal is
+	// bounded by roughly one transaction (already capped by maxSteps) rather than store age.
+	// keep >= 2 keeps a torn-terminal fallback.
+	journalRetentionKeep    = 2
+	journalRetentionTrigger = 8
 )
 
 // Sentinel errors.
@@ -190,6 +198,20 @@ func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
 			return Record{}, fmt.Errorf("%w: %s", ErrPending, cur.TxnID())
 		}
 		head = gsRec.Head()
+		// Next-transaction preflight compaction: with a terminal head (no pending
+		// transaction), bound the journal to its retention BEFORE appending the new prepare,
+		// so a failed/partial prune aborts before ANY new-transaction effect and retrying Run
+		// only finishes maintenance. Recover/Abort never prune (no post-terminal failure mode);
+		// a later Run reconciles a prior preflight prune. keep >= 2 preserves a torn-terminal
+		// fallback (a bit-rotted sole-root terminal would otherwise be an unrecoverable root).
+		if perr := j.gs.PruneKeepIf(g, journalRetentionKeep, journalRetentionTrigger); perr != nil {
+			return Record{}, perr
+		}
+		if gsRec, cur, ok, err = j.latestGS(); err != nil {
+			return Record{}, err
+		} else if ok {
+			head = gsRec.Head() // the prune never removes the terminal head; re-read defensively
+		}
 	}
 	rec, err := j.append(g, head, Record{Intent: plan.Intent, StepIDs: names})
 	if err != nil {

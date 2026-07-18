@@ -8,6 +8,78 @@ import (
 	"testing"
 )
 
+func countGenFiles(t *testing.T, s *Store) int {
+	t.Helper()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), genFileExt) {
+			n++
+		}
+	}
+	return n
+}
+
+// Pre-append hysteresis retention keeps the generation files bounded by the trigger while the
+// head keeps advancing and remains recoverable.
+func TestRetentionHysteresisBoundsChain(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 12; i++ {
+		head = appendConst(t, s, head, fmt.Sprintf("gen-%d", i)).Head()
+		if n := countGenFiles(t, s); n > 4 {
+			t.Fatalf("after append %d: %d generation files, want <= trigger 4", i, n)
+		}
+	}
+	got, ok, err := s.Latest()
+	if err != nil || !ok || got.Generation != head.Generation {
+		t.Fatalf("Latest = %+v ok=%v err=%v, want head generation %d", got, ok, err, head.Generation)
+	}
+}
+
+// A pre-append prune failure is genuinely pre-commit: the append returns an error, the head is
+// unchanged, and generation head+1 is not written.
+func TestRetentionPreAppendFailureLeavesHead(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 4; i++ { // reach the trigger
+		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
+	}
+	s.WithSyncDir(func(string) error { return errors.New("prune barrier fail") })
+	if _, err := s.Append(head, func(uint64, string) ([]byte, error) { return []byte("g5"), nil }); err == nil {
+		t.Fatal("append with a failing pre-append prune should error")
+	}
+	// Latest is read-only (no sync), so it works despite the injected sync failure.
+	got, ok, err := s.Latest()
+	if err != nil || !ok || got.Generation != head.Generation {
+		t.Fatalf("Latest = %+v ok=%v err=%v, want unchanged head generation %d", got, ok, err, head.Generation)
+	}
+	if _, serr := os.Stat(genFile(s, head.Generation+1)); !os.IsNotExist(serr) {
+		t.Fatalf("generation %d was written despite the pre-append prune failure", head.Generation+1)
+	}
+}
+
+// keep>=2 preserves a torn-head fallback: once retention has pruned (rooting a certificate
+// above generation 1), a torn HEAD generation recovers the prior retained generation rather
+// than failing ErrCorrupt (which keep==1 would, per the single-record-root failure domain).
+func TestRetentionTornHeadFallsBackWithKeep2(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 5; i++ { // 5 appends → a prune fires; the certificate roots above gen 1
+		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
+	}
+	if err := os.WriteFile(genFile(s, head.Generation), []byte("torn"), 0o600); err != nil {
+		t.Fatalf("corrupt head: %v", err)
+	}
+	got, ok, err := s.Latest()
+	if err != nil || !ok || got.Generation != head.Generation-1 {
+		t.Fatalf("Latest = %+v ok=%v err=%v, want fallback to generation %d (not ErrCorrupt)", got, ok, err, head.Generation-1)
+	}
+}
+
 func buildChain(t *testing.T, s *Store, n int) []Record {
 	t.Helper()
 	var recs []Record

@@ -500,6 +500,35 @@ func (s *Store) PruneKeep(g *Guard, K int) error {
 	return s.pruneReconcile(g)
 }
 
+// PruneKeepIf prunes to keep ONLY when the retained chain has reached trigger members
+// (hysteresis — amortizing the certificate/fsync cost across appends). trigger must be > keep
+// >= 1. It is the caller-driven form used at the txn journal's next-transaction preflight; the
+// per-mutation state stores use the equivalent pre-append check inside AppendLocked. Run-lock
+// only.
+func (s *Store) PruneKeepIf(g *Guard, keep, trigger int) error {
+	if err := s.checkGuard(g); err != nil {
+		return err
+	}
+	if keep < 1 || trigger <= keep {
+		return fmt.Errorf("%w: keep=%d trigger=%d", ErrInvalidKeep, keep, trigger)
+	}
+	if err := s.ensureDir(); err != nil {
+		return err
+	}
+	valid, _, present, cert, hasCert, err := s.loadGuarded()
+	if err != nil {
+		return err
+	}
+	chain, cerr := certifiedChainSlice(valid, present, hasCert, cert)
+	if cerr != nil {
+		return cerr
+	}
+	if len(chain) < trigger {
+		return nil // below the trigger: nothing to compact yet
+	}
+	return s.PruneKeep(g, keep)
+}
+
 // pruneAdvance publishes a new floor certificate when the retained chain exceeds K members.
 func (s *Store) pruneAdvance(g *Guard, K int) error {
 	valid, _, present, cert, hasCert, err := s.loadGuarded()

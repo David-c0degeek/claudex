@@ -171,6 +171,25 @@ type Store struct {
 	parentBarrier func(dir string) error
 	release       func(*Guard) error
 	readPause     func(phase string) // lock-free-read interleaving seam; nil in production
+	// retentionKeep/retentionTrigger configure PRE-APPEND hysteresis compaction: when set
+	// (trigger > 0), AppendLocked prunes the retained chain to retentionKeep BEFORE writing a
+	// new generation once the chain has reached retentionTrigger members. Pre-append so a
+	// prune failure is genuinely pre-commit (head unchanged, no generation written), and the
+	// certificate/fsync cost is amortized. The txn journal does NOT use this (it prunes at its
+	// own next-transaction preflight); it is for the per-mutation state stores.
+	retentionKeep    int
+	retentionTrigger int
+}
+
+// WithRetention enables pre-append hysteresis compaction and returns the store: once the
+// retained chain reaches trigger members, AppendLocked prunes to keep BEFORE its next write.
+// keep must be >= 1 and trigger > keep. Production wires this from the state package's internal
+// constants; the txn journal leaves it unset.
+func (s *Store) WithRetention(keep, trigger int) *Store {
+	if keep >= 1 && trigger > keep {
+		s.retentionKeep, s.retentionTrigger = keep, trigger
+	}
+	return s
 }
 
 // Open returns a store handle. It performs no I/O: the directory is created
@@ -342,6 +361,22 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 	if expected != head {
 		return Record{}, fmt.Errorf("%w: expected {gen:%d,digest:%s}, have {gen:%d,digest:%s}",
 			ErrConflict, expected.Generation, shortDigest(expected.Digest), head.Generation, shortDigest(head.Digest))
+	}
+
+	// Pre-append hysteresis compaction: when the retained chain has reached the trigger,
+	// prune to keep FIRST. A prune failure here is genuinely PRE-COMMIT — the head is
+	// unchanged and no new generation is written, so the append error contract is preserved.
+	// PruneKeep only certifies a floor and deletes generations strictly below it, never the
+	// head, so the CAS just validated stays valid and next = head.Generation+1 still holds
+	// (the pre-prune occupied set is unaffected above the head).
+	if s.retentionTrigger > 0 {
+		if chain, cerr := certifiedChainSlice(valid, present, hasCert, cert); cerr != nil {
+			return Record{}, cerr
+		} else if len(chain) >= s.retentionTrigger {
+			if perr := s.PruneKeep(g, s.retentionKeep); perr != nil {
+				return Record{}, perr
+			}
+		}
 	}
 
 	next := head.Generation + 1
