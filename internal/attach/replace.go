@@ -220,6 +220,20 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 			if serr != nil {
 				return ReplaceResult{}, errors.Join(serr, releaseAll())
 			}
+			// An activation retry must ALSO prove the RunState effect is intact — not just
+			// the Registry supersession sameReplaceResult checked — so it never returns a
+			// VerifierTurnID the run never durably issued; a rolled-back or stale activation
+			// is recovery-required. This is the SAME lineage authority the different-op
+			// step-over below enforces.
+			if hin.activated() {
+				okLineage, lerr := activationLineageOK(runState, hin)
+				if lerr != nil {
+					return ReplaceResult{}, errors.Join(lerr, releaseAll())
+				}
+				if !okLineage {
+					return ReplaceResult{}, errors.Join(fmt.Errorf("%w: the activation's RunState effect is missing", ErrReplaceRecoveryRequired), releaseAll())
+				}
+			}
 			// Proven committed (a completed transaction): a release failure is a
 			// post-commit warning over the terminal journal revision, not an op error.
 			if relErr := releaseAll(); relErr != nil {
@@ -340,8 +354,12 @@ func prepareReplace(req ReplaceRequest, runState *state.Store, reg state.Registr
 		}
 		// Activate ONLY when the run is a running ownerless VERIFY and the fresh generation
 		// reaches the retained threshold; a below-threshold pair replacement is an ordinary
-		// Registry-only supersession that leaves the run waiting.
-		if ok && rs.RunID == req.RunID && isOwnerlessVerify(rs) && newGen >= rs.Verify.RequiredGeneration {
+		// Registry-only supersession that leaves the run waiting. A VERIFY waiter that is
+		// mid-recovery blocks the replacement (never a silent downgrade).
+		switch classifyActivationReadiness(rs, ok, req.RunID, newGen) {
+		case activateBlockedRecovery:
+			return ReplaceIntent{}, fmt.Errorf("%w: run is recovering at ownerless VERIFY", ErrReplaceRecoveryRequired)
+		case activateVerify:
 			baseline, derr := canonDigest(rs)
 			if derr != nil {
 				return ReplaceIntent{}, derr

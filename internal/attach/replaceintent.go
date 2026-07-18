@@ -248,54 +248,119 @@ func replacePlanFor(registry *state.RegistryStore, runState *state.Store, runGua
 }
 
 // applyActivation issues the verifier assignment onto the frozen ownerless VERIFY
-// pre-state: the pre-state must be the EXACT frozen baseline (a full canonical digest,
-// so no collateral field may have drifted), and the only change is the verifier
-// assignment bound to the appended revision.
+// pre-state: the pre-state must be the EXACT frozen baseline (a full canonical digest of
+// a live ownerless VERIFY at the retained threshold — no collateral field may have
+// drifted, no recovery may be in flight), and the only change is the verifier assignment
+// bound to the appended revision.
 func applyActivation(next *state.RunState, a *ReplaceActivation, nextRev uint64) error {
-	if next.Assignment != nil {
-		return fmt.Errorf("attach: activation pre-state is not ownerless")
+	base, err := activationBaselineOK(*next, a)
+	if err != nil {
+		return err
 	}
-	dig, derr := canonDigest(next)
-	if derr != nil {
-		return derr
-	}
-	if dig != a.StateBaselineDigest {
-		return fmt.Errorf("attach: activation pre-state drifted from the frozen baseline")
+	if !base {
+		return fmt.Errorf("attach: activation pre-state is not the frozen ownerless VERIFY baseline")
 	}
 	next.Assignment = &state.Ref{ID: a.VerifierTurnID, IssuedRevision: nextRev}
 	return nil
 }
 
-// activationLineageOK reports whether a completed activation's RunState effect is still
-// intact enough that a LATER replacement may step over it: either the verifier
-// assignment is still current, or its VERIFY turn was accepted (a legal verifier submit
-// consumed it and advanced the run). Neither means the frozen effect vanished before any
-// legal descendant — recovery-required. This deliberately does NOT require the transient
-// assignment to persist forever, so a valid post-activation transition is not false
-// recovery.
-func activationLineageOK(runState *state.Store, in ReplaceIntent) (bool, error) {
+// activationLineageIntact reports, purely, whether a completed activation's RunState
+// effect is still intact enough that a LATER replacement may step over it: either the
+// verifier turn was ACCEPTED (a permanent ledger proof it issued and the run advanced), or
+// the verifier assignment is STILL the current, live VERIFY turn at EXACT freshness
+// (IssuedRevision == Revision — the rule BuildAssignment enforces — at a running VERIFY, so
+// a stale same-id ref left by a later collateral append does NOT qualify). Neither means
+// the frozen effect vanished before any legal descendant. This deliberately does NOT
+// require the transient assignment to persist forever, so a valid post-activation
+// transition is not false recovery.
+func activationLineageIntact(rs state.RunState, ok bool, in ReplaceIntent) bool {
 	a := in.Activation
+	if !ok || rs.RunID != in.RunID {
+		return false
+	}
+	if _, accepted := rs.AcceptedTurns[a.VerifierTurnID]; accepted {
+		return true
+	}
+	return rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID &&
+		rs.Assignment.IssuedRevision == rs.Revision &&
+		rs.Phase == state.PhaseVerify && rs.Lifecycle == state.LifecycleRunning
+}
+
+// activationLineageOK loads the RunState and applies the pure lineage authority. It is
+// consulted by BOTH the same-operation activation retry and the different-operation
+// step-over, so neither can return a VerifierTurnID the run never durably issued.
+func activationLineageOK(runState *state.Store, in ReplaceIntent) (bool, error) {
 	rs, ok, err := runState.Load()
 	if err != nil {
 		return false, err
 	}
-	if !ok || rs.RunID != in.RunID {
-		return false, nil
-	}
-	if rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID {
-		return true, nil
-	}
-	if _, accepted := rs.AcceptedTurns[a.VerifierTurnID]; accepted {
-		return true, nil
-	}
-	return false, nil
+	return activationLineageIntact(rs, ok, in), nil
 }
 
-// isOwnerlessVerify reports the exact running ownerless VERIFY shape (no assignment, a
-// nonzero retained threshold) a pair activation targets.
-func isOwnerlessVerify(rs state.RunState) bool {
+// verifyAwaitingActivation is the running ownerless VERIFY shape a pair activation
+// targets, DISREGARDING recovery: correct phase/lifecycle, no assignment, and a nonzero
+// retained threshold. A run in this shape that is ALSO mid-recovery is not activatable
+// (status suppresses ownership during recovery) but must not be silently downgraded to an
+// ordinary replacement — prepareReplace blocks it instead.
+func verifyAwaitingActivation(rs state.RunState) bool {
 	return rs.Phase == state.PhaseVerify && rs.Lifecycle == state.LifecycleRunning &&
 		rs.Assignment == nil && rs.Verify != nil && rs.Verify.RequiredGeneration != 0
+}
+
+// isOwnerlessVerify is the exact ACTIVATABLE baseline: the awaiting-activation shape AND
+// not mid-recovery. Activation only fires on a clean waiter.
+func isOwnerlessVerify(rs state.RunState) bool {
+	return verifyAwaitingActivation(rs) && rs.Recovery == nil
+}
+
+// activationBaselineOK reports whether rs is the EXACT frozen ownerless-VERIFY activation
+// baseline the intent authorizes: a live running ownerless VERIFY (not recovering), the
+// retained threshold the activation carries (rs.Verify.RequiredGeneration ==
+// a.RequiredGeneration), and the full frozen state digest. This ONE predicate is shared by
+// classify/apply/prepare, so a forged intent with a mismatched (e.g. lower) threshold, a
+// wrong phase, or a recovery projection can never issue the verifier assignment — the
+// participant fails closed rather than the after-status wedging the transaction.
+func activationBaselineOK(rs state.RunState, a *ReplaceActivation) (bool, error) {
+	if !isOwnerlessVerify(rs) || rs.Verify.RequiredGeneration != a.RequiredGeneration {
+		return false, nil
+	}
+	dig, err := canonDigest(rs)
+	if err != nil {
+		return false, err
+	}
+	return dig == a.StateBaselineDigest, nil
+}
+
+// activationReadiness classifies how a pair replacement at the loaded RunState treats a
+// running ownerless VERIFY.
+type activationReadiness int
+
+const (
+	// activateNone: an ordinary Registry-only supersession (not a VERIFY waiter, or a
+	// below-threshold pair replacement that leaves the run waiting).
+	activateNone activationReadiness = iota
+	// activateVerify: issue the verifier assignment as the second RunState step.
+	activateVerify
+	// activateBlockedRecovery: the run is a running ownerless VERIFY that is ALSO
+	// mid-recovery — activation cannot layer onto an unresolved recovery, and silently
+	// downgrading to an ordinary replacement would strand the waiting run, so the
+	// replacement is blocked until recovery resolves.
+	activateBlockedRecovery
+)
+
+// classifyActivationReadiness decides, purely, whether a qualifying pair replacement with
+// fresh generation newGen activates VERIFY, stays ordinary, or is blocked pending recovery.
+func classifyActivationReadiness(rs state.RunState, ok bool, runID string, newGen uint64) activationReadiness {
+	if !ok || rs.RunID != runID || !verifyAwaitingActivation(rs) {
+		return activateNone
+	}
+	if rs.Recovery != nil {
+		return activateBlockedRecovery
+	}
+	if newGen >= rs.Verify.RequiredGeneration {
+		return activateVerify
+	}
+	return activateNone
 }
 
 // activateStepStatus observes whether the verifier issuance is durably applied.
@@ -308,34 +373,44 @@ func activateStepStatus(runState *state.Store, in ReplaceIntent) (txn.StepStatus
 }
 
 // classifyActivation is the pure participant authority. The baseline digest covers the
-// WHOLE ownerless state (revision reset to the frozen expected revision, assignment
-// cleared), so a recovered applied prefix cannot bless a collateral mutation of the
-// ledger, counters, or the requirement: any such drift is Indeterminate, never Applied.
+// WHOLE ownerless state (a live VERIFY at the retained threshold, not recovering, its
+// revision reset to the frozen expected, assignment cleared), so a recovered applied
+// prefix cannot bless a collateral mutation of the ledger, counters, phase, threshold, or
+// a recovery projection: any such drift is Indeterminate, never Applied. The append may
+// land at ANY revision PAST the frozen expected — genstore.AppendLocked skips torn or
+// occupied slots, so a valid activation can bind at expected+2 — hence Applied is
+// recognized by the assignment bound to the actual resulting revision plus the normalized
+// full-state digest, not a fixed +1.
 func classifyActivation(rs state.RunState, ok bool, in ReplaceIntent) (txn.StepStatus, error) {
 	a := in.Activation
 	if !ok || rs.RunID != in.RunID {
 		return txn.StatusIndeterminate, nil
 	}
-	// NotApplied: the exact frozen ownerless baseline is still in place.
+	// NotApplied: the exact frozen ownerless baseline is still in place and no assignment
+	// has been issued yet.
 	if rs.Revision == a.ExpectedStateRevision && rs.Assignment == nil {
-		if dig, derr := canonDigest(rs); derr != nil {
-			return "", derr
-		} else if dig == a.StateBaselineDigest {
+		base, berr := activationBaselineOK(rs, a)
+		if berr != nil {
+			return "", berr
+		}
+		if base {
 			return txn.StatusNotApplied, nil
 		}
 		return txn.StatusIndeterminate, nil
 	}
-	// Applied: the appended revision with exactly the verifier assignment, and the rest
-	// of the state normalizes back to the frozen baseline.
-	if rs.Revision == a.ExpectedStateRevision+1 && rs.Phase == state.PhaseVerify &&
-		rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID && rs.Assignment.IssuedRevision == rs.Revision &&
-		rs.Verify != nil && rs.Verify.RequiredGeneration == a.RequiredGeneration {
+	// Applied: an append PAST the frozen expected revision carrying exactly the verifier
+	// assignment bound to the actual resulting revision, whose REST (assignment stripped,
+	// revision reset to the frozen expected) normalizes back to the frozen baseline.
+	if rs.Revision > a.ExpectedStateRevision &&
+		rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID && rs.Assignment.IssuedRevision == rs.Revision {
 		norm := rs
 		norm.Assignment = nil
 		norm.Revision = a.ExpectedStateRevision
-		if dig, derr := canonDigest(norm); derr != nil {
-			return "", derr
-		} else if dig == a.StateBaselineDigest {
+		base, berr := activationBaselineOK(norm, a)
+		if berr != nil {
+			return "", berr
+		}
+		if base {
 			return txn.StatusApplied, nil
 		}
 	}
