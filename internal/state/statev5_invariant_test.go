@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,11 +10,18 @@ import (
 	"github.com/David-c0degeek/claudex/internal/protocol"
 )
 
-// rejects asserts a mutation from prev is refused by validation.
+// rejects asserts a mutation from prev is refused by the VALIDATOR under test. A stale
+// prev revision makes Mutate fail its CAS with ErrRevisionConflict BEFORE the validator
+// runs, which would pass this assertion vacuously — so a conflict is a test-authoring bug
+// (fix the fixture to mutate from the current revision), not a satisfied rejection.
 func rejects(t *testing.T, s *Store, prev RunState, label string, mut func(rev uint64, next *RunState)) {
 	t.Helper()
-	if _, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error { mut(rev, next); return nil }); err == nil {
+	_, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error { mut(rev, next); return nil })
+	if err == nil {
 		t.Fatalf("%s: mutation should have been rejected", label)
+	}
+	if errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("%s: rejected by a CAS conflict (stale prev revision %d), not the validator under test — mutate from the current revision", label, prev.Revision)
 	}
 }
 
@@ -104,15 +112,17 @@ func TestV5AgreedPlanWriteOnce(t *testing.T) {
 func TestV5CursorMonotonicAndBounds(t *testing.T) {
 	s := newStore(t)
 	impl := mustAgreedImplement(t, s) // cursor 0
-	tests := toTests(t, s, impl)      // cursor 1
+	// Cursor-past-the-end is checked from impl BEFORE toTests advances the store, so it
+	// reaches the cursor upper-bound validator rather than a stale-revision CAS conflict.
+	rejects(t, s, impl, "cursor past the plan end", func(_ uint64, n *RunState) {
+		idx := 2 // StepCount is 1
+		n.StepIndex = &idx
+	})
+	tests := toTests(t, s, impl) // cursor 1
 	rejects(t, s, tests, "cursor rewind", func(_ uint64, n *RunState) {
 		idx := 0
 		n.StepIndex = &idx
 		n.Phase = PhaseImplementStep
-	})
-	rejects(t, s, impl, "cursor past the plan end", func(_ uint64, n *RunState) {
-		idx := 2 // StepCount is 1
-		n.StepIndex = &idx
 	})
 }
 
@@ -138,9 +148,22 @@ func TestV5VerifyPresenceAndTransfer(t *testing.T) {
 		t.Fatalf("ownerless verify shape wrong: %+v", verify)
 	}
 
+	owned := toOwnedVerify(t, s, verify) // v-turn assigned, Verify still set
+
+	// A transfer that drops the requirement is rejected — checked from `owned` (the current
+	// revision) BEFORE the valid transfer advances the store, so it reaches the VERIFY
+	// context-transfer validator rather than a stale-revision CAS conflict.
+	rejects(t, s, owned, "pausing VERIFY without preserving", func(rev uint64, n *RunState) {
+		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify, Source: EventRef{Digest: hex64("8"), TurnID: "v-turn"}}
+		n.Verify = nil
+		n.Gate = &Ref{ID: "gate-v", IssuedRevision: rev}
+		n.Phase = PhaseAwaitGuidance
+		n.Lifecycle = LifecyclePaused
+		n.AcceptedTurns["v-turn"] = AcceptedTurn{ArtifactDigest: hex64("8"), Receipt: Receipt{TurnID: "v-turn", Revision: rev, ArtifactDigest: hex64("8")}, Phase: PhaseVerify}
+	})
+
 	// Human gate from VERIFY transfers the requirement into the pause and clears the
 	// top-level Verify; restoring brings the same requirement back.
-	owned := toOwnedVerify(t, s, verify) // v-turn assigned, Verify still set
 	gated := acceptTurnAdvance(t, s, owned, "v-turn", hex64("8"), func(rev uint64, n *RunState) {
 		n.Pause = &PauseContext{
 			Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify,
@@ -155,15 +178,6 @@ func TestV5VerifyPresenceAndTransfer(t *testing.T) {
 	if gated.Verify != nil || gated.Pause == nil || gated.Pause.Verify == nil || gated.Pause.Verify.RequiredGeneration != 1 {
 		t.Fatalf("verify not transferred into the pause: %+v", gated)
 	}
-	// A transfer that drops the requirement is rejected.
-	rejects(t, s, owned, "pausing VERIFY without preserving", func(rev uint64, n *RunState) {
-		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify, Source: EventRef{Digest: hex64("8"), TurnID: "v-turn"}}
-		n.Verify = nil
-		n.Gate = &Ref{ID: "gate-v", IssuedRevision: rev}
-		n.Phase = PhaseAwaitGuidance
-		n.Lifecycle = LifecyclePaused
-		n.AcceptedTurns["v-turn"] = AcceptedTurn{ArtifactDigest: hex64("8"), Receipt: Receipt{TurnID: "v-turn", Revision: rev, ArtifactDigest: hex64("8")}, Phase: PhaseVerify}
-	})
 
 	// Restore: back to VERIFY with the same requirement, a freshly issued turn.
 	restored, err := s.Mutate(gated.Revision, func(rev uint64, n *RunState) error {
