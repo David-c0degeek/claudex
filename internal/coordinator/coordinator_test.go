@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1142,11 +1143,14 @@ func unconfirmedWrite(path string, data []byte, perm os.FileMode) error {
 	return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync failed")}
 }
 
-// After a TESTS outcome whose durability confirmation persistently fails, the transition is
-// VISIBLE (the run advanced to VERIFY) but durability-unconfirmed. The outcome primitive is
-// non-idempotent: a re-invocation (a restarted runner) observes the advanced phase and
-// refuses rather than re-applying — outcome identity belongs to the external evidence
-// journal, so recovery is a caller reload, not a silent re-apply.
+// A TESTS outcome whose durability confirmation PERSISTENTLY fails halts
+// (IsDurabilityUnconfirmed) with the committed revision preserved and the run visible at
+// VERIFY but not yet durable. A genuine recovery reopen then RE-CONFIRMS the visible state
+// durable under the run guard before serving — it does not trust the unconfirmed entry — and
+// a reopen whose re-confirmation persistently fails itself halts. Re-deriving a lost-response
+// outcome identity is NOT this path's job: the primitive is non-idempotent and outcome
+// identity belongs to the external evidence journal (4d); this pins state-entry durability
+// recovery and non-reapplication.
 func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)
@@ -1154,10 +1158,10 @@ func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open run: %v", err)
 	}
-	defer rn.Close()
 	tests := driveToTests(t, rn, lead, pair)
 
-	// The outcome append is visible but its durability confirmation persistently fails.
+	// Persistent-failure-halts witness: the outcome append is visible but its durability
+	// confirmation persistently fails.
 	rn.state.WithWrite(unconfirmedWrite).WithSyncDir(func(string) error { return errors.New("sync down") })
 	res, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision)
 	if !genstore.IsDurabilityUnconfirmed(err) {
@@ -1166,20 +1170,54 @@ func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
 	if res.Revision != tests.Revision+1 {
 		t.Fatalf("committed revision not preserved: %d, want %d", res.Revision, tests.Revision+1)
 	}
-	// The outcome IS visible: the run advanced to VERIFY (a caller must not treat it as lost).
 	if v := cur(t, rn); v.Phase != state.PhaseVerify {
-		t.Fatalf("outcome not visible after a durability-unconfirmed commit: %s", v.Phase)
+		t.Fatalf("outcome not visible after the unconfirmed commit: %s", v.Phase)
 	}
-	// Recovery: a re-invocation of the SAME round sees the advanced phase and refuses (the
-	// primitive is non-idempotent). It reads no RNG and appends nothing (rejected before the
-	// phase-guarded append), so the injected write seam is never re-hit.
-	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); !errors.Is(err, transport.ErrNotTestsPhase) {
-		t.Fatalf("re-invoke err = %v, want transport.ErrNotTestsPhase (non-idempotent, advanced past TESTS)", err)
+	if err := rn.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Recovery reopen: a fresh handle with a healthy barrier RE-CONFIRMS the visible state
+	// durable under the guard before serving. A counting override witnesses the barrier ran.
+	confirmed := 0
+	orig := openRecoverConfirm
+	openRecoverConfirm = func(g *genstore.Guard, st *state.Store, reg *state.RegistryStore) error {
+		confirmed++
+		return orig(g, st, reg)
+	}
+	rn2, err := OpenRun(repo, runID, rand.Reader)
+	openRecoverConfirm = orig
+	if err != nil {
+		t.Fatalf("recovery reopen: %v", err)
+	}
+	defer rn2.Close()
+	if confirmed == 0 {
+		t.Fatal("the recovery reopen did not re-confirm store durability")
+	}
+	if v := cur(t, rn2); v.Phase != state.PhaseVerify {
+		t.Fatalf("the recovered run lost the durable VERIFY: %s", v.Phase)
+	}
+	// Non-reapplication: a re-invocation of the same round on the recovered run observes the
+	// advanced phase and refuses (outcome identity is the evidence journal's, not a re-apply).
+	if _, err := rn2.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); !errors.Is(err, transport.ErrNotTestsPhase) {
+		t.Fatalf("re-invoke err = %v, want transport.ErrNotTestsPhase", err)
+	}
+
+	// A reopen whose re-confirmation PERSISTENTLY fails halts (recovery-required), never a
+	// silent trust of the unconfirmed state.
+	openRecoverConfirm = func(*genstore.Guard, *state.Store, *state.RegistryStore) error {
+		return errors.New("persistent re-confirm failure")
+	}
+	_, oerr := OpenRun(repo, runID, rand.Reader)
+	openRecoverConfirm = orig
+	if oerr == nil {
+		t.Fatal("a persistent re-confirm failure on reopen must halt the open")
 	}
 }
 
 // A same-operation activation retry is idempotent: it reconciles to the SAME verifier turn
-// without re-minting or re-issuing, honoring the completed activation's lineage.
+// without re-minting, and it does not re-issue — the run-state revision, verifier assignment,
+// and registry revision are all UNCHANGED by the retry.
 func TestActivationIdempotentRetry(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)
@@ -1205,6 +1243,10 @@ func TestActivationIdempotentRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("activate: %v", err)
 	}
+	// Capture the activated state + registry: the retry must leave them byte-identical.
+	activated := cur(t, rn)
+	regBefore, _, _ := rn.registry.Load()
+
 	// Retry the SAME operation with an RNG that ERRORS if minted — proving no re-mint.
 	req.RNG = errReader{}
 	rep2, err := attach.ReplaceAttach(req)
@@ -1214,9 +1256,126 @@ func TestActivationIdempotentRetry(t *testing.T) {
 	if rep2.VerifierTurnID != rep1.VerifierTurnID || rep2.SessionID != rep1.SessionID || rep2.Generation != rep1.Generation {
 		t.Fatalf("retry did not reconcile to the frozen activation: %+v vs %+v", rep1, rep2)
 	}
-	// The run state still shows the single verifier assignment (no double-issue).
-	if after := cur(t, rn); after.Assignment == nil || after.Assignment.ID != rep1.VerifierTurnID {
-		t.Fatalf("verifier assignment drifted after the retry: %+v", after.Assignment)
+	// No re-issue: no second state append (same revision + assignment) and no registry advance.
+	after := cur(t, rn)
+	if after.Revision != activated.Revision {
+		t.Fatalf("retry appended a new state generation: rev %d -> %d", activated.Revision, after.Revision)
+	}
+	if after.Assignment == nil || activated.Assignment == nil || *after.Assignment != *activated.Assignment {
+		t.Fatalf("retry changed the verifier assignment: %+v -> %+v", activated.Assignment, after.Assignment)
+	}
+	if regAfter, _, _ := rn.registry.Load(); regAfter.Revision != regBefore.Revision {
+		t.Fatalf("retry advanced the registry: rev %d -> %d", regBefore.Revision, regAfter.Revision)
+	}
+}
+
+// A persisted activation whose run-state append lands across a genstore GAP still binds and
+// recovers: a torn file occupies the next state slot, so the verifier assignment binds at a
+// revision past expected+1, and classifyActivation must recognize that as Applied (the exact
+// case the slice-ad fix and the iii-b apply fix cover — proven here end-to-end against a real
+// VERIFY, not a hand-built one).
+func TestActivationBindsAcrossStateGap(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+	v := cur(t, rn) // ownerless VERIFY at revision R
+
+	// Occupy the NEXT state slot (R+1) with a torn file: genstore quarantines it and the
+	// activation's append skips to R+2, binding the verifier assignment across the gap.
+	loc, err := attach.ResolveRun(repo, runID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	torn := filepath.Join(loc.StateDir, fmt.Sprintf("%012d.gen", v.Revision+1))
+	if err := os.WriteFile(torn, []byte("torn quarantined generation"), 0o600); err != nil {
+		t.Fatalf("plant torn gen: %v", err)
+	}
+
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	req := attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	}
+	rep, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("activate across gap: %v", err)
+	}
+	after := cur(t, rn)
+	if after.Assignment == nil || after.Assignment.ID != rep.VerifierTurnID {
+		t.Fatalf("activation did not issue the verifier: %+v", after.Assignment)
+	}
+	if after.Revision <= v.Revision+1 {
+		t.Fatalf("activation did not bind across the gap: revision %d, want > %d", after.Revision, v.Revision+1)
+	}
+	if after.Assignment.IssuedRevision != after.Revision {
+		t.Fatalf("assignment not bound to the gapped resulting revision: %+v", after.Assignment)
+	}
+	// A same-op retry recognizes the gapped activation as Applied (idempotent, no re-mint).
+	req.RNG = errReader{}
+	rep2, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("gapped idempotent retry: %v", err)
+	}
+	if rep2.VerifierTurnID != rep.VerifierTurnID {
+		t.Fatalf("gapped retry did not reconcile: %q vs %q", rep2.VerifierTurnID, rep.VerifierTurnID)
+	}
+}
+
+// A persisted activation whose run-state (verifier-issuance) step lands AMBIGUOUSLY leaves
+// the replacement pending with no verifier issued; a same-op retry recovers it and issues the
+// verifier exactly once (no re-mint). Drives the real replaceAttach authority via the thin
+// crash-fault seam against a genuine coordinator-driven VERIFY.
+func TestActivationRecoversPendingSameOp(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	req := attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	}
+	if _, err := attach.ReplaceAttachWithFaults(req, attach.CrashFaults{AmbiguousState: true}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
+		t.Fatalf("ambiguous activation err = %v, want ErrReplaceOutcomeUnknown", err)
+	}
+	if v := cur(t, rn); v.Assignment != nil {
+		t.Fatalf("ambiguous activation issued a verifier despite the unknown outcome: %+v", v.Assignment)
+	}
+
+	// A same-op retry (erroring RNG proves no re-mint) recovers the pending activation.
+	req.RNG = errReader{}
+	rep, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("recovery retry: %v", err)
+	}
+	if rep.VerifierTurnID == "" {
+		t.Fatal("recovery did not issue the verifier turn")
+	}
+	after := cur(t, rn)
+	if after.Phase != state.PhaseVerify || after.Assignment == nil || after.Assignment.ID != rep.VerifierTurnID {
+		t.Fatalf("recovery did not durably issue the verifier assignment: %+v", after)
 	}
 }
 

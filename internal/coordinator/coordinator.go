@@ -94,6 +94,9 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
+	st := state.Open(loc.StateDir, loc.RunLock)
+	reg := state.OpenRegistry(loc.RegistryDir, loc.RunLock)
+
 	// Fail fast if the run is not a completed pairing (the per-submit journal seam
 	// re-checks under the submit guard).
 	g, ok, err := genstore.Acquire(loc.RunLock)
@@ -105,9 +108,18 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}
 	class, cerr := attach.ClassifyPairJournal(g, loc)
 	repl, rperr := attach.ClassifyReplaceJournal(g, loc)
+	// Recover-confirm on reopen: a prior mutation may have committed VISIBLY but left its
+	// directory entry durability-unconfirmed (a *genstore.PostCommitSyncError the caller must
+	// re-confirm before depending on the visible record). Re-confirm the run stores under the
+	// SAME guard before serving; a persistent failure is recovery-required (halt), never a
+	// silent trust of the visible-but-unconfirmed state.
+	var confErr error
+	if cerr == nil && rperr == nil {
+		confErr = openRecoverConfirm(g, st, reg)
+	}
 	rerr := g.Release()
-	if cerr != nil || rperr != nil || rerr != nil {
-		return nil, errors.Join(cerr, rperr, rerr)
+	if cerr != nil || rperr != nil || confErr != nil || rerr != nil {
+		return nil, errors.Join(cerr, rperr, confErr, rerr)
 	}
 	if class != attach.JournalTerminal {
 		return nil, fmt.Errorf("%w: pair journal class %d", ErrNotReady, class)
@@ -130,11 +142,22 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}
 	return &Run{
 		loc:      loc,
-		state:    state.Open(loc.StateDir, loc.RunLock),
-		registry: state.OpenRegistry(loc.RegistryDir, loc.RunLock),
+		state:    st,
+		registry: reg,
 		store:    store,
 		rng:      rng,
 	}, nil
+}
+
+// openRecoverConfirm re-confirms the run stores' durability on reopen — the M1 recover-confirm:
+// a prior visible-but-durability-unconfirmed append becomes durable (or the open halts) before
+// the visible state is trusted. A test overrides it to witness a persistent re-confirmation
+// failure halting the open.
+var openRecoverConfirm = func(g *genstore.Guard, st *state.Store, reg *state.RegistryStore) error {
+	if err := st.ConfirmDurable(g); err != nil {
+		return err
+	}
+	return reg.ConfirmDurable(g)
 }
 
 // Submit drives one accepted submit. It precomputes the Prepare OFF the run guard
