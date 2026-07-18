@@ -180,23 +180,71 @@ is **never overwritten in place**. Instead it is an append-only sequence of
   ignored; the previous valid generation remains the state. Writing a brand-new
   file cannot corrupt an existing one, so the non-atomic Windows replace problem
   does not touch the root of trust.
-- Recovery **enumerates** the generation files and selects the highest-numbered one
-  whose checksum validates. A `current` pointer file may be written as an
-  optimization, but recovery MUST be able to work without trusting it (a torn
-  pointer falls back to enumeration). If no valid generation exists, recovery
-  fails closed with remediation.
+- Recovery **enumerates** the generation files and validates a digest-linked chain
+  from the current root to the head, selecting the head. A `current` pointer file
+  may be written as an optimization, but recovery MUST be able to work without
+  trusting it (a torn pointer falls back to enumeration). If no valid chain exists,
+  recovery fails closed with remediation.
 - The prepared-transaction journal (D006/01.5) is itself persisted as such a
   generation/immutable record, so it never depends on the single replace whose
   failure it is meant to diagnose. Its reconciliation defines every observable
   target/temp/pointer/generation state after a crash cut.
-- Old generations are pruned only under the exclusive run lock, keeping at least the
-  last known-valid one; pruning never removes the generation recovery would select.
+
+**Amended (M3(B), 2026-07-18) — prunable chain with an immutable structural
+certificate root.** Requiring an unbroken chain from generation 1 bricked pruning,
+failed closed on old-ancestor bit-rot despite a valid head, and let the per-txn
+journal grow without bound (O(n²) re-scan). Recovery is now rooted at a **structural
+certificate**, not at generation 1:
+
+- A certificate is a `<cert_seq>.anchor` file in an INDEPENDENT, monotonically
+  allocated sequence namespace (zero-padded, framed + checksummed exactly like a
+  generation record). Its checksummed body binds `{anchor_format_version,
+  certificate_sequence, root_generation, root_digest}`; the root generation is
+  PAYLOAD, and must be an ACTUAL retained chain member with that exact digest.
+  `cert_seq` is `highest occupied + 1`, skips occupied/torn slots (a torn cert from a
+  crashed publish just reserves its sequence; the retry allocates the next and
+  re-certifies the same floor), and is NEVER reused; the same checked ceiling/overflow
+  rule as generation allocation applies.
+- **Prune (`PruneKeep(K)`), run-lock only, one-way order:** advance the certificate
+  ONLY when the retained chain exceeds K members (floor = the `(len−K)`-th real chain
+  member, gap-safe), publishing the new floor certificate DURABLY (write-through +
+  confirm) **while the prior certificate and all generations still exist**; then
+  ALWAYS reconcile idempotently against the highest DURABLE certificate — confirm it
+  durable and its exact identity BEFORE any deletion, then delete generations below
+  its root, then delete obsolete (lower) certificates, then sync. Reconcile runs
+  whether or not the advance did, so a crash in a prior prune's deletion is finished
+  on re-run without a superfluous certificate.
+- **Recovery** selects the HIGHEST self-intact certificate by `cert_seq` and validates
+  its `root_generation` binds a present member with digest == `root_digest`, then
+  validates `root..head`; records below the root are not required. Taxonomy mirrors
+  the generation taxonomy: canonical-torn/oversize certs are skipped (reserving their
+  sequence); a non-canonical name / symlink / non-regular entry fails closed; a
+  self-intact but UNSUPPORTED `anchor_format_version` fails closed with upgrade
+  remediation (never silently ignored); the highest intact supported certificate whose
+  bound root is missing/mismatched is corrupt with NO fallback to a lower certificate.
+  Recovery does NOT re-compare monotonicity against a (possibly deleted) predecessor —
+  root advancement is enforced at PUBLISH under the guard.
+- **Generation-number non-reuse:** append still continues at `head+1`; pruned numbers
+  are removed and never revisited.
+- **Stable lock-free reads:** a lock-free reader brackets the scan by the highest
+  certificate's identity — note it, validate `root..head`, re-note it; a concurrent
+  prune (a higher certificate, or a root-or-above member deleted mid-scan) triggers a
+  bounded retry, returning a TYPED TRANSIENT "concurrent prune" error on exhaustion
+  (never corruption). A not-exist strictly below the certified root is ignored.
+- **Downgrade contract (fail-closed):** after a prune, generation 1 is gone, so a
+  pre-M3 binary (which required a generation-1 root) finds no root and fails closed —
+  it never silently mis-recovers.
 
 **Acceptance:** inject crash cuts at write / flush / replace / pointer-update and
 prove deterministic recovery — the last valid generation always wins, a torn new
-generation or pointer never wins, and an empty/all-invalid set fails closed. This
-is subject 01's state/recovery acceptance matrix; `internal/atomicfile` writes the
-individual generation files but provides none of this protocol itself.
+generation or pointer never wins, and an empty/all-invalid set fails closed —
+plus the prune fault/race matrix (torn-cert-reserves-sequence + retry, partial-
+deletion finished on re-run, `≤K`-with-stragglers reconcile without a new cert,
+monotonic root at publish, `K==0` rejected, sequence ceiling, the recovery
+certificate taxonomy, and the lock-free reader-race bracket returning the transient
+error and never corruption). This is subject 01's state/recovery acceptance matrix;
+`internal/atomicfile` writes the individual generation/certificate files but provides
+none of this protocol itself.
 
 ## D018 — Transport durability and canonicalization posture
 The client-facing transport (subject 02) commits to four durable rules, each

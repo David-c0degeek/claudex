@@ -32,7 +32,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -171,6 +170,7 @@ type Store struct {
 	syncDir       func(dir string) error
 	parentBarrier func(dir string) error
 	release       func(*Guard) error
+	readPause     func(phase string) // lock-free-read interleaving seam; nil in production
 }
 
 // Open returns a store handle. It performs no I/O: the directory is created
@@ -289,15 +289,12 @@ func (s *Store) checkGuard(g *Guard) error {
 }
 
 // Latest returns the head record. It is lock-free: records are immutable, so a
-// concurrent append either produced a complete new file or not. (_, false, nil)
-// is a truly empty (or absent) store; a wrapped ErrCorrupt means records are
-// present but no valid rooted chain exists.
+// concurrent append either produced a complete new file or not, and a concurrent prune is
+// tolerated by an identity read-bracket (see readHeadBracketed). (_, false, nil) is a truly
+// empty (or absent) store; a wrapped ErrCorrupt means records are present but no valid
+// certified chain exists; a wrapped ErrConcurrentPrune is a TRANSIENT race the caller retries.
 func (s *Store) Latest() (Record, bool, error) {
-	valid, _, present, err := s.enumerate()
-	if err != nil {
-		return Record{}, false, err
-	}
-	return chainHead(valid, present)
+	return s.readHeadBracketed()
 }
 
 // Append is the convenience form: it acquires the guard, appends, and releases.
@@ -330,11 +327,11 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 		return Record{}, err
 	}
 
-	valid, occupied, present, err := s.enumerate()
+	valid, occupied, present, cert, hasCert, err := s.loadGuarded()
 	if err != nil {
 		return Record{}, err
 	}
-	headRec, hasHead, err := chainHead(valid, present)
+	headRec, hasHead, err := chainHeadCertified(valid, present, hasCert, cert)
 	if err != nil {
 		return Record{}, err
 	}
@@ -379,9 +376,9 @@ func (s *Store) AppendLocked(g *Guard, expected Head, build func(next uint64, pr
 // the original error is returned; anything else (corrupt ancestor, broken
 // namespace, a different head) is ambiguous.
 func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, error) {
-	valid, _, present, eerr := s.enumerate()
+	valid, _, present, cert, hasCert, eerr := s.loadGuarded()
 	if eerr == nil {
-		if headRec, hasHead, cerr := chainHead(valid, present); cerr == nil {
+		if headRec, hasHead, cerr := chainHeadCertified(valid, present, hasCert, cert); cerr == nil {
 			var head Head
 			if hasHead {
 				head = headRec.Head()
@@ -403,85 +400,6 @@ func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, e
 		}
 	}
 	return Record{}, fmt.Errorf("%w: %w", ErrAmbiguous, werr)
-}
-
-// enumerate lists the generation files, returning the self-intact records
-// (ascending), the set of occupied generation numbers, and whether any canonical
-// generation files were present. A non-canonical, irregular, or unreadable
-// generation file is a corruption error, not a silent empty store.
-func (s *Store) enumerate() (valid []Record, occupied map[uint64]bool, present bool, err error) {
-	entries, e := os.ReadDir(s.dir)
-	if e != nil {
-		if os.IsNotExist(e) {
-			return nil, map[uint64]bool{}, false, nil // absent store == empty
-		}
-		return nil, nil, false, e
-	}
-
-	occupied = map[uint64]bool{}
-	var gens []uint64
-	for _, ent := range entries {
-		name := ent.Name()
-		if !strings.HasSuffix(name, genFileExt) {
-			continue // e.g. a stale atomicfile temp; outside our namespace
-		}
-		g, ok := parseCanonicalGen(name)
-		if !ok {
-			return nil, nil, true, fmt.Errorf("non-canonical generation file %q: %w", name, ErrCorrupt)
-		}
-		if ent.Type()&os.ModeSymlink != 0 || !ent.Type().IsRegular() {
-			return nil, nil, true, fmt.Errorf("generation file %q is not a regular file: %w", name, ErrCorrupt)
-		}
-		info, ierr := ent.Info()
-		if ierr != nil {
-			return nil, nil, true, ierr
-		}
-		if !info.Mode().IsRegular() {
-			return nil, nil, true, fmt.Errorf("generation file %q is not a regular file: %w", name, ErrCorrupt)
-		}
-		occupied[g] = true
-		if info.Size() <= int64(maxRecordSize) {
-			gens = append(gens, g)
-		}
-		// An over-size file stays occupied (blocks the slot) but is never read.
-	}
-	if len(occupied) == 0 {
-		return nil, occupied, false, nil
-	}
-
-	sort.Slice(gens, func(i, j int) bool { return gens[i] < gens[j] })
-	for _, g := range gens {
-		data, rerr := os.ReadFile(s.genPath(g))
-		if rerr != nil {
-			return nil, nil, true, rerr
-		}
-		if rec, ok := decode(g, data); ok {
-			valid = append(valid, rec)
-		}
-		// torn/invalid files are quarantined (skipped) but remain occupied.
-	}
-	return valid, occupied, true, nil
-}
-
-// chainHead validates that valid forms a chain rooted at generation 1 with an
-// empty prev-digest and returns its head record.
-func chainHead(valid []Record, present bool) (Record, bool, error) {
-	if !present {
-		return Record{}, false, nil
-	}
-	if len(valid) == 0 {
-		return Record{}, false, fmt.Errorf("records present but none valid: %w", ErrCorrupt)
-	}
-	if valid[0].Generation != 1 || valid[0].PrevDigest != "" {
-		return Record{}, false, fmt.Errorf("chain root is generation %d with prev %q (want generation 1, empty prev): %w",
-			valid[0].Generation, shortDigest(valid[0].PrevDigest), ErrCorrupt)
-	}
-	for i := 1; i < len(valid); i++ {
-		if valid[i].PrevDigest != valid[i-1].Digest {
-			return Record{}, false, fmt.Errorf("broken chain at generation %d: %w", valid[i].Generation, ErrCorrupt)
-		}
-	}
-	return valid[len(valid)-1], true, nil
 }
 
 // parseCanonicalGen accepts exactly a 12-digit generation name that round-trips.
