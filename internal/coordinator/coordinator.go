@@ -100,12 +100,18 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 		return nil, genstore.ErrBusy
 	}
 	class, cerr := attach.ClassifyPairJournal(g, loc)
+	repl, rperr := attach.ClassifyReplaceJournal(g, loc)
 	rerr := g.Release()
-	if cerr != nil || rerr != nil {
-		return nil, errors.Join(cerr, rerr)
+	if cerr != nil || rperr != nil || rerr != nil {
+		return nil, errors.Join(cerr, rperr, rerr)
 	}
 	if class != attach.JournalTerminal {
 		return nil, fmt.Errorf("%w: pair journal class %d", ErrNotReady, class)
+	}
+	// A pending session replacement means the run is mid-supersession: fail fast here (the
+	// per-submit journal seam re-checks under the submit guard) rather than open for submits.
+	if repl == attach.ReplaceJournalNonTerminal {
+		return nil, fmt.Errorf("%w: session replacement pending", ErrNotReady)
 	}
 
 	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
@@ -142,7 +148,7 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 	return transport.Submit(ctx, transport.SubmitDeps{
 		Store:    rn.state,
 		Registry: rn.registry,
-		Journal:  pairJournalReader{loc: rn.loc},
+		Journal:  runJournalReader{loc: rn.loc},
 		Sink:     rn.store,
 		Prepare:  prepare,
 	}, sessionID, raw)
@@ -165,34 +171,48 @@ func (rn *Run) RunLock() string { return rn.loc.RunLock }
 
 // --- the journal seam ---
 
-// pairJournalReader adapts the pair-attach journal classification to transport's
-// JournalReader, so a submit never authorizes through a mid-attach registry.
-type pairJournalReader struct {
+// runJournalReader adapts BOTH the pair-attach journal AND the session-replacement
+// journal to transport's JournalReader, so a submit authorizes off the Registry only
+// when the pairing is complete AND no replacement is pending. Both journals are
+// classified under the SAME held submit guard, before any Registry authority.
+type runJournalReader struct {
 	loc attach.RunLocation
 }
 
-func (r pairJournalReader) LockPath() string { return r.loc.RunLock }
+func (r runJournalReader) LockPath() string { return r.loc.RunLock }
 
-// Head classifies the pair journal under the held submit guard. A Run is opened only
-// after the pairing completed, so ONLY a still-Terminal journal may proceed: a
-// NonTerminal maps to recovery, and an Absent/unknown/error (a completed journal that
-// vanished or corrupted after OpenRun) fails closed to recovery-required rather than
-// transport's permissive Absent-proceed.
-func (r pairJournalReader) Head(g *genstore.Guard, runID string) (transport.JournalHead, error) {
+// Head classifies the pair and replacement journals under the held submit guard. A Run
+// is opened only after the pairing completed, so ONLY a still-Terminal pair journal may
+// proceed: a NonTerminal maps to recovery, and an Absent/unknown/error (a completed
+// journal that vanished or corrupted after OpenRun) fails closed to recovery-required
+// rather than transport's permissive Absent-proceed. A pending replacement (a
+// non-terminal or mis-bound replace journal) blocks the submit regardless of the pair
+// journal: the Registry it would authorize against may be mid-supersession, so the
+// submit is recovery-required until replaceAttach completes the pending replacement.
+func (r runJournalReader) Head(g *genstore.Guard, runID string) (transport.JournalHead, error) {
 	if runID != r.loc.RunID {
 		return transport.JournalUnknown, fmt.Errorf("coordinator: submit run id %q is not the opened run %q", runID, r.loc.RunID)
 	}
-	class, err := attach.ClassifyPairJournal(g, r.loc)
+	pair, err := attach.ClassifyPairJournal(g, r.loc)
 	if err != nil {
 		return transport.JournalUnknown, err
 	}
-	switch class {
+	repl, err := attach.ClassifyReplaceJournal(g, r.loc)
+	if err != nil {
+		// A mis-bound replacement head is recovery-required: fail closed rather than
+		// authorize off a Registry a replacement may be mid-superseding.
+		return transport.JournalUnknown, err
+	}
+	if repl == attach.ReplaceJournalNonTerminal {
+		return transport.JournalNonterminal, nil
+	}
+	switch pair {
 	case attach.JournalTerminal:
 		return transport.JournalTerminal, nil
 	case attach.JournalNonTerminal:
 		return transport.JournalNonterminal, nil
 	default: // JournalAbsent or an unknown value: the completed pairing is gone.
-		return transport.JournalUnknown, fmt.Errorf("coordinator: pair journal for %s is no longer a completed pairing (class %d)", runID, class)
+		return transport.JournalUnknown, fmt.Errorf("coordinator: pair journal for %s is no longer a completed pairing (class %d)", runID, pair)
 	}
 }
 

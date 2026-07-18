@@ -772,6 +772,70 @@ func TestE2EReplacedSessionUnauthorized(t *testing.T) {
 	}
 }
 
+// plantPendingReplace leaves a prepared-but-not-completed record in the run's replacement
+// journal — a replacement crashed mid-flight. Here the head is deliberately mis-bound (its
+// kind is not the replacement kind), one recovery-required shape the aggregate reader must
+// fail closed on; the clean bound-but-pending shape (which maps to recovery) is covered by
+// attach's ClassifyReplaceJournal matrix, since only attach's seams can produce it.
+func plantPendingReplace(t *testing.T, repo, runID string) {
+	t.Helper()
+	loc, err := attach.ResolveRun(repo, runID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	g, ok, err := genstore.Acquire(loc.RunLock)
+	if err != nil || !ok {
+		t.Fatalf("acquire run lock: ok=%v err=%v", ok, err)
+	}
+	defer g.Release()
+	j := txn.Open(loc.ReplaceDir, loc.RunLock)
+	plan := txn.Plan{
+		Intent: txn.Intent{
+			Version: txn.IntentVersion, Kind: "planted-block",
+			TxnID:   "run-" + strings.Repeat("e", 32),
+			Payload: json.RawMessage(`{"planted":true}`),
+		},
+		Steps: []txn.Step{{
+			Name:           "registry-replace",
+			Status:         func() (txn.StepStatus, error) { return txn.StatusNotApplied, nil },
+			Apply:          func() error { return errors.New("halt to leave a prepared head") },
+			ConfirmDurable: func() error { return nil },
+		}},
+	}
+	if _, err := j.Run(g, plan); err == nil {
+		t.Fatal("planted plan should halt with a pending head")
+	}
+}
+
+// A pending replacement journal blocks a submit: the aggregate reader classifies the
+// replacement journal under the submit guard, BEFORE Registry authority, and fails closed
+// rather than authorize off a Registry a replacement may be mid-superseding.
+func TestSubmitBlockedByPendingReplacement(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, _ := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+
+	rs := cur(t, rn) // the lead owns the PLAN_DRAFT first turn
+	plantPendingReplace(t, repo, runID)
+	if _, err := rn.Submit(context.Background(), lead, planArtifact(t, rs.Assignment.ID, rs.Revision, false)); err == nil {
+		t.Fatal("submit should fail closed while a replacement is pending")
+	}
+}
+
+// OpenRun fails fast when a replacement is pending, rather than opening the run for submits.
+func TestOpenRunBlockedByPendingReplacement(t *testing.T) {
+	repo := t.TempDir()
+	runID, _, _ := newPairedRun(t, repo)
+	plantPendingReplace(t, repo, runID)
+	if _, err := OpenRun(repo, runID, rand.Reader); err == nil {
+		t.Fatal("OpenRun should fail while a replacement is pending")
+	}
+}
+
 // openPaired opens a Run over a freshly paired repo (for direct loader unit tests).
 func openPaired(t *testing.T) *Run {
 	t.Helper()

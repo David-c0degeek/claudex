@@ -124,3 +124,56 @@ func classifyPairRecord(rec txn.Record, ok bool, runID string) (JournalClass, er
 	// completed pairing the consumer may open.
 	return JournalNonTerminal, nil
 }
+
+// ReplaceJournalClass is the classification of a run's session-replacement journal head.
+type ReplaceJournalClass int
+
+const (
+	// ReplaceJournalAbsent means no session replacement was ever recorded for the run.
+	ReplaceJournalAbsent ReplaceJournalClass = iota
+	// ReplaceJournalNonTerminal means a replacement is present but not a completed
+	// transaction — an in-flight one (recovery required) or a cleanly aborted one. A
+	// consumer must NOT authorize a run operation off the Registry while a replacement is
+	// pending: the supersession it would read against may be mid-flight, so the operation
+	// is recovery-required until replaceAttach completes the pending replacement.
+	ReplaceJournalNonTerminal
+	// ReplaceJournalTerminal means a complete, identity-bound session replacement; the
+	// Registry durably reflects the supersession and an ordinary operation may proceed.
+	ReplaceJournalTerminal
+)
+
+// ClassifyReplaceJournal classifies a resolved run's session-replacement journal head
+// under a held run guard. Like ClassifyPairJournal it proves g is this journal's live
+// lock (CheckGuard) before reading, so the classification is not a lock-free race against
+// a concurrent replaceAttach. Every present record — pending, aborted, or complete — is
+// first bound to its exact replacement envelope/payload/run/step-list (bindReplaceHead);
+// only then is a complete record reported Terminal and a pending/aborted one NonTerminal.
+// A mis-bound record is an error, never a class — it is recovery-required, exactly as
+// replaceAttach itself treats a head it cannot bind.
+func ClassifyReplaceJournal(g *genstore.Guard, loc RunLocation) (ReplaceJournalClass, error) {
+	journal := txn.Open(loc.ReplaceDir, loc.RunLock)
+	if err := journal.CheckGuard(g); err != nil {
+		return ReplaceJournalAbsent, err
+	}
+	rec, ok, err := journal.Latest()
+	if err != nil {
+		return ReplaceJournalAbsent, err
+	}
+	return classifyReplaceRecord(rec, ok, loc.RunID)
+}
+
+func classifyReplaceRecord(rec txn.Record, ok bool, runID string) (ReplaceJournalClass, error) {
+	if !ok {
+		return ReplaceJournalAbsent, nil
+	}
+	// Bind the intent BEFORE the terminality branch: a pending replacement still has a
+	// valid intent envelope+payload, so a corrupt or mis-bound record must fail here
+	// whether or not it is complete (never silently classified as a clean class).
+	if _, err := bindReplaceHead(rec, runID); err != nil {
+		return ReplaceJournalAbsent, err
+	}
+	if rec.Complete && !rec.Aborted {
+		return ReplaceJournalTerminal, nil
+	}
+	return ReplaceJournalNonTerminal, nil
+}

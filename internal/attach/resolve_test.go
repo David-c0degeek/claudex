@@ -3,6 +3,7 @@ package attach
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
@@ -204,5 +205,91 @@ func TestClassifyPairRecordBranches(t *testing.T) {
 	}
 	if c, err := classifyPairRecord(complete, true, a.RunID); err != nil || c != JournalTerminal {
 		t.Fatalf("terminal: c=%d err=%v", c, err)
+	}
+}
+
+// ClassifyReplaceJournal reports Absent before any replacement, NonTerminal for a pending
+// (ambiguous) one, and Terminal after it is recovered forward to completion — so a submit
+// never authorizes off the Registry while a replacement is mid-supersession.
+func TestClassifyReplaceJournalLifecycle(t *testing.T) {
+	repo := t.TempDir()
+	a, _ := pairedRun(t, repo)
+	loc, err := ResolveRun(repo, a.RunID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	classify := func(t *testing.T) ReplaceJournalClass {
+		t.Helper()
+		g, ok, err := genstore.Acquire(loc.RunLock)
+		if err != nil || !ok {
+			t.Fatalf("acquire: ok=%v err=%v", ok, err)
+		}
+		defer g.Release()
+		c, cerr := ClassifyReplaceJournal(g, loc)
+		if cerr != nil {
+			t.Fatalf("classify: %v", cerr)
+		}
+		return c
+	}
+
+	// Absent before any replacement (the replace journal dir does not yet exist).
+	if c := classify(t); c != ReplaceJournalAbsent {
+		t.Fatalf("pre-replace class = %d, want ReplaceJournalAbsent", c)
+	}
+
+	// A genuine pending replacement: an ambiguous Registry mutate leaves the journal
+	// prepared-but-not-completed.
+	req := replaceReq(repo, a.RunID, state.SlotPair, state.AgentCodex, 1, 0x20)
+	amb := defaultReplaceSeams()
+	amb.mutate = ambiguousMutate()
+	if _, err := replaceAttach(req, amb); !errors.Is(err, ErrReplaceOutcomeUnknown) {
+		t.Fatalf("ambiguous replace err = %v, want ErrReplaceOutcomeUnknown", err)
+	}
+	if c := classify(t); c != ReplaceJournalNonTerminal {
+		t.Fatalf("pending class = %d, want ReplaceJournalNonTerminal", c)
+	}
+
+	// A same-operation retry recovers it forward to a completed (terminal) replacement; an
+	// errReader RNG proves the retry never re-mints.
+	retry := req
+	retry.RNG = errReader{}
+	if _, err := ReplaceAttach(retry); err != nil {
+		t.Fatalf("recovery retry: %v", err)
+	}
+	if c := classify(t); c != ReplaceJournalTerminal {
+		t.Fatalf("terminal class = %d, want ReplaceJournalTerminal", c)
+	}
+}
+
+// classifyReplaceRecord binds before the terminality branch: a mis-bound head (wrong kind
+// or a run-id it does not name) is an error, never a clean class.
+func TestClassifyReplaceRecordMisbound(t *testing.T) {
+	runID := "run-" + strings.Repeat("a", 32)
+	in := sampleReplaceIntent(runID, 3)
+	good := txn.Record{
+		Intent: txn.Intent{
+			Version: txn.IntentVersion, Kind: replaceIntentKind, TxnID: in.TxnID,
+			Payload: mustMarshalReplace(in),
+		},
+		StepIDs:  []string{stepRegistryReplace},
+		Complete: true,
+	}
+	// A bound, complete head is Terminal.
+	if c, err := classifyReplaceRecord(good, true, runID); err != nil || c != ReplaceJournalTerminal {
+		t.Fatalf("bound terminal: c=%d err=%v", c, err)
+	}
+	// Not present: Absent.
+	if c, err := classifyReplaceRecord(txn.Record{}, false, runID); err != nil || c != ReplaceJournalAbsent {
+		t.Fatalf("absent: c=%d err=%v", c, err)
+	}
+	// Wrong intent kind: an error.
+	badKind := good
+	badKind.Intent.Kind = "bootstrap"
+	if _, err := classifyReplaceRecord(badKind, true, runID); err == nil {
+		t.Fatal("wrong kind should be an error")
+	}
+	// A run-id the record does not name: an error.
+	if _, err := classifyReplaceRecord(good, true, "run-"+strings.Repeat("b", 32)); err == nil {
+		t.Fatal("run-id mismatch should be an error")
 	}
 }
