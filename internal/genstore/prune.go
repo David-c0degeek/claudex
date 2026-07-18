@@ -607,32 +607,49 @@ func (s *Store) pruneReconcile(g *Guard) error {
 		return err
 	}
 	if !hasCert {
-		return nil // never pruned: nothing to reconcile
+		return nil // never pruned: nothing to confirm or delete
 	}
 	entries, e := os.ReadDir(s.dir)
 	if e != nil {
 		return e
 	}
-	// Collect the stragglers a prior prune may have left below the durable certificate:
-	// generations strictly below the root, and obsolete (lower-sequence) certificates.
+	// Scan for the stragglers a prior prune may have left below the durable certificate,
+	// VALIDATING the generation/certificate namespace BEFORE any removal: a canonical-named but
+	// irregular (symlink/non-regular) entry is fail-closed corruption (ErrCorrupt), never a
+	// straggler to delete — reconcile runs before loadGuarded, so this must catch it here.
 	var belowRoot, obsoleteCerts []uint64
 	for _, ent := range entries {
-		if gen, ok := parseCanonicalGen(ent.Name()); ok && gen < cert.Root {
-			belowRoot = append(belowRoot, gen)
+		name := ent.Name()
+		if gen, ok := parseCanonicalGen(name); ok {
+			if verr := requireRegular(ent, name, "generation"); verr != nil {
+				return verr
+			}
+			if gen < cert.Root {
+				belowRoot = append(belowRoot, gen)
+			}
+			continue
 		}
-		if seq, ok := parseCanonicalCert(ent.Name()); ok && seq < cert.Seq {
-			obsoleteCerts = append(obsoleteCerts, seq)
+		if seq, ok := parseCanonicalCert(name); ok {
+			if verr := requireRegular(ent, name, "certificate"); verr != nil {
+				return verr
+			}
+			if seq < cert.Seq {
+				obsoleteCerts = append(obsoleteCerts, seq)
+			}
 		}
 	}
-	if len(belowRoot) == 0 && len(obsoleteCerts) == 0 {
-		return nil // already reconciled — no confirm/sync needed, so compaction stays amortized
-	}
-	// Pin 4: confirm the selected certificate is DURABLE and its EXACT identity is the one being
-	// reconciled BEFORE deleting anything (never delete against a visible-but-durability-
-	// unconfirmed certificate).
+	// Pin 4 + durability: confirm the selected certificate DURABLE and re-confirm the store
+	// directory ALWAYS, even with no visible stragglers — a prior cleanup may have deleted every
+	// straggler but failed its FINAL sync, which a visible-empty scan cannot distinguish from a
+	// durably-completed cleanup, so the retry must re-run the real barrier to establish the
+	// documented durable retention bound. This is also the pre-delete confirm.
 	if err := s.ConfirmDurable(g); err != nil {
 		return err
 	}
+	if len(belowRoot) == 0 && len(obsoleteCerts) == 0 {
+		return nil // nothing to delete; the directory is re-confirmed durable above
+	}
+	// The selected certificate's EXACT identity must still hold before any deletion.
 	data, rerr := os.ReadFile(s.certPath(cert.Seq))
 	if rerr != nil {
 		return rerr
@@ -655,4 +672,21 @@ func (s *Store) pruneReconcile(g *Guard) error {
 	}
 	// Finally sync the store directory so the deletions are durable (retryable, converges).
 	return s.ConfirmDurable(g)
+}
+
+// requireRegular fails closed (ErrCorrupt) on a canonical-named namespace file that is a
+// symlink or not a regular file, mirroring enumerate/loadChain — so a prune never deletes or
+// trusts an irregular entry.
+func requireRegular(ent os.DirEntry, name, kind string) error {
+	if ent.Type()&os.ModeSymlink != 0 || !ent.Type().IsRegular() {
+		return fmt.Errorf("%s file %q is not a regular file: %w", kind, name, ErrCorrupt)
+	}
+	info, ierr := ent.Info()
+	if ierr != nil {
+		return ierr
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s file %q is not a regular file: %w", kind, name, ErrCorrupt)
+	}
+	return nil
 }

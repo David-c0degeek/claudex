@@ -89,6 +89,67 @@ func TestRetentionPreAppendFailureLeavesHead(t *testing.T) {
 	}
 }
 
+// A prune whose stragglers were deleted but whose FINAL post-delete sync failed leaves the
+// directory visible-empty but not power-safe. The retry cannot trust the empty scan: it must
+// re-invoke a real durability barrier before reporting success, or a later power loss could
+// resurrect the deleted generations and violate the retention bound.
+func TestRetentionRetryReconfirmsAfterFinalSyncFailure(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 4; i++ {
+		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
+	}
+	// Allow the publish-confirm (call 1) and the pre-delete confirm (call 2); fail only the
+	// FINAL post-delete sync (its confirmAttempts retries: calls 3..2+confirmAttempts). The
+	// deletions happen but are not durable.
+	calls := 0
+	s.WithSyncDir(func(string) error {
+		calls++
+		if calls >= 3 && calls <= 2+confirmAttempts {
+			return errors.New("final post-delete sync fail")
+		}
+		return nil
+	})
+	if _, err := s.Append(head, func(uint64, string) ([]byte, error) { return []byte("g5"), nil }); err == nil {
+		t.Fatal("append should error when the prune's final post-delete sync fails")
+	}
+	// The below-root stragglers are gone (visible-empty), but their removal was never synced.
+	before := calls
+	head = appendConst(t, s, head, "g5").Head()
+	if calls <= before {
+		t.Fatal("retry returned success without re-invoking a durability barrier after a prior final-sync failure")
+	}
+	if got, ok, err := s.Latest(); err != nil || !ok || got.Generation != head.Generation {
+		t.Fatalf("after retry Latest = %+v ok=%v err=%v, want head generation %d", got, ok, err, head.Generation)
+	}
+}
+
+// Reconcile runs before loadGuarded, so it must itself fail closed on an irregular below-root
+// generation rather than delete it: a canonical-named directory (or symlink) below the certified
+// root is corruption (ErrCorrupt), and the entry must survive for later namespace validation.
+func TestReconcileIrregularBelowRootFailsClosedNotDeleted(t *testing.T) {
+	s := newStore(t).WithRetention(2, 4)
+	var head Head
+	for i := 1; i <= 5; i++ { // append 5 prunes, rooting a certificate above generation 1
+		head = appendConst(t, s, head, fmt.Sprintf("g%d", i)).Head()
+	}
+	_ = head
+	irregular := genFile(s, 2) // a canonical below-root generation name, but planted as a directory
+	if err := os.Mkdir(irregular, 0o700); err != nil {
+		t.Fatalf("plant irregular below-root entry: %v", err)
+	}
+	var perr error
+	withGuard(t, s, func(g *Guard) {
+		perr = s.PruneKeepIf(g, 2, 4) // reconcile runs FIRST, before any other namespace validation
+	})
+	if !errors.Is(perr, ErrCorrupt) {
+		t.Fatalf("PruneKeepIf with an irregular below-root generation = %v, want ErrCorrupt", perr)
+	}
+	if _, serr := os.Stat(irregular); serr != nil {
+		t.Fatalf("the irregular below-root entry was deleted (want fail-closed, not deleted): %v", serr)
+	}
+}
+
 // keep>=2 preserves a torn-head fallback: once retention has pruned (rooting a certificate
 // above generation 1), a torn HEAD generation recovers the prior retained generation rather
 // than failing ErrCorrupt (which keep==1 would, per the single-record-root failure domain).
