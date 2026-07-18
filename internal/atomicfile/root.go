@@ -36,7 +36,8 @@ type rootOps struct {
 	publishDir func(root *os.Root, name string, perm os.FileMode) error
 	// confirmParent is a REAL, re-runnable barrier that forces the immediate rooted parent
 	// of `name` (and thus `name`'s already-present entry) durable to disk. POSIX fsyncs the
-	// parent; Windows performs a write-through rename within the parent.
+	// parent; Windows flushes a WRITABLE parent-directory handle (identity-proven the same
+	// object the confined resolution found).
 	confirmParent func(root *os.Root, name string) error
 	// publishFile durably publishes an already-written temp `tmp` to `name` (in `dir`) with
 	// NO-CLOBBER semantics, returning whether tmp was consumed by the publish. A no-clobber
@@ -270,8 +271,9 @@ func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error 
 
 // ConfirmParentInRoot forces the immediate rooted parent of `name` (and thus `name`'s own
 // entry) durable to disk with the REAL re-runnable barrier (POSIX: fsync the parent;
-// Windows: a MOVEFILE_WRITE_THROUGH rename within the parent). Use it to re-confirm each
-// created directory entry (and a published file's entry) durable — never a swallowed no-op.
+// Windows: flush a WRITABLE parent-directory handle, identity-proven the same object the
+// confined resolution found). Use it to re-confirm each created directory entry (and a
+// published file's entry) durable — never a swallowed no-op.
 func ConfirmParentInRoot(root *os.Root, name string) error {
 	return confirmParentInRoot(root, name)
 }

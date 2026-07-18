@@ -10,13 +10,15 @@
 //   - Windows: os.Rename's default MoveFileEx(REPLACE_EXISTING) is NOT guaranteed
 //     atomic and is not power-loss durable. This package therefore does NOT use it:
 //     file moves force durability with MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH)
-//     and fresh directories are published durably with a WRITE_THROUGH directory
-//     rename (MkdirAllDurable), both of which flush the parent's metadata to disk
-//     before returning. There is no directory-handle fsync on Windows (it returns
-//     ERROR_ACCESS_DENIED), so re-confirmation relies on durability having been
-//     forced at write/publish time, not on a later flush. This package still makes
-//     no old-or-new atomicity promise on Windows and does not implement recovery of
-//     an overwritten authoritative file: crash-consistency there uses the
+//     and fresh directories/files are published with a WRITE_THROUGH no-clobber
+//     rename. A directory's ENTRY is (re)confirmed durable by FLUSHING the parent
+//     directory itself — a WRITABLE directory handle (opened FILE_APPEND_DATA|
+//     SYNCHRONIZE, the minimal access FlushFileBuffers needs) CAN be flushed; the
+//     ERROR_ACCESS_DENIED seen earlier was only from a READ-ONLY handle. So recovery
+//     re-confirms authoritatively at any time by re-flushing the parent, not merely
+//     by inferring durability from a prior write. This package still makes no
+//     old-or-new atomicity promise on Windows and does not implement recovery of an
+//     overwritten authoritative file: crash-consistency there uses the
 //     immutable-generation protocol (write each new state as a fresh, checksummed
 //     generation file, never overwriting the last valid one; on recovery enumerate
 //     and select the highest valid generation; a torn new generation fails its
@@ -99,20 +101,18 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	return write(path, data, perm, defaultOps)
 }
 
-// SyncDir fsyncs the directory dir so that entries created or renamed inside it are
-// durable across power loss. On POSIX this is a real directory fsync; on Windows the
-// directory-handle flush is refused by the OS, so durability is instead forced at write
-// time by MOVEFILE_WRITE_THROUGH file and directory renames (see the package doc), and
-// SyncDir is the re-confirmation seam whose only obstacle, when present, is that refusal.
-// It is idempotent and re-runnable under a caller-held lock, so a store can re-confirm
-// durability after a prior sync failure or across a process restart.
+// SyncDir is an intentionally BEST-EFFORT, read-only directory sync helper: on POSIX it
+// fsyncs the directory; on Windows the read-only directory-handle flush is refused by the OS
+// (ERROR_ACCESS_DENIED, treated as satisfied). It is NOT the durability barrier — it is used
+// only where entries are independently durable (write-through moves) or for a content re-sync.
+// To FORCE a directory's entry durable, use ParentBarrier (a real writable-handle flush).
 func SyncDir(dir string) error { return syncDir(dir) }
 
 // ParentBarrier forces the immediate parent directory of `dir` (and thus `dir`'s own entry)
-// durable to disk with a REAL re-runnable barrier: on POSIX it fsyncs the parent; on Windows
-// it performs a MOVEFILE_WRITE_THROUGH rename of a throwaway temp directory within the parent
-// (a directory-handle flush is refused by Windows). It is idempotent — used to re-confirm an
-// existing directory's entry durable without a swallowed no-op.
+// durable to disk with a REAL, re-runnable barrier: on POSIX it fsyncs the parent; on Windows
+// it FLUSHES a WRITABLE parent-directory handle (opened FILE_APPEND_DATA|SYNCHRONIZE, no
+// FILE_SHARE_DELETE) via FlushFileBuffers. It is idempotent — used to (re)confirm an existing
+// directory's entry durable, never a swallowed no-op.
 func ParentBarrier(dir string) error { return parentBarrier(dir) }
 
 // ensureDirDurable makes dir exist with its entry DURABLE in its (already-durable)
@@ -120,7 +120,7 @@ func ParentBarrier(dir string) error { return parentBarrier(dir) }
 // disk; an existing dir's entry is RE-confirmed durable without recreating. It is a
 // package var so a test can inject a fail-once-then-succeed confirmer. Production wires
 // the platform primitive (POSIX: create then fsync the parent; Windows: publish a fresh
-// directory via a write-through rename — there is no directory-handle fsync).
+// directory via a write-through no-clobber rename, then flush the writable parent handle).
 var ensureDirDurable = ensureDirDurableImpl
 
 // MkdirAllDurable creates dir and every missing ancestor, durably publishing each new

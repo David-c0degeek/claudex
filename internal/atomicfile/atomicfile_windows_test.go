@@ -55,9 +55,9 @@ func TestMkdirInRootOwnMoveVisibleFlushErrorIsUnconfirmed(t *testing.T) {
 		return errors.New("simulated move error")
 	}
 	defer func() { moveFileEx = origMove }()
-	origFlush := flushDirMetadata
-	flushDirMetadata = func(string) error { return errors.New("parent flush failed") }
-	defer func() { flushDirMetadata = origFlush }()
+	origFlush := flushDirIdent
+	flushDirIdent = func(string, fileIdent) error { return errors.New("parent flush failed") }
+	defer func() { flushDirIdent = origFlush }()
 
 	base := t.TempDir()
 	root, err := os.OpenRoot(base)
@@ -320,9 +320,9 @@ func TestPublishDirWriteThroughOwnMoveVisibleIsUnconfirmed(t *testing.T) {
 		return errors.New("simulated move error")
 	}
 	defer func() { moveFileEx = origMove }()
-	origFlush := flushDirMetadata
-	flushDirMetadata = func(string) error { return errors.New("parent flush failed") }
-	defer func() { flushDirMetadata = origFlush }()
+	origFlush := flushDirByPath
+	flushDirByPath = func(string) error { return errors.New("parent flush failed") }
+	defer func() { flushDirByPath = origFlush }()
 	err := publishDirWriteThrough(dir, 0o700)
 	var pce *PostCommitSyncError
 	if !errors.As(err, &pce) {
@@ -341,15 +341,15 @@ func TestEnsureDirDurableExistsUsesRealBarrier(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	calls := 0
-	orig := flushDirMetadata
-	flushDirMetadata = func(p string) error {
+	orig := flushDirByPath
+	flushDirByPath = func(p string) error {
 		calls++
 		if calls == 1 {
 			return errors.New("barrier failed once")
 		}
 		return orig(p)
 	}
-	defer func() { flushDirMetadata = orig }()
+	defer func() { flushDirByPath = orig }()
 	if err := ensureDirDurableImpl(dir, 0o700); err == nil {
 		t.Fatal("exists-branch re-confirm must surface the barrier failure, not swallow it")
 	}
@@ -357,7 +357,7 @@ func TestEnsureDirDurableExistsUsesRealBarrier(t *testing.T) {
 		t.Fatalf("retry must re-confirm via the real barrier: %v", err)
 	}
 	if calls < 2 {
-		t.Fatalf("flushDirMetadata invoked %d times, want >= 2 (exists-branch used the real barrier)", calls)
+		t.Fatalf("flushDirByPath invoked %d times, want >= 2 (exists-branch used the real barrier)", calls)
 	}
 }
 
@@ -373,15 +373,15 @@ func TestConfirmParentInRootRetriesAfterTransientBarrierFailure(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	calls := 0
-	orig := flushDirMetadata
-	flushDirMetadata = func(p string) error {
+	orig := flushDirIdent
+	flushDirIdent = func(p string, id fileIdent) error {
 		calls++
 		if calls == 1 {
 			return errors.New("barrier failed once")
 		}
-		return orig(p)
+		return orig(p, id)
 	}
-	defer func() { flushDirMetadata = orig }()
+	defer func() { flushDirIdent = orig }()
 	if err := MkdirInRoot(root, "d", 0o700); err == nil {
 		t.Fatal("first re-confirm must surface the transient barrier failure")
 	}
@@ -402,9 +402,9 @@ func TestSyncInRootReconfirmUsesRealBarrier(t *testing.T) {
 	if err := InstallInRoot(root, "f.txt", []byte("x"), 0o600); err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	orig := flushDirMetadata
-	flushDirMetadata = func(string) error { return errors.New("barrier failed") }
-	defer func() { flushDirMetadata = orig }()
+	orig := flushDirIdent
+	flushDirIdent = func(string, fileIdent) error { return errors.New("barrier failed") }
+	defer func() { flushDirIdent = orig }()
 	var pce *PostCommitSyncError
 	if err := SyncInRoot(root, "f.txt"); !errors.As(err, &pce) {
 		t.Fatalf("SyncInRoot must re-confirm the entry via the real barrier, got %v", err)
@@ -423,19 +423,21 @@ func TestArtifactInstallThenIdempotentReconfirm(t *testing.T) {
 	defer root.Close()
 
 	origMove := moveFileEx
-	origFlush := flushDirMetadata
+	origFlush := flushDirIdent
+	// Restore the global seams IMMEDIATELY (before any fatal assertion) so a mid-test failure
+	// cannot poison later tests.
+	defer func() { moveFileEx = origMove; flushDirIdent = origFlush }()
 	moveFileEx = func(from, to *uint16, flags uint32) error {
 		_ = origMove(from, to, flags) // publish the file (visible), consuming our temp...
 		return errors.New("simulated flush-boundary error")
 	}
-	flushDirMetadata = func(string) error { return errors.New("barrier failed on the first publish") }
+	flushDirIdent = func(string, fileIdent) error { return errors.New("barrier failed on the first publish") }
 	var pce *PostCommitSyncError
 	if err := InstallInRoot(root, "f.txt", []byte("data"), 0o600); !errors.As(err, &pce) {
 		t.Fatalf("first install = %v, want *PostCommitSyncError (visible, unconfirmed)", err)
 	}
 	moveFileEx = origMove
-	flushDirMetadata = origFlush
-	defer func() { moveFileEx = origMove; flushDirMetadata = origFlush }()
+	flushDirIdent = origFlush
 
 	if err := InstallInRoot(root, "f.txt", []byte("data"), 0o600); !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("retry install = %v, want fs.ErrExist (no-clobber)", err)

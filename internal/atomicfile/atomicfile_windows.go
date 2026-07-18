@@ -15,15 +15,17 @@ import (
 )
 
 // openRealParent opens the immediate rooted parent of `name` (os.Root refuses symlink
-// traversal) and returns its validated real DOS path plus a close func that KEEPS the
-// handle pinned until called — so the resolved directory cannot be swapped between
-// resolution and the leaf-name operations performed under it.
-func openRealParent(root *os.Root, name string) (realParent string, closeFn func() error, err error) {
+// traversal) and returns its validated real DOS path and the open *os.File. NOTE: keeping
+// this handle open does NOT pin the object — os.Root opens with FILE_SHARE_DELETE, so the
+// directory can still be renamed/replaced. Callers PROVE a by-path reopen is the same object
+// via its identity (identOf) and, for multi-step work, hold a no-share-delete handle
+// (openDirNoDelete) across the ops. The caller closes the returned file.
+func openRealParent(root *os.Root, name string) (realParent string, pf *os.File, err error) {
 	openName := rootParent(name)
 	if openName == "" {
 		openName = "."
 	}
-	pf, err := root.Open(openName)
+	pf, err = root.Open(openName)
 	if err != nil {
 		return "", nil, err
 	}
@@ -32,7 +34,7 @@ func openRealParent(root *os.Root, name string) (realParent string, closeFn func
 		_ = pf.Close()
 		return "", nil, err
 	}
-	return realParent, pf.Close, nil
+	return realParent, pf, nil
 }
 
 // moveFileExPath is moveFileEx over string paths.
@@ -55,71 +57,98 @@ func isAlreadyExists(err error) bool {
 	return errors.Is(err, windows.ERROR_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_FILE_EXISTS)
 }
 
-// flushDirMetadata is the Windows directory-metadata barrier seam: it opens the directory
-// with the MINIMAL write access FlushFileBuffers needs (FILE_APPEND_DATA|SYNCHRONIZE —
-// FlushFileBuffers is refused on a READ-ONLY handle, which is why os.Root.Open's read handle
-// gave ERROR_ACCESS_DENIED) and flushes it, forcing the directory's entries to disk.
-// FILE_FLAG_BACKUP_SEMANTICS is required to open a directory; FILE_FLAG_OPEN_REPARSE_POINT
-// refuses to follow a last-instant symlink swap of the final component (the caller resolved a
-// real path). Behind a package var so a test can drive a fail-once-then-succeed retry.
-var flushDirMetadata = flushDirMetadataImpl
+// fileIdent identifies a filesystem object by volume serial + file index — stable across
+// reopens of the SAME object, so a by-path reopen can be proven to be the object a validated
+// os.Root handle resolved (guarding a directory swap between resolution and the reopen).
+type fileIdent struct{ vol, idxHi, idxLo uint32 }
 
-func flushDirMetadataImpl(realDirPath string) error {
-	p, err := windows.UTF16PtrFromString(realDirPath)
+func identOf(h windows.Handle) (fileIdent, error) {
+	var bhfi windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &bhfi); err != nil {
+		return fileIdent{}, err
+	}
+	return fileIdent{bhfi.VolumeSerialNumber, bhfi.FileIndexHigh, bhfi.FileIndexLow}, nil
+}
+
+// openDirNoDelete opens the directory at dirPath with `access` and WITHOUT FILE_SHARE_DELETE
+// (so it cannot be renamed/deleted while the returned handle is held), requiring it to be the
+// SAME object as `want`. ReOpenFile is refused (ACCESS_DENIED) on an os.Root directory handle
+// on this platform, so identity is proven via GetFileInformationByHandle rather than by
+// handle. FILE_FLAG_OPEN_REPARSE_POINT refuses a final-component symlink swap.
+func openDirNoDelete(dirPath string, access uint32, want fileIdent) (windows.Handle, error) {
+	p, err := windows.UTF16PtrFromString(dirPath)
 	if err != nil {
-		return err
+		return windows.InvalidHandle, err
 	}
 	h, err := windows.CreateFile(
-		p,
-		windows.FILE_APPEND_DATA|windows.SYNCHRONIZE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
+		p, access,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, // NO FILE_SHARE_DELETE — pins the object
+		nil, windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0,
 	)
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	got, ierr := identOf(h)
+	if ierr != nil {
+		_ = windows.CloseHandle(h)
+		return windows.InvalidHandle, ierr
+	}
+	if got != want {
+		_ = windows.CloseHandle(h)
+		return windows.InvalidHandle, fmt.Errorf("atomicfile: directory %q changed identity before the operation", dirPath)
+	}
+	return h, nil
+}
+
+// flushDirIdent is the rooted directory-metadata barrier seam: it opens realParent writable
+// and no-share-delete, PROVES it is the same object as `want`, and FlushFileBuffers it —
+// forcing the directory's entries to disk. Behind a package var so a test can drive a
+// fail-once-then-succeed retry.
+var flushDirIdent = flushDirIdentImpl
+
+func flushDirIdentImpl(realParent string, want fileIdent) error {
+	h, err := openDirNoDelete(realParent, windows.FILE_APPEND_DATA|windows.SYNCHRONIZE, want)
 	if err != nil {
 		return err
 	}
-	ferr := windows.FlushFileBuffers(h)
-	_ = windows.CloseHandle(h)
-	return ferr
+	defer windows.CloseHandle(h)
+	return windows.FlushFileBuffers(h)
 }
 
 // confirmParentInRoot forces the immediate rooted parent of `name` (and thus `name`'s
-// already-present entry) durable to disk with a REAL directory-metadata flush: it resolves
-// the parent's validated real path (symlink-safe via os.Root) and keeps that handle pinned
-// across the flush so the resolution cannot be swapped. Re-runnable and idempotent — used on
-// every re-confirm/recovery path and after an own-move-visible create error.
+// already-present entry) durable with a REAL writable-handle FlushFileBuffers: it resolves
+// the parent's validated real path via os.Root (symlink-safe), captures its identity, and
+// flushes a fresh no-share-delete handle proven to be the SAME object (guarding a swap
+// between resolution and the flush). Re-runnable and idempotent — used on every
+// re-confirm/recovery path and after an own-move-visible create error.
 func confirmParentInRoot(root *os.Root, name string) error {
-	realParent, closeParent, err := openRealParent(root, name)
+	realParent, pf, err := openRealParent(root, name)
 	if err != nil {
 		return err
 	}
-	defer closeParent()
-	return flushDirMetadata(realParent)
+	defer pf.Close()
+	want, ierr := identOf(windows.Handle(pf.Fd()))
+	if ierr != nil {
+		return ierr
+	}
+	return flushDirIdent(realParent, want)
 }
 
 // resolveDirWriteThroughFailure classifies a failed no-clobber write-through DIRECTORY
-// publish of `name`. A GENUINE already-exists error with the target actually a DIRECTORY is
-// a durable concurrent winner (a raced-in file/symlink is refused); any other failure with
-// the target visible AND a directory is OUR own move whose durability is unconfirmed, forced
-// durable by the real parent flush (else committed *PostCommitSyncError); a target not
-// visible (or not a directory) is uncommitted / a raced-in non-directory.
+// publish of `name`, given a parent already pinned by the caller. A raced-in non-directory
+// (file/symlink) is ErrNotDirectory — NOT *PostCommitSyncError, whose Committed() would
+// falsely assert OUR effect is visible. A visible directory — whether a concurrent winner or
+// our own move — is not assumed durable: the REAL parent flush is RUN before accepting it
+// (nil on success, *PostCommitSyncError on barrier failure). A target not visible is
+// uncommitted (raw error).
 func resolveDirWriteThroughFailure(root *os.Root, name string, merr error) error {
 	info, serr := root.Lstat(name)
-	visibleDir := serr == nil && info.IsDir()
-	if isAlreadyExists(merr) {
-		if visibleDir {
-			return nil // a concurrent winner via this same write-through path is durable
-		}
-		return &PostCommitSyncError{Path: name, Err: merr}
-	}
 	if serr != nil {
-		return merr // not visible → the move did not commit (uncommitted, raw error)
+		return merr // not visible → the move did not commit (uncommitted / resolved race)
 	}
-	if !visibleDir {
-		return &PostCommitSyncError{Path: name, Err: merr} // a raced-in non-directory occupies the name
+	if !info.IsDir() {
+		return ErrNotDirectory // a raced-in file/symlink occupies the name — not our effect
 	}
 	if berr := confirmParentInRoot(root, name); berr != nil {
 		return &PostCommitSyncError{Path: name, Err: berr}
@@ -127,16 +156,26 @@ func resolveDirWriteThroughFailure(root *os.Root, name string, merr error) error
 	return nil
 }
 
-// publishDirInRoot durably creates a fresh directory within the confined root. It creates a
-// temp sibling under the validated real parent and renames it to the target leaf with
-// MOVEFILE_WRITE_THROUGH (no REPLACE_EXISTING → no-clobber), which forces the parent's
-// metadata to disk. A failed move is classified by resolveDirWriteThroughFailure.
+// publishDirInRoot durably creates a fresh directory within the confined root. It resolves
+// the validated real parent, PINS it with a no-share-delete handle across the create+rename
+// (so it cannot be renamed/replaced mid-operation), creates a temp sibling and renames it to
+// the target leaf with MOVEFILE_WRITE_THROUGH (no REPLACE_EXISTING → no-clobber). A failed
+// move is classified by resolveDirWriteThroughFailure.
 func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
-	realParent, closeParent, err := openRealParent(root, name)
+	realParent, pf, err := openRealParent(root, name)
 	if err != nil {
 		return err
 	}
-	defer closeParent()
+	defer pf.Close()
+	want, ierr := identOf(windows.Handle(pf.Fd()))
+	if ierr != nil {
+		return ierr
+	}
+	hold, err := openDirNoDelete(realParent, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE, want)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(hold)
 	tmp, err := os.MkdirTemp(realParent, tmpPrefix)
 	if err != nil {
 		return err
@@ -156,11 +195,22 @@ func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
 // sharing/access errors are retried. Consumption is decided by inspecting the UNIQUE SOURCE
 // temp, never target visibility alone.
 func publishFileInRoot(root *os.Root, tmp, name, dir string) (bool, error) {
-	realParent, closeParent, err := openRealParent(root, name)
+	realParent, pf, err := openRealParent(root, name)
 	if err != nil {
 		return false, err
 	}
-	defer closeParent()
+	defer pf.Close()
+	want, ierr := identOf(windows.Handle(pf.Fd()))
+	if ierr != nil {
+		return false, ierr
+	}
+	// Pin the parent (no-share-delete, same object) across the rename so it cannot be
+	// renamed/replaced mid-operation.
+	hold, herr := openDirNoDelete(realParent, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE, want)
+	if herr != nil {
+		return false, herr
+	}
+	defer windows.CloseHandle(hold)
 	tmpAbs := realParent + `\` + path.Base(tmp)
 	target := realParent + `\` + path.Base(name)
 	merr := replaceWith(
@@ -265,10 +315,10 @@ func moveFileWriteThrough(oldpath, newpath string) error {
 	return moveFileEx(from, to, fileReplaceFlags)
 }
 
-// ensureDirDurableImpl durably publishes a fresh directory on Windows, where a directory
-// handle cannot be flushed. A missing dir is published via a write-through rename; an
-// EXISTING dir is RE-confirmed durable via the real parent barrier (never a swallowed
-// no-op), so a retry after a prior partial failure re-forces the entry.
+// ensureDirDurableImpl durably publishes a fresh directory on Windows. A missing dir is
+// published via a write-through rename; an EXISTING dir is RE-confirmed durable via the real
+// parent-metadata flush (never a swallowed no-op), so a retry after a prior partial failure
+// re-forces the entry.
 func ensureDirDurableImpl(dir string, perm os.FileMode) error {
 	if fi, err := os.Lstat(dir); err == nil {
 		if !fi.IsDir() {
@@ -281,11 +331,39 @@ func ensureDirDurableImpl(dir string, perm os.FileMode) error {
 	return publishDirWriteThrough(dir, perm)
 }
 
+// flushDirByPath is the PATH-based directory-metadata barrier seam: it opens dir writable and
+// no-share-delete and FlushFileBuffers it. It does NOT identity-pin, because the genstore
+// store dirs it serves are trusted internal paths created and mutated under the run lock (not
+// attacker-influenced), so a swap is not in scope; it still drops FILE_SHARE_DELETE on the
+// working handle. Behind a package var so a test can drive a fail-once-then-succeed retry.
+var flushDirByPath = flushDirByPathImpl
+
+func flushDirByPathImpl(dir string) error {
+	p, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return err
+	}
+	h, err := windows.CreateFile(
+		p,
+		windows.FILE_APPEND_DATA|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, // NO FILE_SHARE_DELETE
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	return windows.FlushFileBuffers(h)
+}
+
 // parentBarrier forces the immediate parent of dir (and thus dir's already-present entry)
-// durable with a REAL directory-metadata flush (the genstore dirs are trusted local paths,
-// no os.Root). The path-based analogue of confirmParentInRoot. Re-runnable and idempotent.
+// durable with a REAL writable-handle FlushFileBuffers. The path-based analogue of
+// confirmParentInRoot (trusted internal paths, no identity pin — see flushDirByPath).
 func parentBarrier(dir string) error {
-	return flushDirMetadata(filepath.Dir(dir))
+	return flushDirByPath(filepath.Dir(dir))
 }
 
 func publishDirWriteThrough(dir string, perm os.FileMode) error {
@@ -297,24 +375,16 @@ func publishDirWriteThrough(dir string, perm os.FileMode) error {
 	defer os.RemoveAll(tmp) // a no-op once tmp is renamed to the target
 	_ = os.Chmod(tmp, perm)
 	if merr := moveFileExPath(tmp, dir, dirPublishFlags); merr != nil {
-		// Genuine already-exists with the target actually a DIRECTORY → concurrent winner
-		// (durable). Any other error with the target visible AND a directory → our own
-		// visible-but-unconfirmed move: force durability via the real parent barrier,
-		// *PostCommitSyncError if it fails. Target not visible (or a raced-in non-directory)
-		// → uncommitted / non-directory. Never bless a visible-but-unconfirmed dir.
+		// A raced-in non-directory (file/symlink) is ErrNotDirectory — not *PostCommitSyncError
+		// (whose Committed() would falsely assert OUR effect is visible). A visible directory,
+		// whether a concurrent winner or our own move, is not assumed durable: RUN the real
+		// parent barrier before accepting it. Target not visible → uncommitted (raw error).
 		fi, serr := os.Lstat(dir)
-		visibleDir := serr == nil && fi.IsDir()
-		if isAlreadyExists(merr) {
-			if visibleDir {
-				return nil
-			}
-			return &PostCommitSyncError{Path: dir, Err: merr}
-		}
 		if serr != nil {
 			return merr
 		}
-		if !visibleDir {
-			return &PostCommitSyncError{Path: dir, Err: merr}
+		if !fi.IsDir() {
+			return ErrNotDirectory
 		}
 		if berr := parentBarrier(dir); berr != nil {
 			return &PostCommitSyncError{Path: dir, Err: berr}
@@ -349,11 +419,11 @@ func isTransientRename(err error) bool {
 // hard-link/rename publisher hits while another process holds the target.
 func isTransientOpen(err error) bool { return isTransientRename(err) }
 
-// syncRootDir flushes the directory `name` within the confined root so a newly
-// created entry inside it is durable. It opens the directory handle (Go opens dirs
-// with FILE_FLAG_BACKUP_SEMANTICS) and FlushFileBuffers via Sync; Windows refuses to
-// flush a directory handle with ERROR_ACCESS_DENIED, which is treated as satisfied
-// (see swallowDirFlush).
+// syncRootDir is a best-effort READ-ONLY directory sync within the confined root (os.Root
+// opens the directory read-only, so its FlushFileBuffers is refused and swallowed — see
+// swallowDirFlush). It is NOT the entry barrier: ConfirmParentInRoot flushes a WRITABLE
+// parent handle to force an entry durable. syncRootDir remains only in the mutable
+// ReplaceInRoot path (a rebuildable projection whose entry durability is not required).
 func syncRootDir(root *os.Root, name string) error {
 	if name == "" {
 		name = "."
@@ -367,14 +437,13 @@ func syncRootDir(root *os.Root, name string) error {
 	return swallowDirFlush(serr)
 }
 
-// swallowDirFlush treats Windows's refusal to flush a directory handle
-// (ERROR_ACCESS_DENIED from FlushFileBuffers) as satisfied. This is NOT a durability
-// shortcut: on Windows, directory-entry durability is established at WRITE time — new
-// generation files are installed with MOVEFILE_WRITE_THROUGH file renames (replace) and
-// new directories are published with MOVEFILE_WRITE_THROUGH directory renames
-// (ensureDirDurableImpl), both of which force the parent's metadata to disk before
-// returning. So a re-confirmation whose only obstacle is the handle-flush refusal has
-// nothing left to force. Any other error is a real durability failure and is returned.
+// swallowDirFlush treats Windows's refusal to flush a READ-ONLY directory handle
+// (ERROR_ACCESS_DENIED from FlushFileBuffers) as satisfied. FlushFileBuffers needs WRITE
+// access; the real entry-durability barrier (ParentBarrier / confirmParentInRoot) opens the
+// parent with FILE_APPEND_DATA and DOES flush it. This helper backs only the intentionally
+// read-only best-effort syncDir/syncRootDir, used where entries are independently durable
+// (write-through moves) or for a content re-sync — not to force an entry. Any error other
+// than the read-only refusal is a real failure and is returned.
 func swallowDirFlush(err error) error {
 	if err == nil || errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		return nil
@@ -391,13 +460,11 @@ const readOpenExtraFlags = 0
 // os.Root traversal and the pre-open Lstat check.
 func isSymlinkOpenErr(error) bool { return false }
 
-// syncDir attempts to flush the directory `dir`. Go opens a directory with
-// FILE_FLAG_BACKUP_SEMANTICS, so Sync issues FlushFileBuffers on the handle; Windows
-// refuses that with ERROR_ACCESS_DENIED, treated as satisfied (see swallowDirFlush). The
-// load-bearing durability on Windows is not this flush but the MOVEFILE_WRITE_THROUGH file
-// renames (replace) and directory publishes (ensureDirDurableImpl) that force the parent's
-// metadata to disk at write time; syncDir is the re-confirmation seam whose obstacle, when
-// present, is only the handle-flush refusal.
+// syncDir is a best-effort READ-ONLY directory sync (Go opens the directory read-only, so
+// its FlushFileBuffers is refused and swallowed — see swallowDirFlush). It is NOT the entry
+// barrier: to force a directory's entry durable, ParentBarrier flushes a WRITABLE handle.
+// syncDir is used only where entries are independently write-through-durable or for a content
+// re-sync.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
