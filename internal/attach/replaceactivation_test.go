@@ -210,48 +210,71 @@ func TestApplyActivation(t *testing.T) {
 }
 
 // The activation-lineage authority (shared by the same-op retry and the different-op
-// step-over) is exact: an accepted verifier ledger entry OR the current, live VERIFY
-// assignment at exact freshness proves the effect is intact; a STALE same-id assignment
-// (issued at an earlier revision), a wrong id/phase/lifecycle, or a wrong run does not.
+// step-over) is exact, and specific to THIS activation. STILL-CURRENT reuses the full-state
+// classifyActivation == Applied authority (a stale same-id assignment at an earlier revision
+// does NOT qualify). ACCEPTED-DESCENDANT requires the verifier ledger entry to be a
+// VERIFY-phase acceptance past the frozen revision (not mere map-key presence — a foreign
+// accepted id from an older phase does not qualify).
 func TestActivationLineageIntact(t *testing.T) {
 	runID := "run-" + strings.Repeat("a", 32)
-	in := sampleActivatedIntent(runID, 5, strings.Repeat("d", 64))
+	base := sampleOwnerlessVerify(runID, 5, 2)
+	baseline, err := canonDigest(base)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	in := sampleActivatedIntent(runID, 5, baseline)
 
-	current := sampleOwnerlessVerify(runID, 6, 2)
-	current.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6} // fresh: issued == revision
+	// STILL CURRENT: the applied activation (assignment bound to the resulting revision, rest
+	// normalizes to the baseline) is intact lineage.
+	current := base
+	current.Revision = 6
+	current.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6}
 	if !activationLineageIntact(current, true, in) {
-		t.Fatal("a current, fresh verifier assignment is intact lineage")
+		t.Fatal("an applied (still-current) activation is intact lineage")
 	}
 
-	accepted := sampleOwnerlessVerify(runID, 9, 2)
-	accepted.Assignment = nil // the verifier submitted; the turn moved to the ledger
+	// ACCEPTED DESCENDANT: the verifier submitted from VERIFY at a receipt revision past the
+	// frozen activation; the turn moved to the ledger and the run advanced.
+	accepted := base
+	accepted.Phase = state.PhaseDone
+	accepted.Revision = 7
+	accepted.Assignment = nil
 	accepted.AcceptedTurns = cloneTurns(accepted.AcceptedTurns)
-	accepted.AcceptedTurns[verifierTurn] = state.AcceptedTurn{ArtifactDigest: strings.Repeat("c", 64)}
+	accepted.AcceptedTurns[verifierTurn] = state.AcceptedTurn{
+		ArtifactDigest: strings.Repeat("c", 64), Phase: state.PhaseVerify,
+		Receipt: state.Receipt{TurnID: verifierTurn, Revision: 7, ArtifactDigest: strings.Repeat("c", 64)},
+	}
 	if !activationLineageIntact(accepted, true, in) {
-		t.Fatal("an accepted verifier ledger entry is intact lineage")
+		t.Fatal("a VERIFY-phase accepted verifier descendant is intact lineage")
 	}
 
 	negatives := map[string]state.RunState{
 		"stale issued revision": func() state.RunState {
-			rs := sampleOwnerlessVerify(runID, 7, 2)
+			rs := base
+			rs.Revision = 7
 			rs.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6} // a later collateral append left it stale
 			return rs
 		}(),
 		"wrong id": func() state.RunState {
-			rs := sampleOwnerlessVerify(runID, 6, 2)
+			rs := base
+			rs.Revision = 6
 			rs.Assignment = &state.Ref{ID: "turn-" + strings.Repeat("f", 32), IssuedRevision: 6}
 			return rs
 		}(),
-		"not verify phase": func() state.RunState {
-			rs := sampleOwnerlessVerify(runID, 6, 2)
-			rs.Phase = state.PhaseFix
-			rs.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6}
+		"accepted at wrong phase": func() state.RunState {
+			rs := base
+			rs.AcceptedTurns = cloneTurns(rs.AcceptedTurns)
+			rs.AcceptedTurns[verifierTurn] = state.AcceptedTurn{
+				Phase: state.PhasePlanDraft, Receipt: state.Receipt{Revision: 7},
+			}
 			return rs
 		}(),
-		"not running": func() state.RunState {
-			rs := sampleOwnerlessVerify(runID, 6, 2)
-			rs.Lifecycle = state.LifecyclePaused
-			rs.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6}
+		"accepted at stale revision": func() state.RunState {
+			rs := base
+			rs.AcceptedTurns = cloneTurns(rs.AcceptedTurns)
+			rs.AcceptedTurns[verifierTurn] = state.AcceptedTurn{
+				Phase: state.PhaseVerify, Receipt: state.Receipt{Revision: 5}, // not PAST the frozen revision
+			}
 			return rs
 		}(),
 		"wrong run": func() state.RunState {
@@ -269,6 +292,42 @@ func TestActivationLineageIntact(t *testing.T) {
 	}
 	if activationLineageIntact(state.RunState{}, false, in) {
 		t.Fatal("a missing state is not intact lineage")
+	}
+}
+
+// A self-consistent activation intent that names an ALREADY-ACCEPTED turn id (carrying the
+// exact baseline digest + threshold) must fail closed at the participant: the shared
+// baseline predicate requires the verifier turn to be genuinely fresh, so apply rejects and
+// classify never returns NotApplied — recovery cannot issue an assignment reusing an
+// accepted id belonging to an older phase.
+func TestActivationRejectsAcceptedVerifierID(t *testing.T) {
+	runID := "run-" + strings.Repeat("a", 32)
+	base := sampleOwnerlessVerify(runID, 5, 2) // already carries AcceptedTurns["plan-turn"]
+	baseline, err := canonDigest(base)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	in := sampleActivatedIntent(runID, 5, baseline)
+	in.Activation.VerifierTurnID = "plan-turn" // a pre-existing accepted id (validRunID accepts it)
+	if err := in.validate(); err != nil {
+		t.Fatalf("the reuse intent should still validate structurally: %v", err)
+	}
+
+	if st, _ := classifyActivation(base, true, in); st != txn.StatusIndeterminate {
+		t.Fatalf("accepted-id reuse classify = %q, want indeterminate (not not-applied)", st)
+	}
+	next := base
+	if err := applyActivation(&next, in.Activation, 6); err == nil {
+		t.Fatal("apply must reject an activation reusing an accepted verifier id")
+	}
+	// The same guard rejects a collision with the write-once FirstTurn.
+	ft := base
+	ft.FirstTurn = &state.Ref{ID: "turn-" + strings.Repeat("1", 32), IssuedRevision: 1}
+	ftBaseline, _ := canonDigest(ft)
+	ftIntent := sampleActivatedIntent(runID, 5, ftBaseline)
+	ftIntent.Activation.VerifierTurnID = ft.FirstTurn.ID
+	if st, _ := classifyActivation(ft, true, ftIntent); st != txn.StatusIndeterminate {
+		t.Fatalf("first-turn reuse classify = %q, want indeterminate", st)
 	}
 }
 

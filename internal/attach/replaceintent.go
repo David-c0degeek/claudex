@@ -265,25 +265,30 @@ func applyActivation(next *state.RunState, a *ReplaceActivation, nextRev uint64)
 }
 
 // activationLineageIntact reports, purely, whether a completed activation's RunState
-// effect is still intact enough that a LATER replacement may step over it: either the
-// verifier turn was ACCEPTED (a permanent ledger proof it issued and the run advanced), or
-// the verifier assignment is STILL the current, live VERIFY turn at EXACT freshness
-// (IssuedRevision == Revision — the rule BuildAssignment enforces — at a running VERIFY, so
-// a stale same-id ref left by a later collateral append does NOT qualify). Neither means
-// the frozen effect vanished before any legal descendant. This deliberately does NOT
-// require the transient assignment to persist forever, so a valid post-activation
+// effect is still intact enough that a LATER replacement may step over it. Two disjoint
+// proofs, each specific to THIS activation:
+//
+//   - STILL CURRENT: the exact `classifyActivation == Applied` full-state authority (the
+//     verifier assignment bound to the resulting revision, the whole state normalizing back
+//     to the frozen baseline) — not a weaker ID/freshness/phase subset.
+//   - ACCEPTED DESCENDANT: the verifier turn was consumed by a legal VERIFY submission that
+//     THIS activation issued — the accepted ledger entry must be a VERIFY-phase acceptance
+//     at a receipt revision PAST the frozen activation, not mere map-key presence (a stale
+//     id from an older phase does not qualify).
+//
+// Neither means the frozen effect vanished before any legal descendant. This deliberately
+// does NOT require the transient assignment to persist forever, so a valid post-activation
 // transition is not false recovery.
 func activationLineageIntact(rs state.RunState, ok bool, in ReplaceIntent) bool {
 	a := in.Activation
 	if !ok || rs.RunID != in.RunID {
 		return false
 	}
-	if _, accepted := rs.AcceptedTurns[a.VerifierTurnID]; accepted {
+	if st, err := classifyActivation(rs, ok, in); err == nil && st == txn.StatusApplied {
 		return true
 	}
-	return rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID &&
-		rs.Assignment.IssuedRevision == rs.Revision &&
-		rs.Phase == state.PhaseVerify && rs.Lifecycle == state.LifecycleRunning
+	at, accepted := rs.AcceptedTurns[a.VerifierTurnID]
+	return accepted && at.Phase == state.PhaseVerify && at.Receipt.Revision > a.ExpectedStateRevision
 }
 
 // activationLineageOK loads the RunState and applies the pure lineage authority. It is
@@ -322,6 +327,18 @@ func isOwnerlessVerify(rs state.RunState) bool {
 // participant fails closed rather than the after-status wedging the transaction.
 func activationBaselineOK(rs state.RunState, a *ReplaceActivation) (bool, error) {
 	if !isOwnerlessVerify(rs) || rs.Verify.RequiredGeneration != a.RequiredGeneration {
+		return false, nil
+	}
+	// The verifier turn must be GENUINELY FRESH in the frozen baseline: never an
+	// already-accepted turn (which would belong to an older phase) and distinct from the
+	// first turn. The baseline is ownerless, so its assignment is already nil — a fresh mint
+	// is the only legitimate source. Enforcing this HERE (not just in prepareReplace's mint)
+	// stops a self-consistent persisted intent from naming an accepted id, matching the exact
+	// digest/threshold, and issuing an assignment that reuses it.
+	if _, accepted := rs.AcceptedTurns[a.VerifierTurnID]; accepted {
+		return false, nil
+	}
+	if rs.FirstTurn != nil && rs.FirstTurn.ID == a.VerifierTurnID {
 		return false, nil
 	}
 	dig, err := canonDigest(rs)
