@@ -2,12 +2,35 @@ package attach
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
+
+// ConfirmPairJournal re-confirms the pair-attach journal store's durability under a held run
+// guard. A reopen must re-confirm a visible-but-durability-unconfirmed TERMINAL head before
+// its classification authorizes serving the run — ClassifyPairJournal reads the head with no
+// barrier (Latest only), whereas txn.Recover always confirms even a terminal head. A journal
+// store that does not exist (a lead-only run) is a no-op.
+func ConfirmPairJournal(g *genstore.Guard, loc RunLocation) error {
+	return confirmJournalStore(g, loc.AttachDir, loc.RunLock)
+}
+
+// ConfirmReplaceJournal re-confirms the session-replacement journal store's durability under a
+// held run guard (see ConfirmPairJournal); a run that never had a replacement is a no-op.
+func ConfirmReplaceJournal(g *genstore.Guard, loc RunLocation) error {
+	return confirmJournalStore(g, loc.ReplaceDir, loc.RunLock)
+}
+
+func confirmJournalStore(g *genstore.Guard, dir, lock string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil // never recorded: nothing to confirm
+	}
+	return txn.Open(dir, lock).ConfirmDurable(g)
+}
 
 // RunLocation is the canonical, attach-derived location of a bound run. Every path is
 // derived here from the repository layout so a consumer (the coordinator) never joins

@@ -1178,21 +1178,19 @@ func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
 	}
 
 	// Recovery reopen: a fresh handle with a healthy barrier RE-CONFIRMS the visible state
-	// durable under the guard before serving. A counting override witnesses the barrier ran.
+	// durable under the guard before serving. A counting per-call confirmer witnesses the
+	// whole chain (journals + stores) was re-confirmed.
 	confirmed := 0
-	orig := openRecoverConfirm
-	openRecoverConfirm = func(g *genstore.Guard, st *state.Store, reg *state.RegistryStore) error {
+	rn2, err := openRun(repo, runID, rand.Reader, func(g *genstore.Guard, loc attach.RunLocation, st *state.Store, reg *state.RegistryStore) error {
 		confirmed++
-		return orig(g, st, reg)
-	}
-	rn2, err := OpenRun(repo, runID, rand.Reader)
-	openRecoverConfirm = orig
+		return defaultRecoverConfirm(g, loc, st, reg)
+	})
 	if err != nil {
 		t.Fatalf("recovery reopen: %v", err)
 	}
 	defer rn2.Close()
 	if confirmed == 0 {
-		t.Fatal("the recovery reopen did not re-confirm store durability")
+		t.Fatal("the recovery reopen did not re-confirm durability")
 	}
 	if v := cur(t, rn2); v.Phase != state.PhaseVerify {
 		t.Fatalf("the recovered run lost the durable VERIFY: %s", v.Phase)
@@ -1205,11 +1203,9 @@ func TestSubmitTestOutcomeRecoveryAfterPersistentConfirmFailure(t *testing.T) {
 
 	// A reopen whose re-confirmation PERSISTENTLY fails halts (recovery-required), never a
 	// silent trust of the unconfirmed state.
-	openRecoverConfirm = func(*genstore.Guard, *state.Store, *state.RegistryStore) error {
+	_, oerr := openRun(repo, runID, rand.Reader, func(*genstore.Guard, attach.RunLocation, *state.Store, *state.RegistryStore) error {
 		return errors.New("persistent re-confirm failure")
-	}
-	_, oerr := OpenRun(repo, runID, rand.Reader)
-	openRecoverConfirm = orig
+	})
 	if oerr == nil {
 		t.Fatal("a persistent re-confirm failure on reopen must halt the open")
 	}
@@ -1357,7 +1353,7 @@ func TestActivationRecoversPendingSameOp(t *testing.T) {
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
 	}
-	if _, err := attach.ReplaceAttachWithFaults(req, attach.CrashFaults{AmbiguousState: true}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
+	if _, err := attach.ReplaceAttachWith(req, attach.ReplaceStores{StateMutate: ambiguousState}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
 		t.Fatalf("ambiguous activation err = %v, want ErrReplaceOutcomeUnknown", err)
 	}
 	if v := cur(t, rn); v.Assignment != nil {
@@ -1377,6 +1373,174 @@ func TestActivationRecoversPendingSameOp(t *testing.T) {
 	if after.Phase != state.PhaseVerify || after.Assignment == nil || after.Assignment.ID != rep.VerifierTurnID {
 		t.Fatalf("recovery did not durably issue the verifier assignment: %+v", after)
 	}
+}
+
+// ambiguousState reports an ambiguous outcome WITHOUT applying the mutation — a crash BEFORE
+// the participant effect (no verifier issued; classifyActivation NotApplied on retry).
+func ambiguousState(*state.Store, *genstore.Guard, uint64, func(uint64, *state.RunState) error) (state.RunState, error) {
+	return state.RunState{}, fmt.Errorf("%w: crash before the activation effect", genstore.ErrAmbiguous)
+}
+
+// applyThenAmbiguousState APPLIES the mutation durably and THEN reports an ambiguous outcome —
+// a crash AFTER the participant effect but before progress is recorded (the verifier IS
+// issued; classifyActivation StatusApplied on retry).
+func applyThenAmbiguousState(s *state.Store, g *genstore.Guard, exp uint64, fn func(uint64, *state.RunState) error) (state.RunState, error) {
+	rs, err := s.MutateLocked(g, exp, fn)
+	if err != nil {
+		return rs, err
+	}
+	return rs, fmt.Errorf("%w: crash after the activation effect", genstore.ErrAmbiguous)
+}
+
+// The genuine applied-but-unrecorded activation crash: the verifier-issuance step lands
+// DURABLY, then the outcome is ambiguous (progress unrecorded), so the journal is pending. A
+// same-op retry observes StatusApplied, confirms and finishes the journal, and does NOT
+// re-append or re-issue the verifier.
+func TestActivationAppliedButUnrecordedRetry(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	req := attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	}
+	if _, err := attach.ReplaceAttachWith(req, attach.ReplaceStores{StateMutate: applyThenAmbiguousState}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
+		t.Fatalf("applied-but-unrecorded err = %v, want ErrReplaceOutcomeUnknown", err)
+	}
+	// The verifier assignment DID durably land (the effect applied before the crash).
+	landed := cur(t, rn)
+	if landed.Assignment == nil {
+		t.Fatal("the applied activation effect is missing")
+	}
+	issued := landed.Assignment.ID
+
+	// A same-op retry (erroring RNG proves no re-mint) observes the applied effect, finishes
+	// the pending journal, and re-issues nothing.
+	req.RNG = errReader{}
+	rep, err := attach.ReplaceAttach(req)
+	if err != nil {
+		t.Fatalf("applied-but-unrecorded retry: %v", err)
+	}
+	if rep.VerifierTurnID != issued {
+		t.Fatalf("retry re-issued a different verifier: %q vs %q", rep.VerifierTurnID, issued)
+	}
+	after := cur(t, rn)
+	if after.Revision != landed.Revision {
+		t.Fatalf("retry re-appended the run state: %d -> %d", landed.Revision, after.Revision)
+	}
+	if after.Assignment == nil || after.Assignment.ID != issued {
+		t.Fatalf("retry changed the verifier assignment: %+v", after.Assignment)
+	}
+}
+
+// activateRun drives a fresh paired run to ownerless VERIFY and completes a real pair
+// activation, returning the open Run, the activation request, and the activated RunState.
+func activateRun(t *testing.T, repo string) (*Run, attach.ReplaceRequest, state.RunState) {
+	t.Helper()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	req := attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	}
+	if _, err := attach.ReplaceAttach(req); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	return rn, req, cur(t, rn)
+}
+
+// assertReplacementRecoveryRequired pins that BOTH a same-op retry and a fresh different-op
+// step-over fail with ErrReplaceRecoveryRequired and mutate neither the Registry nor the
+// RunState — the two production wiring branches the activation lineage gate protects.
+func assertReplacementRecoveryRequired(t *testing.T, rn *Run, req attach.ReplaceRequest) {
+	t.Helper()
+	regBefore, _, _ := rn.registry.Load()
+	stBefore := cur(t, rn)
+
+	same := req
+	same.RNG = errReader{} // a recovery-required retry never re-mints
+	if _, err := attach.ReplaceAttach(same); !errors.Is(err, attach.ErrReplaceRecoveryRequired) {
+		t.Fatalf("same-op retry err = %v, want ErrReplaceRecoveryRequired", err)
+	}
+	op2, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op2: %v", err)
+	}
+	diff := req
+	diff.OperationID = op2
+	diff.ExpectedGeneration = 2 // the pair is at generation 2 after the first activation
+	diff.RNG = rand.Reader
+	if _, err := attach.ReplaceAttach(diff); !errors.Is(err, attach.ErrReplaceRecoveryRequired) {
+		t.Fatalf("different-op step-over err = %v, want ErrReplaceRecoveryRequired", err)
+	}
+	if regAfter, _, _ := rn.registry.Load(); regAfter.Revision != regBefore.Revision {
+		t.Fatalf("recovery-required replacement mutated the registry: %d -> %d", regBefore.Revision, regAfter.Revision)
+	}
+	if stAfter := cur(t, rn); stAfter.Revision != stBefore.Revision {
+		t.Fatalf("recovery-required replacement mutated the run state: %d -> %d", stBefore.Revision, stAfter.Revision)
+	}
+}
+
+// A completed activation whose RunState effect is later ROLLED BACK — a locally valid mutation
+// that only clears the assignment leaves an ownerless VERIFY at a later revision while the
+// terminal journal + Registry remain — is recovery-required for both the same-op retry and the
+// different-op step-over (the lineage gate must not trust the journal/Registry alone).
+func TestActivationRolledBackStateRequiresRecovery(t *testing.T) {
+	rn, req, activated := activateRun(t, t.TempDir())
+	defer rn.Close()
+
+	// Clearing the assignment is locally valid (state owns no phase edges) and leaves an
+	// ownerless VERIFY at a later revision — the activation effect is gone.
+	if _, err := rn.state.Mutate(activated.Revision, func(_ uint64, next *state.RunState) error {
+		next.Assignment = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("roll back the activation effect: %v", err)
+	}
+	assertReplacementRecoveryRequired(t, rn, req)
+}
+
+// A completed activation whose assignment is later left STALE — a no-op mutation advances the
+// revision while preserving the assignment, so IssuedRevision < Revision, which is locally
+// valid — is recovery-required for both a same-op retry and a different-op step-over (the
+// lineage gate must not call a stale same-id assignment "still current").
+func TestActivationStaleAssignmentRequiresRecovery(t *testing.T) {
+	rn, req, activated := activateRun(t, t.TempDir())
+	defer rn.Close()
+
+	// A no-op mutation advances the revision while carrying the assignment unchanged.
+	if _, err := rn.state.Mutate(activated.Revision, func(uint64, *state.RunState) error { return nil }); err != nil {
+		t.Fatalf("staleify the assignment: %v", err)
+	}
+	staled := cur(t, rn)
+	if staled.Assignment == nil || staled.Assignment.IssuedRevision >= staled.Revision {
+		t.Fatalf("did not produce a stale assignment: %+v @ revision %d", staled.Assignment, staled.Revision)
+	}
+	assertReplacementRecoveryRequired(t, rn, req)
 }
 
 // openPaired opens a Run over a freshly paired repo (for direct loader unit tests).

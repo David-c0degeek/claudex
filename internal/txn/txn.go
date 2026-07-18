@@ -225,6 +225,12 @@ func (j *Journal) Run(g *genstore.Guard, plan Plan) (Record, error) {
 	return j.drive(g, rec, plan.Steps)
 }
 
+// ConfirmDurable re-confirms the journal store's directory is durable under the held guard.
+// A terminal head may be visible-but-durability-unconfirmed after a halted process, so a
+// consumer that trusts a classification of the head (rather than recovering it) must
+// re-confirm the store first — Recover already confirms even a terminal head.
+func (j *Journal) ConfirmDurable(g *genstore.Guard) error { return j.confirmJournal(g) }
+
 // confirmJournal re-confirms the journal store's directory is durable under the held
 // guard, mapping a durability failure to the typed sentinel. Called after every
 // journal append (prepare, progress, terminal) and before trusting a recovered head.

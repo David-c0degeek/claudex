@@ -87,6 +87,35 @@ func hooksFrom(ctx context.Context) *submitHooks {
 // bootstrap-journal authority), verifies the pairing is complete, and opens the
 // artifact store. A partial failure releases everything it acquired.
 func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
+	return openRun(repoDir, runID, rng, defaultRecoverConfirm)
+}
+
+// recoverConfirmFn re-confirms a reopened run's whole durability chain under the held run
+// guard. It is a per-call parameter (not a mutable global) so a test can inject a failing
+// confirmer without behavior bleed across concurrent opens.
+type recoverConfirmFn func(g *genstore.Guard, loc attach.RunLocation, st *state.Store, reg *state.RegistryStore) error
+
+// defaultRecoverConfirm re-confirms BOTH journal authorities AND both stores on reopen. A
+// prior mutation may have committed VISIBLY but left its directory entry durability-
+// unconfirmed after a halted process — including a TERMINAL journal head, which the
+// classifiers read with no barrier (Latest only), which is exactly why txn.Recover confirms
+// even a terminal head. Re-confirm the whole chain under the SAME guard before serving; a
+// persistent failure is recovery-required (halt), never a silent trust of a visible-but-
+// unconfirmed record.
+func defaultRecoverConfirm(g *genstore.Guard, loc attach.RunLocation, st *state.Store, reg *state.RegistryStore) error {
+	if err := attach.ConfirmPairJournal(g, loc); err != nil {
+		return err
+	}
+	if err := attach.ConfirmReplaceJournal(g, loc); err != nil {
+		return err
+	}
+	if err := st.ConfirmDurable(g); err != nil {
+		return err
+	}
+	return reg.ConfirmDurable(g)
+}
+
+func openRun(repoDir, runID string, rng io.Reader, confirm recoverConfirmFn) (*Run, error) {
 	if rng == nil {
 		return nil, fmt.Errorf("coordinator: OpenRun requires an RNG")
 	}
@@ -108,14 +137,9 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 	}
 	class, cerr := attach.ClassifyPairJournal(g, loc)
 	repl, rperr := attach.ClassifyReplaceJournal(g, loc)
-	// Recover-confirm on reopen: a prior mutation may have committed VISIBLY but left its
-	// directory entry durability-unconfirmed (a *genstore.PostCommitSyncError the caller must
-	// re-confirm before depending on the visible record). Re-confirm the run stores under the
-	// SAME guard before serving; a persistent failure is recovery-required (halt), never a
-	// silent trust of the visible-but-unconfirmed state.
 	var confErr error
 	if cerr == nil && rperr == nil {
-		confErr = openRecoverConfirm(g, st, reg)
+		confErr = confirm(g, loc, st, reg)
 	}
 	rerr := g.Release()
 	if cerr != nil || rperr != nil || confErr != nil || rerr != nil {
@@ -147,17 +171,6 @@ func OpenRun(repoDir, runID string, rng io.Reader) (*Run, error) {
 		store:    store,
 		rng:      rng,
 	}, nil
-}
-
-// openRecoverConfirm re-confirms the run stores' durability on reopen — the M1 recover-confirm:
-// a prior visible-but-durability-unconfirmed append becomes durable (or the open halts) before
-// the visible state is trusted. A test overrides it to witness a persistent re-confirmation
-// failure halting the open.
-var openRecoverConfirm = func(g *genstore.Guard, st *state.Store, reg *state.RegistryStore) error {
-	if err := st.ConfirmDurable(g); err != nil {
-		return err
-	}
-	return reg.ConfirmDurable(g)
 }
 
 // Submit drives one accepted submit. It precomputes the Prepare OFF the run guard
