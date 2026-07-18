@@ -25,6 +25,24 @@ func rejects(t *testing.T, s *Store, prev RunState, label string, mut func(rev u
 	}
 }
 
+// rejectsWith is rejects plus an assertion that the rejection came from the INTENDED
+// validator, identified by a substring of its message. An earlier shape validator that
+// masks the branch under test (a locally-invalid next state rejected before the transition
+// rule runs) is caught here rather than silently counting as coverage.
+func rejectsWith(t *testing.T, s *Store, prev RunState, label, wantMsg string, mut func(rev uint64, next *RunState)) {
+	t.Helper()
+	_, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error { mut(rev, next); return nil })
+	if err == nil {
+		t.Fatalf("%s: mutation should have been rejected", label)
+	}
+	if errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("%s: rejected by a CAS conflict (stale prev revision %d), not the validator under test", label, prev.Revision)
+	}
+	if !strings.Contains(err.Error(), wantMsg) {
+		t.Fatalf("%s: rejected by %q, but the branch under test rejects with %q — an earlier validator is masking it", label, err.Error(), wantMsg)
+	}
+}
+
 // toTests advances an agreed IMPLEMENT_STEP run to TESTS (cursor at the plan end).
 func toTests(t *testing.T, s *Store, impl RunState) RunState {
 	t.Helper()
@@ -148,19 +166,29 @@ func TestV5VerifyPresenceAndTransfer(t *testing.T) {
 		t.Fatalf("ownerless verify shape wrong: %+v", verify)
 	}
 
-	owned := toOwnedVerify(t, s, verify) // v-turn assigned, Verify still set
+	owned := toOwnedVerify(t, s, verify) // v-turn assigned, Verify still set (generation 1)
 
-	// A transfer that drops the requirement is rejected — checked from `owned` (the current
-	// revision) BEFORE the valid transfer advances the store, so it reaches the VERIFY
-	// context-transfer validator rather than a stale-revision CAS conflict.
-	rejects(t, s, owned, "pausing VERIFY without preserving", func(rev uint64, n *RunState) {
-		n.Pause = &PauseContext{Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify, Source: EventRef{Digest: hex64("8"), TurnID: "v-turn"}}
-		n.Verify = nil
-		n.Gate = &Ref{ID: "gate-v", IssuedRevision: rev}
-		n.Phase = PhaseAwaitGuidance
-		n.Lifecycle = LifecyclePaused
-		n.AcceptedTurns["v-turn"] = AcceptedTurn{ArtifactDigest: hex64("8"), Receipt: Receipt{TurnID: "v-turn", Revision: rev, ArtifactDigest: hex64("8")}, Phase: PhaseVerify}
-	})
+	// A transfer that CHANGES the requirement rather than preserving it is rejected
+	// SPECIFICALLY by the VERIFY context-transfer rule. The next state is otherwise locally
+	// valid — the assignment is accepted+cleared and Pause.Verify is non-nil (so the
+	// VERIFY-resume shape validator passes) — but Pause.Verify is generation 2 while
+	// old.Verify is generation 1, so only the cross-generation transfer equality can refuse
+	// it. Checked from `owned` (current) before the valid transfer advances the store; the
+	// asserted message proves no earlier validator masked the branch.
+	rejectsWith(t, s, owned, "transfer that changes the verify requirement",
+		"pausing VERIFY must preserve the verify requirement", func(rev uint64, n *RunState) {
+			n.AcceptedTurns["v-turn"] = AcceptedTurn{ArtifactDigest: hex64("8"), Receipt: Receipt{TurnID: "v-turn", Revision: rev, ArtifactDigest: hex64("8")}, Phase: PhaseVerify}
+			n.Assignment = nil
+			n.Pause = &PauseContext{
+				Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify,
+				Source: EventRef{Digest: hex64("8"), TurnID: "v-turn"},
+				Verify: &VerifyRequirement{RequiredGeneration: 2}, // old.Verify is generation 1
+			}
+			n.Verify = nil
+			n.Gate = &Ref{ID: "gate-v", IssuedRevision: rev}
+			n.Phase = PhaseAwaitGuidance
+			n.Lifecycle = LifecyclePaused
+		})
 
 	// Human gate from VERIFY transfers the requirement into the pause and clears the
 	// top-level Verify; restoring brings the same requirement back.
