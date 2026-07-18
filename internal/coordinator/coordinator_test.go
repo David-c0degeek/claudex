@@ -1083,6 +1083,55 @@ func TestOpenRunBlockedByPendingReplacement(t *testing.T) {
 	}
 }
 
+// The real-run activation integration: a coordinator-driven run reaches ownerless VERIFY,
+// and a qualifying pair replacement ACTIVATES it — issuing the verifier turn and binding the
+// assignment to the run state. This is the 4c-2a activation authority meeting a genuine
+// coordinator-driven VERIFY (not a hand-built one).
+func TestE2EActivationAtOwnerlessVerify(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+
+	// A coordinator TESTS pass enters ownerless VERIFY at threshold 2 (pair generation 1 + 1).
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+	v := cur(t, rn)
+	if v.Phase != state.PhaseVerify || v.Assignment != nil || v.Verify == nil || v.Verify.RequiredGeneration != 2 {
+		t.Fatalf("not ownerless VERIFY at threshold 2: %+v", v)
+	}
+
+	// A pair replacement (generation 1 -> 2, meeting the retained threshold) activates VERIFY.
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	})
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if rep.VerifierTurnID == "" {
+		t.Fatal("a qualifying pair replacement at ownerless VERIFY must issue a verifier turn")
+	}
+	// The ownerless VERIFY now has an owner: the verifier assignment, bound to the resulting
+	// revision, and the run is still a live VERIFY awaiting that verifier.
+	after := cur(t, rn)
+	if after.Phase != state.PhaseVerify || after.Assignment == nil || after.Assignment.ID != rep.VerifierTurnID {
+		t.Fatalf("activation did not issue the verifier assignment: turn=%q state=%+v", rep.VerifierTurnID, after)
+	}
+	if after.Assignment.IssuedRevision != after.Revision {
+		t.Fatalf("verifier assignment not bound to the current revision: %+v", after.Assignment)
+	}
+}
+
 // openPaired opens a Run over a freshly paired repo (for direct loader unit tests).
 func openPaired(t *testing.T) *Run {
 	t.Helper()

@@ -172,11 +172,22 @@ func TestApplyActivation(t *testing.T) {
 	a := &ReplaceActivation{ExpectedStateRevision: 5, StateBaselineDigest: baseline, VerifierTurnID: verifierTurn, RequiredGeneration: 2}
 
 	next := base
+	next.Revision = 6 // the generation builder sets the appended revision BEFORE applyActivation
 	if err := applyActivation(&next, a, 6); err != nil {
 		t.Fatalf("valid activation: %v", err)
 	}
 	if next.Assignment == nil || next.Assignment.ID != verifierTurn || next.Assignment.IssuedRevision != 6 {
 		t.Fatalf("verifier assignment not issued: %+v", next.Assignment)
+	}
+	// A gap-skipped append (the resulting revision is past expected+1) still activates: the
+	// baseline check normalizes the revision back to the frozen expected.
+	gapped := base
+	gapped.Revision = 8
+	if err := applyActivation(&gapped, a, 8); err != nil {
+		t.Fatalf("gap-skipped activation: %v", err)
+	}
+	if gapped.Assignment == nil || gapped.Assignment.IssuedRevision != 8 {
+		t.Fatalf("gap activation did not bind to the resulting revision: %+v", gapped.Assignment)
 	}
 
 	drift := base

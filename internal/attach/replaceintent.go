@@ -255,7 +255,16 @@ func replacePlanFor(registry *state.RegistryStore, runState *state.Store, runGua
 // drifted, no recovery may be in flight), and the only change is the verifier assignment
 // bound to the appended revision.
 func applyActivation(next *state.RunState, a *ReplaceActivation, nextRev uint64) error {
-	base, err := activationBaselineOK(*next, a)
+	// The baseline was frozen at the ownerless pre-state (assignment nil) at the frozen
+	// expected revision. `next` is the pre-assignment clone about to be appended, but the
+	// generation builder has ALREADY set next.Revision to the resulting generation (nextRev,
+	// possibly past expected+1 across a gap), so a raw digest never matches the baseline.
+	// Normalize the revision back to the frozen expected before the baseline check — exactly
+	// as classifyActivation's Applied path does — then bind the verifier to the actual
+	// resulting revision.
+	probe := *next
+	probe.Revision = a.ExpectedStateRevision
+	base, err := activationBaselineOK(probe, a)
 	if err != nil {
 		return err
 	}

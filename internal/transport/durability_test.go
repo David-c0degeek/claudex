@@ -15,7 +15,9 @@ import (
 // post-commit sync failure, so the append is committed-but-durability-unconfirmed — the
 // exact condition the inline re-confirmation must handle.
 func visibleUnconfirmedWrite(path string, data []byte, perm os.FileMode) error {
-	_ = atomicfile.Write(path, data, perm)
+	if werr := atomicfile.Write(path, data, perm); werr != nil {
+		return werr // surface an unexpected underlying failure rather than mask it
+	}
 	return &atomicfile.PostCommitSyncError{Path: path, Err: errors.New("dir sync failed")}
 }
 
