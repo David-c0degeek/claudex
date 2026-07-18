@@ -182,7 +182,17 @@ func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest 
 	if rn.closed {
 		return transport.TestOutcomeResult{}, ErrClosed
 	}
-	prepare, err := rn.precomputeTestOutcome(pass)
+	// Validate context and cheap inputs BEFORE precompute, so an RNG/load error can never mask
+	// the exact rejection the primitive returns (context cancellation, ErrBadEvidence), and a
+	// doomed request reads no RNG. The primitive re-checks all of these authoritatively under
+	// the run guard.
+	if err := ctx.Err(); err != nil {
+		return transport.TestOutcomeResult{}, err
+	}
+	if !state.IsHex64(evidenceDigest) || expectedRevision == 0 {
+		return transport.TestOutcomeResult{}, transport.ErrBadEvidence
+	}
+	prepare, err := rn.precomputeTestOutcome(pass, expectedRevision)
 	if err != nil {
 		return transport.TestOutcomeResult{}, err
 	}
@@ -194,22 +204,28 @@ func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest 
 	}, expectedRevision, evidenceDigest)
 }
 
-// precomputeTestOutcome pre-mints both candidate identities OFF the guard (mirroring the
-// agent-submit precompute) and returns a TestPrepare whose guarded work is pure: evaluate
-// the ownerless outcome against the LOCKED snapshot, choose the pre-minted id the route
-// requires (none for a pass into VERIFY, the turn for a fail into FIX, the gate for the
-// test-budget gate), and bind the apply. No I/O, no minting, no ledger mutation under guard.
-func (rn *Run) precomputeTestOutcome(pass bool) (transport.TestPrepare, error) {
-	rs, ok, err := rn.state.Load()
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, transport.ErrNoRun
-	}
-	turnCand, gateCand, err := rn.mintPair(takenSet(rs))
-	if err != nil {
-		return nil, err
+// precomputeTestOutcome returns a TestPrepare whose guarded work is pure (evaluate the
+// ownerless outcome against the LOCKED snapshot, choose the required id, bind the apply). A
+// PASS enters ownerless VERIFY (IDNone): it mints NOTHING and reads no RNG. A FAIL may issue
+// an identity (the lead's FIX turn or the test-budget gate), so it pre-mints both candidates
+// OFF the guard (mirroring the agent-submit precompute) — but ONLY when the optimistic
+// snapshot is a live TESTS phase at the expected revision, the exact precondition under which
+// the primitive calls this prepare. A doomed request (wrong phase, stale round) thus reads no
+// RNG; the primitive re-validates under the guard, and a round that advances between here and
+// the lock is stale-rejected BEFORE prepare runs (so a pre-minted candidate is never bound to
+// the wrong round). No I/O, no minting, no ledger mutation under the guard.
+func (rn *Run) precomputeTestOutcome(pass bool, expectedRevision uint64) (transport.TestPrepare, error) {
+	var turnCand, gateCand string
+	if !pass {
+		rs, ok, err := rn.state.Load()
+		if err != nil {
+			return nil, err
+		}
+		if ok && rs.Phase == state.PhaseTests && rs.Revision == expectedRevision {
+			if turnCand, gateCand, err = rn.mintPair(takenSet(rs)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	prepare := func(snapshot state.RunState, prepared transport.PreparedTestOutcome) (transport.PreparedTransition, error) {
 		ev := engine.Event{Kind: engine.EvTestsOutcome, Source: prepared.Source, Pass: pass}
@@ -225,11 +241,17 @@ func (rn *Run) precomputeTestOutcome(pass bool) (transport.TestPrepare, error) {
 		var issuedTurn, issuedGate string
 		switch idKind {
 		case engine.IDAssignment:
+			if turnCand == "" { // the optimistic gate must have pre-minted for a live fail
+				return transport.PreparedTransition{}, fmt.Errorf("coordinator: a fail outcome reached prepare without a pre-minted turn")
+			}
 			ids.AssignmentTurnID, issuedTurn = turnCand, turnCand
 		case engine.IDGate:
+			if gateCand == "" {
+				return transport.PreparedTransition{}, fmt.Errorf("coordinator: a gate outcome reached prepare without a pre-minted gate")
+			}
 			ids.GateID, issuedGate = gateCand, gateCand
 		case engine.IDNone:
-			// Ownerless TESTS pass -> VERIFY: neither pre-minted candidate is used.
+			// Ownerless TESTS pass -> VERIFY: no identity, and no candidate was minted.
 		default:
 			return transport.PreparedTransition{}, fmt.Errorf("coordinator: unknown id kind %d", idKind)
 		}

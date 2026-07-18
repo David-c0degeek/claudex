@@ -208,6 +208,17 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 		}
 		return nil
 	})
+	if merr != nil && genstore.IsDurabilityUnconfirmed(merr) {
+		// The transition is VISIBLE and committed (committed.Revision is authoritative) but its
+		// directory entry is not yet power-safe. Re-confirm inline before classifying: on
+		// success it is durable; a persistent failure MUST preserve the committed/visible
+		// classification (the caller re-confirms on recovery), never a proven-uncommitted zero
+		// that would invite a retry of an already-applied ownerless transition.
+		if cerr := deps.Store.ConfirmDurable(g); cerr != nil {
+			return TestOutcomeResult{Revision: committed.Revision}, errors.Join(merr, cerr, release())
+		}
+		merr = nil
+	}
 	return classifyTestOutcome(committed.Revision, merr, release())
 }
 

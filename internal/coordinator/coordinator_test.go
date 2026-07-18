@@ -362,11 +362,85 @@ func TestSubmitTestOutcomeFailLeavesTests(t *testing.T) {
 	defer rn.Close()
 	tests := driveToTests(t, rn, lead, pair)
 
+	// A live FAIL pre-mints its FIX candidate off-guard: it reads the RNG (unlike a pass).
+	crng := &countingRNG{r: rand.Reader}
+	rn.rng = crng
 	if _, err := rn.SubmitTestOutcome(context.Background(), false, strings.Repeat("f", 64), tests.Revision); err != nil {
 		t.Fatalf("submit tests fail: %v", err)
 	}
+	if crng.count() == 0 {
+		t.Fatal("a live FAIL should pre-mint the FIX candidate (read the RNG)")
+	}
 	if next := cur(t, rn); next.Phase == state.PhaseTests {
 		t.Fatalf("a TESTS fail should leave the TESTS phase: %+v", next)
+	}
+}
+
+// A PASS is ownerless (IDNone): it depends on no RNG. Even with an exhausted reader the
+// pass commits and enters VERIFY.
+func TestSubmitTestOutcomePassNeedsNoRNG(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+
+	rn.rng = errReader{} // a PASS must not read the RNG
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("a PASS must not depend on the RNG: %v", err)
+	}
+	if cur(t, rn).Phase != state.PhaseVerify {
+		t.Fatal("the pass did not enter ownerless VERIFY")
+	}
+}
+
+// Every request the primitive will reject — a cancelled context, malformed evidence, a stale
+// round, or a wrong live phase — mints nothing: it reads no RNG, so a rejected request never
+// consumes a future identity and its RNG cannot mask the typed rejection.
+func TestSubmitTestOutcomeRejectedMintNothing(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	crng := &countingRNG{r: rand.Reader}
+	rn, err := OpenRun(repo, runID, crng)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+	digest := strings.Repeat("e", 64)
+
+	readsNothing := func(name string, call func()) {
+		t.Helper()
+		before := crng.count()
+		call()
+		if got := crng.count() - before; got != 0 {
+			t.Fatalf("%s read %d RNG bytes, want 0", name, got)
+		}
+	}
+	readsNothing("cancelled", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		rn.SubmitTestOutcome(ctx, false, digest, tests.Revision)
+	})
+	readsNothing("bad evidence", func() { rn.SubmitTestOutcome(context.Background(), false, "bad", tests.Revision) })
+	readsNothing("stale round", func() { rn.SubmitTestOutcome(context.Background(), false, digest, tests.Revision+1) })
+
+	// Wrong live phase (a fresh PLAN_DRAFT run): a FAIL mints nothing.
+	repo2 := t.TempDir()
+	id2, _, _ := newPairedRun(t, repo2)
+	crng2 := &countingRNG{r: rand.Reader}
+	rn2, err := OpenRun(repo2, id2, crng2)
+	if err != nil {
+		t.Fatalf("open run2: %v", err)
+	}
+	defer rn2.Close()
+	before := crng2.count()
+	rn2.SubmitTestOutcome(context.Background(), false, digest, cur(t, rn2).Revision)
+	if got := crng2.count() - before; got != 0 {
+		t.Fatalf("a wrong-phase fail read %d RNG bytes, want 0", got)
 	}
 }
 
@@ -423,9 +497,12 @@ func TestSubmitTestOutcomeStaleRoundRejected(t *testing.T) {
 	}
 
 	// A delayed pass carrying the ORIGINAL round's revision is stale, even though the live
-	// phase is TESTS again — the delayed-runner hazard the expectedRevision guard closes.
-	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err == nil {
-		t.Fatal("a stale-round TESTS outcome should be rejected")
+	// phase is TESTS again — the delayed-runner hazard the expectedRevision guard closes. The
+	// rejection is the typed StaleError, not a generic failure.
+	_, err = rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision)
+	var stale *transport.StaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("stale-round err = %v, want *transport.StaleError", err)
 	}
 	if after := cur(t, rn); after.Revision != back.Revision {
 		t.Fatalf("the stale outcome mutated the run: rev %d -> %d", back.Revision, after.Revision)
@@ -503,6 +580,11 @@ func TestE2EHumanGatePausesRun(t *testing.T) {
 		t.Fatal("a submit against a paused run should be refused")
 	}
 }
+
+// errReader always errors, proving a code path (an ownerless PASS) reads no RNG.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 // countingRNG counts bytes drawn, proving pre-minted candidates are not regenerated.
 type countingRNG struct {
