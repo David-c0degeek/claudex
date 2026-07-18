@@ -6,13 +6,14 @@
 // transport acquires the lock, so the guarded critical section is only the pure
 // engine work (re-validate refs, Project, Evaluate, choose the pre-minted id, Apply).
 //
-// Scope: this build serves the PLAN_DRAFT..FIX agent-submit subset plus the
-// coordinator-authored TESTS outcome (Run.SubmitTestOutcome drives the ownerless
-// TESTS pass/fail into VERIFY or FIX). It does NOT implement the VERIFY submit, gate
-// resolution, session replacement (attach.ReplaceAttach stands alone), or any CLI; an
-// unsupported edge fails closed before any effect is published. Every mutating entrypoint
-// gates on the aggregate journal reader (a complete pairing, no pending replacement)
-// before Registry authority.
+// Scope: this build serves the full agent-submit phase graph (PLAN_DRAFT..FIX plus the
+// VERIFY verification, projected against the frozen task snapshot) and the
+// coordinator-authored TESTS outcome (Run.SubmitTestOutcome drives the ownerless TESTS
+// pass/fail into VERIFY or FIX). The ownerless VERIFY is activated by attach.ReplaceAttach
+// (which stands alone). It does NOT yet run the tests itself (the TESTS runner seam is a
+// later slice), resolve human gates, or expose a CLI; an unsupported edge fails closed
+// before any effect is published. Every mutating entrypoint gates on the aggregate journal
+// reader (a complete pairing, no pending replacement) before Registry authority.
 package coordinator
 
 import (
@@ -20,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"sort"
 	"sync"
@@ -400,13 +402,20 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 	}
 
 	// New turn: reconstruct facts (only where the phase needs them) and pre-mint both
-	// candidates against the optimistic snapshot.
+	// candidates against the optimistic snapshot. A plan-review submit needs the candidate
+	// planning refs; a VERIFY submit needs the frozen task-contract snapshot (Project
+	// re-verifies its digest under the guard).
 	phaseNeedsFacts := rs.Phase == state.PhasePlanCritique || rs.Phase == state.PhasePlanRevise
 	var facts engine.ProjectionFacts
 	var refs engine.CandidateRefs
 	if phaseNeedsFacts {
 		facts, refs, err = rn.loadFacts(rs)
 		if err != nil {
+			return nil, err
+		}
+	}
+	if rs.Phase == state.PhaseVerify {
+		if facts.Task, err = rn.loadTaskFacts(rs); err != nil {
 			return nil, err
 		}
 	}
@@ -479,6 +488,34 @@ func (rn *Run) mintPair(taken map[string]bool) (turn, gate string, err error) {
 		return "", "", err
 	}
 	return turn, gate, nil
+}
+
+// loadTaskFacts reconstructs the frozen task-contract snapshot a VERIFY submit is projected
+// against, reading it from the run directory confined via os.Root so a forged relative path
+// cannot escape the run. Project re-verifies the snapshot digest under the guard, so this
+// loader only asserts presence and bounds the size (never trusts the bytes on its own).
+func (rn *Run) loadTaskFacts(snapshot state.RunState) (engine.TaskFacts, error) {
+	if snapshot.TaskSnapshot.RelPath == "" {
+		return engine.TaskFacts{}, fmt.Errorf("%w: run has no task snapshot", ErrEvidence)
+	}
+	root, err := os.OpenRoot(rn.loc.RunDir)
+	if err != nil {
+		return engine.TaskFacts{}, err
+	}
+	defer root.Close()
+	f, err := root.Open(snapshot.TaskSnapshot.RelPath)
+	if err != nil {
+		return engine.TaskFacts{}, fmt.Errorf("%w: task snapshot: %v", ErrEvidence, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, int64(engine.MaxMaterializeBytes)+1))
+	if err != nil {
+		return engine.TaskFacts{}, fmt.Errorf("%w: task snapshot: %v", ErrEvidence, err)
+	}
+	if len(data) > engine.MaxMaterializeBytes {
+		return engine.TaskFacts{}, fmt.Errorf("%w: task snapshot over %d bytes", engine.ErrHistoryTooLarge, engine.MaxMaterializeBytes)
+	}
+	return engine.TaskFacts{SnapshotBytes: string(data)}, nil
 }
 
 // loadFacts reconstructs the candidate facts from the real ArtifactStore, bounding

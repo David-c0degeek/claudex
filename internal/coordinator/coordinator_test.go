@@ -183,6 +183,21 @@ func checkpointArtifact(t *testing.T, turnID string, rev uint64, verdict string,
 	})
 }
 
+// verificationArtifact covers the task's single acceptance criterion ("it works"); a "pass"
+// with met=true is a consistent acceptance, a "fail" with met=false a consistent rejection.
+func verificationArtifact(t *testing.T, turnID string, rev uint64, verdict string, met bool) []byte {
+	return mustJSON(t, map[string]any{
+		"protocol_version": 1, "message_type": "verification", "turn_id": turnID, "state_revision": rev,
+		"human_context": nil, "requires_human_decision": false, "decision_question": nil,
+		"verdict":            verdict,
+		"criteria":           []any{map[string]any{"criterion": "it works", "met": met, "evidence": "e"}},
+		"scope_expansion":    []any{},
+		"tests_meaningful":   true,
+		"unsupported_claims": []any{},
+		"notes":              "n",
+	})
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -1541,6 +1556,76 @@ func TestActivationStaleAssignmentRequiresRecovery(t *testing.T) {
 		t.Fatalf("did not produce a stale assignment: %+v @ revision %d", staled.Assignment, staled.Revision)
 	}
 	assertReplacementRecoveryRequired(t, rn, req)
+}
+
+// verifyReadyRun drives a run to an ACTIVATED ownerless VERIFY (the verifier assignment
+// issued to the new pair session) and returns the Run + the verifier session + the VERIFY
+// RunState.
+func verifyReadyRun(t *testing.T, repo string) (*Run, string, state.RunState) {
+	t.Helper()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	tests := driveToTests(t, rn, lead, pair)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err != nil {
+		t.Fatalf("tests pass: %v", err)
+	}
+	op, err := state.MintOperationID(rand.Reader)
+	if err != nil {
+		t.Fatalf("mint op: %v", err)
+	}
+	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+	})
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	return rn, rep.SessionID, cur(t, rn)
+}
+
+// The full loop closes: after activation, the verifier's passing verification (projected
+// against the frozen task snapshot) promotes the run to DONE.
+func TestE2EVerifyToDone(t *testing.T) {
+	rn, verifier, v := verifyReadyRun(t, t.TempDir())
+	defer rn.Close()
+	if v.Phase != state.PhaseVerify || v.Assignment == nil {
+		t.Fatalf("not at an owned VERIFY: %+v", v)
+	}
+	submitOK(t, rn, verifier, verificationArtifact(t, v.Assignment.ID, v.Revision, "pass", true))
+	if final := cur(t, rn); final.Phase != state.PhaseDone {
+		t.Fatalf("passing verification did not reach DONE: %s", final.Phase)
+	}
+}
+
+// A failing verification routes to the lead's FIX (returning to VERIFY) under the verify budget.
+func TestE2EVerifyFailToFix(t *testing.T) {
+	rn, verifier, v := verifyReadyRun(t, t.TempDir())
+	defer rn.Close()
+	submitOK(t, rn, verifier, verificationArtifact(t, v.Assignment.ID, v.Revision, "fail", false))
+	if next := cur(t, rn); next.Phase != state.PhaseFix || next.FixReturn != state.PhaseVerify {
+		t.Fatalf("failing verification did not route to a VERIFY-returning FIX: %+v", next)
+	}
+}
+
+// A VERIFY submit whose frozen task snapshot is missing fails closed (ErrEvidence) — the
+// verification cannot be projected without the durable task contract.
+func TestE2EVerifyMissingTaskSnapshot(t *testing.T) {
+	repo := t.TempDir()
+	rn, verifier, v := verifyReadyRun(t, repo)
+	defer rn.Close()
+	loc, err := attach.ResolveRun(repo, v.RunID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := os.Remove(filepath.Join(loc.RunDir, v.TaskSnapshot.RelPath)); err != nil {
+		t.Fatalf("remove task snapshot: %v", err)
+	}
+	if _, err := rn.Submit(context.Background(), verifier, verificationArtifact(t, v.Assignment.ID, v.Revision, "pass", true)); !errors.Is(err, ErrEvidence) {
+		t.Fatalf("missing task snapshot err = %v, want ErrEvidence", err)
+	}
 }
 
 // openPaired opens a Run over a freshly paired repo (for direct loader unit tests).
