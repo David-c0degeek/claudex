@@ -379,15 +379,13 @@ func (s *Store) reconcile(candidate Record, oldHead Head, werr error) (Record, e
 			}
 			switch {
 			case hasHead && head.Digest == candidate.Digest:
-				// Committed: the candidate is the validated head. If the write's failure
-				// was a committed-but-unsynced directory sync (visible, durability
-				// unconfirmed), surface it as a durability error the caller must confirm
-				// before depending on the record — never as clean success.
-				var pse *atomicfile.PostCommitSyncError
-				if errors.As(werr, &pse) {
-					return candidate, &PostCommitSyncError{Generation: candidate.Generation, Err: werr}
-				}
-				return candidate, nil
+				// The candidate is the visible validated head, but the writer returned a
+				// non-nil error, so durability was NOT established (a directory sync failed,
+				// or a WRITE_THROUGH move/flush failed after the destination became visible,
+				// or any other post-visibility failure). No writer error type proves durable
+				// completion, so ANY non-nil werr here is a durability-unconfirmed record the
+				// caller must confirm before depending on it — never clean success.
+				return candidate, &PostCommitSyncError{Generation: candidate.Generation, Err: werr}
 			case head == oldHead:
 				// Old head intact (including an empty store, where both are the
 				// zero Head): the write did not commit — return the original error.

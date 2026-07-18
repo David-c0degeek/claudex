@@ -30,13 +30,24 @@ var (
 // publication, so tests can force a post-visibility sync/open failure and prove
 // the committed-error and re-confirm semantics.
 type rootOps struct {
-	syncDir func(root *os.Root, name string) error
-	openRW  func(root *os.Root, name string) (*os.File, error)
+	syncDir    func(root *os.Root, name string) error
+	openRW     func(root *os.Root, name string) (*os.File, error)
+	publishDir func(root *os.Root, name string, perm os.FileMode) error
 }
 
 var defaultRootOps = rootOps{
-	syncDir: syncRootDir,
-	openRW:  func(root *os.Root, name string) (*os.File, error) { return root.OpenFile(name, os.O_RDWR, 0) },
+	syncDir:    syncRootDir,
+	openRW:     func(root *os.Root, name string) (*os.File, error) { return root.OpenFile(name, os.O_RDWR, 0) },
+	publishDir: publishDirInRoot,
+}
+
+// rootParent is the rooted parent of a rooted-relative name; "" denotes the root itself.
+func rootParent(name string) string {
+	d := path.Dir(name)
+	if d == "." || d == "/" {
+		return ""
+	}
+	return d
 }
 
 // randName returns a unique temp name in dir. It fails closed if the OS RNG
@@ -175,35 +186,34 @@ func syncInRoot(root *os.Root, name string, o rootOps) error {
 	return nil
 }
 
-// MkdirInRoot creates a directory and fsyncs the root so the new entry is
-// durable. An existing path is re-confirmed: it must be a directory (else
-// ErrNotDirectory), and the root is re-synced so a directory left visible by a
-// prior sync failure becomes durable. A sync failure after visibility is a
-// committed *PostCommitSyncError.
+// MkdirInRoot durably creates a directory within the confined root, forcing the new
+// entry durable in its IMMEDIATE rooted parent (not merely the root). A fresh directory
+// is published durably (POSIX: create + fsync the parent; Windows: a temp sibling + a
+// MOVEFILE_WRITE_THROUGH directory rename within the confinement). An existing directory
+// is RE-confirmed durably without recreating (re-runnable after a prior partial failure),
+// and it must be a directory (else ErrNotDirectory). A durability failure after the entry
+// is visible is a committed *PostCommitSyncError.
 func MkdirInRoot(root *os.Root, name string, perm os.FileMode) error {
 	return mkdirInRoot(root, name, perm, defaultRootOps)
 }
 
 func mkdirInRoot(root *os.Root, name string, perm os.FileMode, o rootOps) error {
-	if err := root.Mkdir(name, perm); err != nil {
-		if !errors.Is(err, fs.ErrExist) {
-			return err
-		}
-		// Lstat, not Stat: an in-root symlink to a directory must not be accepted
-		// as a canonical turn/session directory.
-		info, serr := root.Lstat(name)
-		if serr != nil {
-			return serr
-		}
+	// Lstat, not Stat: an in-root symlink to a directory must not be accepted as a
+	// canonical turn/session directory.
+	if info, err := root.Lstat(name); err == nil {
 		if !info.IsDir() {
 			return ErrNotDirectory
 		}
+		// Exists: re-confirm the entry durable in its immediate parent, without recreating.
+		if serr := o.syncDir(root, rootParent(name)); serr != nil {
+			return &PostCommitSyncError{Path: name, Err: serr}
+		}
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-	// Re-confirm root durability whether freshly created or already visible.
-	if serr := o.syncDir(root, ""); serr != nil {
-		return &PostCommitSyncError{Path: name, Err: serr}
-	}
-	return nil
+	// Missing: durably publish the fresh directory.
+	return o.publishDir(root, name, perm)
 }
 
 // SyncDirInRoot fsyncs the directory name within the confined root (name "" is the

@@ -241,6 +241,25 @@ func TestWriteVisibleButDurabilityUnconfirmed(t *testing.T) {
 	}
 }
 
+// A candidate that is the visible head after ANY non-nil writer error (not only an
+// atomicfile sync error — e.g. a WRITE_THROUGH move/flush failure) is durability-
+// unconfirmed, never clean success.
+func TestReconcilePlainWriteErrorIsDurabilityUnconfirmed(t *testing.T) {
+	s := newStore(t)
+	r1 := appendConst(t, s, Head{}, "one")
+	s.write = func(path string, data []byte, perm os.FileMode) error {
+		_ = atomicfile.Write(path, data, perm) // the record IS written and visible...
+		return errors.New("write-through move/flush failed after the destination was visible")
+	}
+	rec, err := s.Append(r1.Head(), func(uint64, string) ([]byte, error) { return []byte("two"), nil })
+	if !IsDurabilityUnconfirmed(err) {
+		t.Fatalf("plain post-visibility write error = %v, want IsDurabilityUnconfirmed", err)
+	}
+	if rec.Generation != 2 {
+		t.Fatalf("rec gen = %d, want 2 (the visible head)", rec.Generation)
+	}
+}
+
 // An ambiguous write that merely wraps an atomicfile durability error must NOT be
 // classified as the proven-visible durability-unconfirmed condition.
 func TestAmbiguousIsNotDurabilityUnconfirmed(t *testing.T) {

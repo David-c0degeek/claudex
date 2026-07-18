@@ -27,9 +27,23 @@ import (
 	"io"
 	"reflect"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
+
+// isDurabilityUnconfirmed reports whether err is a visible-but-unconfirmed durability
+// condition from a participant effect: the genstore type (a store append) OR a raw
+// atomicfile type (a rooted directory/file publish from a snapshot step). ErrAmbiguous is
+// EXCLUDED — an unproven write is not a visible record.
+func isDurabilityUnconfirmed(err error) bool {
+	if errors.Is(err, genstore.ErrAmbiguous) {
+		return false
+	}
+	var g *genstore.PostCommitSyncError
+	var a *atomicfile.PostCommitSyncError
+	return errors.As(err, &g) || errors.As(err, &a)
+}
 
 const (
 	RecordVersion = 1
@@ -323,11 +337,12 @@ func (j *Journal) drive(g *genstore.Guard, rec Record, steps []Step) (Record, er
 		case StatusNotApplied:
 			if err := steps[i].Apply(); err != nil {
 				// Any Apply error halts with no progress. A participant whose effect is
-				// visible but durability-unconfirmed (state.MutateLocked decode-and-pair)
-				// returns a *genstore.PostCommitSyncError; wrap it so the value carries
-				// ErrDurabilityUnconfirmed too — control flow is unchanged (still a halt),
-				// and errors.As to the genstore type is preserved. Any other error stays raw.
-				if genstore.IsDurabilityUnconfirmed(err) {
+				// visible but durability-unconfirmed returns a *genstore.PostCommitSyncError
+				// (a store append, via decode-and-pair) OR a raw *atomicfile.PostCommitSyncError
+				// (a rooted snapshot dir/file publish); wrap either so the value carries
+				// ErrDurabilityUnconfirmed too — control flow is unchanged (still a halt), and
+				// errors.As to the underlying type is preserved. Any other error stays raw.
+				if isDurabilityUnconfirmed(err) {
 					return Record{}, fmt.Errorf("%w: step %d (%s) apply: %w", ErrDurabilityUnconfirmed, i, steps[i].Name, err)
 				}
 				return Record{}, err

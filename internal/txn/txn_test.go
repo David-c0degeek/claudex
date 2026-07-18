@@ -578,6 +578,36 @@ func TestDurabilityParticipantApplyRealGenstoreErrorWraps(t *testing.T) {
 	}
 }
 
+// A participant Apply that returns a RAW *atomicfile.PostCommitSyncError (a rooted
+// snapshot dir/file publish) halts wrapping ErrDurabilityUnconfirmed while preserving
+// errors.As to the atomicfile type; Recover completes with the effect applied exactly once.
+func TestDurabilityParticipantApplyRawAtomicfileErrorWraps(t *testing.T) {
+	j, lock := newJournal(t)
+	step := &fakeStep{name: "a", applyDurErr: &atomicfile.PostCommitSyncError{Path: "x", Err: errors.New("rooted dir publish")}}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		_, err := j.Run(g, planFrom("t1", []*fakeStep{step}))
+		if !errors.Is(err, ErrDurabilityUnconfirmed) {
+			t.Fatalf("Run err = %v, want errors.Is ErrDurabilityUnconfirmed", err)
+		}
+		var ae *atomicfile.PostCommitSyncError
+		if !errors.As(err, &ae) {
+			t.Fatalf("Run err = %v, want errors.As *atomicfile.PostCommitSyncError preserved", err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", step.applyCalls)
+	}
+	withGuard(t, lock, func(g *genstore.Guard) {
+		out, recovered, err := j.Recover(g, func(Intent) (Plan, error) { return planFrom("t1", []*fakeStep{step}), nil })
+		if err != nil || !recovered || !out.Complete {
+			t.Fatalf("recover out=%+v recovered=%v err=%v, want complete", out, recovered, err)
+		}
+	})
+	if step.applyCalls != 1 {
+		t.Fatalf("apply calls after recover = %d, want 1 (no reapply)", step.applyCalls)
+	}
+}
+
 func TestNilCallbackRejected(t *testing.T) {
 	j, lock := newJournal(t)
 	withGuard(t, lock, func(g *genstore.Guard) {

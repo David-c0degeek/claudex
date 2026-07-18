@@ -116,7 +116,15 @@ func TestSyncInRootReconfirms(t *testing.T) {
 // healthy call re-confirms durability and succeeds.
 func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 	errInject := errors.New("injected dir sync failure")
-	bad := rootOps{syncDir: func(*os.Root, string) error { return errInject }, openRW: defaultRootOps.openRW}
+	bad := rootOps{
+		syncDir: func(*os.Root, string) error { return errInject },
+		openRW:  defaultRootOps.openRW,
+		// A fresh directory is created (visible) but its durability publish fails.
+		publishDir: func(root *os.Root, name string, perm os.FileMode) error {
+			_ = root.Mkdir(name, perm)
+			return &PostCommitSyncError{Path: name, Err: errInject}
+		},
+	}
 	asCommitted := func(t *testing.T, err error) {
 		t.Helper()
 		var pce *PostCommitSyncError
@@ -172,6 +180,48 @@ func TestRootedSyncFaultsAreCommitted(t *testing.T) {
 			t.Fatalf("healthy re-confirm: %v", err)
 		}
 	})
+}
+
+// mkdirInRoot durably PUBLISHES a fresh directory (via the publishDir seam) and
+// RE-CONFIRMS an existing one via its immediate rooted parent — re-runnably, so a retry
+// after a confirm failure re-confirms rather than blessing an unconfirmed directory.
+func TestMkdirInRootPublishesAndReconfirms(t *testing.T) {
+	r, _ := openRoot(t)
+	var published, confirmed []string
+	failConfirmOnce := true
+	ops := rootOps{
+		openRW: defaultRootOps.openRW,
+		publishDir: func(root *os.Root, name string, perm os.FileMode) error {
+			published = append(published, name)
+			return root.Mkdir(name, perm)
+		},
+		syncDir: func(root *os.Root, name string) error {
+			confirmed = append(confirmed, name)
+			if failConfirmOnce {
+				failConfirmOnce = false
+				return errors.New("parent confirm failed once")
+			}
+			return nil
+		},
+	}
+	// Create: goes through the durable publisher, not a bare Mkdir+root-sync.
+	if err := mkdirInRoot(r, "d", 0o700, ops); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(published) != 1 || published[0] != "d" {
+		t.Fatalf("publishDir calls = %v, want [d]", published)
+	}
+	// Exists: re-confirm via the immediate parent (root, ""), and the first confirm failure
+	// is surfaced; a retry re-confirms rather than blessing.
+	if err := mkdirInRoot(r, "d", 0o700, ops); err == nil {
+		t.Fatal("re-confirm must surface the injected durability failure")
+	}
+	if err := mkdirInRoot(r, "d", 0o700, ops); err != nil {
+		t.Fatalf("re-confirm retry must succeed: %v", err)
+	}
+	if len(confirmed) != 2 || confirmed[0] != "" || confirmed[1] != "" {
+		t.Fatalf("re-confirm synced parents %v, want two confirms of the immediate parent", confirmed)
+	}
 }
 
 // Re-confirming an already-visible file whose writable open fails for any reason

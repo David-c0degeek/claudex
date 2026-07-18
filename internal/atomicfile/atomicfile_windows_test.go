@@ -190,6 +190,42 @@ func TestDirPublishInvokesMoveFileExWithWriteThroughFlag(t *testing.T) {
 	}
 }
 
+// The ROOTED directory publish (MkdirInRoot, as snapshotStep uses per ancestor) goes
+// through the confined write-through rename with EXACTLY MOVEFILE_WRITE_THROUGH — pinned
+// via the seam. This is the rooted path, not the path-based MkdirAllDurable helper.
+func TestMkdirInRootPublishesViaWriteThrough(t *testing.T) {
+	var gotFlags []uint32
+	orig := moveFileEx
+	moveFileEx = func(from, to *uint16, flags uint32) error {
+		gotFlags = append(gotFlags, flags)
+		return orig(from, to, flags)
+	}
+	defer func() { moveFileEx = orig }()
+
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	for _, d := range []string{"a", "a/b", "a/b/c"} { // nested tree, level by level
+		if err := MkdirInRoot(root, d, 0o700); err != nil {
+			t.Fatalf("MkdirInRoot(%s): %v", d, err)
+		}
+	}
+	if len(gotFlags) != 3 {
+		t.Fatalf("moveFileEx invoked %d times, want 3 (one write-through publish per level)", len(gotFlags))
+	}
+	for i, f := range gotFlags {
+		if f != uint32(windows.MOVEFILE_WRITE_THROUGH) {
+			t.Fatalf("rooted publish %d flags = %#x, want %#x", i, f, uint32(windows.MOVEFILE_WRITE_THROUGH))
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(base, "a", "b", "c")); err != nil || !fi.IsDir() {
+		t.Fatalf("rooted directory tree not published: fi=%v err=%v", fi, err)
+	}
+}
+
 // swallowDirFlush treats only the Windows directory-flush refusal as satisfied; a real
 // error propagates.
 func TestSwallowDirFlush(t *testing.T) {

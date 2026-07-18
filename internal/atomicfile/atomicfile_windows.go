@@ -6,11 +6,86 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"time"
 
 	"golang.org/x/sys/windows"
 )
+
+// publishDirInRoot durably creates a fresh directory within the confined root on Windows,
+// where a directory handle cannot be flushed. It opens the immediate rooted parent (os.Root
+// refuses symlink traversal) and keeps that handle OPEN to pin the resolved directory, reads
+// its validated real DOS path, then creates a temp sibling and renames it to the target with
+// MOVEFILE_WRITE_THROUGH — operating on LEAF names under the validated real parent (no path
+// traversal, so no symlink escape), which forces the parent's metadata to disk.
+func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
+	openName := rootParent(name)
+	if openName == "" {
+		openName = "."
+	}
+	pf, err := root.Open(openName)
+	if err != nil {
+		return err
+	}
+	defer pf.Close()
+	realParent, err := finalPathByHandle(windows.Handle(pf.Fd()))
+	if err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(realParent, tmpPrefix)
+	if err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+	_ = os.Chmod(tmp, perm)
+	from, err := windows.UTF16PtrFromString(tmp)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(realParent + `\` + path.Base(name))
+	if err != nil {
+		return err
+	}
+	if err := moveFileEx(from, to, dirPublishFlags); err != nil {
+		// A concurrent publisher may have created the target first (the write-through rename
+		// fails when the destination already exists). If it now exists as a directory it was
+		// durably published by that writer — all creates use this same write-through path —
+		// so treat it as done (our temp is cleaned up by the defer).
+		if info, serr := root.Lstat(name); serr == nil && info.IsDir() {
+			return nil
+		}
+		return &PostCommitSyncError{Path: name, Err: err}
+	}
+	cleanup = false // the temp directory was renamed to its final name
+	return nil
+}
+
+// finalPathFlags is VOLUME_NAME_DOS (0x0) | FILE_NAME_NORMALIZED (0x0): a normalized DOS
+// drive-letter path. x/sys/windows does not export these zero-valued flags, so named here.
+const finalPathFlags = 0
+
+// finalPathByHandle returns the validated real DOS path of an open handle, keeping the
+// caller's handle open so the resolution cannot be swapped out from under it.
+func finalPathByHandle(h windows.Handle) (string, error) {
+	buf := make([]uint16, 260)
+	for {
+		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), finalPathFlags)
+		if err != nil {
+			return "", err
+		}
+		if n > uint32(len(buf)) {
+			buf = make([]uint16, n)
+			continue
+		}
+		return windows.UTF16ToString(buf[:n]), nil
+	}
+}
 
 // maxRenameAttempts bounds the transient-error retry loop on Windows.
 const maxRenameAttempts = 20

@@ -4,10 +4,24 @@ package atomicfile
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 )
+
+// publishDirInRoot creates a fresh directory within the confined root and forces its entry
+// durable by fsyncing the immediate rooted parent. Re-runnable: os.Root.Mkdir's EEXIST is
+// ignored and the parent fsync re-confirms on a retry.
+func publishDirInRoot(root *os.Root, name string, perm os.FileMode) error {
+	if err := root.Mkdir(name, perm); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	if serr := syncRootDir(root, rootParent(name)); serr != nil {
+		return &PostCommitSyncError{Path: name, Err: serr}
+	}
+	return nil
+}
 
 // replace renames oldpath onto newpath. POSIX rename(2) is an atomic replace.
 func replace(oldpath, newpath string) error {

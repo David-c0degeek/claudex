@@ -100,12 +100,12 @@ func Write(path string, data []byte, perm os.FileMode) error {
 }
 
 // SyncDir fsyncs the directory dir so that entries created or renamed inside it are
-// durable across power loss. On POSIX this is a real directory fsync; on Windows it
-// attempts a FlushFileBuffers on the directory handle and treats the OS's
-// no-directory-flush limitation as satisfied (durability there rests on
-// MOVEFILE_WRITE_THROUGH renames plus NTFS metadata journaling — see the package
-// doc). It is idempotent and re-runnable under a caller-held lock, so a store can
-// re-confirm durability after a prior sync failure or across a process restart.
+// durable across power loss. On POSIX this is a real directory fsync; on Windows the
+// directory-handle flush is refused by the OS, so durability is instead forced at write
+// time by MOVEFILE_WRITE_THROUGH file and directory renames (see the package doc), and
+// SyncDir is the re-confirmation seam whose only obstacle, when present, is that refusal.
+// It is idempotent and re-runnable under a caller-held lock, so a store can re-confirm
+// durability after a prior sync failure or across a process restart.
 func SyncDir(dir string) error { return syncDir(dir) }
 
 // ensureDirDurable makes dir exist with its entry DURABLE in its (already-durable)
