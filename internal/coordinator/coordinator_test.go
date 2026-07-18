@@ -328,15 +328,20 @@ func TestE2ENonGatedChain(t *testing.T) {
 	}
 	defer rn.Close()
 
-	driveToTests(t, rn, lead, pair)
+	tests := driveToTests(t, rn, lead, pair)
 
-	// The coordinator authors the TESTS pass (ownerless: no agent, no artifact, no id).
-	next, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64))
+	// The coordinator authors the TESTS pass (ownerless: no agent, no artifact, no id),
+	// carrying the revision the outcome was derived against.
+	res, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision)
 	if err != nil {
 		t.Fatalf("submit tests pass: %v", err)
 	}
+	if res.Revision <= tests.Revision {
+		t.Fatalf("committed revision %d did not advance past %d", res.Revision, tests.Revision)
+	}
 	// Ownerless VERIFY: no assignment, and the fresh threshold is one past the pair
 	// session (freshly paired at generation 1, never replaced, so 2).
+	next := cur(t, rn)
 	if next.Phase != state.PhaseVerify || next.Assignment != nil || next.Verify == nil {
 		t.Fatalf("TESTS pass did not enter ownerless VERIFY: %+v", next)
 	}
@@ -355,18 +360,18 @@ func TestSubmitTestOutcomeFailLeavesTests(t *testing.T) {
 		t.Fatalf("open run: %v", err)
 	}
 	defer rn.Close()
-	driveToTests(t, rn, lead, pair)
+	tests := driveToTests(t, rn, lead, pair)
 
-	next, err := rn.SubmitTestOutcome(context.Background(), false, strings.Repeat("f", 64))
-	if err != nil {
+	if _, err := rn.SubmitTestOutcome(context.Background(), false, strings.Repeat("f", 64), tests.Revision); err != nil {
 		t.Fatalf("submit tests fail: %v", err)
 	}
-	if next.Phase == state.PhaseTests {
+	if next := cur(t, rn); next.Phase == state.PhaseTests {
 		t.Fatalf("a TESTS fail should leave the TESTS phase: %+v", next)
 	}
 }
 
-// SubmitTestOutcome fails closed for a run that is not a live TESTS phase.
+// SubmitTestOutcome fails closed for a run that is not a live TESTS phase (transport's typed
+// ErrNotTestsPhase), distinct from malformed evidence (ErrBadEvidence).
 func TestSubmitTestOutcomeWrongPhase(t *testing.T) {
 	repo := t.TempDir()
 	runID, _, _ := newPairedRun(t, repo)
@@ -375,21 +380,82 @@ func TestSubmitTestOutcomeWrongPhase(t *testing.T) {
 		t.Fatalf("open run: %v", err)
 	}
 	defer rn.Close()
-	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64)); !errors.Is(err, ErrNotTestsPhase) {
-		t.Fatalf("wrong-phase err = %v, want ErrNotTestsPhase", err)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), cur(t, rn).Revision); !errors.Is(err, transport.ErrNotTestsPhase) {
+		t.Fatalf("wrong-phase err = %v, want transport.ErrNotTestsPhase", err)
 	}
 }
 
-// SubmitTestOutcome rejects a malformed (non hex64) evidence digest before touching the run.
+// SubmitTestOutcome rejects a malformed (non hex64) evidence digest as ErrBadEvidence — bad
+// input and a wrong live phase are distinguishable.
 func TestSubmitTestOutcomeBadEvidenceDigest(t *testing.T) {
 	rn := openPaired(t)
-	if _, err := rn.SubmitTestOutcome(context.Background(), true, "not-a-digest"); !errors.Is(err, ErrNotTestsPhase) {
-		t.Fatalf("bad digest err = %v, want ErrNotTestsPhase", err)
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, "not-a-digest", 1); !errors.Is(err, transport.ErrBadEvidence) {
+		t.Fatalf("bad digest err = %v, want transport.ErrBadEvidence", err)
 	}
 }
 
-// A pending replacement blocks a coordinator-authored TESTS outcome under the same guard,
-// before any state mutation.
+// A stale-round outcome (derived against an earlier TESTS revision than the live one) is
+// rejected: only the round the outcome was derived from may apply, even though the live
+// phase is still TESTS. This is the delayed-runner hazard the expectedRevision guard closes.
+func TestSubmitTestOutcomeStaleRoundRejected(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+
+	// A fail routes to the lead's FIX (which returns to TESTS); the lead's FIX report lands
+	// the run back at a NEW TESTS round at a later revision.
+	if _, err := rn.SubmitTestOutcome(context.Background(), false, strings.Repeat("f", 64), tests.Revision); err != nil {
+		t.Fatalf("first TESTS fail: %v", err)
+	}
+	fix := cur(t, rn)
+	if fix.Phase != state.PhaseFix || fix.FixReturn != state.PhaseTests {
+		t.Fatalf("a TESTS fail did not open a TESTS-returning FIX: %+v", fix)
+	}
+	submitOK(t, rn, lead, implReport(t, fix.Assignment.ID, fix.Revision)) // FIX -> TESTS
+	back := cur(t, rn)
+	if back.Phase != state.PhaseTests || back.Revision <= tests.Revision {
+		t.Fatalf("FIX did not return to a later TESTS round: phase=%s rev=%d (was %d)", back.Phase, back.Revision, tests.Revision)
+	}
+
+	// A delayed pass carrying the ORIGINAL round's revision is stale, even though the live
+	// phase is TESTS again — the delayed-runner hazard the expectedRevision guard closes.
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), tests.Revision); err == nil {
+		t.Fatal("a stale-round TESTS outcome should be rejected")
+	}
+	if after := cur(t, rn); after.Revision != back.Revision {
+		t.Fatalf("the stale outcome mutated the run: rev %d -> %d", back.Revision, after.Revision)
+	}
+}
+
+// An already-cancelled context commits nothing, honoring the transport primitive's
+// cancellation contract.
+func TestSubmitTestOutcomeContextCancelled(t *testing.T) {
+	repo := t.TempDir()
+	runID, lead, pair := newPairedRun(t, repo)
+	rn, err := OpenRun(repo, runID, rand.Reader)
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	defer rn.Close()
+	tests := driveToTests(t, rn, lead, pair)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := rn.SubmitTestOutcome(ctx, true, strings.Repeat("e", 64), tests.Revision); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled ctx err = %v, want context.Canceled", err)
+	}
+	if after := cur(t, rn); after.Revision != tests.Revision || after.Phase != state.PhaseTests {
+		t.Fatalf("a cancelled outcome mutated the run: %+v", after)
+	}
+}
+
+// A pending replacement blocks a coordinator-authored TESTS outcome through the aggregate
+// journal reader (transport.ErrRecoveryRequired), before any state mutation.
 func TestSubmitTestOutcomeBlockedByPendingReplacement(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)
@@ -401,7 +467,7 @@ func TestSubmitTestOutcomeBlockedByPendingReplacement(t *testing.T) {
 	before := driveToTests(t, rn, lead, pair)
 
 	plantPendingReplace(t, repo, runID)
-	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64)); !errors.Is(err, transport.ErrRecoveryRequired) {
+	if _, err := rn.SubmitTestOutcome(context.Background(), true, strings.Repeat("e", 64), before.Revision); !errors.Is(err, transport.ErrRecoveryRequired) {
 		t.Fatalf("blocked TESTS outcome err = %v, want transport.ErrRecoveryRequired", err)
 	}
 	// No durable effect: the run is still at TESTS at the same revision.

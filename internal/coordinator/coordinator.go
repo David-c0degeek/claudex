@@ -46,9 +46,6 @@ var (
 	// ErrReplayInPrepare means Prepare was invoked for an already-accepted turn, which
 	// the locked transport resolves before Prepare — a defensive invariant.
 	ErrReplayInPrepare = errors.New("coordinator: prepare invoked for an already-accepted turn")
-	// ErrNotTestsPhase means SubmitTestOutcome was called for a run that is not a live
-	// TESTS phase, so the coordinator-authored outcome cannot be applied.
-	ErrNotTestsPhase = errors.New("coordinator: run is not awaiting a TESTS outcome")
 )
 
 // Run is an opened run: its bound paths, the state/registry/artifact stores under the
@@ -167,103 +164,81 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 	}, sessionID, raw)
 }
 
-// SubmitTestOutcome authors the coordinator-owned TESTS pass/fail under the run guard. It
-// is ownerless — no agent turn, no artifact, and no minted identity: the coordinator's
-// TESTS runner (wired in 4d) supplies the outcome and the evidence digest. On a pass the
-// run enters ownerless VERIFY with a fresh threshold one generation past the current pair
-// session; a fail routes to the lead's FIX or the test-budget gate (the pure engine
-// decides). It fails closed unless the pairing is complete, no replacement is pending, and
-// the run is a live TESTS phase.
+// SubmitTestOutcome authors the coordinator-owned TESTS pass/fail through the locked
+// transport primitive. It is ownerless — no agent turn, no artifact, no accepted turn: the
+// coordinator's TESTS runner (wired in 4d) supplies the outcome, the evidence digest, and
+// the expectedRevision the outcome was derived against. The candidate identities are
+// pre-minted OFF the guard (the FIX/gate id, selected under the guard by the pure engine
+// adapter — never minted under the guard), and transport enforces the run identity bind
+// (the aggregate journal reader), the stale-round guard (expectedRevision), context
+// cancellation, and the exact TESTS-outcome shape. A pass enters ownerless VERIFY one
+// generation past the pair; a fail routes to the lead's FIX or the test-budget gate.
 //
 // evidenceDigest is the sha256 of the TESTS run's evidence; 4d will bind it to a real
-// evidence artifact. Here it is required to be a well-formed ownerless source (hex64), the
-// exact shape validateApply demands, but is not yet checked against a stored artifact.
-func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest string) (state.RunState, error) {
+// evidence artifact. transport validates it as the ownerless empty-turn source shape.
+func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest string, expectedRevision uint64) (transport.TestOutcomeResult, error) {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
 	if rn.closed {
-		return state.RunState{}, ErrClosed
+		return transport.TestOutcomeResult{}, ErrClosed
 	}
-	if !state.IsHex64(evidenceDigest) {
-		return state.RunState{}, fmt.Errorf("%w: evidence digest is not a sha256", ErrNotTestsPhase)
-	}
-
-	g, ok, err := genstore.Acquire(rn.loc.RunLock)
+	prepare, err := rn.precomputeTestOutcome(pass)
 	if err != nil {
-		return state.RunState{}, err
+		return transport.TestOutcomeResult{}, err
 	}
-	if !ok {
-		return state.RunState{}, genstore.ErrBusy
-	}
-	rs, merr := rn.authorTestOutcome(g, pass, evidenceDigest)
-	if rerr := g.Release(); merr == nil && rerr != nil {
-		// The append committed but the lock release failed: report a committed error so a
-		// caller never retries a done transition (mirrors state.Mutate / genstore.Append).
-		return rs, &genstore.PostCommitError{Generation: rs.Revision, Err: rerr}
-	}
-	return rs, merr
+	return transport.SubmitTestOutcome(ctx, transport.TestOutcomeDeps{
+		Store:    rn.state,
+		Registry: rn.registry,
+		Journal:  runJournalReader{loc: rn.loc},
+		Prepare:  prepare,
+	}, expectedRevision, evidenceDigest)
 }
 
-// authorTestOutcome is SubmitTestOutcome's guarded critical section: the aggregate journal
-// gate, the TESTS-phase precondition, the current pair generation, the pure engine
-// decision, and the durable state append.
-func (rn *Run) authorTestOutcome(g *genstore.Guard, pass bool, evidenceDigest string) (state.RunState, error) {
-	// Aggregate journal gate: a complete pairing and no pending replacement, under the SAME
-	// guard, before authoring off the RunState/Registry.
-	if err := requireRunReady(g, rn.loc); err != nil {
-		return state.RunState{}, err
-	}
+// precomputeTestOutcome pre-mints both candidate identities OFF the guard (mirroring the
+// agent-submit precompute) and returns a TestPrepare whose guarded work is pure: evaluate
+// the ownerless outcome against the LOCKED snapshot, choose the pre-minted id the route
+// requires (none for a pass into VERIFY, the turn for a fail into FIX, the gate for the
+// test-budget gate), and bind the apply. No I/O, no minting, no ledger mutation under guard.
+func (rn *Run) precomputeTestOutcome(pass bool) (transport.TestPrepare, error) {
 	rs, ok, err := rn.state.Load()
 	if err != nil {
-		return state.RunState{}, err
+		return nil, err
 	}
 	if !ok {
-		return state.RunState{}, transport.ErrNoRun
+		return nil, transport.ErrNoRun
 	}
-	if rs.Phase != state.PhaseTests {
-		return state.RunState{}, fmt.Errorf("%w: run is in %s", ErrNotTestsPhase, rs.Phase)
-	}
-	reg, ok, err := rn.registry.Load()
+	turnCand, gateCand, err := rn.mintPair(takenSet(rs))
 	if err != nil {
-		return state.RunState{}, err
+		return nil, err
 	}
-	if !ok {
-		return state.RunState{}, transport.ErrNoRun
-	}
-	if reg.RunID != rs.RunID {
-		return state.RunState{}, fmt.Errorf("%w: registry %q != state %q", transport.ErrRunMismatch, reg.RunID, rs.RunID)
-	}
-	pairGen, err := currentPairGeneration(reg)
-	if err != nil {
-		return state.RunState{}, err
-	}
-
-	ev := engine.Event{Kind: engine.EvTestsOutcome, Source: state.EventRef{Digest: evidenceDigest}, Pass: pass}
-	dec, err := engine.Evaluate(rs, ev, engine.RuntimeFacts{CurrentPairGeneration: pairGen})
-	if err != nil {
-		return state.RunState{}, err
-	}
-	// A TESTS pass enters ownerless VERIFY (no identity); a fail issues the lead's FIX
-	// assignment or the test-budget gate id. Mint exactly what the route requires.
-	ids, err := rn.mintForDecision(dec, rs)
-	if err != nil {
-		return state.RunState{}, err
-	}
-	next, merr := rn.state.MutateLocked(g, rs.Revision, func(gen uint64, n *state.RunState) error {
-		return engine.Apply(dec, ev.Source, ids, gen, n)
-	})
-	if merr != nil {
-		if !genstore.IsDurabilityUnconfirmed(merr) {
-			return state.RunState{}, merr
+	prepare := func(snapshot state.RunState, prepared transport.PreparedTestOutcome) (transport.PreparedTransition, error) {
+		ev := engine.Event{Kind: engine.EvTestsOutcome, Source: prepared.Source, Pass: pass}
+		dec, perr := engine.Evaluate(snapshot, ev, engine.RuntimeFacts{CurrentPairGeneration: prepared.CurrentPairGeneration})
+		if perr != nil {
+			return transport.PreparedTransition{}, perr
 		}
-		// Visible-but-durability-unconfirmed: the state append is valid but not power-safe.
-		// Re-confirm the state store durable inline (still under the held guard) before
-		// returning success; a persistent failure halts, never a false durable success.
-		if cerr := rn.state.ConfirmDurable(g); cerr != nil {
-			return state.RunState{}, errors.Join(merr, cerr)
+		idKind, perr := engine.RequiredID(dec)
+		if perr != nil {
+			return transport.PreparedTransition{}, perr
 		}
+		var ids engine.Ids
+		var issuedTurn, issuedGate string
+		switch idKind {
+		case engine.IDAssignment:
+			ids.AssignmentTurnID, issuedTurn = turnCand, turnCand
+		case engine.IDGate:
+			ids.GateID, issuedGate = gateCand, gateCand
+		case engine.IDNone:
+			// Ownerless TESTS pass -> VERIFY: neither pre-minted candidate is used.
+		default:
+			return transport.PreparedTransition{}, fmt.Errorf("coordinator: unknown id kind %d", idKind)
+		}
+		apply := func(gen uint64, next *state.RunState) error {
+			return engine.Apply(dec, prepared.Source, ids, gen, next)
+		}
+		return transport.NewPreparedTransition(issuedTurn, issuedGate, apply), nil
 	}
-	return next, nil
+	return prepare, nil
 }
 
 // Close releases the artifact store. It waits for in-flight submits (the write lock
@@ -333,78 +308,6 @@ func (r runJournalReader) Head(g *genstore.Guard, runID string) (transport.Journ
 	default: // JournalAbsent or an unknown value: the completed pairing is gone.
 		return transport.JournalUnknown, fmt.Errorf("coordinator: pair journal for %s is no longer a completed pairing (class %d)", runID, pair)
 	}
-}
-
-// mintForDecision mints the exact identity the decision's route requires: a turn id for a
-// running edge (a TESTS fail routing to the lead's FIX), a gate id for a gate edge (the
-// test-budget gate), or none for an ownerless edge (a TESTS pass entering VERIFY). RNG
-// access is serialized with concurrent submit precomputes via mintMu.
-func (rn *Run) mintForDecision(dec engine.Decision, rs state.RunState) (engine.Ids, error) {
-	idKind, err := engine.RequiredID(dec)
-	if err != nil {
-		return engine.Ids{}, err
-	}
-	rn.mintMu.Lock()
-	defer rn.mintMu.Unlock()
-	switch idKind {
-	case engine.IDNone:
-		return engine.Ids{}, nil
-	case engine.IDAssignment:
-		turn, err := state.MintTurnID(rn.rng, takenSet(rs))
-		if err != nil {
-			return engine.Ids{}, err
-		}
-		return engine.Ids{AssignmentTurnID: turn}, nil
-	case engine.IDGate:
-		gate, err := state.MintGateID(rn.rng, takenSet(rs))
-		if err != nil {
-			return engine.Ids{}, err
-		}
-		return engine.Ids{GateID: gate}, nil
-	default:
-		return engine.Ids{}, fmt.Errorf("coordinator: unknown id kind %d", idKind)
-	}
-}
-
-// requireRunReady classifies the pair and replacement journals under the held guard and
-// returns transport.ErrRecoveryRequired unless the pairing is complete and no replacement
-// is pending. It is the same aggregate gate runJournalReader.Head applies, for the
-// coordinator-authored paths (SubmitTestOutcome) that do not flow through transport.
-func requireRunReady(g *genstore.Guard, loc attach.RunLocation) error {
-	pair, err := attach.ClassifyPairJournal(g, loc)
-	if err != nil {
-		return fmt.Errorf("%w: %v", transport.ErrRecoveryRequired, err)
-	}
-	if pair != attach.JournalTerminal {
-		return fmt.Errorf("%w: pair journal class %d", transport.ErrRecoveryRequired, pair)
-	}
-	repl, err := attach.ClassifyReplaceJournal(g, loc)
-	if err != nil {
-		return fmt.Errorf("%w: %v", transport.ErrRecoveryRequired, err)
-	}
-	switch repl {
-	case attach.ReplaceJournalAbsent, attach.ReplaceJournalTerminal:
-		return nil
-	case attach.ReplaceJournalNonTerminal:
-		return fmt.Errorf("%w: session replacement pending", transport.ErrRecoveryRequired)
-	default:
-		return fmt.Errorf("%w: unknown replace journal class %d", transport.ErrRecoveryRequired, repl)
-	}
-}
-
-// currentPairGeneration is the generation of the pair slot's current session, from the
-// LOCKED validated Registry — the fresh-session VERIFY threshold is one past it. A
-// missing/mismatched pair shape is a run mismatch (never a zero, which would corrupt the
-// threshold). Mirrors transport's identical read for the agent-submit path.
-func currentPairGeneration(reg state.Registry) (uint64, error) {
-	if reg.Pair == nil {
-		return 0, fmt.Errorf("%w: the run has no pair slot", transport.ErrRunMismatch)
-	}
-	r := reg.Resolve(reg.Pair.CurrentSessionID)
-	if r.Status != state.RegCurrent || r.Role != state.SlotPair || r.CurrentGeneration == 0 {
-		return 0, fmt.Errorf("%w: the pair slot's current session is not resolvable", transport.ErrRunMismatch)
-	}
-	return r.CurrentGeneration, nil
 }
 
 // --- precompute: build the Prepare off the run guard ---
