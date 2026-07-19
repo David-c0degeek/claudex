@@ -8,18 +8,19 @@
 //
 // Scope: this build serves the full agent-submit phase graph (PLAN_DRAFT..FIX plus the
 // VERIFY verification, projected against the frozen task snapshot) and the
-// coordinator-authored TESTS outcome (Run.SubmitTestOutcome drives the ownerless TESTS
-// pass/fail into VERIFY or FIX). The ownerless VERIFY is activated by attach.ReplaceAttach
-// (which stands alone). It does NOT yet run the tests itself (the TESTS runner seam is a
-// later slice), resolve human gates, or expose a CLI; an unsupported edge fails closed
-// before any effect is published. Every mutating entrypoint gates on the aggregate journal
-// reader (a complete pairing, no pending replacement) before Registry authority.
+// coordinator-authored TESTS outcome COMPOSITION primitive (Run.SubmitTestOutcome applies an
+// already-decided ownerless TESTS pass/fail into VERIFY or FIX). The ownerless VERIFY is
+// activated by attach.ReplaceAttach (which stands alone). It does NOT run the mechanical test
+// gate itself — the attempt/executor/evidence authority (deciding the outcome by exit code
+// and the unchanged exact tree over a durable attempt record) is subject 04.5, which binds the
+// git commit/tree identities from 04.1–04.4 and then composes onto SubmitTestOutcome. It also
+// does not resolve human gates or expose a CLI; an unsupported edge fails closed before any
+// effect is published. Every mutating entrypoint gates on the aggregate journal reader (a
+// complete pairing, no pending replacement) before Registry authority.
 package coordinator
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -29,7 +30,6 @@ import (
 	"sync"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
-	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -243,53 +243,6 @@ func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest 
 		Journal:  runJournalReader{loc: rn.loc},
 		Prepare:  prepare,
 	}, expectedRevision, evidenceDigest)
-}
-
-// TestRunner executes a run's mechanical test gate and reports the outcome plus the evidence
-// its digest binds to. It is an INJECTED SEAM: the coordinator never execs a command itself —
-// production supplies a confined command executor (a later, security-reviewed slice), and
-// tests supply a deterministic fake. The evidence bytes are whatever the runner captured
-// (e.g. test output); the coordinator digests them for the outcome's ownerless source.
-type TestRunner interface {
-	RunTests(ctx context.Context, command string) (pass bool, evidence []byte, err error)
-}
-
-// RunTests runs the coordinator-owned TESTS gate for a run at ownerless TESTS and authors its
-// outcome. Off the run guard it runs the gate — a DISABLED gate is a pass with no mechanical
-// evidence (the pairing relies on the checkpoint reviews' tests_adequate), an ENABLED gate
-// defers to the injected runner — digests the evidence into the ownerless source, and applies
-// the outcome via SubmitTestOutcome (which re-validates the phase/revision and gates on the
-// aggregate journal reader under the guard). The optimistic phase read only avoids running the
-// gate for a run that plainly is not at TESTS; the authoritative check is SubmitTestOutcome's.
-func (rn *Run) RunTests(ctx context.Context, runner TestRunner) (transport.TestOutcomeResult, error) {
-	rs, ok, err := rn.state.Load()
-	if err != nil {
-		return transport.TestOutcomeResult{}, err
-	}
-	if !ok {
-		return transport.TestOutcomeResult{}, transport.ErrNoRun
-	}
-	if rs.Phase != state.PhaseTests {
-		return transport.TestOutcomeResult{}, fmt.Errorf("%w: run is in %s", transport.ErrNotTestsPhase, rs.Phase)
-	}
-	pass, evidence, err := runTestGate(ctx, rs.EffectivePolicy.TestGate, runner)
-	if err != nil {
-		return transport.TestOutcomeResult{}, err
-	}
-	sum := sha256.Sum256(evidence)
-	return rn.SubmitTestOutcome(ctx, pass, hex.EncodeToString(sum[:]), rs.Revision)
-}
-
-// runTestGate produces the (pass, evidence) for a run's test gate. A disabled gate needs no
-// runner; an enabled gate requires one.
-func runTestGate(ctx context.Context, gate config.TestGate, runner TestRunner) (bool, []byte, error) {
-	if gate.Disabled {
-		return true, []byte("test-gate-disabled"), nil
-	}
-	if runner == nil {
-		return false, nil, fmt.Errorf("coordinator: an enabled test gate requires a runner")
-	}
-	return runner.RunTests(ctx, gate.Command)
 }
 
 // precomputeTestOutcome returns a TestPrepare whose guarded work is pure (evaluate the
