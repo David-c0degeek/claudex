@@ -31,6 +31,11 @@ const maxGitOutput = 1 << 20 // 1 MiB per stream
 // ErrGit is the sentinel a non-zero git exit (or a failure to run git) wraps.
 var ErrGit = errors.New("gitx: git command failed")
 
+// runObserver is a test-only seam invoked with the full argv (the -c overrides plus the caller's
+// args) of every git invocation, so a test can assert, e.g., that object writers carry the fsync
+// configuration. Nil in production.
+var runObserver func(argv []string)
+
 // ErrClosed is returned when Run/RunCode is called after Close. A closed handle no longer owns
 // its hooks directory, so running git would emit the ambiguous empty core.hooksPath value the
 // hardening exists to prevent; the handle fails closed instead.
@@ -109,6 +114,9 @@ func (g *Git) exec(ctx context.Context, dir string, extraEnv map[string]string, 
 		"-c", "commit.gpgsign=false",
 		"-c", "tag.gpgsign=false",
 	}, args...)
+	if runObserver != nil {
+		runObserver(full)
+	}
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = dir
 	cmd.Env = scrubbedEnv(extraEnv)
