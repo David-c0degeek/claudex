@@ -35,6 +35,16 @@ type BaseResolver interface {
 	ResolveBase(ctx context.Context, repoDir, baseBranch string) (commit string, err error)
 }
 
+// Preflighter validates that the repository is a pristine root ready to host a
+// NEW run (exact repository root, the runtime dir git-ignored with nothing
+// tracked under it, a clean working tree). It runs ONLY on the definite-new-run
+// path, read-only, BEFORE any .claudex/lock/run-dir is created; a recovering
+// bootstrap never reruns it (the bootstrap itself perturbs the ambient state it
+// checks). Subject 04 supplies the real git implementation.
+type Preflighter interface {
+	Preflight(ctx context.Context, repoDir string) error
+}
+
 // WorktreeProvisioner creates and verifies the run's isolated worktree at the
 // frozen run-relative locator + branch from the intent's exact base commit. It is
 // an idempotent Observe/Apply/Confirm participant driven inside the bootstrap
@@ -94,6 +104,7 @@ type FirstAttachRequest struct {
 	CreatedUnix     int64
 	RNG             io.Reader
 	Base            BaseResolver
+	Preflight       Preflighter
 	Worktree        WorktreeProvisioner
 	Classifier      Classifier
 }
@@ -119,8 +130,12 @@ type layout struct {
 	bootstrapJournal string
 }
 
+// runtimeDirName is the repo-relative directory the coordinator writes all run state under; it
+// must be git-ignored (enforced by the definite-new-run preflight).
+const runtimeDirName = ".claudex"
+
 func layoutFor(repoDir string) layout {
-	base := filepath.Join(repoDir, ".claudex")
+	base := filepath.Join(repoDir, runtimeDirName)
 	return layout{
 		repoDir:          repoDir,
 		repoLock:         filepath.Join(base, "repo.lock"),
@@ -173,6 +188,12 @@ func FirstAttach(ctx context.Context, req FirstAttachRequest) (FirstAttachResult
 		}
 		if _, _, _, ferr := decideFS(res, policy); ferr != nil {
 			return FirstAttachResult{}, ferr
+		}
+		// Definite-new-run git preflight: refuse a non-root, dirty, or runtime-not-ignored
+		// repository BEFORE any .claudex/lock/run-dir is created. This runs only here (the
+		// no-pending, no-active path), so a recovering bootstrap never reruns ambient preflight.
+		if perr := req.Preflight.Preflight(ctx, lay.repoDir); perr != nil {
+			return FirstAttachResult{}, perr
 		}
 	}
 
@@ -442,6 +463,9 @@ func (req FirstAttachRequest) validateForNewBootstrap() (config.RunPolicy, error
 	}
 	if req.Base == nil {
 		return config.RunPolicy{}, fmt.Errorf("attach: a base resolver is required")
+	}
+	if req.Preflight == nil {
+		return config.RunPolicy{}, fmt.Errorf("attach: a preflighter is required")
 	}
 	task, err := config.ParseTaskContract(req.TaskCanonical)
 	if err != nil {

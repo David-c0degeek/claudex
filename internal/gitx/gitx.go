@@ -62,6 +62,30 @@ func (g *Git) Close() error {
 // GIT_AUTHOR_*) onto the scrubbed environment. A non-zero exit wraps ErrGit with the redacted,
 // bounded stderr. The context governs cancellation and timeout.
 func (g *Git) Run(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]byte, error) {
+	stdout, stderr, code, err := g.exec(ctx, dir, extraEnv, args...)
+	if err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("%w: git %s: exit %d: %s", ErrGit, args[0], code, redact.Text(strings.TrimSpace(string(stderr))))
+	}
+	return stdout, nil
+}
+
+// RunCode runs git and reports the process EXIT CODE as data rather than an error, so a caller
+// can treat a specific non-zero code as a boolean answer (e.g. check-ignore's 1 = "not ignored",
+// or `merge-base --is-ancestor`'s 1). err is non-nil ONLY when git could not be started or the
+// context was cancelled (code -1 then); an ordinary non-zero git exit returns (stdout, code, nil).
+func (g *Git) RunCode(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]byte, int, error) {
+	stdout, _, code, err := g.exec(ctx, dir, extraEnv, args...)
+	return stdout, code, err
+}
+
+// exec runs git under the hardened isolation and returns trimmed stdout, raw stderr, the process
+// exit code, and a run error. The run error is set only for a cancelled context or a failure to
+// start the process (code -1); a git command that runs and exits non-zero returns that code with
+// a nil error, so callers that treat exit codes as data can distinguish the two.
+func (g *Git) exec(ctx context.Context, dir string, extraEnv map[string]string, args ...string) (stdout, stderr []byte, code int, err error) {
 	// -c overrides precede the subcommand: no hooks, no signing, no ambient config surprises.
 	full := append([]string{
 		"-c", "core.hooksPath=" + g.hooksDir,
@@ -72,19 +96,27 @@ func (g *Git) Run(ctx context.Context, dir string, extraEnv map[string]string, a
 	cmd.Dir = dir
 	cmd.Env = scrubbedEnv(extraEnv)
 
-	var stdout, stderr boundedBuffer
-	stdout.limit = maxGitOutput
-	stderr.limit = maxGitOutput
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var out, errb boundedBuffer
+	out.limit = maxGitOutput
+	errb.limit = maxGitOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
 
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err() // cancellation/timeout, not a git verdict
-		}
-		return nil, fmt.Errorf("%w: git %s: %v: %s", ErrGit, args[0], err, redact.Text(strings.TrimSpace(stderr.String())))
+	runErr := cmd.Run()
+	stdout = bytes.TrimRight(out.Bytes(), "\n")
+	stderr = errb.Bytes()
+	if runErr == nil {
+		return stdout, stderr, 0, nil
 	}
-	return bytes.TrimRight(stdout.Bytes(), "\n"), nil
+	if ctx.Err() != nil {
+		return stdout, stderr, -1, ctx.Err() // cancellation/timeout, not a git verdict
+	}
+	var ee *exec.ExitError
+	if errors.As(runErr, &ee) {
+		return stdout, stderr, ee.ExitCode(), nil // a git verdict; the code is data
+	}
+	// git could not be started (not on PATH, permission, etc.).
+	return stdout, stderr, -1, fmt.Errorf("%w: git %s: %v", ErrGit, args[0], runErr)
 }
 
 // scrubbedEnv builds a minimal, git-config-neutral child environment. It keeps only what git

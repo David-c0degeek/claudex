@@ -33,6 +33,10 @@ type fakeBase struct{ commit string }
 
 func (f fakeBase) ResolveBase(context.Context, string, string) (string, error) { return f.commit, nil }
 
+type fakePreflight struct{}
+
+func (fakePreflight) Preflight(context.Context, string) error { return nil }
+
 type fakeWorktree struct{ applied bool }
 
 func (f *fakeWorktree) ObserveWorktree(context.Context, string, attach.BootstrapIntent) (txn.StepStatus, error) {
@@ -86,7 +90,7 @@ func newPairedRunWithPolicy(t *testing.T, repo string, pol []byte) (runID, lead,
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
 		TaskCanonical: taskBytes(), PolicyCanonical: pol,
 		CreatedUnix: 1000, RNG: rand.Reader,
-		Base: fakeBase{commit: strings.Repeat("a", 40)}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
+		Base: fakeBase{commit: strings.Repeat("a", 40)}, Preflight: fakePreflight{}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
 	})
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
@@ -805,7 +809,7 @@ func TestOpenRunRejectsUnpaired(t *testing.T) {
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
 		TaskCanonical: taskBytes(), PolicyCanonical: policyBytes(),
 		CreatedUnix: 1000, RNG: rand.Reader,
-		Base: fakeBase{commit: strings.Repeat("a", 40)}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
+		Base: fakeBase{commit: strings.Repeat("a", 40)}, Preflight: fakePreflight{}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
 	})
 	if err != nil {
 		t.Fatalf("first attach: %v", err)

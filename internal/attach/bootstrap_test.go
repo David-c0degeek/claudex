@@ -45,6 +45,11 @@ type fakeBase struct{ commit string }
 
 func (f fakeBase) ResolveBase(context.Context, string, string) (string, error) { return f.commit, nil }
 
+// fakePreflight is a no-op definite-new-run preflighter; err makes it refuse.
+type fakePreflight struct{ err error }
+
+func (f fakePreflight) Preflight(context.Context, string) error { return f.err }
+
 // countingBase records how many times the base resolver was called.
 type countingBase struct {
 	commit string
@@ -115,6 +120,7 @@ func newRequest(t *testing.T, repoDir string, wt WorktreeProvisioner) FirstAttac
 		CreatedUnix:     1000,
 		RNG:             bytes.NewReader(bytes.Repeat([]byte{0x3c, 0x9a, 0x17, 0x42}, 64)), // 256 bytes
 		Base:            fakeBase{commit: strings.Repeat("a", 40)},
+		Preflight:       fakePreflight{},
 		Worktree:        wt,
 		Classifier:      supportedFS(),
 	}
@@ -567,6 +573,20 @@ func TestFirstAttachConcurrent(t *testing.T) {
 // operation id, and a worktree observer — no task/policy/RNG/base/agent/clock.
 func minimalRequest(repo, op string, wt WorktreeProvisioner) FirstAttachRequest {
 	return FirstAttachRequest{RepoDir: repo, OperationID: op, Worktree: wt}
+}
+
+// A definite-new-run preflight refusal (a dirty or runtime-not-ignored repo) fails closed
+// BEFORE any mutation: no .claudex directory is created.
+func TestFirstAttachPreflightRefusalNoMutation(t *testing.T) {
+	repo := t.TempDir()
+	req := newRequest(t, repo, &fakeWorktree{})
+	req.Preflight = fakePreflight{err: errors.New("dirty working tree")}
+	if _, err := FirstAttach(context.Background(), req); err == nil {
+		t.Fatal("a preflight refusal should fail the attach")
+	}
+	if _, e := os.Stat(filepath.Join(repo, ".claudex")); !os.IsNotExist(e) {
+		t.Fatalf(".claudex created despite a preflight refusal")
+	}
 }
 
 // A classifier I/O error is propagated (fail-closed) BEFORE any mutation — never
