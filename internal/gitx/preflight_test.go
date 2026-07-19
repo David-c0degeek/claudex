@@ -89,6 +89,53 @@ func TestPreflightTrackedUnderRuntime(t *testing.T) {
 	}
 }
 
+func TestParseGitVersion(t *testing.T) {
+	ok := []struct {
+		in       string
+		maj, min int
+	}{
+		{"git version 2.54.0.windows.1", 2, 54},
+		{"git version 2.36.0", 2, 36},
+		{"git version 2.35.1", 2, 35},
+		{"git version 3.0.0", 3, 0},
+	}
+	for _, c := range ok {
+		maj, min, err := parseGitVersion(c.in)
+		if err != nil || maj != c.maj || min != c.min {
+			t.Errorf("parseGitVersion(%q) = %d.%d err=%v, want %d.%d", c.in, maj, min, err, c.maj, c.min)
+		}
+	}
+	bad := []string{"", "git 2.54", "not a version", "git version x.y", "git version 2"}
+	for _, in := range bad {
+		if _, _, err := parseGitVersion(in); err == nil {
+			t.Errorf("parseGitVersion(%q) = nil error, want a parse error", in)
+		}
+	}
+}
+
+func TestBelowMinVersion(t *testing.T) {
+	below := [][2]int{{2, 31}, {2, 35}, {1, 99}, {0, 0}}
+	for _, v := range below {
+		if !belowMinVersion(v[0], v[1]) {
+			t.Errorf("belowMinVersion(%d,%d) = false, want true (min %d.%d)", v[0], v[1], minGitMajor, minGitMinor)
+		}
+	}
+	okv := [][2]int{{2, 36}, {2, 54}, {3, 0}}
+	for _, v := range okv {
+		if belowMinVersion(v[0], v[1]) {
+			t.Errorf("belowMinVersion(%d,%d) = true, want false", v[0], v[1])
+		}
+	}
+}
+
+// The installed git satisfies the minimum-version preflight (a supported real output).
+func TestCheckMinVersionSupported(t *testing.T) {
+	repo, g := repoWithIgnore(t, ".claudex/\n")
+	if err := g.checkMinVersion(context.Background(), repo); err != nil {
+		t.Fatalf("installed git rejected by min-version check: %v", err)
+	}
+}
+
 // A dirty working tree (a non-ignored untracked file) is refused.
 func TestPreflightDirtyTree(t *testing.T) {
 	repo, g := repoWithIgnore(t, ".claudex/\n")

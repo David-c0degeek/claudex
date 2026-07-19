@@ -244,6 +244,79 @@ func TestFirstAttachRealGitForeignRefFailsClosed(t *testing.T) {
 	}
 }
 
+// deterministicSeed returns a fixed RNG seed and the run id its first 16 bytes mint, so a foreign
+// object can be planted at the derived worktree path before the attach runs.
+func deterministicSeed(t *testing.T) ([]byte, string) {
+	t.Helper()
+	seed := make([]byte, 512)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	return seed, "run-" + hex.EncodeToString(seed[:16])
+}
+
+// A preexisting (ignored) directory with a foreign marker at the derived worktree path is not
+// proven ours: the bootstrap fails closed, activates no run, and never deletes the marker.
+func TestFirstAttachRealGitForeignWorktreeDirFailsClosed(t *testing.T) {
+	repo, g, _ := realGitRepo(t)
+	seed, runID := deterministicSeed(t)
+	marker := filepath.Join(repo, ".claudex", "runs", runID, "worktree", "foreign-marker")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatalf("plant dir: %v", err)
+	}
+	writeFile(t, marker, "not ours\n")
+
+	if _, err := FirstAttach(context.Background(), realRequest(t, repo, g, opID("a"), newSeedReader(seed))); err == nil {
+		t.Fatal("a foreign worktree directory should fail the bootstrap closed")
+	}
+	assertNoActiveRun(t, repo)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("foreign marker was disturbed: %v", err)
+	}
+}
+
+// A regular file at the derived worktree path is foreign: fail closed, file untouched.
+func TestFirstAttachRealGitForeignFileFailsClosed(t *testing.T) {
+	repo, g, _ := realGitRepo(t)
+	seed, runID := deterministicSeed(t)
+	abs := filepath.Join(repo, ".claudex", "runs", runID, "worktree")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, abs, "i am a file\n")
+
+	if _, err := FirstAttach(context.Background(), realRequest(t, repo, g, opID("a"), newSeedReader(seed))); err == nil {
+		t.Fatal("a regular file at the worktree path should fail the bootstrap closed")
+	}
+	assertNoActiveRun(t, repo)
+	if b, err := os.ReadFile(abs); err != nil || string(b) != "i am a file\n" {
+		t.Fatalf("foreign file disturbed: %q err=%v", b, err)
+	}
+}
+
+// The derived run branch already checked out at a different (ignored) path is foreign: fail closed.
+func TestFirstAttachRealGitBranchElsewhereFailsClosed(t *testing.T) {
+	repo, g, base := realGitRepo(t)
+	seed, runID := deterministicSeed(t)
+	branch := "claudex/" + runID
+	mustGit(t, g, repo, nil, "update-ref", "refs/heads/"+branch, base, "")
+	other := filepath.Join(repo, ".claudex", "elsewhere-wt")
+	mustGit(t, g, repo, nil, "worktree", "add", other, branch)
+
+	if _, err := FirstAttach(context.Background(), realRequest(t, repo, g, opID("a"), newSeedReader(seed))); err == nil {
+		t.Fatal("the run branch checked out elsewhere should fail the bootstrap closed")
+	}
+	assertNoActiveRun(t, repo)
+}
+
+func assertNoActiveRun(t *testing.T, repo string) {
+	t.Helper()
+	lay := layoutFor(repo)
+	if cur, ok, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load(); ok && cur.Active {
+		t.Fatalf("a run was activated despite a foreign worktree object: %+v", cur)
+	}
+}
+
 // A dirty working tree is refused by preflight before any run directory is created.
 func TestFirstAttachRealGitDirtyPreflightNoRun(t *testing.T) {
 	repo, g, _ := realGitRepo(t)

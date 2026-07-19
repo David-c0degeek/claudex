@@ -31,10 +31,16 @@ const maxGitOutput = 1 << 20 // 1 MiB per stream
 // ErrGit is the sentinel a non-zero git exit (or a failure to run git) wraps.
 var ErrGit = errors.New("gitx: git command failed")
 
+// ErrClosed is returned when Run/RunCode is called after Close. A closed handle no longer owns
+// its hooks directory, so running git would emit the ambiguous empty core.hooksPath value the
+// hardening exists to prevent; the handle fails closed instead.
+var ErrClosed = errors.New("gitx: handle is closed")
+
 // Git is a hardened handle to the native git executable. It owns a fresh empty hooks
-// directory reused across invocations; Close removes it.
+// directory reused across invocations; Close removes it and disables the handle.
 type Git struct {
 	hooksDir string
+	closed   bool
 }
 
 // New creates a Git handle backed by a fresh empty hooks directory. The directory exists only
@@ -47,14 +53,19 @@ func New() (*Git, error) {
 	return &Git{hooksDir: dir}, nil
 }
 
-// Close removes the owned hooks directory.
+// Close removes the owned hooks directory and marks the handle unusable so a later Run/RunCode
+// fails closed rather than running git with an empty (ambiguous) hooks path. It is idempotent.
 func (g *Git) Close() error {
-	if g.hooksDir == "" {
+	if g.closed {
 		return nil
 	}
-	err := os.RemoveAll(g.hooksDir)
+	g.closed = true
+	dir := g.hooksDir
 	g.hooksDir = ""
-	return err
+	if dir == "" {
+		return nil
+	}
+	return os.RemoveAll(dir)
 }
 
 // Run executes `git <args...>` in dir with the hardened isolation described on the package,
@@ -86,6 +97,12 @@ func (g *Git) RunCode(ctx context.Context, dir string, extraEnv map[string]strin
 // start the process (code -1); a git command that runs and exits non-zero returns that code with
 // a nil error, so callers that treat exit codes as data can distinguish the two.
 func (g *Git) exec(ctx context.Context, dir string, extraEnv map[string]string, args ...string) (stdout, stderr []byte, code int, err error) {
+	if g.closed {
+		return nil, nil, -1, ErrClosed
+	}
+	if len(args) == 0 {
+		return nil, nil, -1, fmt.Errorf("%w: no git subcommand", ErrGit)
+	}
 	// -c overrides precede the subcommand: no hooks, no signing, no ambient config surprises.
 	full := append([]string{
 		"-c", "core.hooksPath=" + g.hooksDir,

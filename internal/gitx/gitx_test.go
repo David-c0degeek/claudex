@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,36 @@ func TestRunContextCancelled(t *testing.T) {
 	cancel()
 	if _, err := g.Run(ctx, repo, nil, "rev-parse", "HEAD"); err == nil {
 		t.Fatal("a cancelled context should fail the call")
+	}
+}
+
+// After Close the handle no longer owns its hooks directory, so Run/RunCode fail closed with
+// ErrClosed rather than silently running git with an empty (ambiguous) core.hooksPath.
+func TestRunAfterCloseFailsClosed(t *testing.T) {
+	repo, g := initRepo(t)
+	if err := g.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := g.Run(context.Background(), repo, nil, "rev-parse", "HEAD"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Run after Close = %v, want ErrClosed", err)
+	}
+	if _, _, err := g.RunCode(context.Background(), repo, nil, "status"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("RunCode after Close = %v, want ErrClosed", err)
+	}
+	if err := g.Close(); err != nil { // idempotent
+		t.Fatalf("second close: %v", err)
+	}
+}
+
+// An empty argv is rejected rather than panicking on args[0].
+func TestRunEmptyArgsRejected(t *testing.T) {
+	g, err := New()
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	if _, err := g.Run(context.Background(), t.TempDir(), nil); err == nil {
+		t.Fatal("Run with no args should fail, not panic")
 	}
 }
 
