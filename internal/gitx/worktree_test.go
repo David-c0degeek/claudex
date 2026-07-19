@@ -115,7 +115,7 @@ func TestWorktreeRecoverInternalAddCut(t *testing.T) {
 	abs := worktreeAbs(repo, spec)
 	// Reconstruct the cut state.
 	mustRun(t, g, repo, nil, "update-ref", "refs/heads/"+spec.Branch, base, "")
-	if err := ensureOwnerMarker(abs, spec.OwnerToken); err != nil {
+	if err := ensureOwnerMarker(repo, spec); err != nil {
 		t.Fatalf("plant owner marker: %v", err)
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil { // git's leading-directory creation, no linkage yet
@@ -136,7 +136,9 @@ func TestWorktreeRecoverInternalAddCut(t *testing.T) {
 func TestWorktreeBareDirWrongTokenForeign(t *testing.T) {
 	repo, g, spec, _ := provisionRepo(t)
 	abs := worktreeAbs(repo, spec)
-	if err := ensureOwnerMarker(abs, "some-other-run-token"); err != nil {
+	foreign := spec
+	foreign.OwnerToken = "some-other-run-token"
+	if err := ensureOwnerMarker(repo, foreign); err != nil {
 		t.Fatalf("plant foreign marker: %v", err)
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil {
@@ -148,6 +150,86 @@ func TestWorktreeBareDirWrongTokenForeign(t *testing.T) {
 	if err := NewWorktree(g).Apply(context.Background(), repo, spec); err == nil {
 		t.Fatal("apply over a foreign-marked bare directory should fail closed")
 	}
+}
+
+// An existing ownership marker is durably RE-CONFIRMED on every retry (not blindly trusted): a
+// prior halt after the content write but before the entry barrier is repaired forward, and a
+// re-confirm failure fails closed.
+func TestWorktreeMarkerReconfirmedOnRetry(t *testing.T) {
+	repo, _, spec, _ := provisionRepo(t)
+	if err := ensureOwnerMarker(repo, spec); err != nil { // first publish
+		t.Fatalf("first publish: %v", err)
+	}
+	orig := markerReconfirm
+	defer func() { markerReconfirm = orig }()
+	calls := 0
+	markerReconfirm = func(root *os.Root, rel string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected re-confirm failure")
+		}
+		return orig(root, rel)
+	}
+	if err := ensureOwnerMarker(repo, spec); err == nil { // existing-marker path must re-confirm
+		t.Fatal("a re-confirm failure should fail marker publication")
+	}
+	if err := ensureOwnerMarker(repo, spec); err != nil { // healthy retry re-confirms
+		t.Fatalf("healthy re-confirm retry: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("the existing-marker path did not re-confirm durability (calls=%d)", calls)
+	}
+}
+
+// After our marker is published, a foreign file appearing in the target directory (a non-empty
+// unregistered target) is NOT adopted or deleted — the sibling token authorizes only the exact
+// empty interrupted prefix.
+func TestWorktreeMarkerDoesNotAuthorizeForeignTargetDeletion(t *testing.T) {
+	repo, g, spec, _ := provisionRepo(t)
+	abs := worktreeAbs(repo, spec)
+	if err := ensureOwnerMarker(repo, spec); err != nil {
+		t.Fatalf("publish marker: %v", err)
+	}
+	sentinel := filepath.Join(abs, "foreign-sentinel")
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	if err := os.WriteFile(sentinel, []byte("appeared in the interval"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	w := NewWorktree(g)
+	if st, err := w.Observe(context.Background(), repo, spec); err != nil || st != WorktreeForeign {
+		t.Fatalf("Observe = %v (err %v), want foreign for a non-empty target", st, err)
+	}
+	if err := w.Apply(context.Background(), repo, spec); err == nil {
+		t.Fatal("apply over a non-empty target must fail closed")
+	}
+	if b, err := os.ReadFile(sentinel); err != nil || string(b) != "appeared in the interval" {
+		t.Fatalf("foreign sentinel disturbed: %q err=%v", b, err)
+	}
+}
+
+// A truncated/empty marker (the shape an atomicity failure would leave, though InstallInRoot
+// prevents it) never authorizes adoption: it reads as foreign.
+func TestWorktreeEmptyMarkerNotAdopted(t *testing.T) {
+	repo, g, spec, _ := provisionRepo(t)
+	abs := worktreeAbs(repo, spec)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
+	if err := os.WriteFile(ownerMarkerPathForTest(repo, spec), nil, 0o600); err != nil {
+		t.Fatalf("plant empty marker: %v", err)
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		t.Fatalf("plant bare target: %v", err)
+	}
+	if st, err := NewWorktree(g).Observe(context.Background(), repo, spec); err != nil || st != WorktreeForeign {
+		t.Fatalf("Observe with an empty marker = %v (err %v), want foreign", st, err)
+	}
+}
+
+func ownerMarkerPathForTest(repo string, spec WorktreeSpec) string {
+	return filepath.Join(repo, filepath.FromSlash(ownerMarkerRel(spec)))
 }
 
 // Confirm forces the checked-out FILE CONTENTS durable, not only the linkage — a tracked checkout

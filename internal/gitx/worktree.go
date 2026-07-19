@@ -2,9 +2,11 @@ package gitx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -79,80 +81,125 @@ func worktreeAbs(repoDir string, spec WorktreeSpec) string {
 // the run directory), so it survives an interrupted `git worktree add` that leaves a bare target.
 const ownerMarkerName = ".claudex-worktree-owner"
 
-func ownerMarkerPath(abs string) string { return filepath.Join(filepath.Dir(abs), ownerMarkerName) }
+// maxOwnerMarker bounds the marker read; the token is a short id.
+const maxOwnerMarker = 256
+
+// ownerMarkerRel is the marker's slash path relative to the repository root (a sibling of the
+// worktree directory, in the run directory).
+func ownerMarkerRel(spec WorktreeSpec) string {
+	return path.Dir(spec.RelPath) + "/" + ownerMarkerName
+}
 
 // ownerState is whether the ownership marker proves the target prefix is ours.
 type ownerState int
 
 const (
 	ownerAbsent  ownerState = iota // no marker: we have not started provisioning here
-	ownerOurs                      // marker carries our token: a bare target here is our own prefix
-	ownerForeign                   // marker carries a different token: never ours
+	ownerOurs                      // marker carries our exact token: our own interrupted prefix
+	ownerForeign                   // marker missing our bytes, or a non-regular node: never ours
 )
 
-func readOwnerToken(abs string) (string, bool, error) {
-	b, err := os.ReadFile(ownerMarkerPath(abs))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
-		}
-		return "", false, err
-	}
-	return strings.TrimSpace(string(b)), true, nil
-}
-
-func classifyOwner(abs, token string) (ownerState, error) {
-	got, present, err := readOwnerToken(abs)
+// classifyOwner reads the ownership marker through the confined root (refusing a symlink or other
+// non-regular node) and matches its EXACT bytes against the operation token.
+func classifyOwner(repoDir string, spec WorktreeSpec) (ownerState, error) {
+	root, err := os.OpenRoot(repoDir)
 	if err != nil {
 		return ownerAbsent, err
 	}
-	if !present {
-		return ownerAbsent, nil
+	defer root.Close()
+	got, err := atomicfile.ReadInRoot(root, ownerMarkerRel(spec), maxOwnerMarker)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ownerAbsent, nil
+		}
+		if errors.Is(err, atomicfile.ErrNotRegular) {
+			return ownerForeign, nil
+		}
+		return ownerAbsent, err
 	}
-	if token != "" && got == token {
+	if spec.OwnerToken != "" && string(got) == spec.OwnerToken {
 		return ownerOurs, nil
 	}
 	return ownerForeign, nil
 }
 
-// ensureOwnerMarker durably publishes our ownership marker BEFORE `git worktree add`, no-clobber
-// and idempotent: a fresh create is fsynced and its directory entry barriered; an existing marker
-// must already carry our token (otherwise it is foreign and we fail closed).
-func ensureOwnerMarker(abs, token string) error {
-	if token == "" {
+// ensureOwnerMarker publishes our ownership marker BEFORE `git worktree add`, and RE-CONFIRMS its
+// durability on every call. Publication is complete-or-absent and no-clobber (InstallInRoot writes
+// and fsyncs a temp, then durably installs it), so a halt mid-publish never leaves a truncated
+// marker that recovery would read as foreign. On a retry the existing marker's exact bytes are
+// verified and its content + directory entry are re-forced durable (SyncInRoot + ConfirmParentInRoot),
+// so a prior halt after the content write but before the entry barrier is repaired rather than
+// trusted. The certificate is therefore safe under its own crash cuts.
+func ensureOwnerMarker(repoDir string, spec WorktreeSpec) error {
+	if spec.OwnerToken == "" {
 		return fmt.Errorf("gitx: a worktree owner token is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return err
-	}
-	mp := ownerMarkerPath(abs)
-	f, err := os.OpenFile(mp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	root, err := os.OpenRoot(repoDir)
 	if err != nil {
-		if os.IsExist(err) {
-			got, present, rerr := readOwnerToken(abs)
-			if rerr != nil {
-				return rerr
-			}
-			if !present || got != token {
-				return fmt.Errorf("gitx: worktree owner marker at %s is not ours", mp)
-			}
-			return nil // already ours and durable
-		}
 		return err
 	}
-	_, werr := f.WriteString(token)
-	serr := f.Sync()
-	cerr := f.Close()
-	if werr != nil {
-		return werr
+	defer root.Close()
+	rel := ownerMarkerRel(spec)
+	if err := mkdirAllInRoot(root, path.Dir(rel)); err != nil {
+		return err
 	}
-	if serr != nil {
-		return serr
+	err = atomicfile.InstallInRoot(root, rel, []byte(spec.OwnerToken), 0o600)
+	if err == nil {
+		return nil // freshly installed: content and entry are durable
 	}
-	if cerr != nil {
-		return cerr
+	if errors.Is(err, fs.ErrExist) {
+		got, rerr := atomicfile.ReadInRoot(root, rel, maxOwnerMarker)
+		if rerr != nil {
+			return rerr
+		}
+		if string(got) != spec.OwnerToken {
+			return fmt.Errorf("gitx: worktree owner marker is not ours")
+		}
+		return markerReconfirm(root, rel) // re-force content + entry durable on every retry
 	}
-	return confirmDirBarrier(mp)
+	return err // includes *PostCommitSyncError (committed but unsynced) -> a retry re-confirms
+}
+
+// markerReconfirm re-forces an existing marker's content and directory entry durable (a package
+// var so a test can inject a fail-once barrier proving the retry actually re-confirms).
+var markerReconfirm = func(root *os.Root, rel string) error {
+	if err := atomicfile.SyncInRoot(root, rel); err != nil {
+		return err
+	}
+	return atomicfile.ConfirmParentInRoot(root, rel)
+}
+
+// mkdirAllInRoot durably creates dir and each missing ancestor within the confined root, each
+// entry re-confirmed durable (MkdirInRoot is idempotent on an existing directory).
+func mkdirAllInRoot(root *os.Root, dir string) error {
+	if dir == "" || dir == "." {
+		return nil
+	}
+	cur := ""
+	for _, p := range strings.Split(dir, "/") {
+		if p == "" {
+			continue
+		}
+		if cur == "" {
+			cur = p
+		} else {
+			cur += "/" + p
+		}
+		if err := atomicfile.MkdirInRoot(root, cur, 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isEmptyDir reports whether a directory has no entries — the precise shape git's `worktree add`
+// leaves when interrupted after it creates the target but before it writes any linkage/checkout.
+func isEmptyDir(abs string) (bool, error) {
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
 }
 
 // fsyncArgs prepends the durability config to a MUTATING git command so git fsyncs everything it
@@ -181,9 +228,24 @@ func (w Worktree) Observe(ctx context.Context, repoDir string, spec WorktreeSpec
 	if err != nil {
 		return WorktreeForeign, err
 	}
-	owner, err := classifyOwner(abs, spec.OwnerToken)
+	owner, err := classifyOwner(repoDir, spec)
 	if err != nil {
 		return WorktreeForeign, err
+	}
+
+	// An UNREGISTERED directory at our path is recoverable ONLY when it is both proven ours by the
+	// marker AND the precise empty shape git's interrupted `worktree add` leaves; a bare directory
+	// carrying any content, or without our marker, is foreign — the marker (a sibling token) can
+	// authorize touching only that exact empty prefix, never a populated target.
+	bareForeign := false
+	if node == nodeDir && regAtPath == nil {
+		if owner != ownerOurs {
+			bareForeign = true
+		} else if empty, eerr := isEmptyDir(abs); eerr != nil {
+			return WorktreeForeign, eerr
+		} else {
+			bareForeign = !empty // our marker only authorizes the exact empty interrupted prefix
+		}
 	}
 
 	// Foreign / mismatched — fail closed, never touched:
@@ -191,15 +253,12 @@ func (w Worktree) Observe(ctx context.Context, repoDir string, spec WorktreeSpec
 	//   - a worktree at our path is registered on a different branch;
 	//   - our branch is already checked out at a DIFFERENT path;
 	//   - a non-directory node (regular file, symlink, device) occupies our path;
-	//   - a directory occupies our path with NO registration AND no marker proving it ours (the
-	//     marker is consulted ONLY here — it is the one thing distinguishing a foreign bare
-	//     directory from our own interrupted `git worktree add`, which leaves a bare target our
-	//     marker vouches for; a real registration proves ownership on its own).
+	//   - an unregistered directory that is not our own empty interrupted prefix.
 	if (oid != "" && oid != spec.BaseCommit) ||
 		(regAtPath != nil && !regAtPath.onBranch(spec.Branch)) ||
 		(regOfBranch != nil && !samePath(regOfBranch.path, abs)) ||
 		node == nodeOther ||
-		(node == nodeDir && regAtPath == nil && owner != ownerOurs) {
+		bareForeign {
 		return WorktreeForeign, nil
 	}
 
@@ -221,9 +280,9 @@ func (w Worktree) Observe(ctx context.Context, repoDir string, spec WorktreeSpec
 		return WorktreeAbsent, nil
 	}
 
-	// Our own incomplete prefix: a ref-only branch (path absent), our marker plus a bare target
-	// from an interrupted `git worktree add`, or a worktree registered to our branch that is not
-	// yet a clean base checkout (present, stale, or its directory gone). Every foreign shape was
+	// Our own incomplete prefix: a ref-only branch (path absent), our marker plus the empty target
+	// of an interrupted `git worktree add`, or a worktree registered to our branch that is not yet
+	// a clean base checkout (present, stale, or its directory gone). Every foreign shape was
 	// rejected above, so completing this forward is safe.
 	return WorktreeOwnPartial, nil
 }
@@ -266,7 +325,7 @@ func (w Worktree) Apply(ctx context.Context, repoDir string, spec WorktreeSpec) 
 	if err != nil {
 		return err
 	}
-	owner, err := classifyOwner(abs, spec.OwnerToken)
+	owner, err := classifyOwner(repoDir, spec)
 	if err != nil {
 		return err
 	}
@@ -279,15 +338,23 @@ func (w Worktree) Apply(ctx context.Context, repoDir string, spec WorktreeSpec) 
 	if node == nodeOther {
 		return fmt.Errorf("gitx: %s exists and is not a directory", abs)
 	}
-	if node == nodeDir && regAtPath == nil && owner != ownerOurs {
-		return fmt.Errorf("gitx: %s is an unregistered directory, not provisioned by this run", abs)
+	// An unregistered directory must be BOTH proven ours and the exact empty interrupted prefix.
+	if node == nodeDir && regAtPath == nil {
+		if owner != ownerOurs {
+			return fmt.Errorf("gitx: %s is an unregistered directory, not provisioned by this run", abs)
+		}
+		if empty, eerr := isEmptyDir(abs); eerr != nil {
+			return eerr
+		} else if !empty {
+			return fmt.Errorf("gitx: %s is a non-empty unregistered directory; refusing to touch it", abs)
+		}
 	}
 
-	// 3) Publish our durable ownership marker (no-clobber) — so that if `git worktree add` is
-	// interrupted after it creates the target directory but before it writes the linkage files, a
-	// later recovery can prove that bare directory is ours. Only reached once abs is confirmed
-	// non-foreign above, so the marker never vouches for a foreign occupant.
-	if err := ensureOwnerMarker(abs, spec.OwnerToken); err != nil {
+	// 3) Publish our durable ownership marker (atomic, no-clobber, re-confirmed) — so that if
+	// `git worktree add` is interrupted after it creates the target directory but before it writes
+	// the linkage files, a later recovery can prove that empty directory is ours. Only reached once
+	// abs is confirmed non-foreign above, so the marker never vouches for a foreign occupant.
+	if err := ensureOwnerMarker(repoDir, spec); err != nil {
 		return err
 	}
 
@@ -302,19 +369,25 @@ func (w Worktree) Apply(ctx context.Context, repoDir string, spec WorktreeSpec) 
 	// Clear our own incomplete prefix so `git worktree add` starts from a clean path:
 	//   - a registered-to-us worktree: git removes its own record (identity-bound, works even when
 	//     the directory is already gone);
-	//   - a bare target directory from an interrupted worktree add: proven ours by the marker, so
-	//     removing it is safe — a foreign directory was already rejected above.
+	//   - the empty target of an interrupted worktree add: proven ours by the marker AND re-checked
+	//     empty, then removed with a NON-recursive os.Remove (it fails on any content) — a
+	//     populated or foreign directory was already rejected above and is never deleted.
 	if regAtPath != nil {
 		if _, err := w.git.Run(ctx, repoDir, nil, "worktree", "remove", "--force", abs); err != nil {
 			return err
 		}
 	} else if node == nodeDir {
-		if st, err := classifyOwner(abs, spec.OwnerToken); err != nil {
+		if st, err := classifyOwner(repoDir, spec); err != nil {
 			return err
 		} else if st != ownerOurs {
 			return fmt.Errorf("gitx: refusing to remove %s: ownership not proven", abs)
 		}
-		if err := os.RemoveAll(abs); err != nil {
+		if empty, eerr := isEmptyDir(abs); eerr != nil {
+			return eerr
+		} else if !empty {
+			return fmt.Errorf("gitx: refusing to remove non-empty directory %s", abs)
+		}
+		if err := os.Remove(abs); err != nil {
 			return err
 		}
 	}
@@ -414,7 +487,7 @@ func (w Worktree) Confirm(ctx context.Context, repoDir string, spec WorktreeSpec
 	// every directory's entries durable; a symlink has no content to fsync and its entry is forced
 	// by its parent directory's flush. (git worktree add does not populate submodules, so a gitlink
 	// is only an empty placeholder directory here.)
-	if err := w.barrierCheckoutTree(abs); err != nil {
+	if err := w.barrierCheckoutTree(ctx, abs); err != nil {
 		return err
 	}
 	return nil
@@ -422,11 +495,16 @@ func (w Worktree) Confirm(ctx context.Context, repoDir string, spec WorktreeSpec
 
 // barrierCheckoutTree forces every regular file's content and every directory's entries in the
 // checked-out worktree durable. WalkDir uses Lstat, so symlinks are not followed (no loops) and a
-// symlinked directory is treated as a leaf entry made durable by its parent's flush.
-func (w Worktree) barrierCheckoutTree(abs string) error {
+// symlinked directory is treated as a leaf entry made durable by its parent's flush. The context
+// is checked between entries so a cancellation stops the (O(checkout)) walk promptly — an
+// individual fsync is left to complete rather than being interrupted mid-flight.
+func (w Worktree) barrierCheckoutTree(ctx context.Context, abs string) error {
 	return filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
 		}
 		if d.IsDir() {
 			// Flush this directory so its child entries (files, subdirs, symlinks) are durable.
