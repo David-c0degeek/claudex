@@ -3,6 +3,7 @@
 package attach
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,7 +24,7 @@ func TestSnapshotAncestorSymlinkEscape(t *testing.T) {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 
-	_, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	_, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err == nil {
 		t.Fatalf("bootstrap should fail when an ancestor of the run dir is a symlink")
 	}

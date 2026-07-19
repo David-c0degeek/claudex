@@ -2,6 +2,7 @@ package attach
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -17,7 +18,7 @@ import (
 // bootstrapRun bootstraps a lead-claude run and returns its id.
 func bootstrapRun(t *testing.T, repo string) FirstAttachResult {
 	t.Helper()
-	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}

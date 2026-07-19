@@ -2,6 +2,7 @@ package attach
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -42,7 +43,7 @@ func fsResultUnknown() fsclass.Result {
 
 type fakeBase struct{ commit string }
 
-func (f fakeBase) ResolveBase(string, string) (string, error) { return f.commit, nil }
+func (f fakeBase) ResolveBase(context.Context, string, string) (string, error) { return f.commit, nil }
 
 // countingBase records how many times the base resolver was called.
 type countingBase struct {
@@ -50,7 +51,7 @@ type countingBase struct {
 	calls  int
 }
 
-func (b *countingBase) ResolveBase(string, string) (string, error) {
+func (b *countingBase) ResolveBase(context.Context, string, string) (string, error) {
 	b.calls++
 	return b.commit, nil
 }
@@ -63,14 +64,14 @@ type fakeWorktree struct {
 	applyCalls int
 }
 
-func (f *fakeWorktree) ObserveWorktree(string, BootstrapIntent) (txn.StepStatus, error) {
+func (f *fakeWorktree) ObserveWorktree(context.Context, string, BootstrapIntent) (txn.StepStatus, error) {
 	if f.applied {
 		return txn.StatusApplied, nil
 	}
 	return txn.StatusNotApplied, nil
 }
 
-func (f *fakeWorktree) ApplyWorktree(string, BootstrapIntent) error {
+func (f *fakeWorktree) ApplyWorktree(context.Context, string, BootstrapIntent) error {
 	f.applyCalls++
 	if f.failFirst && f.applyCalls == 1 {
 		return errors.New("simulated worktree provisioning failure")
@@ -78,6 +79,8 @@ func (f *fakeWorktree) ApplyWorktree(string, BootstrapIntent) error {
 	f.applied = true
 	return nil
 }
+
+func (f *fakeWorktree) ConfirmWorktree(context.Context, string, BootstrapIntent) error { return nil }
 
 type fakeClassifier struct {
 	res fsclass.Result
@@ -119,7 +122,7 @@ func newRequest(t *testing.T, repoDir string, wt WorktreeProvisioner) FirstAttac
 
 func TestFirstAttachHappyPath(t *testing.T) {
 	repo := t.TempDir()
-	res, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	res, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
@@ -172,7 +175,7 @@ func TestFirstAttachHappyPath(t *testing.T) {
 // incumbent lead session — idempotent across a lost response after completion.
 func TestFirstAttachActiveRunSemantics(t *testing.T) {
 	repo := t.TempDir()
-	first, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	first, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
@@ -180,7 +183,7 @@ func TestFirstAttachActiveRunSemantics(t *testing.T) {
 	// A genuinely different operation refuses.
 	other := newRequest(t, repo, &fakeWorktree{})
 	other.OperationID = opID("d")
-	if _, err := FirstAttach(other); !errors.Is(err, ErrRunExists) {
+	if _, err := FirstAttach(context.Background(), other); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("different-op attach err = %v, want ErrRunExists", err)
 	}
 
@@ -188,7 +191,7 @@ func TestFirstAttachActiveRunSemantics(t *testing.T) {
 	// run and lead session — never a forced replacement — even though the journal
 	// is already terminal.
 	retry := newRequest(t, repo, &fakeWorktree{}) // same OperationID opID("a")
-	got, err := FirstAttach(retry)
+	got, err := FirstAttach(context.Background(), retry)
 	if err != nil {
 		t.Fatalf("idempotent retry: %v", err)
 	}
@@ -205,7 +208,7 @@ func TestFirstAttachRecoversMidBootstrap(t *testing.T) {
 	wt := &fakeWorktree{failFirst: true}
 	req := newRequest(t, repo, wt)
 
-	if _, err := FirstAttach(req); err == nil {
+	if _, err := FirstAttach(context.Background(), req); err == nil {
 		t.Fatalf("first attach should fail at the worktree step")
 	}
 
@@ -221,7 +224,7 @@ func TestFirstAttachRecoversMidBootstrap(t *testing.T) {
 	}
 
 	// Retry: recovery drives the bootstrap to completion with the same ids.
-	res, err := FirstAttach(req)
+	res, err := FirstAttach(context.Background(), req)
 	if err != nil {
 		t.Fatalf("recovery attach: %v", err)
 	}
@@ -252,7 +255,7 @@ func TestFirstAttachRefusesKnownUnsupportedFS(t *testing.T) {
 	req.Base = base
 	req.Classifier = fakeClassifier{res: fsclass.Result{Class: fsclass.KnownUnsupported, Reason: "network share"}}
 
-	_, err := FirstAttach(req)
+	_, err := FirstAttach(context.Background(), req)
 	var ufs *UnsupportedFSError
 	if !errors.As(err, &ufs) || !errors.Is(err, ErrUnsupportedFS) || ufs.AckRequired {
 		t.Fatalf("known-unsupported err = %v, want *UnsupportedFSError (ack not required)", err)
@@ -279,7 +282,7 @@ func TestFirstAttachRefusesDuplicateCriteria(t *testing.T) {
 	req.Base = base
 	req.TaskCanonical = []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
 
-	if _, err := FirstAttach(req); err == nil {
+	if _, err := FirstAttach(context.Background(), req); err == nil {
 		t.Fatalf("duplicate acceptance_criteria should be refused")
 	}
 	if base.calls != 0 || wt.applyCalls != 0 {
@@ -323,7 +326,7 @@ func TestFirstAttachRefusesLegacyRun(t *testing.T) {
 		t.Fatalf("write current pointer: %v", err)
 	}
 
-	_, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	_, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	var lre *legacy.LegacyRunError
 	if !errors.As(err, &lre) {
 		t.Fatalf("legacy attach err = %v, want *legacy.LegacyRunError", err)
@@ -348,7 +351,7 @@ func TestFirstAttachBusyWhenLocked(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer g.Release()
-	if _, err := FirstAttach(newRequest(t, repo, &fakeWorktree{})); !errors.Is(err, genstore.ErrBusy) {
+	if _, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{})); !errors.Is(err, genstore.ErrBusy) {
 		t.Fatalf("locked attach err = %v, want ErrBusy", err)
 	}
 }
@@ -402,12 +405,12 @@ func TestSnapshotConflictIsIndeterminate(t *testing.T) {
 // recovery but is told the run exists — it never receives the incumbent session.
 func TestFirstAttachDifferentOpDoesNotGetSession(t *testing.T) {
 	repo := t.TempDir()
-	if _, err := FirstAttach(newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
+	if _, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
 		t.Fatalf("first attach should fail at the worktree step")
 	}
 	other := newRequest(t, repo, &fakeWorktree{}) // healthy worktree drives recovery
 	other.OperationID = opID("d")
-	if _, err := FirstAttach(other); !errors.Is(err, ErrRunExists) {
+	if _, err := FirstAttach(context.Background(), other); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("different-op pending recovery err = %v, want ErrRunExists", err)
 	}
 	// Recovery still completed: an active run now exists.
@@ -423,7 +426,7 @@ func TestFirstAttachDifferentOpDoesNotGetSession(t *testing.T) {
 // retained and the second run is current.
 func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 	repo := t.TempDir()
-	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err != nil {
 		t.Fatalf("run A: %v", err)
 	}
@@ -437,7 +440,7 @@ func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 	running := newRequest(t, repo, &fakeWorktree{})
 	running.OperationID = opID("e")
 	running.RNG = bytes.NewReader(bytes.Repeat([]byte{0x01, 0x02, 0x03, 0x04}, 64))
-	if _, err := FirstAttach(running); !errors.Is(err, ErrRunExists) {
+	if _, err := FirstAttach(context.Background(), running); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("attach over a running run err = %v, want ErrRunExists", err)
 	}
 
@@ -451,7 +454,7 @@ func TestFirstAttachSecondRunAfterClear(t *testing.T) {
 	reqB := newRequest(t, repo, &fakeWorktree{})
 	reqB.OperationID = opID("b")
 	reqB.RNG = bytes.NewReader(bytes.Repeat([]byte{0x77, 0x11, 0x88, 0x22}, 64)) // distinct ids from run A
-	b, err := FirstAttach(reqB)
+	b, err := FirstAttach(context.Background(), reqB)
 	if err != nil {
 		t.Fatalf("run B: %v", err)
 	}
@@ -492,11 +495,11 @@ func TestBootstrapCutRecovers(t *testing.T) {
 			// One worktree instance across both calls, so it reports its provisioned
 			// state on recovery (a real provisioner observes the on-disk worktree).
 			wt := &fakeWorktree{}
-			if _, err := FirstAttach(newRequest(t, repo, wt)); err == nil {
+			if _, err := FirstAttach(context.Background(), newRequest(t, repo, wt)); err == nil {
 				t.Fatalf("expected a crash after %s", step)
 			}
 			stepFailpoint = nil // healthy retry
-			got, err := FirstAttach(newRequest(t, repo, wt))
+			got, err := FirstAttach(context.Background(), newRequest(t, repo, wt))
 			if err != nil {
 				t.Fatalf("recovery after %s cut: %v", step, err)
 			}
@@ -527,7 +530,7 @@ func TestFirstAttachConcurrent(t *testing.T) {
 			req := newRequest(t, repo, &fakeWorktree{})
 			req.OperationID = op
 			req.RNG = bytes.NewReader(bytes.Repeat(seeds[i], 64))
-			_, err := FirstAttach(req)
+			_, err := FirstAttach(context.Background(), req)
 			results <- outcome{op, err}
 		}()
 	}
@@ -550,7 +553,7 @@ func TestFirstAttachConcurrent(t *testing.T) {
 	retry := newRequest(t, repo, &fakeWorktree{})
 	retry.OperationID = loser
 	retry.RNG = bytes.NewReader(bytes.Repeat([]byte{0x9a, 0xbc, 0xde, 0xf0}, 64))
-	if _, err := FirstAttach(retry); !errors.Is(err, ErrRunExists) {
+	if _, err := FirstAttach(context.Background(), retry); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("loser retry err = %v, want ErrRunExists", err)
 	}
 	lay := layoutFor(repo)
@@ -572,7 +575,7 @@ func TestFirstAttachClassifierError(t *testing.T) {
 	repo := t.TempDir()
 	req := newRequest(t, repo, &fakeWorktree{})
 	req.Classifier = fakeClassifier{err: errors.New("classify io failure")}
-	_, err := FirstAttach(req)
+	_, err := FirstAttach(context.Background(), req)
 	if err == nil || errors.Is(err, ErrUnsupportedFS) {
 		t.Fatalf("classifier error = %v, want the propagated cause (not ErrUnsupportedFS)", err)
 	}
@@ -586,11 +589,11 @@ func TestFirstAttachClassifierError(t *testing.T) {
 func TestFirstAttachMinimalRecoveryInputs(t *testing.T) {
 	t.Run("pending recovery", func(t *testing.T) {
 		repo := t.TempDir()
-		if _, err := FirstAttach(newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
+		if _, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{failFirst: true})); err == nil {
 			t.Fatalf("first attach should fail at the worktree step")
 		}
 		// Retry with NOTHING but repo + op + a healthy worktree.
-		got, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{}))
+		got, err := FirstAttach(context.Background(), minimalRequest(repo, opID("a"), &fakeWorktree{}))
 		if err != nil {
 			t.Fatalf("minimal pending recovery: %v", err)
 		}
@@ -600,11 +603,11 @@ func TestFirstAttachMinimalRecoveryInputs(t *testing.T) {
 	})
 	t.Run("completed response retry", func(t *testing.T) {
 		repo := t.TempDir()
-		a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+		a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 		if err != nil {
 			t.Fatalf("first attach: %v", err)
 		}
-		got, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{}))
+		got, err := FirstAttach(context.Background(), minimalRequest(repo, opID("a"), &fakeWorktree{}))
 		if err != nil {
 			t.Fatalf("minimal completed retry: %v", err)
 		}
@@ -618,7 +621,7 @@ func TestFirstAttachMinimalRecoveryInputs(t *testing.T) {
 // run-exists, never the stale credential — the Registry is the sole session truth.
 func TestSameOpRefusesReplacedSession(t *testing.T) {
 	repo := t.TempDir()
-	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
@@ -635,7 +638,7 @@ func TestSameOpRefusesReplacedSession(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("replace lead session: %v", err)
 	}
-	if _, err := FirstAttach(minimalRequest(repo, opID("a"), &fakeWorktree{})); !errors.Is(err, ErrRunExists) {
+	if _, err := FirstAttach(context.Background(), minimalRequest(repo, opID("a"), &fakeWorktree{})); !errors.Is(err, ErrRunExists) {
 		t.Fatalf("retry after replacement err = %v, want ErrRunExists (never the stale session)", err)
 	}
 }
@@ -646,7 +649,7 @@ func TestSecondRunCutRecovers(t *testing.T) {
 	for _, step := range []string{"current-clear", "current-run-set"} {
 		t.Run(step, func(t *testing.T) {
 			repo := t.TempDir()
-			a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+			a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 			if err != nil {
 				t.Fatalf("run A: %v", err)
 			}
@@ -672,12 +675,12 @@ func TestSecondRunCutRecovers(t *testing.T) {
 			reqB := newRequest(t, repo, wtB)
 			reqB.OperationID = opID("b")
 			reqB.RNG = bytes.NewReader(bytes.Repeat([]byte{0x77, 0x11, 0x88, 0x22}, 64))
-			if _, err := FirstAttach(reqB); err == nil {
+			if _, err := FirstAttach(context.Background(), reqB); err == nil {
 				t.Fatalf("expected a crash after %s", step)
 			}
 			stepFailpoint = nil
 
-			gotB, err := FirstAttach(minimalRequest(repo, opID("b"), wtB))
+			gotB, err := FirstAttach(context.Background(), minimalRequest(repo, opID("b"), wtB))
 			if err != nil {
 				t.Fatalf("recover B after %s cut: %v", step, err)
 			}
@@ -700,7 +703,7 @@ func TestSecondRunCutRecovers(t *testing.T) {
 // mismatch (hand-built pointer) and a missing registry.
 func TestSameOpResultRejectsMismatch(t *testing.T) {
 	repo := t.TempDir()
-	FirstAttach(newRequest(t, repo, &fakeWorktree{}))
+	FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{}))
 	lay := layoutFor(repo)
 	journal := txn.Open(lay.bootstrapJournal, lay.repoLock)
 	good, _, _ := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
@@ -731,7 +734,7 @@ func TestSameOpResultRejectsMismatch(t *testing.T) {
 // tampered journal can never evict a live run.
 func TestPlanForRejectsNonterminalClearPrior(t *testing.T) {
 	repo := t.TempDir()
-	a, err := FirstAttach(newRequest(t, repo, &fakeWorktree{})) // A is RUNNING
+	a, err := FirstAttach(context.Background(), newRequest(t, repo, &fakeWorktree{})) // A is RUNNING
 	if err != nil {
 		t.Fatalf("run A: %v", err)
 	}
@@ -746,7 +749,7 @@ func TestPlanForRejectsNonterminalClearPrior(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer g.Release()
-	_, perr := planFor(lay, seams{base: fakeBase{commit: strings.Repeat("a", 40)}, worktree: &fakeWorktree{}}, g,
+	_, perr := planFor(context.Background(), lay, seams{base: fakeBase{commit: strings.Repeat("a", 40)}, worktree: &fakeWorktree{}}, g,
 		txn.Intent{Version: txn.IntentVersion, Kind: intentKind, TxnID: in.TxnID, Payload: payload})
 	if perr == nil {
 		t.Fatalf("planFor accepted a clear-prior naming a running run")

@@ -31,19 +31,23 @@ func opID(c string) string { return "op-" + strings.Repeat(c, 32) }
 
 type fakeBase struct{ commit string }
 
-func (f fakeBase) ResolveBase(string, string) (string, error) { return f.commit, nil }
+func (f fakeBase) ResolveBase(context.Context, string, string) (string, error) { return f.commit, nil }
 
 type fakeWorktree struct{ applied bool }
 
-func (f *fakeWorktree) ObserveWorktree(string, attach.BootstrapIntent) (txn.StepStatus, error) {
+func (f *fakeWorktree) ObserveWorktree(context.Context, string, attach.BootstrapIntent) (txn.StepStatus, error) {
 	if f.applied {
 		return txn.StatusApplied, nil
 	}
 	return txn.StatusNotApplied, nil
 }
 
-func (f *fakeWorktree) ApplyWorktree(string, attach.BootstrapIntent) error {
+func (f *fakeWorktree) ApplyWorktree(context.Context, string, attach.BootstrapIntent) error {
 	f.applied = true
+	return nil
+}
+
+func (f *fakeWorktree) ConfirmWorktree(context.Context, string, attach.BootstrapIntent) error {
 	return nil
 }
 
@@ -78,7 +82,7 @@ func newPairedRun(t *testing.T, repo string) (runID, lead, pair string) {
 
 func newPairedRunWithPolicy(t *testing.T, repo string, pol []byte) (runID, lead, pair string) {
 	t.Helper()
-	fa, err := attach.FirstAttach(attach.FirstAttachRequest{
+	fa, err := attach.FirstAttach(context.Background(), attach.FirstAttachRequest{
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
 		TaskCanonical: taskBytes(), PolicyCanonical: pol,
 		CreatedUnix: 1000, RNG: rand.Reader,
@@ -797,7 +801,7 @@ func TestE2EReplaySkipsRNG(t *testing.T) {
 // OpenRun refuses a run that is not a completed pairing.
 func TestOpenRunRejectsUnpaired(t *testing.T) {
 	repo := t.TempDir()
-	fa, err := attach.FirstAttach(attach.FirstAttachRequest{
+	fa, err := attach.FirstAttach(context.Background(), attach.FirstAttachRequest{
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
 		TaskCanonical: taskBytes(), PolicyCanonical: policyBytes(),
 		CreatedUnix: 1000, RNG: rand.Reader,

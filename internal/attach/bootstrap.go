@@ -1,6 +1,7 @@
 package attach
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,17 +29,23 @@ var ErrUnsupportedFS = errors.New("attach: unsupported filesystem for a run")
 
 // BaseResolver resolves the policy base branch to an EXACT commit OID during
 // read-only preparation, so every Apply works from a frozen OID and never a
-// moving branch. Subject 04 supplies the real git implementation.
+// moving branch. The context governs cancellation of the underlying git command:
+// a cancelled resolution fails read-only, before any journal record exists.
 type BaseResolver interface {
-	ResolveBase(repoDir, baseBranch string) (commit string, err error)
+	ResolveBase(ctx context.Context, repoDir, baseBranch string) (commit string, err error)
 }
 
 // WorktreeProvisioner creates and verifies the run's isolated worktree at the
 // frozen run-relative locator + branch from the intent's exact base commit. It is
-// an idempotent Observe/Apply participant; subject 04 fills the real git.
+// an idempotent Observe/Apply/Confirm participant driven inside the bootstrap
+// journal, so a cancelled Apply (via the context) halts with no recorded progress
+// and the next mutator recovers it forward. ConfirmWorktree re-confirms the
+// provisioned identity AND its OS durability under the held guard before the
+// journal records the step — Observe==Applied proves identity, not durability.
 type WorktreeProvisioner interface {
-	ObserveWorktree(repoDir string, in BootstrapIntent) (txn.StepStatus, error)
-	ApplyWorktree(repoDir string, in BootstrapIntent) error
+	ObserveWorktree(ctx context.Context, repoDir string, in BootstrapIntent) (txn.StepStatus, error)
+	ApplyWorktree(ctx context.Context, repoDir string, in BootstrapIntent) error
+	ConfirmWorktree(ctx context.Context, repoDir string, in BootstrapIntent) error
 }
 
 // Classifier classifies the durability-support class of the run location. The
@@ -131,7 +138,7 @@ func (l layout) runDir(relDir string) string {
 // recovers any pending bootstrap forward (an idempotent retry returns the same
 // identities), then — only when no run exists — prepares a deterministic intent
 // read-only and journals the bootstrap to completion.
-func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
+func FirstAttach(ctx context.Context, req FirstAttachRequest) (FirstAttachResult, error) {
 	if err := req.validateMinimal(); err != nil {
 		return FirstAttachResult{}, err
 	}
@@ -188,7 +195,7 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	// that started it; a different operation completes the recovery but is told the
 	// run exists.
 	rec, recovered, err := journal.Recover(g, func(in txn.Intent) (txn.Plan, error) {
-		return planFor(lay, seams, g, in)
+		return planFor(ctx, lay, seams, g, in)
 	})
 	if err != nil {
 		return FirstAttachResult{}, err
@@ -242,11 +249,11 @@ func FirstAttach(req FirstAttachRequest) (FirstAttachResult, error) {
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	intent, err := prepare(lay, req, policy, classifier, clearPrior)
+	intent, err := prepare(ctx, lay, req, policy, classifier, clearPrior)
 	if err != nil {
 		return FirstAttachResult{}, err
 	}
-	plan, err := planFor(lay, seams, g, txn.Intent{
+	plan, err := planFor(ctx, lay, seams, g, txn.Intent{
 		Version: txn.IntentVersion, Kind: intentKind, TxnID: intent.TxnID,
 		ExpectedStateRevision: 0, Payload: mustMarshalIntent(intent),
 	})
@@ -455,7 +462,7 @@ func (req FirstAttachRequest) validateForNewBootstrap() (config.RunPolicy, error
 // identity, classifies the run location, and resolves the base commit from a
 // frozen OID — so every downstream Apply and any recovery works from exactly
 // these values.
-func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier, clearPrior *state.CurrentRun) (BootstrapIntent, error) {
+func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy config.RunPolicy, classifier Classifier, clearPrior *state.CurrentRun) (BootstrapIntent, error) {
 	if err := legacyRepoRefusal(lay.repoDir); err != nil {
 		return BootstrapIntent{}, err
 	}
@@ -487,7 +494,7 @@ func prepare(lay layout, req FirstAttachRequest, policy config.RunPolicy, classi
 		return BootstrapIntent{}, err
 	}
 
-	baseCommit, err := req.Base.ResolveBase(lay.repoDir, policy.BaseBranch)
+	baseCommit, err := req.Base.ResolveBase(ctx, lay.repoDir, policy.BaseBranch)
 	if err != nil {
 		return BootstrapIntent{}, fmt.Errorf("attach: resolve base: %w", err)
 	}

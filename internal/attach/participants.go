@@ -2,6 +2,7 @@ package attach
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -36,7 +37,7 @@ type seams struct {
 // revision, txn id) so a forged or mismatched journal record cannot drive writes.
 // No step returns identity after a mutation: each is an idempotent Observe
 // (Status) / Apply over the frozen intent.
-func planFor(lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan, error) {
+func planFor(ctx context.Context, lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan, error) {
 	if raw.Kind != intentKind {
 		return txn.Plan{}, fmt.Errorf("attach: intent kind %q is not a bootstrap", raw.Kind)
 	}
@@ -76,13 +77,14 @@ func planFor(lay layout, sm seams, g *genstore.Guard, raw txn.Intent) (txn.Plan,
 		snapshotStep("snapshot-policy", lay.repoDir, in.RelDir+"/"+in.PolicyRelPath, in.PolicyCanonical, in.PolicyDigest),
 		{
 			Name:   "worktree",
-			Status: func() (txn.StepStatus, error) { return sm.worktree.ObserveWorktree(lay.repoDir, in) },
-			Apply:  func() error { return sm.worktree.ApplyWorktree(lay.repoDir, in) },
-			// The worktree is an EXTERNAL git participant (subject 04, a no-op seam today):
-			// its Status query against the real repository is itself the durability proof,
-			// so a documented no-op confirmer is correct here. When 04 lands its provisioner
-			// it will carry a real confirmer covering any directory entries it creates.
-			ConfirmDurable: func() error { return nil },
+			Status: func() (txn.StepStatus, error) { return sm.worktree.ObserveWorktree(ctx, lay.repoDir, in) },
+			Apply:  func() error { return sm.worktree.ApplyWorktree(ctx, lay.repoDir, in) },
+			// The worktree is an EXTERNAL git participant (subject 04). ConfirmWorktree
+			// reconfirms the provisioned branch/registration/HEAD/clean-tree identity AND
+			// forces the git/OS durability barrier under the held guard — Observe==Applied
+			// proves identity, not that the directory entries survive a crash — so the journal
+			// only records this step's progress once the worktree is durably present.
+			ConfirmDurable: func() error { return sm.worktree.ConfirmWorktree(ctx, lay.repoDir, in) },
 		},
 		registryInitStep(registry, g, in),
 		stateInitStep(runState, g, in),
