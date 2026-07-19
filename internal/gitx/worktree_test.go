@@ -15,7 +15,7 @@ func provisionRepo(t *testing.T) (string, *Git, WorktreeSpec, string) {
 	t.Helper()
 	repo, g := initRepo(t)
 	base := oidOf(t, g, repo, "refs/heads/main")
-	spec := WorktreeSpec{RelPath: ".claudex/runs/r1/worktree", Branch: "claudex/r1", BaseCommit: base}
+	spec := WorktreeSpec{RelPath: ".claudex/runs/r1/worktree", Branch: "claudex/r1", BaseCommit: base, OwnerToken: "boot-token-r1"}
 	return repo, g, spec, base
 }
 
@@ -105,6 +105,91 @@ func TestWorktreeRecoverMissingDir(t *testing.T) {
 		t.Fatalf("recover apply: %v", err)
 	}
 	assertApplied(t, g, repo, spec)
+}
+
+// The precise internal cut of `git worktree add`: it creates the target directory before writing
+// the linkage files, so a halt there leaves our ref + our ownership marker + a bare, unregistered
+// target directory. That is our own prefix (the marker proves it), recovered forward — not foreign.
+func TestWorktreeRecoverInternalAddCut(t *testing.T) {
+	repo, g, spec, base := provisionRepo(t)
+	abs := worktreeAbs(repo, spec)
+	// Reconstruct the cut state.
+	mustRun(t, g, repo, nil, "update-ref", "refs/heads/"+spec.Branch, base, "")
+	if err := ensureOwnerMarker(abs, spec.OwnerToken); err != nil {
+		t.Fatalf("plant owner marker: %v", err)
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil { // git's leading-directory creation, no linkage yet
+		t.Fatalf("plant bare target: %v", err)
+	}
+	w := NewWorktree(g)
+	if st, err := w.Observe(context.Background(), repo, spec); err != nil || st != WorktreeOwnPartial {
+		t.Fatalf("Observe = %v (err %v), want own-partial", st, err)
+	}
+	if err := w.Apply(context.Background(), repo, spec); err != nil {
+		t.Fatalf("recover apply: %v", err)
+	}
+	assertApplied(t, g, repo, spec)
+}
+
+// A bare target directory WITHOUT our marker (a different token, or none) is foreign even though a
+// bare target is the same shape our own interrupted add leaves — ownership is proven, not shaped.
+func TestWorktreeBareDirWrongTokenForeign(t *testing.T) {
+	repo, g, spec, _ := provisionRepo(t)
+	abs := worktreeAbs(repo, spec)
+	if err := ensureOwnerMarker(abs, "some-other-run-token"); err != nil {
+		t.Fatalf("plant foreign marker: %v", err)
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		t.Fatalf("plant bare target: %v", err)
+	}
+	if st, err := NewWorktree(g).Observe(context.Background(), repo, spec); err != nil || st != WorktreeForeign {
+		t.Fatalf("Observe = %v (err %v), want foreign", st, err)
+	}
+	if err := NewWorktree(g).Apply(context.Background(), repo, spec); err == nil {
+		t.Fatal("apply over a foreign-marked bare directory should fail closed")
+	}
+}
+
+// Confirm forces the checked-out FILE CONTENTS durable, not only the linkage — a tracked checkout
+// file is among the content barriers.
+func TestWorktreeConfirmBarriersCheckoutContent(t *testing.T) {
+	repo, g, spec, _ := provisionRepo(t)
+	w := NewWorktree(g)
+	if err := w.Apply(context.Background(), repo, spec); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	origFile := confirmFileBarrier
+	defer func() { confirmFileBarrier = origFile }()
+	var files []string
+	confirmFileBarrier = func(p string) error { files = append(files, p); return origFile(p) }
+	if err := w.Confirm(context.Background(), repo, spec); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// initRepo committed a.txt, so the base checkout contains it; its content must be barriered.
+	if !containsPath(files, filepath.Join(worktreeAbs(repo, spec), "a.txt")) {
+		t.Fatalf("checkout content barriers %v did not include the checked-out a.txt", files)
+	}
+}
+
+// A durability failure on a CHECKOUT payload file fails Confirm — checkout content, not just
+// linkage, is authority-bearing.
+func TestWorktreeConfirmCheckoutBarrierFailure(t *testing.T) {
+	repo, g, spec, _ := provisionRepo(t)
+	w := NewWorktree(g)
+	if err := w.Apply(context.Background(), repo, spec); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	origFile := confirmFileBarrier
+	defer func() { confirmFileBarrier = origFile }()
+	confirmFileBarrier = func(p string) error {
+		if strings.HasSuffix(p, "a.txt") {
+			return errors.New("injected checkout durability failure")
+		}
+		return origFile(p)
+	}
+	if err := w.Confirm(context.Background(), repo, spec); err == nil {
+		t.Fatal("a checkout payload barrier failure should fail Confirm")
+	}
 }
 
 // A branch of our name at a DIFFERENT commit is foreign: never overwritten, Apply fails closed.

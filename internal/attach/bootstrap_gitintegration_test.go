@@ -204,6 +204,68 @@ func (p *cancelOnceProvisioner) ConfirmWorktree(ctx context.Context, repoDir str
 	return p.real.ConfirmWorktree(ctx, repoDir, in)
 }
 
+// internalAddCutProvisioner reproduces git's internal `worktree add` cut on its FIRST Apply: our
+// ref, our durable ownership marker, and a bare target directory with no linkage, then an error.
+// Later Applies delegate to the real provisioner, which must recover this own prefix forward.
+type internalAddCutProvisioner struct {
+	real WorktreeProvisioner
+	g    *gitx.Git
+	done bool
+}
+
+func (p *internalAddCutProvisioner) ObserveWorktree(ctx context.Context, repoDir string, in BootstrapIntent) (txn.StepStatus, error) {
+	return p.real.ObserveWorktree(ctx, repoDir, in)
+}
+
+func (p *internalAddCutProvisioner) ApplyWorktree(ctx context.Context, repoDir string, in BootstrapIntent) error {
+	if !p.done {
+		p.done = true
+		abs := filepath.Join(repoDir, filepath.FromSlash(in.WorktreeRelPath))
+		if _, err := p.g.Run(ctx, repoDir, nil, "update-ref", "refs/heads/"+in.RunBranch, in.BaseCommit, ""); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+			return err
+		}
+		// The ownership marker the provisioner writes before `git worktree add` (name/content are
+		// gitx's contract: the run dir's .claudex-worktree-owner carries the frozen txn id).
+		if err := os.WriteFile(filepath.Join(filepath.Dir(abs), ".claudex-worktree-owner"), []byte(in.TxnID), 0o600); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(abs, 0o700); err != nil { // git's leading-directory creation, no linkage
+			return err
+		}
+		return errors.New("simulated interruption inside git worktree add")
+	}
+	return p.real.ApplyWorktree(ctx, repoDir, in)
+}
+
+func (p *internalAddCutProvisioner) ConfirmWorktree(ctx context.Context, repoDir string, in BootstrapIntent) error {
+	return p.real.ConfirmWorktree(ctx, repoDir, in)
+}
+
+// An interruption inside git's worktree add (bare target directory, no linkage) leaves a
+// recoverable own prefix — the retry proves it ours via the marker and completes it forward.
+func TestFirstAttachRealGitInternalAddCutRecovers(t *testing.T) {
+	repo, g, _ := realGitRepo(t)
+	base, pre, _ := NewGitSeams(g)
+	req := FirstAttachRequest{
+		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
+		TaskCanonical: taskBytes(), PolicyCanonical: policyBytes(), CreatedUnix: 1000,
+		RNG: rand.Reader, Base: base, Preflight: pre,
+		Worktree:   &internalAddCutProvisioner{real: NewGitWorktreeProvisioner(g), g: g},
+		Classifier: supportedFS(),
+	}
+	if _, err := FirstAttach(context.Background(), req); err == nil {
+		t.Fatal("expected the internal add cut to fail the attach")
+	}
+	res, err := FirstAttach(context.Background(), realRequest(t, repo, g, opID("a"), rand.Reader))
+	if err != nil {
+		t.Fatalf("recovery after the internal add cut: %v", err)
+	}
+	assertProvisioned(t, g, repo, res.RunID)
+}
+
 // A foreign preexisting run branch at a different commit fails the bootstrap closed: the worktree
 // step is indeterminate, so no run is activated and the foreign ref is never overwritten.
 func TestFirstAttachRealGitForeignRefFailsClosed(t *testing.T) {

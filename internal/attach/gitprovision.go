@@ -28,7 +28,9 @@ func NewGitWorktreeProvisioner(g *gitx.Git) WorktreeProvisioner {
 }
 
 func specOf(in BootstrapIntent) gitx.WorktreeSpec {
-	return gitx.WorktreeSpec{RelPath: in.WorktreeRelPath, Branch: in.RunBranch, BaseCommit: in.BaseCommit}
+	// OwnerToken is the frozen txn id: unpredictable and stable across recovery, so a bare target
+	// directory left by an interrupted `git worktree add` is provably ours on the retry.
+	return gitx.WorktreeSpec{RelPath: in.WorktreeRelPath, Branch: in.RunBranch, BaseCommit: in.BaseCommit, OwnerToken: in.TxnID}
 }
 
 // gitPreflighter adapts gitx.Preflight to the attach Preflighter seam, binding the runtime dir
