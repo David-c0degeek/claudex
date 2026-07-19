@@ -540,11 +540,7 @@ func fsyncFileContent(path string) error {
 
 // revParsePath runs `git -C wtPath rev-parse <args...>` and returns the trimmed single-line path.
 func (w Worktree) revParsePath(ctx context.Context, wtPath string, args ...string) (string, error) {
-	out, err := w.git.Run(ctx, wtPath, nil, append([]string{"rev-parse"}, args...)...)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return w.git.revParse(ctx, wtPath, args...)
 }
 
 // refOID returns the exact OID of refs/heads/<branch>, or "" if the branch does not exist.
