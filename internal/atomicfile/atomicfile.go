@@ -108,6 +108,13 @@ func Write(path string, data []byte, perm os.FileMode) error {
 // To FORCE a directory's entry durable, use ParentBarrier (a real writable-handle flush).
 func SyncDir(dir string) error { return syncDir(dir) }
 
+// Replace atomically renames oldPath onto newPath, replacing any existing newPath. On POSIX this
+// is rename(2) (an atomic replace); on Windows it is MoveFileEx with
+// MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH (retrying only transient sharing/access errors).
+// The caller forces the containing directory durable separately (via ParentBarrier) — this is the
+// atomic-publish primitive, not the durability barrier.
+func Replace(oldPath, newPath string) error { return replace(oldPath, newPath) }
+
 // ParentBarrier forces the immediate parent directory of `dir` (and thus `dir`'s own entry)
 // durable to disk with a REAL, re-runnable barrier: on POSIX it fsyncs the parent; on Windows
 // it FLUSHES a WRITABLE parent-directory handle (opened FILE_APPEND_DATA|SYNCHRONIZE, no
