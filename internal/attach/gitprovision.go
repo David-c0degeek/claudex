@@ -7,6 +7,15 @@ import (
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
+// NewGitSeams assembles the three real git-backed FirstAttach seams over a SINGLE hardened git
+// handle: the base resolver, the definite-new-run preflighter, and the worktree provisioner.
+// This is the one place production code wires FirstAttach to native git — a caller supplies a
+// *gitx.Git (whose owned hooks directory it closes) and passes the three results straight into a
+// FirstAttachRequest.
+func NewGitSeams(g *gitx.Git) (BaseResolver, Preflighter, WorktreeProvisioner) {
+	return gitx.NewBaseResolver(g), NewGitPreflighter(g), NewGitWorktreeProvisioner(g)
+}
+
 // gitWorktreeProvisioner adapts the primitive gitx.Worktree to the attach WorktreeProvisioner
 // seam, translating the frozen BootstrapIntent into a gitx.WorktreeSpec and the four-state
 // classification into the transaction's StepStatus. It carries no state beyond the git handle.
