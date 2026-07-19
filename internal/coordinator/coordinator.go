@@ -207,16 +207,16 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 
 // SubmitTestOutcome authors the coordinator-owned TESTS pass/fail through the locked
 // transport primitive. It is ownerless — no agent turn, no artifact, no accepted turn: the
-// coordinator's TESTS runner (wired in 4d) supplies the outcome, the evidence digest, and
-// the expectedRevision the outcome was derived against. The candidate identities are
+// mechanical-gate attempt authority (subject 04.5) supplies the outcome, the evidence digest,
+// and the expectedRevision the outcome was derived against. The candidate identities are
 // pre-minted OFF the guard (the FIX/gate id, selected under the guard by the pure engine
 // adapter — never minted under the guard), and transport enforces the run identity bind
 // (the aggregate journal reader), the stale-round guard (expectedRevision), context
 // cancellation, and the exact TESTS-outcome shape. A pass enters ownerless VERIFY one
 // generation past the pair; a fail routes to the lead's FIX or the test-budget gate.
 //
-// evidenceDigest is the sha256 of the TESTS run's evidence; 4d will bind it to a real
-// evidence artifact. transport validates it as the ownerless empty-turn source shape.
+// evidenceDigest is the sha256 the outcome's ownerless source hashes; subject 04.5 binds it
+// to a durable attempt record. transport validates it as the ownerless empty-turn source shape.
 func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest string, expectedRevision uint64) (transport.TestOutcomeResult, error) {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
