@@ -3,6 +3,7 @@ package gitx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,34 +18,29 @@ func writeFile(t *testing.T, path, body string) {
 	}
 }
 
-// snapshotWorktree provisions a real LINKED run worktree (branch claudex/r1 at the base commit)
-// and returns the repo, handle, worktree path, base OID, and branch.
-func snapshotWorktree(t *testing.T) (repo string, g *Git, wt, base, branch string) {
+// snapshotRun provisions a real linked run worktree for the given (coherent) run id.
+func snapshotRun(t *testing.T, runID string) (repo string, g *Git, wt, base string) {
 	repo, g = initRepo(t)
 	base = oidOf(t, g, repo, "refs/heads/main")
-	branch = "claudex/r1"
-	spec := WorktreeSpec{RelPath: ".claudex/runs/r1/worktree", Branch: branch, BaseCommit: base, OwnerToken: "boot-token"}
+	spec := WorktreeSpec{RelPath: runWorktreeRel(runID), Branch: runBranch(runID), BaseCommit: base, OwnerToken: "boot-token"}
 	if err := NewWorktree(g).Apply(context.Background(), repo, spec); err != nil {
 		t.Fatalf("provision run worktree: %v", err)
 	}
-	return repo, g, worktreeAbs(repo, spec), base, branch
+	return repo, g, runWorktreeAbs(repo, runID), base
 }
 
-func snapReq(repo, wt, base, branch string) SnapshotReq {
-	return SnapshotReq{
-		RepoDir: repo, Worktree: wt, Branch: branch, Parent: base,
-		RunID: "run-" + strings.Repeat("a", 32), StartingRevision: 5, CreatedUnix: 1700000000,
-	}
+func snapReq(repo, base, runID string) SnapshotReq {
+	return SnapshotReq{RepoDir: repo, Parent: base, RunID: runID, StartingRevision: 5, CreatedUnix: 1700000000}
 }
 
 // A snapshot of the linked run worktree captures its content, commits off the parent, moves no ref,
 // never touches the real index, and reproduces its OID deterministically.
 func TestSnapshotCommitHappyPath(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
 	writeFile(t, filepath.Join(wt, "b.txt"), "new")
 
-	commit, tree, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch))
+	commit, tree, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1"))
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -64,92 +60,111 @@ func TestSnapshotCommitHappyPath(t *testing.T) {
 	if st := strings.TrimSpace(string(mustRun(t, g, wt, nil, "diff", "--cached", "--name-only"))); st != "" {
 		t.Fatalf("real index changed: %q", st)
 	}
-	commit2, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch))
+	commit2, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1"))
 	if err != nil || commit2 != commit {
 		t.Fatalf("non-deterministic commit: %q vs %q (err %v)", commit2, commit, err)
 	}
 }
 
 func TestSnapshotRejectsNoOp(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrEmptySnapshot) {
+	repo, g, _, base := snapshotRun(t, "r1")
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrEmptySnapshot) {
 		t.Fatalf("clean worktree = %v, want ErrEmptySnapshot", err)
 	}
 }
 
-// The main worktree is not a linked run worktree, even at the matching HEAD.
-func TestSnapshotRejectsMainWorktree(t *testing.T) {
-	repo, g := initRepo(t)
-	base := oidOf(t, g, repo, "refs/heads/main")
-	writeFile(t, filepath.Join(repo, "a.txt"), "edited")
-	req := snapReq(repo, repo, base, "main") // repo itself = the main worktree
-	if _, _, err := g.SnapshotCommit(context.Background(), req); !errors.Is(err, ErrSnapshotWorktree) {
-		t.Fatalf("main worktree = %v, want ErrSnapshotWorktree", err)
+// A run id whose DERIVED worktree/branch do not exist (labelling one run while snapshotting another
+// or nothing) fails closed — the identity is derived, not a caller claim.
+func TestSnapshotRejectsWrongDerivedRunID(t *testing.T) {
+	repo, g, wt, base := snapshotRun(t, "r1")
+	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
+	// Provisioned run is r1; ask to snapshot r2 (whose derived worktree does not exist).
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r2")); !errors.Is(err, ErrSnapshotWorktree) {
+		t.Fatalf("wrong derived run id = %v, want ErrSnapshotWorktree", err)
+	}
+}
+
+// The derived worktree path on a DIFFERENT branch than the derived run branch fails closed.
+func TestSnapshotRejectsWrongBranchAtDerivedPath(t *testing.T) {
+	repo, g, wt, base := snapshotRun(t, "r1")
+	mustRun(t, g, wt, nil, "checkout", "-b", "other") // move the run worktree off claudex/r1
+	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrSnapshotWorktree) {
+		t.Fatalf("wrong branch at derived path = %v, want ErrSnapshotWorktree", err)
 	}
 }
 
 // A detached HEAD (no run branch) is rejected.
 func TestSnapshotRejectsDetachedHead(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	mustRun(t, g, wt, nil, "checkout", "--detach")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrSnapshotWorktree) {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrSnapshotWorktree) {
 		t.Fatalf("detached HEAD = %v, want ErrSnapshotWorktree", err)
 	}
 }
 
-// A worktree that belongs to a different repository is rejected even if its HEAD matches.
-func TestSnapshotRejectsForeignRepo(t *testing.T) {
-	repo, g, _, base, branch := snapshotWorktree(t)
-	foreign, _ := initRepo(t) // a different repo, on main at its own base
-	writeFile(t, filepath.Join(foreign, "a.txt"), "edited")
-	req := snapReq(repo, foreign, base, branch) // RepoDir is repo, worktree is foreign
-	if _, _, err := g.SnapshotCommit(context.Background(), req); !errors.Is(err, ErrSnapshotWorktree) {
-		t.Fatalf("foreign repo = %v, want ErrSnapshotWorktree", err)
+// A non-canonical run id is rejected before any git runs.
+func TestSnapshotRejectsNonCanonicalRunID(t *testing.T) {
+	repo, g, wt, base := snapshotRun(t, "r1")
+	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
+	for _, bad := range []string{"", ".", "..", ".hidden", "-lead", "has space", "non\nascii"} {
+		if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, bad)); !errors.Is(err, ErrSnapshotInput) {
+			t.Errorf("run id %q = %v, want ErrSnapshotInput", bad, err)
+		}
 	}
 }
 
-// A staged edit that differs from the worktree would be discarded and fails closed.
 func TestSnapshotStagedEditDivergence(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "staged-version")
 	mustRun(t, g, wt, commitEnv(), "add", "a.txt")
 	writeFile(t, filepath.Join(wt, "a.txt"), "worktree-version-differs")
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrStagedDivergence) {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrStagedDivergence) {
 		t.Fatalf("staged edit divergence = %v, want ErrStagedDivergence", err)
 	}
 }
 
-// A staged DELETION with the worktree file retained is discarded by the snapshot and fails closed
-// (the name-set intersection missed this; the exact entry comparison catches it).
+// A staged DELETION with the worktree file retained is discarded by the snapshot and fails closed.
 func TestSnapshotStagedDeletionDivergence(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
-	mustRun(t, g, wt, commitEnv(), "rm", "--cached", "a.txt") // staged deletion, file retained
+	repo, g, wt, base := snapshotRun(t, "r1")
+	mustRun(t, g, wt, commitEnv(), "rm", "--cached", "a.txt")
 	writeFile(t, filepath.Join(wt, "b.txt"), "make it non-empty")
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrStagedDivergence) {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrStagedDivergence) {
 		t.Fatalf("staged deletion = %v, want ErrStagedDivergence", err)
+	}
+}
+
+// A staged divergence on a filename with pathspec metacharacters is compared exactly (the map
+// lookup uses the literal byte path, not a pathspec).
+func TestSnapshotStagedMetacharFilename(t *testing.T) {
+	repo, g, wt, base := snapshotRun(t, "r1")
+	name := "a[b].txt"
+	writeFile(t, filepath.Join(wt, name), "staged")
+	mustRun(t, g, wt, commitEnv(), "add", "--", name)
+	writeFile(t, filepath.Join(wt, name), "worktree-differs")
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrStagedDivergence) {
+		t.Fatalf("metacharacter staged divergence = %v, want ErrStagedDivergence", err)
 	}
 }
 
 // A racing edit that changes the tree between captures is rejected.
 func TestSnapshotRacingEdit(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
 	orig := snapshotRaceHook
 	defer func() { snapshotRaceHook = orig }()
 	snapshotRaceHook = func() error {
 		return os.WriteFile(filepath.Join(wt, "a.txt"), []byte("raced-in edit"), 0o600)
 	}
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrRacingEdit) {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrRacingEdit) {
 		t.Fatalf("racing edit = %v, want ErrRacingEdit", err)
 	}
 }
 
-// The barrier catches a staged divergence interposed at the seam even when both trees match: the
-// hook stages alternate bytes and restores the worktree bytes, so tree1 == tree2 but the real
-// index now holds a version the snapshot discards.
+// The barrier catches a staged divergence interposed at the seam even when both trees match.
 func TestSnapshotBarrierCatchesStagedInjection(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "worktree")
 	orig := snapshotRaceHook
 	defer func() { snapshotRaceHook = orig }()
@@ -158,21 +173,21 @@ func TestSnapshotBarrierCatchesStagedInjection(t *testing.T) {
 		if _, err := g.Run(context.Background(), wt, commitEnv(), "add", "a.txt"); err != nil {
 			return err
 		}
-		writeFile(t, filepath.Join(wt, "a.txt"), "worktree") // restore so both trees match
+		writeFile(t, filepath.Join(wt, "a.txt"), "worktree")
 		return nil
 	}
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrStagedDivergence) {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrStagedDivergence) {
 		t.Fatalf("barrier staged injection = %v, want ErrStagedDivergence", err)
 	}
 }
 
 // A symlink is captured as a symlink entry (mode 120000), not dereferenced.
 func TestSnapshotCapturesSymlink(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	if err := os.Symlink("a.txt", filepath.Join(wt, "link")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	_, tree, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch))
+	_, tree, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1"))
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -184,13 +199,13 @@ func TestSnapshotCapturesSymlink(t *testing.T) {
 
 // Object-writing commands run under the fsync contract so a frozen object cannot be lost.
 func TestSnapshotObjectWritersFsynced(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
 	orig := runObserver
 	defer func() { runObserver = orig }()
 	var seen []string
 	runObserver = func(argv []string) { seen = append(seen, strings.Join(argv, "\x00")) }
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); err != nil {
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	for _, want := range []string{"add", "write-tree", "commit-tree"} {
@@ -207,18 +222,16 @@ func TestSnapshotObjectWritersFsynced(t *testing.T) {
 	}
 }
 
-// The frozen ASCII/timestamp contract is enforced, not assumed.
+// The frozen timestamp contract is enforced (overflow/range checked).
 func TestSnapshotInputValidation(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
-	base0 := snapReq(repo, wt, base, branch)
+	base0 := snapReq(repo, base, "r1")
 	mut := func(f func(*SnapshotReq)) SnapshotReq { r := base0; f(&r); return r }
 	bad := []SnapshotReq{
-		mut(func(r *SnapshotReq) { r.RunID = "run\ninjected" }),
-		mut(func(r *SnapshotReq) { r.RunID = "" }),
-		mut(func(r *SnapshotReq) { r.RunID = "not ascii é" }),
 		mut(func(r *SnapshotReq) { r.StartingRevision = math.MaxUint64 }),
 		mut(func(r *SnapshotReq) { r.CreatedUnix = -1 }),
+		mut(func(r *SnapshotReq) { r.CreatedUnix = 0 }),
 	}
 	for i, req := range bad {
 		if _, _, err := g.SnapshotCommit(context.Background(), req); !errors.Is(err, ErrSnapshotInput) {
@@ -229,10 +242,10 @@ func TestSnapshotInputValidation(t *testing.T) {
 
 // An ambient repo commitEncoding does not leak an encoding header into the object.
 func TestSnapshotForcesCommitEncoding(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktree(t)
+	repo, g, wt, base := snapshotRun(t, "r1")
 	mustRun(t, g, wt, nil, "config", "i18n.commitEncoding", "ISO-8859-1")
 	writeFile(t, filepath.Join(wt, "a.txt"), "edited")
-	commit, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch))
+	commit, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1"))
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -244,51 +257,27 @@ func TestSnapshotForcesCommitEncoding(t *testing.T) {
 	}
 }
 
-// snapshotWorktreeWithSubmodule provisions a linked run worktree whose base contains an
-// initialized submodule at subPath (which may contain a space).
-func snapshotWorktreeWithSubmodule(t *testing.T, subPath string) (repo string, g *Git, wt, base, branch string) {
-	subSrc, _ := initRepo(t)
-	repo, g = initRepo(t)
-	allow := func(args ...string) []string { return append([]string{"-c", "protocol.file.allow=always"}, args...) }
-	if _, err := g.Run(context.Background(), repo, commitEnv(), allow("submodule", "add", subSrc, subPath)...); err != nil {
-		t.Skipf("submodule add unavailable: %v", err)
+// A large captured tree (its ls-tree inventory exceeds the plain-Run 1 MiB cap) is read in full, so
+// a divergent record beyond the cap is still caught rather than silently truncated away.
+func TestSnapshotLargeTreeNotTruncated(t *testing.T) {
+	repo, g, wt, base := snapshotRun(t, "r1")
+	pad := strings.Repeat("p", 120)
+	if err := os.MkdirAll(filepath.Join(wt, "big"), 0o700); err != nil {
+		t.Fatalf("mkdir big: %v", err)
 	}
-	mustRun(t, g, repo, commitEnv(), "commit", "-m", "add sub")
-	base = oidOf(t, g, repo, "refs/heads/main")
-	branch = "claudex/r1"
-	spec := WorktreeSpec{RelPath: ".claudex/runs/r1/worktree", Branch: branch, BaseCommit: base, OwnerToken: "tok"}
-	if err := NewWorktree(g).Apply(context.Background(), repo, spec); err != nil {
-		t.Fatalf("provision: %v", err)
+	// ~6500 entries at ~178 bytes each puts the inventory well over 1 MiB before "zzz-retained".
+	for i := 0; i < 6500; i++ {
+		writeFile(t, filepath.Join(wt, "big", fmt.Sprintf("%s-%05d", pad, i)), "x")
 	}
-	wt = worktreeAbs(repo, spec)
-	if _, err := g.Run(context.Background(), wt, commitEnv(), allow("submodule", "update", "--init")...); err != nil {
-		t.Skipf("submodule init in linked worktree unavailable: %v", err)
-	}
-	return repo, g, wt, base, branch
-}
+	writeFile(t, filepath.Join(wt, "zzz-retained"), "tracked") // sorts LAST, after the 1 MiB point
+	mustRun(t, g, wt, commitEnv(), "add", "-A")
+	mustRun(t, g, wt, commitEnv(), "commit", "-m", "big")
+	base = oidOf(t, g, wt, "HEAD")
 
-// A submodule with uncommitted content fails closed; the path (with a space) is parsed NUL-safely.
-func TestSnapshotRejectsDirtySubmoduleWithSpacePath(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktreeWithSubmodule(t, "sub dir")
-	writeFile(t, filepath.Join(wt, "a.txt"), "ordinary edit") // make the snapshot non-empty
-	writeFile(t, filepath.Join(wt, "sub dir", "dirty.txt"), "uncommitted submodule content")
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrDirtySubmodule) {
-		t.Fatalf("dirty submodule = %v, want ErrDirtySubmodule", err)
-	}
-}
-
-// The barrier catches a submodule dirtied at the seam even though both superproject trees match
-// (the gitlink HEAD is unchanged).
-func TestSnapshotBarrierCatchesSubmoduleDirt(t *testing.T) {
-	repo, g, wt, base, branch := snapshotWorktreeWithSubmodule(t, "sub")
-	writeFile(t, filepath.Join(wt, "a.txt"), "ordinary edit")
-	orig := snapshotRaceHook
-	defer func() { snapshotRaceHook = orig }()
-	snapshotRaceHook = func() error {
-		return os.WriteFile(filepath.Join(wt, "sub", "untracked.txt"), []byte("dirtied at the seam"), 0o600)
-	}
-	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, wt, base, branch)); !errors.Is(err, ErrDirtySubmodule) {
-		t.Fatalf("barrier submodule dirt = %v, want ErrDirtySubmodule", err)
+	writeFile(t, filepath.Join(wt, "ordinary.txt"), "edit") // make the snapshot non-empty
+	mustRun(t, g, wt, commitEnv(), "rm", "--cached", "zzz-retained")
+	if _, _, err := g.SnapshotCommit(context.Background(), snapReq(repo, base, "r1")); !errors.Is(err, ErrStagedDivergence) {
+		t.Fatalf("large-tree trailing divergence = %v, want ErrStagedDivergence (truncated inventory?)", err)
 	}
 }
 

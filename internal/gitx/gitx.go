@@ -12,6 +12,7 @@
 package gitx
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -95,6 +96,85 @@ func (g *Git) Run(ctx context.Context, dir string, extraEnv map[string]string, a
 func (g *Git) RunCode(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]byte, int, error) {
 	stdout, _, code, err := g.exec(ctx, dir, extraEnv, args...)
 	return stdout, code, err
+}
+
+// maxNulRecord bounds a SINGLE NUL-separated record (a path or a diff header), guarding against a
+// hostile single entry; the TOTAL output is not capped, so a machine inventory of a large tree is
+// never silently truncated — the reason plain Run's 1 MiB cap is wrong for `ls-tree`/`diff-index`.
+const maxNulRecord = 1 << 20
+
+// RunNulRecords runs git and returns its stdout split into NUL-separated records WITHOUT the
+// output cap, so a large machine inventory (`ls-tree -r -z`, `diff-index -z`) is read in full. It
+// streams the pipe rather than buffering a capped blob; a record exceeding maxNulRecord, a
+// cancelled context, or a non-zero exit is a fail-closed error, never a truncated success.
+func (g *Git) RunNulRecords(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]string, error) {
+	if g.closed {
+		return nil, ErrClosed
+	}
+	if len(args) == 0 {
+		return nil, fmt.Errorf("%w: no git subcommand", ErrGit)
+	}
+	full := append([]string{
+		"-c", "core.hooksPath=" + g.hooksDir,
+		"-c", "commit.gpgsign=false",
+		"-c", "tag.gpgsign=false",
+	}, args...)
+	if runObserver != nil {
+		runObserver(full)
+	}
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Dir = dir
+	cmd.Env = scrubbedEnv(extraEnv)
+	var stderr boundedBuffer
+	stderr.limit = maxGitOutput
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w: git %s: %v", ErrGit, args[0], err)
+	}
+	var records []string
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), maxNulRecord)
+	scanner.Split(scanNul)
+	for scanner.Scan() {
+		records = append(records, scanner.Text())
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if waitErr != nil {
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
+			return nil, fmt.Errorf("%w: git %s: exit %d: %s", ErrGit, args[0], ee.ExitCode(), redact.Text(strings.TrimSpace(stderr.String())))
+		}
+		return nil, fmt.Errorf("%w: git %s: %v", ErrGit, args[0], waitErr)
+	}
+	if scanErr != nil {
+		return nil, fmt.Errorf("%w: git %s: reading output: %v", ErrGit, args[0], scanErr)
+	}
+	return records, nil
+}
+
+// scanNul is a bufio.SplitFunc that yields NUL-separated records, dropping a trailing empty one.
+func scanNul(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, 0); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // exec runs git under the hardened isolation and returns trimmed stdout, raw stderr, the process
