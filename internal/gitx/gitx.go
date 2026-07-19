@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -98,15 +99,29 @@ func (g *Git) RunCode(ctx context.Context, dir string, extraEnv map[string]strin
 	return stdout, code, err
 }
 
-// maxNulRecord bounds a SINGLE NUL-separated record (a path or a diff header), guarding against a
-// hostile single entry; the TOTAL output is not capped, so a machine inventory of a large tree is
-// never silently truncated — the reason plain Run's 1 MiB cap is wrong for `ls-tree`/`diff-index`.
-const maxNulRecord = 1 << 20
+// ErrOutputTooLarge means a machine inventory exceeded the total output bound (fail closed, never a
+// truncated success). ErrUnterminatedRecord means a NUL-record stream ended without a final NUL.
+var (
+	ErrOutputTooLarge     = errors.New("gitx: git output exceeded the bound")
+	ErrUnterminatedRecord = errors.New("gitx: unterminated NUL record")
+)
 
-// RunNulRecords runs git and returns its stdout split into NUL-separated records WITHOUT the
-// output cap, so a large machine inventory (`ls-tree -r -z`, `diff-index -z`) is read in full. It
-// streams the pipe rather than buffering a capped blob; a record exceeding maxNulRecord, a
-// cancelled context, or a non-zero exit is a fail-closed error, never a truncated success.
+// maxNulRecord bounds a SINGLE NUL-separated record (a path or a diff header). maxInventoryBytes is
+// the TOTAL output ceiling for RunNulRecords — a documented, realistic bound (a very large tree's
+// `ls-tree -r` inventory is tens of MiB) that keeps memory bounded per 04.0's hardened-leaf
+// requirement while comfortably covering legitimate >1 MiB inventories. Both are package vars so a
+// test can shrink them to exercise the fail-closed overflow paths cheaply.
+var (
+	maxNulRecord      = 1 << 20  // 1 MiB per record
+	maxInventoryBytes = 64 << 20 // 64 MiB total
+)
+
+// RunNulRecords runs git and returns its stdout split into NUL-separated records, reading past
+// plain Run's 1 MiB cap so a machine inventory (`ls-tree -r -z`, `diff-index -z`) is never silently
+// truncated — while staying BOUNDED: total output over maxInventoryBytes, a single record over
+// maxNulRecord, an UNTERMINATED final record, a cancelled context, or a non-zero exit are all
+// fail-closed errors. On any early abort the child is killed and its pipe drained before Wait, so a
+// runaway producer cannot deadlock the wait.
 func (g *Git) RunNulRecords(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]string, error) {
 	if g.closed {
 		return nil, ErrClosed
@@ -138,14 +153,31 @@ func (g *Git) RunNulRecords(ctx context.Context, dir string, extraEnv map[string
 		}
 		return nil, fmt.Errorf("%w: git %s: %v", ErrGit, args[0], err)
 	}
+	// abort kills the child and drains the remaining buffered output before Wait, so a producer
+	// still writing cannot block the wait; the caller's error is returned.
+	abort := func(retErr error) ([]string, error) {
+		_ = cmd.Process.Kill()
+		_, _ = io.Copy(io.Discard, stdout)
+		_ = cmd.Wait()
+		return nil, retErr
+	}
+
 	var records []string
+	var total int
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), maxNulRecord)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxNulRecord)
 	scanner.Split(scanNul)
 	for scanner.Scan() {
-		records = append(records, scanner.Text())
+		b := scanner.Bytes()
+		total += len(b) + 1 // include the record's NUL terminator
+		if total > maxInventoryBytes {
+			return abort(fmt.Errorf("%w: git %s", ErrOutputTooLarge, args[0]))
+		}
+		records = append(records, string(b))
 	}
-	scanErr := scanner.Err()
+	if scanErr := scanner.Err(); scanErr != nil {
+		return abort(fmt.Errorf("%w: git %s: %v", ErrGit, args[0], scanErr))
+	}
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -157,24 +189,23 @@ func (g *Git) RunNulRecords(ctx context.Context, dir string, extraEnv map[string
 		}
 		return nil, fmt.Errorf("%w: git %s: %v", ErrGit, args[0], waitErr)
 	}
-	if scanErr != nil {
-		return nil, fmt.Errorf("%w: git %s: reading output: %v", ErrGit, args[0], scanErr)
-	}
 	return records, nil
 }
 
-// scanNul is a bufio.SplitFunc that yields NUL-separated records, dropping a trailing empty one.
+// scanNul is a bufio.SplitFunc yielding NUL-terminated records. Because these commands promise a
+// NUL after EVERY record, output that ends without one is malformed and fails closed rather than
+// yielding an unterminated final token.
 func scanNul(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
 	if i := bytes.IndexByte(data, 0); i >= 0 {
 		return i + 1, data[:i], nil
 	}
 	if atEOF {
-		return len(data), data, nil
+		if len(data) > 0 {
+			return 0, nil, ErrUnterminatedRecord
+		}
+		return 0, nil, nil
 	}
-	return 0, nil, nil
+	return 0, nil, nil // need more data
 }
 
 // exec runs git under the hardened isolation and returns trimmed stdout, raw stderr, the process

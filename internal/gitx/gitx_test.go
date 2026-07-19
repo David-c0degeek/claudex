@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,61 @@ import (
 	"strings"
 	"testing"
 )
+
+// scanNul yields NUL-terminated records and fails closed on an unterminated or overlong one.
+func TestScanNulTerminated(t *testing.T) {
+	sc := bufio.NewScanner(strings.NewReader("a\x00bb\x00ccc\x00"))
+	sc.Split(scanNul)
+	var got []string
+	for sc.Scan() {
+		got = append(got, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan err: %v", err)
+	}
+	if strings.Join(got, ",") != "a,bb,ccc" {
+		t.Fatalf("records = %v", got)
+	}
+}
+
+func TestScanNulUnterminated(t *testing.T) {
+	sc := bufio.NewScanner(strings.NewReader("a\x00trailing-without-nul"))
+	sc.Split(scanNul)
+	for sc.Scan() {
+	}
+	if !errors.Is(sc.Err(), ErrUnterminatedRecord) {
+		t.Fatalf("unterminated = %v, want ErrUnterminatedRecord", sc.Err())
+	}
+}
+
+func TestScanNulOverlong(t *testing.T) {
+	sc := bufio.NewScanner(strings.NewReader(strings.Repeat("x", 100))) // no NUL, long
+	sc.Buffer(make([]byte, 0, 8), 16)                                   // max token 16
+	sc.Split(scanNul)
+	for sc.Scan() {
+	}
+	if !errors.Is(sc.Err(), bufio.ErrTooLong) {
+		t.Fatalf("overlong = %v, want bufio.ErrTooLong", sc.Err())
+	}
+}
+
+// A valid inventory is returned in full; exceeding the total ceiling fails closed.
+func TestRunNulRecordsBounds(t *testing.T) {
+	repo, g := initRepo(t) // one committed file a.txt
+	recs, err := g.RunNulRecords(context.Background(), repo, nil, "ls-tree", "-r", "-z", "HEAD")
+	if err != nil {
+		t.Fatalf("valid inventory: %v", err)
+	}
+	if len(recs) != 1 || !strings.Contains(recs[0], "a.txt") {
+		t.Fatalf("records = %v, want one a.txt entry", recs)
+	}
+	orig := maxInventoryBytes
+	defer func() { maxInventoryBytes = orig }()
+	maxInventoryBytes = 4 // smaller than one ls-tree entry
+	if _, err := g.RunNulRecords(context.Background(), repo, nil, "ls-tree", "-r", "-z", "HEAD"); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("over-ceiling = %v, want ErrOutputTooLarge", err)
+	}
+}
 
 // commitEnv gives git a deterministic identity so plumbing/porcelain commits work under the
 // scrubbed (config-neutral) environment.
