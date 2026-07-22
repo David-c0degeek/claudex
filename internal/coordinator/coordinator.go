@@ -367,6 +367,34 @@ func (rn *Run) precomputeTestOutcome(pass bool, expectedRevision uint64) (transp
 	return prepare, nil
 }
 
+// MirrorMailbox rebuilds the human-readable .claudex/mailbox.md transcript from the run's
+// durable ledger and immutable artifacts (D018: a rebuildable, re-validated projection,
+// atomically replaced). It is idempotent — every submit rebuilds it, so a mirror a crash left
+// stale or missing is repaired by the next successful or replayed submit — and lock-free (the
+// transcript is a projection of already-committed state, atomically replaced). The mailbox
+// directory is attach-derived (RunLocation.MailboxDir); the artifact loader is the run's own
+// verifying store.
+func (rn *Run) MirrorMailbox() error {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	if rn.closed {
+		return ErrClosed
+	}
+	rs, ok, err := rn.state.Load()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return transport.ErrNoRun
+	}
+	mb, err := transport.NewMailboxStore(rn.loc.MailboxDir)
+	if err != nil {
+		return err
+	}
+	defer mb.Close()
+	return mb.Write(state.Ledger(rs), rn.store.Get)
+}
+
 // Close releases the artifact store and the git handle. It waits for in-flight
 // submits (the write lock blocks until every read lock is released), so it never
 // races an artifact Get/Put or a running git transaction.
