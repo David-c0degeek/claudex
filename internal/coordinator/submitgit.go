@@ -118,7 +118,7 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	// pre-PREPARE recheck below and ApplyIndex's live-digest CAS both fail closed
 	// on it instead).
 	worktree := rn.runWorktree()
-	preDigest, derr := rn.git.IndexDigest(ctx, worktree)
+	preDigest, derr := rn.git.IndexDigest(ctx, rn.repoDir, worktree)
 	if derr != nil {
 		return transport.SubmitResult{}, derr
 	}
@@ -148,11 +148,8 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	if terr != nil {
 		return transport.SubmitResult{}, terr
 	}
-	private, pverr := rn.git.TargetIndexPath(ctx, worktree, txnID)
-	if pverr != nil {
-		return transport.SubmitResult{}, pverr
-	}
-	targetDigest, berr := rn.git.BuildTargetIndex(ctx, worktree, commit, private)
+	private := gitx.TargetIndexName(txnID)
+	targetDigest, berr := rn.git.BuildTargetIndex(ctx, rn.repoDir, worktree, commit, private)
 	if berr != nil {
 		return transport.SubmitResult{}, berr
 	}
@@ -294,10 +291,7 @@ func (rn *Run) commitTxnPlanFor(ctx context.Context, g *genstore.Guard) func(txn
 // foreign observation fails closed.
 func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan transport.GitAcceptPlan, txnID string) ([]txn.Step, error) {
 	worktree := rn.runWorktree()
-	private, err := rn.git.TargetIndexPath(ctx, worktree, txnID)
-	if err != nil {
-		return nil, err
-	}
+	private := gitx.TargetIndexName(txnID)
 	// Crash-cut seams (nil in production): fire at the start of a step's Apply and
 	// ConfirmDurable, so a test halts the transaction with exactly the durable state
 	// a power cut at that point would leave.
@@ -321,6 +315,7 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 		Commit: plan.GitCommit.Commit,
 	}
 	idxT := gitx.IndexTarget{
+		RepoDir:      rn.repoDir,
 		Worktree:     worktree,
 		Commit:       plan.GitCommit.Commit,
 		Tree:         plan.GitCommit.Tree,
