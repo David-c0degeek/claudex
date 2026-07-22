@@ -10,10 +10,41 @@ import (
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
-	"github.com/David-c0degeek/claudex/internal/transport"
 )
 
 // --- test adapter: simulate transport (schema + CAS), then Project->Evaluate->Apply ---
+
+// phaseMessageTypes mirrors transport's turn-spec table (the artifact message type per
+// actionable phase). The engine's in-package tests cannot import transport (transport now
+// imports engine), so the adapter carries the mapping locally.
+var phaseMessageTypes = map[state.Phase]string{
+	state.PhasePlanDraft:     "plan",
+	state.PhasePlanCritique:  "plan_critique",
+	state.PhasePlanRevise:    "plan_revision",
+	state.PhaseImplementStep: "implementation_report",
+	state.PhaseCheckpoint:    "checkpoint_review",
+	state.PhaseFix:           "implementation_report",
+	state.PhaseVerify:        "verification",
+}
+
+// testEvidenceFor returns chained git-commit evidence for an IMPLEMENT_STEP/FIX acceptance
+// (schema v6 requires it) and nil for every other phase. The chain mirrors the production
+// transaction: the first acceptance's parent is BaseCommit, each later parent is the previous
+// acceptance's commit, with synthetic distinct 40-hex tree/commit OIDs per position.
+func testEvidenceFor(phase state.Phase, rs *state.RunState) *state.GitCommitEvidence {
+	if phase != state.PhaseImplementStep && phase != state.PhaseFix {
+		return nil
+	}
+	parent := rs.BaseCommit
+	n := 0
+	for _, e := range state.Ledger(*rs) {
+		if rs.AcceptedTurns[e.TurnID].GitCommit != nil {
+			n++
+			parent = rs.AcceptedTurns[e.TurnID].GitCommit.Commit
+		}
+	}
+	return &state.GitCommitEvidence{Parent: parent, Tree: fmt.Sprintf("%040d", n*2+1), Commit: fmt.Sprintf("%040d", n*2+2)}
+}
 
 // step drives one accepted submit through the pure engine exactly as a production
 // adapter would: it schema-validates the phase's expected artifact type, checks the
@@ -25,11 +56,11 @@ func step(t *testing.T, store *state.Store, facts ProjectionFacts, canonical []b
 	if err != nil || !ok {
 		t.Fatalf("load: ok=%v err=%v", ok, err)
 	}
-	spec, ok := transport.TurnSpec(cur.Phase)
+	msgType, ok := phaseMessageTypes[cur.Phase]
 	if !ok {
 		t.Fatalf("no turn spec for phase %s", cur.Phase)
 	}
-	canon, err := protocol.Validate(spec.ArtifactMessageType, canonical)
+	canon, err := protocol.Validate(msgType, canonical)
 	if err != nil {
 		return state.RunState{}, fmt.Errorf("schema: %w", err)
 	}
@@ -64,6 +95,7 @@ func step(t *testing.T, store *state.Store, facts ProjectionFacts, canonical []b
 			ArtifactDigest: ev.Source.Digest,
 			Receipt:        state.Receipt{TurnID: ev.Source.TurnID, Revision: gen, ArtifactDigest: ev.Source.Digest},
 			Phase:          cur.Phase,
+			GitCommit:      testEvidenceFor(cur.Phase, next),
 		}
 		return nil
 	})

@@ -106,6 +106,7 @@ func stepRT(t *testing.T, store *state.Store, facts ProjectionFacts, rt RuntimeF
 			ArtifactDigest: ev.Source.Digest,
 			Receipt:        state.Receipt{TurnID: ev.Source.TurnID, Revision: gen, ArtifactDigest: ev.Source.Digest},
 			Phase:          cur.Phase,
+			GitCommit:      testEvidenceFor(cur.Phase, next),
 		}
 		return nil
 	})

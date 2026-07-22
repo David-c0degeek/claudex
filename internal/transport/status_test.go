@@ -33,18 +33,18 @@ func TestStatusProjectsLiveTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if s.RunID != "run-a" || s.Phase != state.PhaseImplementStep || s.Lifecycle != state.LifecycleRunning {
+	if s.RunID != "run-a" || s.Phase != state.PhaseCheckpoint || s.Lifecycle != state.LifecycleRunning {
 		t.Fatalf("status header wrong: %+v", s)
 	}
-	if s.WhoseTurn == nil || *s.WhoseTurn != RoleLead || s.TurnID == nil || *s.TurnID != "turn-1" {
+	if s.WhoseTurn == nil || *s.WhoseTurn != RolePair || s.TurnID == nil || *s.TurnID != "turn-1" {
 		t.Fatalf("whose_turn/turn_id wrong: %+v", s)
 	}
 	if s.Honesty.Tier != TierProtocolOnly || len(s.Honesty.Capabilities) != 2 {
 		t.Fatalf("honesty wrong: %+v", s.Honesty)
 	}
 	pol := config.DefaultRunPolicy()
-	// Two turns (plan, critique) were accepted reaching the agreed plan.
-	if s.Caps.RunTurns.Used != 2 || s.Caps.RunTurns.Limit != pol.Limits.MaxRunTurns {
+	// Three turns (plan, critique, implement) were accepted reaching the checkpoint.
+	if s.Caps.RunTurns.Used != 3 || s.Caps.RunTurns.Limit != pol.Limits.MaxRunTurns {
 		t.Fatalf("run_turns cap wrong: %+v", s.Caps.RunTurns)
 	}
 	if s.Caps.PlanRounds.Remaining != pol.Budgets.PlanRounds || s.Caps.RunTurns.Mechanism != "durable-state-counter" {
@@ -192,9 +192,9 @@ func TestStatusHonestyValueFree(t *testing.T) {
 
 // Status reflects a real Submit: the resulting revision and newly issued owner.
 func TestStatusAfterSubmit(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t) // IMPLEMENT_STEP, lead turn-1
+	store, rev := newRunWithActiveTurn(t) // CHECKPOINT, pair turn-1
 	adv := checkpointPrep()
-	res, err := submit(store, newMemSink(), "sess-1", report("turn-1", rev, "done"), ownerAuth("sess-1"), adv)
+	res, err := submit(store, newMemSink(), "sess-2", report("turn-1", rev, "done"), ownerAuth("sess-2"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestStatusAfterSubmit(t *testing.T) {
 	if s.Revision != res.Receipt.Revision {
 		t.Fatalf("status revision %d != receipt revision %d", s.Revision, res.Receipt.Revision)
 	}
-	if s.Phase != state.PhaseCheckpoint || s.WhoseTurn == nil || *s.WhoseTurn != RolePair || s.TurnID == nil || *s.TurnID != "turn-2" {
+	if s.Phase != state.PhaseImplementStep || s.WhoseTurn == nil || *s.WhoseTurn != RoleLead || s.TurnID == nil || *s.TurnID != "turn-2" {
 		t.Fatalf("status did not reflect the submit's transition: %+v", s)
 	}
 }

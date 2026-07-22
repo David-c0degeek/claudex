@@ -23,11 +23,12 @@ func prepareErr(err error) Prepare {
 	return func(state.RunState, PreparedSubmit) (PreparedTransition, error) { return PreparedTransition{}, err }
 }
 
-// checkpointApply is the standard running transition body: advance to CHECKPOINT and
-// issue turn-2. checkpointPrep declares that turn; countingPrep additionally counts
-// each real apply so exact-once is observable.
+// checkpointApply is the standard running transition body for the CHECKPOINT fixture:
+// the review agrees, so the run advances to the next IMPLEMENT_STEP and issues turn-2.
+// checkpointPrep declares that turn; countingPrep additionally counts each real apply
+// so exact-once is observable.
 func checkpointApply(gen uint64, next *state.RunState) error {
-	next.Phase = state.PhaseCheckpoint
+	next.Phase = state.PhaseImplementStep
 	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 	return nil
 }

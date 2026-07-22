@@ -210,6 +210,28 @@ func (g *Git) realIndexPath(ctx context.Context, worktree string) (string, error
 	return filepath.Join(admin, "index"), nil
 }
 
+// TargetIndexPath derives the txn-private target-index path for txnID: a sibling of the
+// worktree's real index (so the hard-link CAS stays on one filesystem), named by the
+// transaction id so recovery re-derives the exact journalled path and two transactions
+// can never collide.
+func (g *Git) TargetIndexPath(ctx context.Context, worktree, txnID string) (string, error) {
+	indexPath, err := g.realIndexPath(ctx, worktree)
+	if err != nil {
+		return "", err
+	}
+	return indexPath + ".claudex-target-" + txnID, nil
+}
+
+// IndexDigest returns the digest of the worktree's real checked-out index — the I0 the
+// transaction freezes before the index-cas step.
+func (g *Git) IndexDigest(ctx context.Context, worktree string) (string, error) {
+	indexPath, err := g.realIndexPath(ctx, worktree)
+	if err != nil {
+		return "", err
+	}
+	return fileDigest(indexPath)
+}
+
 func (g *Git) worktreeClean(ctx context.Context, worktree string) (bool, error) {
 	out, err := g.Run(ctx, worktree, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {

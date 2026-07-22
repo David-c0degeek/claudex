@@ -92,7 +92,7 @@ func TestWaitStopPriority(t *testing.T) {
 			n.Assignment = nil
 		}, WaitCompleted},
 		{"gate", func(gen uint64, n *state.RunState) {
-			acceptAndHumanGate(n, gen, state.PhaseImplementStep, "turn-1", dig("7"), "gate-1")
+			acceptAndHumanGate(n, gen, state.PhaseCheckpoint, "turn-1", dig("7"), "gate-1")
 		}, WaitGate},
 		{"paused_budget", func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecyclePausedBudget }, WaitPausedBudget},
 		{"rate_limited", func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecycleRateLimited }, WaitRateLimited},
@@ -305,7 +305,8 @@ func TestWaitCatchesEventAtBoundary(t *testing.T) {
 func TestWaitIgnoresOtherRoleTurn(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	mutate(t, store, rev, func(gen uint64, n *state.RunState) {
-		// IMPLEMENT_STEP is already a lead turn; reissue turn-2 there.
+		// Advance to IMPLEMENT_STEP (a lead turn) so the pair waiter has nothing.
+		n.Phase = state.PhaseImplementStep
 		n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
 	})
 	clk := newFakeClock()

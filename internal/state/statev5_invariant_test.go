@@ -335,7 +335,7 @@ func TestV5SecretRejectedInEnumField(t *testing.T) {
 	secret := "sk-ant-abcdefghijklmnopqrstuvwx"
 	assigned := assignAt(t, s, mustAgreedImplement(t, s), "t1")
 	rejects(t, s, assigned, "secret in pause kind", func(rev uint64, n *RunState) {
-		n.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseImplementStep}
+		n.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("7"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("7")}, Phase: PhaseImplementStep, GitCommit: gitEv(n)}
 		n.Pause = &PauseContext{Kind: PauseKind(secret), OriginPhase: PhaseImplementStep, ResumePhase: PhaseImplementStep, Source: EventRef{Digest: hex64("7"), TurnID: "t1"}}
 		n.Gate = &Ref{ID: "g", IssuedRevision: rev}
 		n.Phase = PhaseAwaitGuidance

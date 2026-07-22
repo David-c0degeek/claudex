@@ -25,6 +25,17 @@ func ConfirmReplaceJournal(g *genstore.Guard, loc RunLocation) error {
 	return confirmJournalStore(g, loc.ReplaceDir, loc.RunLock)
 }
 
+// ConfirmCommitTxnJournal re-confirms the implementation-submit git-commit transaction journal
+// store's durability under a held run guard (see ConfirmPairJournal); a run that has accepted no
+// git commit is a no-op.
+func ConfirmCommitTxnJournal(g *genstore.Guard, loc RunLocation) error {
+	return confirmJournalStore(g, loc.CommitTxnDir, loc.RunLock)
+}
+
+// CommitTxnJournalDir is the per-run git-commit transaction journal directory (a helper so the
+// coordinator opens exactly this store, never joining paths of its own).
+func CommitTxnJournalDir(loc RunLocation) string { return loc.CommitTxnDir }
+
 func confirmJournalStore(g *genstore.Guard, dir, lock string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return nil // never recorded: nothing to confirm
@@ -44,6 +55,7 @@ type RunLocation struct {
 	RegistryDir  string // the Registry genstore directory
 	AttachDir    string // the pair-attach transaction journal directory
 	ReplaceDir   string // the dedicated session-replacement transaction journal directory
+	CommitTxnDir string // the dedicated implementation-submit git-commit transaction journal directory
 	ArtifactsDir string // the content-addressed submit-artifact store directory
 }
 
@@ -86,6 +98,7 @@ func runLocationFor(lay layout, runID string) RunLocation {
 		RegistryDir:  filepath.Join(runDir, "registry"),
 		AttachDir:    lay.attachJournalDir(runDir),
 		ReplaceDir:   lay.replaceJournalDir(runDir),
+		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 	}
 }

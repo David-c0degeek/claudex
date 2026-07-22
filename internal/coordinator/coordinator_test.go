@@ -20,6 +20,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/fsclass"
 	"github.com/David-c0degeek/claudex/internal/genstore"
+	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -78,19 +79,76 @@ func taskBytes() []byte {
 	return []byte(`{"schema_version":1,"goal":"drive the pairing loop","current_behavior":"none","desired_behavior":"two terminals converge","scope":"coordinator core","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
 }
 
-// newPairedRun bootstraps a lead-claude run and fills the codex pair, leaving the run
-// at PLAN_DRAFT with the lead's first turn issued.
+// initGitRepo turns the empty repo dir into a real one-commit repository on branch
+// main with .claudex git-ignored — the shape FirstAttach's real preflight requires
+// and the git commit transaction snapshots against.
+func initGitRepo(t *testing.T, repo string) {
+	t.Helper()
+	g, err := gitx.New()
+	if err != nil {
+		t.Fatalf("gitx.New: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	env := map[string]string{
+		"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+		"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+	}
+	mustGit(t, g, repo, nil, "init", "-b", "main")
+	writeRepoFile(t, filepath.Join(repo, ".gitignore"), ".claudex/\n")
+	writeRepoFile(t, filepath.Join(repo, "README"), "hi\n")
+	mustGit(t, g, repo, env, "add", "-A")
+	mustGit(t, g, repo, env, "commit", "-m", "init")
+}
+
+func mustGit(t *testing.T, g *gitx.Git, dir string, env map[string]string, args ...string) []byte {
+	t.Helper()
+	out, err := g.Run(context.Background(), dir, env, args...)
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return out
+}
+
+func writeRepoFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// editWorktree makes a fresh tracked-content change in the run's linked worktree so
+// the next IMPLEMENT/FIX submit snapshots a non-empty tree (the transaction rejects
+// a no-op snapshot).
+var editSeq int
+
+func editWorktree(t *testing.T, rn *Run) {
+	t.Helper()
+	editSeq++
+	writeRepoFile(t, filepath.Join(rn.runWorktree(), "work.txt"), fmt.Sprintf("edit %d\n", editSeq))
+}
+
+// newPairedRun bootstraps a lead-claude run over a REAL git repository (created in
+// the empty repo dir) and fills the codex pair, leaving the run at PLAN_DRAFT with
+// the lead's first turn issued. The real seams matter since 04.2: an IMPLEMENT/FIX
+// submit routes through the git commit transaction against the real linked worktree.
 func newPairedRun(t *testing.T, repo string) (runID, lead, pair string) {
 	return newPairedRunWithPolicy(t, repo, policyBytes())
 }
 
 func newPairedRunWithPolicy(t *testing.T, repo string, pol []byte) (runID, lead, pair string) {
 	t.Helper()
+	initGitRepo(t, repo)
+	g, err := gitx.New()
+	if err != nil {
+		t.Fatalf("gitx.New: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	base, pre, wt := attach.NewGitSeams(g)
 	fa, err := attach.FirstAttach(context.Background(), attach.FirstAttachRequest{
 		RepoDir: repo, Agent: state.AgentClaude, OperationID: opID("a"),
 		TaskCanonical: taskBytes(), PolicyCanonical: pol,
 		CreatedUnix: 1000, RNG: rand.Reader,
-		Base: fakeBase{commit: strings.Repeat("a", 40)}, Preflight: fakePreflight{}, Worktree: &fakeWorktree{}, Classifier: supportedFS(),
+		Base: base, Preflight: pre, Worktree: wt, Classifier: supportedFS(),
 	})
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
@@ -285,7 +343,8 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 		t.Fatalf("not promoted to IMPLEMENT_STEP: %+v", rs)
 	}
 
-	// IMPLEMENT_STEP (lead) -> CHECKPOINT.
+	// IMPLEMENT_STEP (lead) -> CHECKPOINT (through the git commit transaction).
+	editWorktree(t, rn)
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
 	if rs.Phase != state.PhaseCheckpoint {
@@ -307,6 +366,7 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 	}
 
 	// FIX implementation report -> back to CHECKPOINT.
+	editWorktree(t, rn)
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
 	if rs.Phase != state.PhaseCheckpoint || rs.FixReturn != "" {
@@ -323,6 +383,7 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 	// IMPLEMENT the final step, then AGREE on it. The final checkpoint is accepted and
 	// the run enters ownerless TESTS; this build does not yet author the coordinator
 	// TESTS outcome that would leave TESTS.
+	editWorktree(t, rn)
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
 	final := checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)
@@ -515,6 +576,7 @@ func TestSubmitTestOutcomeStaleRoundRejected(t *testing.T) {
 	if fix.Phase != state.PhaseFix || fix.FixReturn != state.PhaseTests {
 		t.Fatalf("a TESTS fail did not open a TESTS-returning FIX: %+v", fix)
 	}
+	editWorktree(t, rn)
 	submitOK(t, rn, lead, implReport(t, fix.Assignment.ID, fix.Revision)) // FIX -> TESTS
 	back := cur(t, rn)
 	if back.Phase != state.PhaseTests || back.Revision <= tests.Revision {
@@ -865,6 +927,7 @@ func TestE2ECheckpointQualityGate(t *testing.T) {
 	if rs.Phase != state.PhaseImplementStep {
 		t.Fatalf("not promoted: %s", rs.Phase)
 	}
+	editWorktree(t, rn)
 	submitOK(t, rn, lead, implReport(t, rs.Assignment.ID, rs.Revision))
 	rs = cur(t, rn)
 	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"blocking"}))

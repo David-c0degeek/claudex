@@ -46,7 +46,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("cancel: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = submit(store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-2", report("turn-1", rc.Revision, "x"), ownerAuth("sess-2"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("cancelled submit err = %v, want ErrNotAccepting", err)
 		}
@@ -65,7 +65,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("recovery: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = submit(store, sink, "sess-1", report("turn-1", rr.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-2", report("turn-1", rr.Revision, "x"), ownerAuth("sess-2"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("recovering submit err = %v, want ErrNotAccepting", err)
 		}
@@ -86,7 +86,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("advance: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = submit(store, sink, "sess-1", report("turn-1", r2.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-2", report("turn-1", r2.Revision, "x"), ownerAuth("sess-2"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("stale-assignment submit err = %v, want ErrNotAccepting", err)
 		}
@@ -108,7 +108,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 			t.Fatalf("cancel: %v", err)
 		}
 		sink := &countingSink{}
-		_, err = submit(store, sink, "sess-1", report("turn-1", rc.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-2", report("turn-1", rc.Revision, "x"), ownerAuth("sess-2"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("cancelled-cleared submit err = %v, want ErrNotAccepting", err)
 		}
@@ -122,7 +122,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 	t.Run("paused gate", func(t *testing.T) {
 		store, rev := newRunWithActiveTurn(t)
 		rg, err := store.Mutate(rev, func(gen uint64, next *state.RunState) error {
-			acceptAndHumanGate(next, gen, state.PhaseImplementStep, "turn-1", dig("7"), "gate-1")
+			acceptAndHumanGate(next, gen, state.PhaseCheckpoint, "turn-1", dig("7"), "gate-1")
 			return nil
 		})
 		if err != nil {
@@ -131,7 +131,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 		sink := &countingSink{}
 		// turn-1 is the accepted gate source; submit a fresh turn so the not-accepting
 		// refusal (not an already-accepted replay) is what surfaces.
-		_, err = submit(store, sink, "sess-1", report("turn-2", rg.Revision, "x"), ownerAuth("sess-1"), adv)
+		_, err = submit(store, sink, "sess-2", report("turn-2", rg.Revision, "x"), ownerAuth("sess-2"), adv)
 		if !errors.Is(err, ErrNotAccepting) {
 			t.Fatalf("paused-gate submit err = %v, want ErrNotAccepting", err)
 		}
@@ -148,7 +148,7 @@ func TestSubmitDoesNotAdvanceOnSinkSyncFailure(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := &syncFailSink{}
 	adv := checkpointPrep()
-	_, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
+	_, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv)
 	var pce *atomicfile.PostCommitSyncError
 	if !errors.As(err, &pce) {
 		t.Fatalf("submit err = %v, want *atomicfile.PostCommitSyncError", err)
@@ -344,7 +344,7 @@ func TestArtifactStoreAsSubmitSink(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newStore(t)
 	adv := checkpointPrep()
-	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv)
+	res, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}

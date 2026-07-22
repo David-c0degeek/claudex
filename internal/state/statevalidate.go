@@ -225,7 +225,7 @@ func validateTransition(old, next *RunState) error {
 	// must have been accepted at the resulting revision.
 	for k, v := range old.AcceptedTurns {
 		nv, ok := next.AcceptedTurns[k]
-		if !ok || nv != v {
+		if !ok || !reflect.DeepEqual(nv, v) { // DeepEqual: AcceptedTurn now holds a *GitCommitEvidence
 			return fmt.Errorf("accepted turn %q is immutable", k)
 		}
 	}
@@ -391,6 +391,61 @@ func validateAcceptedTurns(rs *RunState) error {
 		if !knownPhases[v.Phase] {
 			return fmt.Errorf("accepted turn %q has an unknown phase %q", k, v.Phase)
 		}
+		if err := validateGitCommitEvidence(k, v); err != nil {
+			return err
+		}
+	}
+	return validateGitCommitChain(rs)
+}
+
+// gitEvidencePhases are the phases whose acceptance carries a git-commit snapshot (schema v6).
+var gitEvidencePhases = map[Phase]bool{PhaseImplementStep: true, PhaseFix: true}
+
+// validateGitCommitEvidence enforces the v6 presence rule: an IMPLEMENT_STEP/FIX acceptance MUST
+// carry a well-formed git-commit tuple; every other acceptance MUST NOT.
+func validateGitCommitEvidence(k string, v AcceptedTurn) error {
+	if !gitEvidencePhases[v.Phase] {
+		if v.GitCommit != nil {
+			return fmt.Errorf("accepted turn %q (phase %q) must not carry git-commit evidence", k, v.Phase)
+		}
+		return nil
+	}
+	gc := v.GitCommit
+	if gc == nil {
+		return fmt.Errorf("accepted turn %q (phase %q) requires git-commit evidence", k, v.Phase)
+	}
+	for _, oid := range []string{gc.Parent, gc.Tree, gc.Commit} {
+		if !isGitOID(oid) {
+			return fmt.Errorf("accepted turn %q git-commit evidence has a malformed OID", k)
+		}
+	}
+	if len(gc.Parent) != len(gc.Tree) || len(gc.Tree) != len(gc.Commit) {
+		return fmt.Errorf("accepted turn %q git-commit OIDs mix hash widths", k)
+	}
+	return nil
+}
+
+// validateGitCommitChain proves the run's git acceptances form a parent chain in receipt-revision
+// order: the first has parent BaseCommit, each later has parent equal to the preceding acceptance's
+// commit, and all OIDs share BaseCommit's hash width.
+func validateGitCommitChain(rs *RunState) error {
+	var chain []AcceptedTurn
+	for _, e := range Ledger(*rs) { // receipt-revision order
+		at := rs.AcceptedTurns[e.TurnID]
+		if at.GitCommit != nil {
+			chain = append(chain, at)
+		}
+	}
+	prev := rs.BaseCommit
+	for i, at := range chain {
+		gc := at.GitCommit
+		if i == 0 && len(gc.Parent) != len(rs.BaseCommit) {
+			return fmt.Errorf("git acceptance %q OID width disagrees with base_commit", at.Receipt.TurnID)
+		}
+		if gc.Parent != prev {
+			return fmt.Errorf("git acceptance %q parent %s breaks the commit chain (want %s)", at.Receipt.TurnID, gc.Parent, prev)
+		}
+		prev = gc.Commit
 	}
 	return nil
 }
@@ -516,6 +571,11 @@ func redactAndGuard(rs *RunState) error {
 		control["accepted_turns.key."+k] = k
 		control["accepted_turns."+k+".turn_id"] = v.Receipt.TurnID
 		control["accepted_turns."+k+".digest"] = v.ArtifactDigest
+		if v.GitCommit != nil {
+			control["accepted_turns."+k+".git_commit.parent"] = v.GitCommit.Parent
+			control["accepted_turns."+k+".git_commit.tree"] = v.GitCommit.Tree
+			control["accepted_turns."+k+".git_commit.commit"] = v.GitCommit.Commit
+		}
 	}
 	for field, v := range control {
 		if redact.Text(v) != v {

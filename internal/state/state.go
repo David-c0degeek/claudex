@@ -36,9 +36,14 @@ import (
 // (CandidatePlan/CandidateChecks/PendingFindings), the frozen immutable AgreedPlan,
 // the implementation cursor (StepIndex) and per-phase FIX/VERIFY context, and the
 // durable human-gate resume record (Pause) unifying human-decision and
-// quality-budget gates. An older generation is missing a required field, so it
-// fails with version remediation, not a vague error (see checkSchemaVersion).
-const RunStateVersion = 5
+// quality-budget gates. v6 added the immutable git-commit evidence tuple on each
+// IMPLEMENT_STEP/FIX accepted turn (GitCommit) — the parent/tree/commit the git
+// transaction produced — with a receipt-order commit-chain invariant. It is a
+// semantic format change: an older v5 generation is rejected outright (no implicit
+// migration; a missing IMPLEMENT/FIX tuple is never treated as valid). An older
+// generation is missing a required field, so it fails with version remediation,
+// not a vague error (see checkSchemaVersion).
+const RunStateVersion = 6
 
 // stateRetention{Keep,Trigger} configure the state stores' pre-append hysteresis compaction
 // (genstore.WithRetention): each generation is a full self-sufficient snapshot, so recovery
@@ -129,11 +134,26 @@ type Receipt struct {
 // AcceptedTurn records what was accepted for a turn (keyed by turn_id in the map).
 // Phase is the single coordinator-authored acceptance fact: the phase the turn
 // was in. Role and artifact message type are derived from it via the turn spec,
-// so no redundant, disagreeing facts are persisted.
+// so no redundant, disagreeing facts are persisted. GitCommit is the immutable
+// git-commit evidence of the accepted implementation snapshot; it is REQUIRED
+// exactly when Phase is IMPLEMENT_STEP or FIX and forbidden otherwise (schema v6).
+// The field stays a pointer so a nil is the natural "no evidence" — the immutable
+// append-only check compares turns by value (reflect.DeepEqual).
 type AcceptedTurn struct {
-	ArtifactDigest string  `json:"artifact_digest"`
-	Receipt        Receipt `json:"receipt"`
-	Phase          Phase   `json:"phase"`
+	ArtifactDigest string             `json:"artifact_digest"`
+	Receipt        Receipt            `json:"receipt"`
+	Phase          Phase              `json:"phase"`
+	GitCommit      *GitCommitEvidence `json:"git_commit,omitempty"`
+}
+
+// GitCommitEvidence is the immutable (parent, tree, commit) the git transaction froze and applied
+// for an IMPLEMENT_STEP/FIX acceptance. All three are lower-hex OIDs of one consistent hash width;
+// the run's git acceptances form a chain in receipt-revision order (first parent == BaseCommit,
+// each later parent == the preceding git acceptance's commit).
+type GitCommitEvidence struct {
+	Parent string `json:"parent"`
+	Tree   string `json:"tree"`
+	Commit string `json:"commit"`
 }
 
 // Projection is a typed recovery or failure summary.

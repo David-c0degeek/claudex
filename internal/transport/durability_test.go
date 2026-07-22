@@ -70,7 +70,7 @@ func TestSubmitDurabilityReconfirmed(t *testing.T) {
 	sink := newMemSink()
 	adv := &advancer{}
 	store.WithWrite(visibleUnconfirmedWrite).WithSyncDir(passingSync)
-	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
+	res, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv.prep())
 	if err != nil {
 		t.Fatalf("inline re-confirm should rescue a visible submit: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSubmitDurabilityPersistentFailurePreservesReceipt(t *testing.T) {
 	sink := newMemSink()
 	adv := &advancer{}
 	store.WithWrite(visibleUnconfirmedWrite).WithSyncDir(failingSync)
-	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
+	res, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv.prep())
 	if !genstore.IsDurabilityUnconfirmed(err) {
 		t.Fatalf("persistent-fail err = %v, want IsDurabilityUnconfirmed", err)
 	}
@@ -107,12 +107,12 @@ func TestSubmitReplayReconfirmsState(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sink := newMemSink()
 	adv := &advancer{}
-	first, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
+	first, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv.prep())
 	if err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
 	store.WithSyncDir(failingSync)
-	res, err := submit(store, sink, "sess-1", report("turn-1", rev, "did it"), ownerAuth("sess-1"), adv.prep())
+	res, err := submit(store, sink, "sess-2", report("turn-1", rev, "did it"), ownerAuth("sess-2"), adv.prep())
 	// The replay ran the state barrier and surfaced its failure (a raw ConfirmDurable error,
 	// not a PostCommitSyncError — no append happened on a replay); without the re-confirm it
 	// would have reported a false durable idempotent success (nil error).

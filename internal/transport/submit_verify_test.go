@@ -233,8 +233,9 @@ func TestVerifyFreshGenerationAuth(t *testing.T) {
 // fresh-session wait), nor clear an active VERIFY back to the ownerless wait.
 func TestVerifyForgedTransitionsRejected(t *testing.T) {
 	t.Run("entering VERIFY with an assignment", func(t *testing.T) {
-		store, rev := runAtFixReturningVerify(t)
-		registryPairGen(t, store, 2)
+		// A CHECKPOINT submit forges the VERIFY entry (a FIX submit would be rejected
+		// earlier — the standalone path takes no implementation turn under schema v6).
+		store, rev := newRunWithActiveTurn(t)
 		cp := &capturedPrep{turn: "forged-verify", apply: func(gen uint64, next *state.RunState) error {
 			*next.StepIndex = next.AgreedPlan.Plan.StepCount
 			next.Phase = state.PhaseVerify
@@ -243,7 +244,7 @@ func TestVerifyForgedTransitionsRejected(t *testing.T) {
 			next.Assignment = &state.Ref{ID: "forged-verify", IssuedRevision: gen}
 			return nil
 		}}
-		_, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), leadSess, report("fix-turn", rev, "fixed"))
+		_, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), pairSess, report("turn-1", rev, "fixed"))
 		if !errors.Is(err, ErrTransitionInvalid) {
 			t.Fatalf("assigned entry err = %v, want ErrTransitionInvalid", err)
 		}

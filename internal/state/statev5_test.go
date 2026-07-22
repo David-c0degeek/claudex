@@ -57,6 +57,7 @@ func acceptTurnAdvance(t *testing.T, s *Store, prev RunState, turnID, digest str
 			ArtifactDigest: digest,
 			Receipt:        Receipt{TurnID: turnID, Revision: rev, ArtifactDigest: digest},
 			Phase:          prev.Phase,
+			GitCommit:      evidenceFor(prev.Phase, next),
 		}
 		next.Assignment = nil
 		adv(rev, next)

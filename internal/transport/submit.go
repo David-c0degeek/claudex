@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/redact"
@@ -135,6 +136,7 @@ type PreparedTransition struct {
 	issuedTurnID string
 	issuedGateID string
 	apply        func(gen uint64, next *state.RunState) error
+	decision     *engine.Decision
 }
 
 // NewPreparedTransition constructs a PreparedTransition. issuedTurnID is the next
@@ -142,6 +144,23 @@ type PreparedTransition struct {
 // edge issues (else ""); a terminal edge issues neither.
 func NewPreparedTransition(issuedTurnID, issuedGateID string, apply func(gen uint64, next *state.RunState) error) PreparedTransition {
 	return PreparedTransition{issuedTurnID: issuedTurnID, issuedGateID: issuedGateID, apply: apply}
+}
+
+// WithDecision returns a copy carrying the serializable engine decision the git
+// acceptance plan freezes. The standalone accept path ignores it; PrepareGitSubmit
+// requires it (the transaction's state-cas re-applies the decision from the frozen
+// plan, without the apply closure).
+func (p PreparedTransition) WithDecision(dec engine.Decision) PreparedTransition {
+	p.decision = &dec
+	return p
+}
+
+// Decision returns the frozen engine decision, if the Prepare attached one.
+func (p PreparedTransition) Decision() (engine.Decision, bool) {
+	if p.decision == nil {
+		return engine.Decision{}, false
+	}
+	return *p.decision, true
 }
 
 // IssuedTurnID / IssuedGateID expose the identities the transition will issue.
@@ -289,6 +308,208 @@ func Submit(ctx context.Context, deps SubmitDeps, sessionID string, raw []byte) 
 	return SubmitResult{}, fmt.Errorf("transport: submit did not acquire the run lock after %d attempts: %w", submitMaxAttempts, genstore.ErrBusy)
 }
 
+// submitAuthorized is the authorized context the shared pipeline produced under the
+// held guard: the loaded run state, the phase's turn spec, and the locked current
+// pair generation.
+type submitAuthorized struct {
+	rs         state.RunState
+	spec       TurnSpecEntry
+	curPairGen uint64
+}
+
+// gitEvidencePhase reports whether an acceptance in phase p must carry git-commit
+// evidence (schema v6): only the coordinator's git transaction can accept it.
+func gitEvidencePhase(p state.Phase) bool {
+	return p == state.PhaseImplementStep || p == state.PhaseFix
+}
+
+// authorizeLockedSubmit runs the shared authorization pipeline under the held guard
+// g: load the run, gate on the aggregate journal head, authorize the session against
+// the locked Registry, resolve an accept-once replay, then validate staleness,
+// liveness, turn identity, role, the locked pair generation, and the VERIFY
+// threshold. A replay returns the accepted turn and no authorized context. It never
+// releases g.
+func authorizeLockedSubmit(deps SubmitDeps, g *genstore.Guard, sessionID, digest string, env submitEnvelope) (submitAuthorized, *state.AcceptedTurn, error) {
+	rs, ok, lerr := deps.Store.Load()
+	if lerr != nil {
+		return submitAuthorized{}, nil, lerr
+	}
+	if !ok {
+		return submitAuthorized{}, nil, ErrNoRun
+	}
+
+	// Attach-journal policy comes BEFORE the registry: a crash can leave the run
+	// state present, the attach intent nonterminal, and the registry not yet created,
+	// which is recovery — not a permanent run mismatch. Only a terminal or truly-absent
+	// journal proceeds; nonterminal/unknown/out-of-range/unreadable fails closed.
+	head, jerr := deps.Journal.Head(g, rs.RunID)
+	if jerr != nil {
+		return submitAuthorized{}, nil, fmt.Errorf("%w: %v", ErrRecoveryRequired, jerr)
+	}
+	switch head {
+	case JournalTerminal, JournalAbsent:
+		// proceed
+	default: // JournalNonterminal, JournalUnknown, or any out-of-range value
+		return submitAuthorized{}, nil, ErrRecoveryRequired
+	}
+
+	reg, ok, rerr := deps.Registry.Load()
+	if rerr != nil {
+		return submitAuthorized{}, nil, rerr
+	}
+	if !ok {
+		return submitAuthorized{}, nil, ErrRunMismatch
+	}
+	// Run identity: the registry must belong to this run.
+	if reg.RunID != rs.RunID {
+		return submitAuthorized{}, nil, ErrRunMismatch
+	}
+	// Definitive authorization: the session must be a current (non-replaced) session.
+	registration := reg.Resolve(sessionID)
+	if registration.Status != state.RegCurrent {
+		return submitAuthorized{}, nil, ErrUnauthorized
+	}
+
+	// Accept-once replay (after authorization). A same-digest replay re-confirms the
+	// sink and returns the durable receipt even if the run is now terminal; a
+	// different digest conflicts without touching the sink. No transition/mutation.
+	// The replaying session must currently own the role of the phase the turn was
+	// accepted in, so a later different-role owner cannot claim another's receipt.
+	if acc, seen := rs.AcceptedTurns[env.TurnID]; seen {
+		// Role authorization precedes both same-digest replay and different-digest
+		// conflict, so a wrong-slot session never learns a conflict for another role's
+		// turn and never re-confirms the sink.
+		if err := requireCurrentRole(registration, acc.Phase); err != nil {
+			return submitAuthorized{}, nil, err
+		}
+		if acc.ArtifactDigest != digest {
+			return submitAuthorized{}, nil, ErrConflict
+		}
+		accCopy := acc
+		return submitAuthorized{}, &accCopy, nil
+	}
+
+	// Staleness first, then liveness — a paused/gated/recovering run refuses before
+	// any turn/phase reasoning (its phase has no turn spec), then turn identity.
+	if env.StateRevision != rs.Revision {
+		return submitAuthorized{}, nil, staleErr(rs, env.StateRevision)
+	}
+	if rs.Lifecycle != state.LifecycleRunning || rs.Recovery != nil || rs.Gate != nil {
+		return submitAuthorized{}, nil, ErrNotAccepting
+	}
+	if rs.Assignment == nil {
+		return submitAuthorized{}, nil, ErrNoActiveTurn
+	}
+	if env.TurnID != rs.Assignment.ID {
+		return submitAuthorized{}, nil, ErrWrongTurn
+	}
+	if rs.Assignment.IssuedRevision != rs.Revision {
+		return submitAuthorized{}, nil, ErrNotAccepting
+	}
+
+	// The current phase's role must be the session's current role.
+	spec, ok := TurnSpec(rs.Phase)
+	if !ok {
+		return submitAuthorized{}, nil, fmt.Errorf("%w: %s", ErrPhaseNotActionable, rs.Phase)
+	}
+	if err := requireCurrentRole(registration, rs.Phase); err != nil {
+		return submitAuthorized{}, nil, err
+	}
+
+	// The locked current pair generation (from the validated pair slot) — the numeric
+	// fact Prepare needs and the FIX->VERIFY threshold is checked against. A missing or
+	// mismatched pair shape is a run mismatch, never a zero.
+	curPairGen, pgErr := currentPairGeneration(reg)
+	if pgErr != nil {
+		return submitAuthorized{}, nil, pgErr
+	}
+
+	// Active VERIFY (an assignment issued by a qualifying replacement) authorizes the
+	// verifier only if the current pair generation meets the retained threshold; the
+	// incumbent generation is a fresh-session rejection before schema/Prepare/sink.
+	if rs.Phase == state.PhaseVerify {
+		if rs.Verify == nil {
+			return submitAuthorized{}, nil, fmt.Errorf("%w: a running VERIFY has no requirement", ErrTransitionInvalid)
+		}
+		if curPairGen < rs.Verify.RequiredGeneration {
+			return submitAuthorized{}, nil, ErrFreshSessionRequired
+		}
+	}
+	return submitAuthorized{rs: rs, spec: spec, curPairGen: curPairGen}, nil, nil
+}
+
+// confirmReplay re-confirms an accept-once replay under the held guard: the sink
+// artifact, then the state store's durability. It never releases g. A sink error
+// returns a zero result (nothing confirmed — reject); a durability error returns the
+// durable receipt (Idempotent set) WITH the error, which the caller must surface.
+func confirmReplay(deps SubmitDeps, g *genstore.Guard, acc state.AcceptedTurn, turnID string, canonRedacted []byte) (SubmitResult, error) {
+	if perr := deps.Sink.Put(turnID, acc.ArtifactDigest, canonRedacted); perr != nil {
+		return SubmitResult{}, perr
+	}
+	// Re-confirm the STATE store durable too, not only the sink: the original accepting
+	// append may have been visible-but-durability-unconfirmed, so an idempotent replay
+	// must not report a durable receipt whose run-state entry was never confirmed
+	// power-safe. A persistent failure preserves the receipt + the durability error.
+	if cerr := deps.Store.ConfirmDurable(g); cerr != nil {
+		return SubmitResult{Receipt: acc.Receipt, Idempotent: true}, cerr
+	}
+	return SubmitResult{Receipt: acc.Receipt, Idempotent: true}, nil
+}
+
+// preparePublish runs everything between authorization and acceptance under the held
+// guard: schema-validate the artifact, run Prepare on a deep snapshot, recheck the
+// issued identities and cancellation, then publish the immutable artifact. It never
+// releases g.
+func preparePublish(ctx context.Context, deps SubmitDeps, auth submitAuthorized, raw, canonRedacted []byte, digest string, env submitEnvelope) (PreparedTransition, error) {
+	rs := auth.rs
+	// Schema-validate both the raw and the canonical-redacted bytes (value-free).
+	if _, verr := protocol.Validate(auth.spec.ArtifactMessageType, raw); verr != nil {
+		return PreparedTransition{}, fmt.Errorf("transport: submission fails its schema: %w", verr)
+	}
+	if _, verr := protocol.Validate(auth.spec.ArtifactMessageType, canonRedacted); verr != nil {
+		return PreparedTransition{}, fmt.Errorf("transport: redacted submission fails its schema: %w", verr)
+	}
+	if derr := checkDecision(env); derr != nil {
+		return PreparedTransition{}, derr
+	}
+
+	prepared := PreparedSubmit{
+		MessageType:           auth.spec.ArtifactMessageType,
+		TurnID:                env.TurnID,
+		Revision:              rs.Revision,
+		Digest:                digest,
+		CanonicalJSON:         string(canonRedacted),
+		RequiresHumanDecision: env.RequiresHumanDecision,
+		DecisionQuestion:      deref(env.DecisionQuestion),
+		CurrentPairGeneration: auth.curPairGen,
+	}
+	snapshot, cerr := cloneRunState(rs)
+	if cerr != nil {
+		return PreparedTransition{}, fmt.Errorf("transport: could not snapshot the run state: %w", cerr)
+	}
+	pt, perr := deps.Prepare(snapshot, prepared)
+	if perr != nil {
+		return PreparedTransition{}, perr
+	}
+	if pt.apply == nil {
+		return PreparedTransition{}, fmt.Errorf("%w: prepared transition has no apply", ErrTransitionInvalid)
+	}
+	// Recheck the issued identities against the locked state before publishing.
+	if idErr := recheckIssuedIDs(pt, rs, env.TurnID); idErr != nil {
+		return PreparedTransition{}, idErr
+	}
+	// Recheck cancellation immediately before publishing; after Put the append runs.
+	if err := ctx.Err(); err != nil {
+		return PreparedTransition{}, err
+	}
+
+	// PUBLISH the immutable artifact before recording acceptance.
+	if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
+		return PreparedTransition{}, perr
+	}
+	return pt, nil
+}
+
 // lockedSubmit runs the whole authorize -> publish -> accept sequence under the held
 // guard g, which it releases exactly once on every path.
 func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessionID string, raw, canonRedacted []byte, digest string, env submitEnvelope) (SubmitResult, error) {
@@ -305,166 +526,35 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		return SubmitResult{}, errors.Join(opErr, releaseOutcome(false, 0, release()))
 	}
 
-	rs, ok, lerr := deps.Store.Load()
-	if lerr != nil {
-		return reject(lerr)
+	auth, replay, aerr := authorizeLockedSubmit(deps, g, sessionID, digest, env)
+	if aerr != nil {
+		return reject(aerr)
 	}
-	if !ok {
-		return reject(ErrNoRun)
-	}
-
-	// Attach-journal policy comes BEFORE the registry: a crash can leave the run
-	// state present, the attach intent nonterminal, and the registry not yet created,
-	// which is recovery — not a permanent run mismatch. Only a terminal or truly-absent
-	// journal proceeds; nonterminal/unknown/out-of-range/unreadable fails closed.
-	head, jerr := deps.Journal.Head(g, rs.RunID)
-	if jerr != nil {
-		return reject(fmt.Errorf("%w: %v", ErrRecoveryRequired, jerr))
-	}
-	switch head {
-	case JournalTerminal, JournalAbsent:
-		// proceed
-	default: // JournalNonterminal, JournalUnknown, or any out-of-range value
-		return reject(ErrRecoveryRequired)
-	}
-
-	reg, ok, rerr := deps.Registry.Load()
-	if rerr != nil {
-		return reject(rerr)
-	}
-	if !ok {
-		return reject(ErrRunMismatch)
-	}
-	// Run identity: the registry must belong to this run.
-	if reg.RunID != rs.RunID {
-		return reject(ErrRunMismatch)
-	}
-	// Definitive authorization: the session must be a current (non-replaced) session.
-	registration := reg.Resolve(sessionID)
-	if registration.Status != state.RegCurrent {
-		return reject(ErrUnauthorized)
-	}
-
-	// Accept-once replay (after authorization). A same-digest replay re-confirms the
-	// sink and returns the durable receipt even if the run is now terminal; a
-	// different digest conflicts without touching the sink. No transition/mutation.
-	// The replaying session must currently own the role of the phase the turn was
-	// accepted in, so a later different-role owner cannot claim another's receipt.
-	if acc, seen := rs.AcceptedTurns[env.TurnID]; seen {
-		// Role authorization precedes both same-digest replay and different-digest
-		// conflict, so a wrong-slot session never learns a conflict for another role's
-		// turn and never re-confirms the sink.
-		if err := requireCurrentRole(registration, acc.Phase); err != nil {
-			return reject(err)
+	if replay != nil {
+		res, cerr := confirmReplay(deps, g, *replay, env.TurnID, canonRedacted)
+		if cerr != nil {
+			if res.Idempotent {
+				return res, errors.Join(cerr, release())
+			}
+			return reject(cerr)
 		}
-		if acc.ArtifactDigest != digest {
-			return reject(ErrConflict)
-		}
-		if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
-			return reject(perr)
-		}
-		// Re-confirm the STATE store durable too, not only the sink: the original accepting
-		// append may have been visible-but-durability-unconfirmed, so an idempotent replay
-		// must not report a durable receipt whose run-state entry was never confirmed
-		// power-safe. A persistent failure preserves the receipt + the durability error.
-		if cerr := deps.Store.ConfirmDurable(g); cerr != nil {
-			return SubmitResult{Receipt: acc.Receipt, Idempotent: true}, errors.Join(cerr, release())
-		}
-		return SubmitResult{Receipt: acc.Receipt, Idempotent: true, ReleaseWarning: releaseOutcome(true, acc.Receipt.Revision, release())}, nil
+		res.ReleaseWarning = releaseOutcome(true, res.Receipt.Revision, release())
+		return res, nil
 	}
 
-	// Staleness first, then liveness — a paused/gated/recovering run refuses before
-	// any turn/phase reasoning (its phase has no turn spec), then turn identity.
-	if env.StateRevision != rs.Revision {
-		return reject(staleErr(rs, env.StateRevision))
-	}
-	if rs.Lifecycle != state.LifecycleRunning || rs.Recovery != nil || rs.Gate != nil {
-		return reject(ErrNotAccepting)
-	}
-	if rs.Assignment == nil {
-		return reject(ErrNoActiveTurn)
-	}
-	if env.TurnID != rs.Assignment.ID {
-		return reject(ErrWrongTurn)
-	}
-	if rs.Assignment.IssuedRevision != rs.Revision {
-		return reject(ErrNotAccepting)
+	// An IMPLEMENT_STEP/FIX acceptance must carry git-commit evidence (schema v6),
+	// which only the coordinator's git transaction produces. This standalone low-level
+	// path has no git participant, so it fails closed rather than accepting an
+	// implementation turn the state store would reject (or worse, accept bare).
+	if gitEvidencePhase(auth.rs.Phase) {
+		return reject(ErrGitParticipantRequired)
 	}
 
-	// The current phase's role must be the session's current role.
-	spec, ok := TurnSpec(rs.Phase)
-	if !ok {
-		return reject(fmt.Errorf("%w: %s", ErrPhaseNotActionable, rs.Phase))
-	}
-	if err := requireCurrentRole(registration, rs.Phase); err != nil {
-		return reject(err)
-	}
-
-	// The locked current pair generation (from the validated pair slot) — the numeric
-	// fact Prepare needs and the FIX->VERIFY threshold is checked against. A missing or
-	// mismatched pair shape is a run mismatch, never a zero.
-	curPairGen, pgErr := currentPairGeneration(reg)
-	if pgErr != nil {
-		return reject(pgErr)
-	}
-
-	// Active VERIFY (an assignment issued by a qualifying replacement) authorizes the
-	// verifier only if the current pair generation meets the retained threshold; the
-	// incumbent generation is a fresh-session rejection before schema/Prepare/sink.
-	if rs.Phase == state.PhaseVerify {
-		if rs.Verify == nil {
-			return reject(fmt.Errorf("%w: a running VERIFY has no requirement", ErrTransitionInvalid))
-		}
-		if curPairGen < rs.Verify.RequiredGeneration {
-			return reject(ErrFreshSessionRequired)
-		}
-	}
-
-	// Schema-validate both the raw and the canonical-redacted bytes (value-free).
-	if _, verr := protocol.Validate(spec.ArtifactMessageType, raw); verr != nil {
-		return reject(fmt.Errorf("transport: submission fails its schema: %w", verr))
-	}
-	if _, verr := protocol.Validate(spec.ArtifactMessageType, canonRedacted); verr != nil {
-		return reject(fmt.Errorf("transport: redacted submission fails its schema: %w", verr))
-	}
-	if derr := checkDecision(env); derr != nil {
-		return reject(derr)
-	}
-
-	prepared := PreparedSubmit{
-		MessageType:           spec.ArtifactMessageType,
-		TurnID:                env.TurnID,
-		Revision:              rs.Revision,
-		Digest:                digest,
-		CanonicalJSON:         string(canonRedacted),
-		RequiresHumanDecision: env.RequiresHumanDecision,
-		DecisionQuestion:      deref(env.DecisionQuestion),
-		CurrentPairGeneration: curPairGen,
-	}
-	snapshot, cerr := cloneRunState(rs)
-	if cerr != nil {
-		return reject(fmt.Errorf("transport: could not snapshot the run state: %w", cerr))
-	}
-	pt, perr := deps.Prepare(snapshot, prepared)
+	pt, perr := preparePublish(ctx, deps, auth, raw, canonRedacted, digest, env)
 	if perr != nil {
 		return reject(perr)
 	}
-	if pt.apply == nil {
-		return reject(fmt.Errorf("%w: prepared transition has no apply", ErrTransitionInvalid))
-	}
-	// Recheck the issued identities against the locked state before publishing.
-	if idErr := recheckIssuedIDs(pt, rs, env.TurnID); idErr != nil {
-		return reject(idErr)
-	}
-	// Recheck cancellation immediately before publishing; after Put the append runs.
-	if err := ctx.Err(); err != nil {
-		return reject(err)
-	}
-
-	// PUBLISH the immutable artifact before recording acceptance.
-	if perr := deps.Sink.Put(env.TurnID, digest, canonRedacted); perr != nil {
-		return reject(perr)
-	}
+	rs, curPairGen := auth.rs, auth.curPairGen
 
 	// ACCEPT: from here the append completes regardless of context cancellation, and
 	// runs exactly once. A failure leaves an orphan artifact for an identical retry.

@@ -29,6 +29,30 @@ func hex64(c string) string { return strings.Repeat(c, 64) }
 
 func hex40() string { return strings.Repeat("a", 40) }
 
+// gitEv builds valid, chained git-commit evidence for an IMPLEMENT_STEP/FIX acceptance being added
+// to rs: the parent is the run's latest git acceptance (or BaseCommit for the first), and the tree
+// and commit are distinct 40-hex OIDs keyed by the chain position, so the receipt-order chain
+// invariant holds across multiple git acceptances.
+func gitEv(rs *RunState) *GitCommitEvidence {
+	parent := rs.BaseCommit
+	n := 0
+	for _, e := range Ledger(*rs) {
+		if rs.AcceptedTurns[e.TurnID].GitCommit != nil {
+			n++
+			parent = rs.AcceptedTurns[e.TurnID].GitCommit.Commit
+		}
+	}
+	return &GitCommitEvidence{Parent: parent, Tree: fmt.Sprintf("%040d", n*2+1), Commit: fmt.Sprintf("%040d", n*2+2)}
+}
+
+// evidenceFor returns chained git-commit evidence for an IMPLEMENT_STEP/FIX acceptance, or nil.
+func evidenceFor(phase Phase, rs *RunState) *GitCommitEvidence {
+	if gitEvidencePhases[phase] {
+		return gitEv(rs)
+	}
+	return nil
+}
+
 // initState populates a valid first-generation run state.
 func initState(next *RunState) {
 	next.RunID = "run-a"
@@ -268,8 +292,9 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 	s := newStore(t)
 	r1 := mustInit(t, s)
 	r1b := assignAgentTurn(t, s, r1, "t1")
+	ev := &GitCommitEvidence{Parent: hex40(), Tree: fmt.Sprintf("%040d", 1), Commit: fmt.Sprintf("%040d", 2)}
 	r2, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep, GitCommit: ev}
 		next.Assignment = nil
 		return nil
 	})
@@ -277,7 +302,7 @@ func TestAcceptedTurnImmutable(t *testing.T) {
 		t.Fatalf("add turn: %v", err)
 	}
 	if _, err := s.Mutate(r2.Revision, func(_ uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Phase: PhaseImplementStep}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("d"), Receipt: Receipt{TurnID: "t1", Revision: 2, ArtifactDigest: hex64("d")}, Phase: PhaseImplementStep, GitCommit: ev}
 		return nil
 	}); err == nil {
 		t.Fatalf("changing an accepted turn should be rejected")
@@ -296,7 +321,7 @@ func TestRefBindsToResultingRevisionAcrossGap(t *testing.T) {
 	}
 	r4, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
 		next.Assignment = &Ref{ID: "assign-1", IssuedRevision: rev} // issued in the skipped-to gen
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep, GitCommit: gitEv(next)}
 		return nil
 	})
 	if err != nil {
@@ -353,7 +378,7 @@ func TestDecodeRejectsOlderSchemaVersion(t *testing.T) {
 // cannot accept a turn even if it still names an assigned agent turn.
 func TestAcceptRequiresLiveRun(t *testing.T) {
 	acceptT1 := func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		next.AcceptedTurns["t1"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "t1", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep, GitCommit: gitEv(next)}
 		return nil
 	}
 
@@ -422,7 +447,7 @@ func TestAcceptRequiresAssignedAgentTurn(t *testing.T) {
 	// A different turn than the one assigned: rejected.
 	r1b := assignAgentTurn(t, s, r1, "t1")
 	if _, err := s.Mutate(r1b.Revision, func(rev uint64, next *RunState) error {
-		next.AcceptedTurns["other"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "other", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep}
+		next.AcceptedTurns["other"] = AcceptedTurn{ArtifactDigest: hex64("c"), Receipt: Receipt{TurnID: "other", Revision: rev, ArtifactDigest: hex64("c")}, Phase: PhaseImplementStep, GitCommit: gitEv(next)}
 		return nil
 	}); err == nil {
 		t.Fatalf("accepting a turn other than the assigned one should be rejected")

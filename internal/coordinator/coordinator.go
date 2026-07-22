@@ -32,6 +32,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/genstore"
+	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 )
@@ -54,12 +55,15 @@ var (
 )
 
 // Run is an opened run: its bound paths, the state/registry/artifact stores under the
-// shared run lock, and the RNG the precompute mints identities from.
+// shared run lock, the hardened git handle the commit transaction drives, and the RNG
+// the precompute mints identities from.
 type Run struct {
 	loc      attach.RunLocation
+	repoDir  string
 	state    *state.Store
 	registry *state.RegistryStore
 	store    *transport.ArtifactStore
+	git      *gitx.Git
 	rng      io.Reader
 
 	mintMu sync.Mutex // serializes RNG-backed minting across concurrent precomputes
@@ -112,6 +116,9 @@ func defaultRecoverConfirm(g *genstore.Guard, loc attach.RunLocation, st *state.
 		return err
 	}
 	if err := attach.ConfirmReplaceJournal(g, loc); err != nil {
+		return err
+	}
+	if err := attach.ConfirmCommitTxnJournal(g, loc); err != nil {
 		return err
 	}
 	if err := st.ConfirmDurable(g); err != nil {
@@ -169,11 +176,17 @@ func openRun(repoDir, runID string, rng io.Reader, confirm recoverConfirmFn) (*R
 	if err != nil {
 		return nil, err
 	}
+	git, err := gitx.New()
+	if err != nil {
+		return nil, errors.Join(err, store.Close())
+	}
 	return &Run{
 		loc:      loc,
+		repoDir:  repoDir,
 		state:    st,
 		registry: reg,
 		store:    store,
+		git:      git,
 		rng:      rng,
 	}, nil
 }
@@ -187,6 +200,17 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 	defer rn.mu.RUnlock()
 	if rn.closed {
 		return transport.SubmitResult{}, ErrClosed
+	}
+
+	// An IMPLEMENT_STEP/FIX submit routes through the git commit transaction — its
+	// acceptance must carry the snapshot's git-commit evidence (schema v6), which the
+	// standalone transport path rejects. The optimistic phase read only routes; every
+	// authorization re-runs under the run guard, and a replay of an already-accepted
+	// implementation turn resolves identically on either path.
+	if rs, ok, err := rn.state.Load(); err != nil {
+		return transport.SubmitResult{}, err
+	} else if ok && (rs.Phase == state.PhaseImplementStep || rs.Phase == state.PhaseFix) {
+		return rn.submitGit(ctx, sessionID, raw)
 	}
 
 	prepare, err := rn.precompute(ctx, raw)
@@ -304,8 +328,9 @@ func (rn *Run) precomputeTestOutcome(pass bool, expectedRevision uint64) (transp
 	return prepare, nil
 }
 
-// Close releases the artifact store. It waits for in-flight submits (the write lock
-// blocks until every read lock is released), so it never races an artifact Get/Put.
+// Close releases the artifact store and the git handle. It waits for in-flight
+// submits (the write lock blocks until every read lock is released), so it never
+// races an artifact Get/Put or a running git transaction.
 func (rn *Run) Close() error {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -313,7 +338,7 @@ func (rn *Run) Close() error {
 		return nil
 	}
 	rn.closed = true
-	return rn.store.Close()
+	return errors.Join(rn.store.Close(), rn.git.Close())
 }
 
 // RunLock is the run's mutation lock (exposed for tests that acquire it directly).
@@ -362,6 +387,21 @@ func (r runJournalReader) Head(g *genstore.Guard, runID string) (transport.Journ
 		return transport.JournalNonterminal, nil
 	default:
 		return transport.JournalUnknown, fmt.Errorf("coordinator: unknown replace journal class %d", repl)
+	}
+	// A pending git commit transaction blocks every submit the same way: its state-cas
+	// may still be owed, so no other mutator may advance the expected state revision
+	// until the transaction completes (only the git driver's recovery does).
+	ctxn, err := attach.ClassifyCommitTxnJournal(g, r.loc)
+	if err != nil {
+		return transport.JournalUnknown, err
+	}
+	switch ctxn {
+	case attach.CommitTxnJournalAbsent, attach.CommitTxnJournalTerminal:
+		// No pending commit transaction — the pair-journal decision below governs.
+	case attach.CommitTxnJournalNonTerminal:
+		return transport.JournalNonterminal, nil
+	default:
+		return transport.JournalUnknown, fmt.Errorf("coordinator: unknown commit-txn journal class %d", ctxn)
 	}
 	switch pair {
 	case attach.JournalTerminal:
@@ -469,7 +509,9 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 		apply := func(gen uint64, next *state.RunState) error {
 			return engine.Apply(dec, submitted, ids, gen, next)
 		}
-		return transport.NewPreparedTransition(issuedTurn, issuedGate, apply), nil
+		// The decision rides along so the git transaction can freeze it in its
+		// serializable acceptance plan; the standalone accept path ignores it.
+		return transport.NewPreparedTransition(issuedTurn, issuedGate, apply).WithDecision(dec), nil
 	}
 	return prepare, nil
 }
