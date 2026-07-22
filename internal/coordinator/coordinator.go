@@ -160,13 +160,14 @@ func openRun(repoDir, runID string, rng io.Reader, confirm recoverConfirmFn) (*R
 	}
 	class, cerr := attach.ClassifyPairJournal(g, loc)
 	repl, rperr := attach.ClassifyReplaceJournal(g, loc)
+	ctxn, ctErr := attach.ClassifyCommitTxnJournal(g, loc)
 	var confErr error
-	if cerr == nil && rperr == nil {
+	if cerr == nil && rperr == nil && ctErr == nil {
 		confErr = confirm(g, loc, st, reg)
 	}
 	rerr := g.Release()
-	if cerr != nil || rperr != nil || confErr != nil || rerr != nil {
-		return nil, errors.Join(cerr, rperr, confErr, rerr)
+	if cerr != nil || rperr != nil || ctErr != nil || confErr != nil || rerr != nil {
+		return nil, errors.Join(cerr, rperr, ctErr, confErr, rerr)
 	}
 	if class != attach.JournalTerminal {
 		return nil, fmt.Errorf("%w: pair journal class %d", ErrNotReady, class)
@@ -181,6 +182,19 @@ func openRun(repoDir, runID string, rng io.Reader, confirm recoverConfirmFn) (*R
 		return nil, fmt.Errorf("%w: session replacement pending", ErrNotReady)
 	default:
 		return nil, fmt.Errorf("%w: unknown replace journal class %d", ErrNotReady, repl)
+	}
+	// The commit-txn journal is the acceptance's durable authority: an ABSENT journal
+	// with accepted git evidence in the run state is corruption, never a fresh run. A
+	// NonTerminal journal stays OPEN — the git driver's recovery (the first submit)
+	// completes it; refusing here would strand the pending transaction.
+	if ctxn == attach.CommitTxnJournalAbsent {
+		if rs, ok, lerr := st.Load(); lerr != nil {
+			return nil, lerr
+		} else if ok {
+			if _, has := state.LatestGitCommit(rs); has {
+				return nil, fmt.Errorf("%w: the commit-txn journal vanished after accepted git evidence", transport.ErrRecoveryRequired)
+			}
+		}
 	}
 
 	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
@@ -245,7 +259,7 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 	return transport.Submit(ctx, transport.SubmitDeps{
 		Store:    rn.state,
 		Registry: rn.registry,
-		Journal:  runJournalReader{loc: rn.loc},
+		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Sink:     rn.store,
 		Prepare:  prepare,
 	}, sessionID, raw)
@@ -286,7 +300,7 @@ func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest 
 	return transport.SubmitTestOutcome(ctx, transport.TestOutcomeDeps{
 		Store:    rn.state,
 		Registry: rn.registry,
-		Journal:  runJournalReader{loc: rn.loc},
+		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Prepare:  prepare,
 	}, expectedRevision, evidenceDigest)
 }
@@ -373,7 +387,8 @@ func (rn *Run) RunLock() string { return rn.loc.RunLock }
 // when the pairing is complete AND no replacement is pending. Both journals are
 // classified under the SAME held submit guard, before any Registry authority.
 type runJournalReader struct {
-	loc attach.RunLocation
+	loc   attach.RunLocation
+	state *state.Store
 }
 
 func (r runJournalReader) LockPath() string { return r.loc.RunLock }
@@ -418,7 +433,20 @@ func (r runJournalReader) Head(g *genstore.Guard, runID string) (transport.Journ
 		return transport.JournalUnknown, err
 	}
 	switch ctxn {
-	case attach.CommitTxnJournalAbsent, attach.CommitTxnJournalTerminal:
+	case attach.CommitTxnJournalAbsent:
+		// Absence is legal ONLY before any accepted git evidence: the journal is the
+		// commit transaction's durable authority, so a journal that vanished after an
+		// accepted git tuple is corruption (recovery-required), never a fresh run.
+		rs, ok, lerr := r.state.Load()
+		if lerr != nil {
+			return transport.JournalUnknown, lerr
+		}
+		if ok {
+			if _, has := state.LatestGitCommit(rs); has {
+				return transport.JournalUnknown, fmt.Errorf("coordinator: the commit-txn journal vanished after accepted git evidence")
+			}
+		}
+	case attach.CommitTxnJournalTerminal:
 		// No pending commit transaction — the pair-journal decision below governs.
 	case attach.CommitTxnJournalNonTerminal:
 		return transport.JournalNonterminal, nil

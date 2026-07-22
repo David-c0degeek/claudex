@@ -210,6 +210,41 @@ func (g *Git) realIndexPath(ctx context.Context, worktree string) (string, error
 	return filepath.Join(admin, "index"), nil
 }
 
+// ConfirmPreState re-proves the frozen pre-transaction identity immediately before the
+// journal PREPARE: the worktree HEAD is still at the frozen parent, the worktree
+// content is still exactly the frozen tree, and the real checked-out index still has
+// the frozen pre-digest I0. Any drift — a foreign staged change, a post-snapshot edit,
+// a moved branch — fails closed BEFORE any journal record or effect exists, so a later
+// index can never be adopted as the transaction's expected old identity.
+func (g *Git) ConfirmPreState(ctx context.Context, worktree, parent, tree, preDigest string) error {
+	head, err := g.revParse(ctx, worktree, "--verify", "HEAD")
+	if err != nil {
+		return err
+	}
+	if head != parent {
+		return fmt.Errorf("%w: HEAD moved off the frozen parent before prepare", ErrIndexCAS)
+	}
+	wtTree, err := g.snapshotTree(ctx, worktree, parent)
+	if err != nil {
+		return err
+	}
+	if wtTree != tree {
+		return fmt.Errorf("%w: the worktree changed after the snapshot", ErrIndexCAS)
+	}
+	indexPath, err := g.realIndexPath(ctx, worktree)
+	if err != nil {
+		return err
+	}
+	live, err := fileDigest(indexPath)
+	if err != nil {
+		return err
+	}
+	if live != preDigest {
+		return fmt.Errorf("%w: the real index diverged from the frozen pre-identity before prepare", ErrIndexCAS)
+	}
+	return nil
+}
+
 // TargetIndexPath derives the txn-private target-index path for txnID: a sibling of the
 // worktree's real index (so the hard-link CAS stays on one filesystem), named by the
 // transaction id so recovery re-derives the exact journalled path and two transactions

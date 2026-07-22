@@ -185,6 +185,17 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	// releaseAll releases in reverse acquisition order (run, then repo).
 	releaseAll := func() error { return errors.Join(releaseRun(), releaseRepo()) }
 
+	// 0. A pending git commit transaction blocks a session replacement outright: its
+	//    state-cas may still be owed, so the Registry/RunState this replacement would
+	//    mutate are mid-transaction. Only the coordinator's git driver completes it —
+	//    the replacement is recovery-required until the transaction is terminal.
+	switch ctxn, cterr := ClassifyCommitTxnJournal(runGuard, loc); {
+	case cterr != nil:
+		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, cterr), releaseAll())
+	case ctxn == CommitTxnJournalNonTerminal:
+		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: a git commit transaction is pending", ErrReplaceRecoveryRequired), releaseAll())
+	}
+
 	// 1. Recover any pending replacement FIRST, before authorizing a new one. A pending
 	//    operation that cannot be completed (ambiguous/indeterminate) blocks every
 	//    request — a different one cannot step around it.

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/atomicfile"
+	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
@@ -292,6 +293,137 @@ func TestGitTxnForeignWorktreeFailsClosed(t *testing.T) {
 	}
 	if rec, _, ok := r.journalRecord(t); !ok || rec.Terminal() {
 		t.Fatalf("foreign-worktree recovery terminalized the transaction: %+v", rec)
+	}
+}
+
+// A foreign index staged in the snapshot..PREPARE window must fail the submit closed
+// BEFORE any journal record or effect: the transaction may never adopt a later index
+// as its expected old identity (the section-D counterexample), and the foreign staged
+// state is preserved untouched.
+func TestGitTxnForeignStagedIndexPrePrepareFailsClosed(t *testing.T) {
+	r := newGitTxnRig(t)
+	base := r.branchOID(t)
+	hooks := &submitHooks{beforeGitJournal: func() error {
+		// Stage a foreign index entry WITHOUT touching worktree bytes: an index-only
+		// cacheinfo add of a blob that has no worktree file.
+		blob := strings.TrimSpace(string(mustGit(t, r.g, r.rn.runWorktree(), nil, "hash-object", "-w", "--stdin")))
+		mustGit(t, r.g, r.rn.runWorktree(), nil, "update-index", "--add", "--cacheinfo", "100644,"+blob+",foreign-staged.txt")
+		return nil
+	}}
+	_, err := r.rn.Submit(withHooks(context.Background(), hooks), r.lead, r.implRaw)
+	if !errors.Is(err, gitx.ErrIndexCAS) {
+		t.Fatalf("pre-prepare foreign-staged submit err = %v, want gitx.ErrIndexCAS", err)
+	}
+	if _, _, ok := r.journalRecord(t); ok {
+		t.Fatal("a pre-prepare identity failure still wrote a journal record")
+	}
+	if got := r.branchOID(t); got != base {
+		t.Fatalf("a pre-prepare identity failure moved the ref to %s", got)
+	}
+	if rs := cur(t, r.rn); rs.Revision != r.preRevision {
+		t.Fatalf("a pre-prepare identity failure advanced the state to %d", rs.Revision)
+	}
+	staged := string(mustGit(t, r.g, r.rn.runWorktree(), nil, "diff", "--cached", "--name-only"))
+	if !strings.Contains(staged, "foreign-staged.txt") {
+		t.Fatalf("the foreign staged entry was not preserved: %q", staged)
+	}
+}
+
+// After PREPARE, a missing or corrupted frozen evidence artifact fails recovery closed
+// BEFORE any ref/index/state effect: a transaction whose artifact vanished can never
+// become an accepted receipt.
+func TestGitTxnMissingArtifactRecoveryFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		corrupt func(t *testing.T, path string)
+	}{
+		{"missing", func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove artifact: %v", err)
+			}
+		}},
+		{"corrupt", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte(`{"tampered":true}`), 0o600); err != nil {
+				t.Fatalf("corrupt artifact: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newGitTxnRig(t)
+			base := r.branchOID(t)
+			if _, err := r.rn.Submit(withHooks(context.Background(), oneShotApply("ref-cas")), r.lead, r.implRaw); !errors.Is(err, errCut) {
+				t.Fatalf("cut submit err = %v, want the injected cut", err)
+			}
+			_, plan, ok := r.journalRecord(t)
+			if !ok {
+				t.Fatal("no pending transaction after the cut")
+			}
+			tc.corrupt(t, filepath.Join(r.rn.loc.ArtifactsDir, plan.TurnID, plan.Digest+".json"))
+
+			_, err := r.rn.Submit(context.Background(), r.lead, r.implRaw)
+			if err == nil || !strings.Contains(err.Error(), "missing or corrupt") {
+				t.Fatalf("recovery with a %s artifact err = %v, want the missing-or-corrupt refusal", tc.name, err)
+			}
+			if got := r.branchOID(t); got != base {
+				t.Fatalf("recovery with a %s artifact moved the ref to %s", tc.name, got)
+			}
+			if rs := cur(t, r.rn); rs.Revision != r.preRevision {
+				t.Fatalf("recovery with a %s artifact advanced the state to %d", tc.name, rs.Revision)
+			}
+			if rec, _, ok := r.journalRecord(t); !ok || rec.Terminal() || rec.StepsDone != 0 {
+				t.Fatalf("recovery with a %s artifact recorded progress: %+v", tc.name, rec)
+			}
+		})
+	}
+}
+
+// Deleting the commit-txn journal after an accepted git tuple is corruption, not a
+// fresh run: the open handle fails every submit recovery-required, and a reopen
+// refuses the run.
+func TestGitTxnJournalVanishedAfterEvidence(t *testing.T) {
+	r := newGitTxnRig(t)
+	if _, err := r.rn.Submit(context.Background(), r.lead, r.implRaw); err != nil {
+		t.Fatalf("implement transaction: %v", err)
+	}
+	if err := os.RemoveAll(r.rn.loc.CommitTxnDir); err != nil {
+		t.Fatalf("delete commit journal: %v", err)
+	}
+	// The open run: the aggregate journal seam fails the next submit closed.
+	rs := cur(t, r.rn)
+	if _, err := r.rn.Submit(context.Background(), r.pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", true, nil)); !errors.Is(err, transport.ErrRecoveryRequired) {
+		t.Fatalf("submit after journal deletion err = %v, want ErrRecoveryRequired", err)
+	}
+	// A reopen refuses the run outright.
+	if _, err := OpenRun(r.repo, r.runID, rand.Reader); !errors.Is(err, transport.ErrRecoveryRequired) {
+		t.Fatalf("reopen after journal deletion err = %v, want ErrRecoveryRequired", err)
+	}
+}
+
+// A pending commit transaction blocks a session replacement outright, with the
+// Registry and RunState untouched.
+func TestGitTxnPendingBlocksReplaceAttach(t *testing.T) {
+	r := newGitTxnRig(t)
+	if _, err := r.rn.Submit(withHooks(context.Background(), oneShotApply("index-cas")), r.lead, r.implRaw); !errors.Is(err, errCut) {
+		t.Fatalf("cut submit err = %v, want the injected cut", err)
+	}
+	regBefore, ok, err := r.rn.registry.Load()
+	if err != nil || !ok {
+		t.Fatalf("registry load: ok=%v err=%v", ok, err)
+	}
+	stateBefore := cur(t, r.rn)
+
+	_, rerr := attach.ReplaceAttach(attach.ReplaceRequest{
+		RepoDir: r.repo, RunID: r.runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: opID("c"), RNG: rand.Reader,
+	})
+	if !errors.Is(rerr, attach.ErrReplaceRecoveryRequired) {
+		t.Fatalf("replace with a pending commit txn err = %v, want ErrReplaceRecoveryRequired", rerr)
+	}
+	if regAfter, _, _ := r.rn.registry.Load(); regAfter.Revision != regBefore.Revision {
+		t.Fatalf("a blocked replacement still mutated the registry (%d -> %d)", regBefore.Revision, regAfter.Revision)
+	}
+	if stateAfter := cur(t, r.rn); stateAfter.Revision != stateBefore.Revision {
+		t.Fatalf("a blocked replacement still mutated the run state (%d -> %d)", stateBefore.Revision, stateAfter.Revision)
 	}
 }
 

@@ -44,7 +44,7 @@ func (rn *Run) submitGit(ctx context.Context, sessionID string, raw []byte) (tra
 	deps := transport.SubmitDeps{
 		Store:    rn.state,
 		Registry: rn.registry,
-		Journal:  runJournalReader{loc: rn.loc},
+		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Sink:     rn.store,
 		Prepare:  prepare,
 	}
@@ -111,6 +111,18 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 		return transport.SubmitResult{}, fmt.Errorf("coordinator: run advanced under the held guard (revision %d, plan %d)", rs.Revision, plan.ExpectedStateRevision)
 	}
 
+	// Freeze I0 BEFORE the snapshot: the snapshot's own barrier then validates the
+	// staged index against the captured worktree, so the frozen pre-identity is
+	// exactly the index that validation blessed — a foreign index staged after the
+	// barrier can never be adopted as the transaction's expected old identity (the
+	// pre-PREPARE recheck below and ApplyIndex's live-digest CAS both fail closed
+	// on it instead).
+	worktree := rn.runWorktree()
+	preDigest, derr := rn.git.IndexDigest(ctx, worktree)
+	if derr != nil {
+		return transport.SubmitResult{}, derr
+	}
+
 	// SNAPSHOT: parent is the run's latest accepted git commit (or the base for the
 	// first), so the accepted history forms the exact chain the state store validates.
 	parent := rs.BaseCommit
@@ -128,14 +140,13 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 		return transport.SubmitResult{}, serr
 	}
 
-	// Freeze the index identities: build the deterministic target at the txn-private
-	// path (proves hard-link support pre-PREPARE), then capture I0. A crash before the
-	// journal prepare leaves only a private orphan and an unreferenced commit object.
+	// Build the deterministic target at the txn-private path (proves hard-link
+	// support pre-PREPARE). A crash before the journal prepare leaves only a private
+	// orphan and an unreferenced commit object.
 	txnID, terr := rn.mintTxnID()
 	if terr != nil {
 		return transport.SubmitResult{}, terr
 	}
-	worktree := rn.runWorktree()
 	private, pverr := rn.git.TargetIndexPath(ctx, worktree, txnID)
 	if pverr != nil {
 		return transport.SubmitResult{}, pverr
@@ -143,10 +154,6 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	targetDigest, berr := rn.git.BuildTargetIndex(ctx, worktree, commit, private)
 	if berr != nil {
 		return transport.SubmitResult{}, berr
-	}
-	preDigest, derr := rn.git.IndexDigest(ctx, worktree)
-	if derr != nil {
-		return transport.SubmitResult{}, derr
 	}
 	plan.GitCommit = state.GitCommitEvidence{Parent: parent, Tree: tree, Commit: commit}
 	plan.IndexPreDigest = preDigest
@@ -160,6 +167,17 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 		if herr := h.beforeGitJournal(); herr != nil {
 			return transport.SubmitResult{}, herr
 		}
+	}
+	// Pinned pre-PREPARE recheck: re-prove the frozen branch/worktree/index identity
+	// and cancellation immediately before the journal records the intent, so a foreign
+	// change in the snapshot..prepare window fails closed with NO journal record and
+	// NO effect (the worktree HEAD is the run branch, so HEAD==parent re-proves the
+	// ref identity too).
+	if err := ctx.Err(); err != nil {
+		return transport.SubmitResult{}, err
+	}
+	if err := rn.git.ConfirmPreState(ctx, worktree, parent, tree, preDigest); err != nil {
+		return transport.SubmitResult{}, err
 	}
 	steps, sterr := rn.commitTxnSteps(ctx, g, plan, txnID)
 	if sterr != nil {
@@ -250,6 +268,12 @@ func (rn *Run) commitTxnPlanFor(ctx context.Context, g *genstore.Guard) func(txn
 		}
 		if plan.RunID != rn.loc.RunID {
 			return txn.Plan{}, fmt.Errorf("coordinator: commit-txn payload run id %q is not the opened run %q", plan.RunID, rn.loc.RunID)
+		}
+		// Recovery must re-read and re-confirm the exact frozen evidence artifact by
+		// key BEFORE any step runs — never re-project it, and never let a transaction
+		// whose artifact vanished or corrupted move the ref/index or accept the turn.
+		if _, err := rn.store.Get(plan.TurnID, plan.Digest); err != nil {
+			return txn.Plan{}, fmt.Errorf("coordinator: the frozen evidence artifact is missing or corrupt: %w", err)
 		}
 		steps, err := rn.commitTxnSteps(ctx, g, plan, in.TxnID)
 		if err != nil {
@@ -382,6 +406,12 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 			Apply: func() error {
 				if err := cutApply("state-cas"); err != nil {
 					return err
+				}
+				// The acceptance references the artifact by (turn, digest): re-read and
+				// re-confirm it immediately before the append, so a vanished/corrupted
+				// artifact can never become an accepted receipt.
+				if _, err := rn.store.Get(plan.TurnID, plan.Digest); err != nil {
+					return fmt.Errorf("coordinator: the frozen evidence artifact is missing or corrupt: %w", err)
 				}
 				rs, ok, err := rn.state.Load()
 				if err != nil {

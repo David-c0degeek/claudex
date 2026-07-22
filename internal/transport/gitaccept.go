@@ -51,12 +51,12 @@ const (
 	GitAcceptForeign
 )
 
-// ObserveGitAccept classifies the current run state against a frozen accept plan: applied if the
-// turn is already accepted with the exact digest and git-commit evidence; not-applied if the run is
-// at the expected pre-revision with the plan's turn assigned and unaccepted; foreign otherwise.
+// ObserveGitAccept classifies the current run state against a frozen accept plan: applied only if
+// the run holds the EXACT frozen acceptance; not-applied if the run is at the expected
+// pre-revision with the plan's turn assigned and unaccepted; foreign otherwise.
 func ObserveGitAccept(rs state.RunState, plan GitAcceptPlan) GitAcceptState {
 	if acc, ok := rs.AcceptedTurns[plan.TurnID]; ok {
-		if acc.ArtifactDigest == plan.Digest && acc.GitCommit != nil && *acc.GitCommit == plan.GitCommit {
+		if gitAcceptExactlyApplied(rs, acc, plan) {
 			return GitAcceptApplied
 		}
 		return GitAcceptForeign
@@ -67,6 +67,42 @@ func ObserveGitAccept(rs state.RunState, plan GitAcceptPlan) GitAcceptState {
 		return GitAcceptNotApplied
 	}
 	return GitAcceptForeign
+}
+
+// gitAcceptExactlyApplied requires the run to hold EXACTLY the frozen acceptance: the accepted
+// turn (digest, accepted phase, receipt bound to this turn/digest and to the run's current
+// revision — nothing else can move while the transaction is pending), the exact git evidence
+// tuple, the frozen decision's resulting phase, and exactly the issued identities (present iff
+// the plan issued them). A valid-looking foreign append that reused the tuple with a different
+// outcome or assignment is Foreign, so the journal can never terminalize over it.
+func gitAcceptExactlyApplied(rs state.RunState, acc state.AcceptedTurn, plan GitAcceptPlan) bool {
+	if acc.ArtifactDigest != plan.Digest || acc.Phase != plan.Phase {
+		return false
+	}
+	if acc.GitCommit == nil || *acc.GitCommit != plan.GitCommit {
+		return false
+	}
+	if acc.Receipt.TurnID != plan.TurnID || acc.Receipt.ArtifactDigest != plan.Digest || acc.Receipt.Revision != rs.Revision {
+		return false
+	}
+	if rs.Phase != plan.Decision.Next {
+		return false
+	}
+	if plan.IssuedTurnID != "" {
+		if rs.Assignment == nil || rs.Assignment.ID != plan.IssuedTurnID {
+			return false
+		}
+	} else if rs.Assignment != nil {
+		return false
+	}
+	if plan.IssuedGateID != "" {
+		if rs.Gate == nil || rs.Gate.ID != plan.IssuedGateID {
+			return false
+		}
+	} else if rs.Gate != nil {
+		return false
+	}
+	return true
 }
 
 // PrepareGitSubmit runs the shared authorize -> prepare -> publish pipeline for an
