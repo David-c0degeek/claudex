@@ -551,7 +551,10 @@ func readOnlyWorktreeGate(deps SubmitDeps, auth submitAuthorized) error {
 	}
 	clean, err := deps.WorktreeClean()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrWorktreeUnobserved, err)
+		// Join, not %v-flatten: the worktree still failed closed as unobserved, AND the
+		// caller can still detect the underlying typed cause (context.Canceled / deadline,
+		// or a typed git error) via errors.Is — preserving Submit's cancellation contract.
+		return errors.Join(ErrWorktreeUnobserved, err)
 	}
 	if !clean {
 		return ErrRepoMutationInReadOnlyPhase
