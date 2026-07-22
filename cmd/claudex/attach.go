@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
+	"github.com/David-c0degeek/claudex/internal/coordinator"
 	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -216,6 +217,16 @@ func attachFirst(ctx context.Context, repo, agentS, roleS, task, config, opID st
 	if err != nil {
 		fmt.Fprintf(stderr, "claudex: attach (first): %v\n", err)
 		return 1
+	}
+
+	// Reset the repo-level mailbox transcript to the new run's (empty) projection, so a fresh
+	// run never leaves the prior terminal run's transcript visible before its first submit. A
+	// reset failure is non-fatal (the run is created; the mirror is a convenience) — warn and
+	// continue, since the first submit will rebuild it anyway.
+	if loc, rerr := attach.ResolveRun(repo, res.RunID); rerr != nil {
+		fmt.Fprintf(stderr, "claudex: attach (first) WARNING: could not resolve the run to reset the mailbox: %v\n", rerr)
+	} else if merr := coordinator.RebuildMailbox(loc); merr != nil {
+		fmt.Fprintf(stderr, "claudex: attach (first) WARNING: could not reset the mailbox mirror: %v\n", merr)
 	}
 
 	// The join command is complete and stable in the library result (the pair join op id is

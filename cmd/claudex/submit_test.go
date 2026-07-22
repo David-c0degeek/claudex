@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
+	"github.com/David-c0degeek/claudex/internal/transport"
 )
 
 // bootstrapPair drives a real first attach + pair join over a fresh git repo and returns the
@@ -149,6 +151,57 @@ func TestSubmitUsageErrors(t *testing.T) {
 		if code := run(context.Background(), args, &out, &errb); code != 2 {
 			t.Fatalf("case %d: exit %d, want 2; stderr=%q", i, code, errb.String())
 		}
+	}
+}
+
+// TestClassifySubmit pins the receipt/exit contract for every Run.Submit result+error shape:
+// an authoritative receipt accompanying a durability/reconfirm error is emitted (never dropped)
+// and exits 1; a clean success mirrors and exits 0; a zero-receipt error is a receipt-less
+// failure; a ReleaseWarning is a non-fatal warning on a committed acceptance.
+func TestClassifySubmit(t *testing.T) {
+	rc := state.Receipt{TurnID: "turn-1", Revision: 5, ArtifactDigest: repeat("a", 64)}
+	durErr := errors.New("durability unconfirmed")
+
+	// Clean success: emit, mirror, exit 0.
+	if emit, warn, mirror, exit := classifySubmit(transport.SubmitResult{Receipt: rc}, nil); !emit || warn != nil || !mirror || exit != 0 {
+		t.Fatalf("clean: emit=%v warn=%v mirror=%v exit=%d", emit, warn, mirror, exit)
+	}
+	// Idempotent replay whose state re-confirm failed: emit the receipt, warn, DO NOT mirror, exit 1.
+	if emit, warn, mirror, exit := classifySubmit(transport.SubmitResult{Receipt: rc, Idempotent: true}, durErr); !emit || warn != durErr || mirror || exit != 1 {
+		t.Fatalf("replay+durErr: emit=%v warn=%v mirror=%v exit=%d", emit, warn, mirror, exit)
+	}
+	// Visible-but-unconfirmed acceptance: same shape (receipt + error) -> emit + exit 1, no mirror.
+	if emit, _, mirror, exit := classifySubmit(transport.SubmitResult{Receipt: rc}, durErr); !emit || mirror || exit != 1 {
+		t.Fatalf("accept+durErr: emit=%v mirror=%v exit=%d", emit, mirror, exit)
+	}
+	// Zero receipt + error: an ordinary receipt-less failure.
+	if emit, warn, _, exit := classifySubmit(transport.SubmitResult{}, durErr); emit || warn != durErr || exit != 1 {
+		t.Fatalf("receiptless: emit=%v warn=%v exit=%d", emit, warn, exit)
+	}
+	// A committed acceptance with a release warning: success-with-warning (exit 0), still mirrors.
+	relErr := errors.New("guard release failed")
+	if emit, warn, mirror, exit := classifySubmit(transport.SubmitResult{Receipt: rc, ReleaseWarning: relErr}, nil); !emit || warn != relErr || !mirror || exit != 0 {
+		t.Fatalf("releaseWarning: emit=%v warn=%v mirror=%v exit=%d", emit, warn, mirror, exit)
+	}
+}
+
+// TestResolveRunIDExitCodes pins the run-resolution classification: only a malformed CLI id is a
+// usage error (2); a canonical-but-unbound id and no-active-run are operational (1).
+func TestResolveRunIDExitCodes(t *testing.T) {
+	repo := gitRepo(t) // a real repo with NO active run
+	var errb bytes.Buffer
+
+	// Malformed explicit id (a space is outside the id grammar): usage (2).
+	if _, code := resolveRunID(repo, "bad id", &errb); code != 2 {
+		t.Fatalf("malformed --run exit = %d, want 2", code)
+	}
+	// Grammar-valid but unbound (no such active run): operational (1), not usage.
+	if _, code := resolveRunID(repo, "run-"+repeat("a", 32), &errb); code != 1 {
+		t.Fatalf("valid-but-unbound --run exit = %d, want 1", code)
+	}
+	// No --run and no active run in the repo: operational (1).
+	if _, code := resolveRunID(repo, "", &errb); code != 1 {
+		t.Fatalf("no active run exit = %d, want 1", code)
 	}
 }
 

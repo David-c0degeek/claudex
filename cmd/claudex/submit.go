@@ -18,31 +18,32 @@ import (
 // this only stops an accidental/hostile huge file before it is read into memory.
 const maxSubmitFile = 1 << 20
 
-// resolveRunID returns the run id a verb operates on: the explicit --run if given (validated
-// through ResolveRun's active-bootstrap binding), else the discovered active run. A discovered
-// or explicit id that fails the binding is an error, never a silent fallback.
-func resolveRunID(repo, run string, stderr io.Writer) (string, bool) {
+// resolveRunID returns the run id a verb operates on and an exit code (0 = ok). Only a
+// malformed CLI id is a USAGE error (2); a failed active-bootstrap binding, no active run, or a
+// store/I/O/legacy error is OPERATIONAL (1) per D6 — never collapsed into usage. A discovered or
+// explicit id that fails the binding is an error, never a silent fallback.
+func resolveRunID(repo, run string, stderr io.Writer) (string, int) {
 	if run != "" {
 		if !state.IsRunID(run) {
 			fmt.Fprintln(stderr, "claudex: --run is not a canonical run id")
-			return "", false
+			return "", 2 // malformed CLI id = usage
 		}
 		if _, err := attach.ResolveRun(repo, run); err != nil {
 			fmt.Fprintf(stderr, "claudex: --run does not bind to an active run: %v\n", err)
-			return "", false
+			return "", 1 // binding/store failure = operational
 		}
-		return run, true
+		return run, 0
 	}
 	id, ok, err := attach.ActiveRunID(repo)
 	if err != nil {
 		fmt.Fprintf(stderr, "claudex: discover active run: %v\n", err)
-		return "", false
+		return "", 1 // I/O / legacy refusal = operational
 	}
 	if !ok {
 		fmt.Fprintln(stderr, "claudex: no active run in this repository (pass --run or run attach first)")
-		return "", false
+		return "", 1 // no active run = operational
 	}
-	return id, true
+	return id, 0
 }
 
 // readFileArg reads a required flag's file, bounded and regular-file-checked on the OPENED
@@ -102,9 +103,9 @@ func submitCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if !ok {
 		return 2
 	}
-	runID, ok := resolveRunID(*repo, *run, stderr)
-	if !ok {
-		return 2
+	runID, code := resolveRunID(*repo, *run, stderr)
+	if code != 0 {
+		return code
 	}
 
 	rn, err := coordinator.OpenRun(*repo, runID, rand.Reader)
@@ -115,20 +116,24 @@ func submitCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	defer rn.Close()
 
 	res, serr := rn.Submit(ctx, *sessionID, raw)
-	if serr != nil {
-		fmt.Fprintf(stderr, "claudex: submit: %v\n", serr)
-		return 1
+	emitReceipt, warn, doMirror, exit := classifySubmit(res, serr)
+	if !emitReceipt {
+		// An ordinary receipt-less failure (zero receipt + error).
+		fmt.Fprintf(stderr, "claudex: submit: %v\n", warn)
+		return exit
 	}
 
-	// Rebuild the human-readable mailbox mirror from the durable ledger + artifacts. This runs
-	// on a fresh acceptance AND an idempotent replay, so a mirror a crash missed is repaired.
-	// A mirror failure does not void the durable acceptance: surface it distinctly and keep the
-	// authoritative receipt.
-	mirrorErr := rn.MirrorMailbox()
+	// Rebuild the human-readable mailbox mirror ONLY on a clean acceptance — never while
+	// durability is unconfirmed (do not project un-power-safe state); a later replay repairs it.
+	var mirrorErr error
+	if doMirror {
+		mirrorErr = rn.MirrorMailbox()
+	}
 
-	wire, err := transport.MarshalReceipt(res.Receipt)
-	if err != nil {
-		fmt.Fprintf(stderr, "claudex: submit: render receipt: %v\n", err)
+	// The receipt is authoritative even alongside a durability/reconfirm/release warning: emit it.
+	wire, merr := transport.MarshalReceipt(res.Receipt)
+	if merr != nil {
+		fmt.Fprintf(stderr, "claudex: submit: render receipt: %v\n", merr)
 		return 1
 	}
 	if _, err := fmt.Fprintf(stdout, "%s\n", wire); err != nil {
@@ -138,12 +143,33 @@ func submitCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if res.Idempotent {
 		fmt.Fprintln(stderr, "claudex: submit: idempotent replay (receipt re-confirmed)")
 	}
-	if res.ReleaseWarning != nil {
-		fmt.Fprintf(stderr, "claudex: submit WARNING: %v\n", res.ReleaseWarning)
+	if warn != nil {
+		fmt.Fprintf(stderr, "claudex: submit WARNING: %v\n", warn)
 	}
 	if mirrorErr != nil {
 		fmt.Fprintf(stderr, "claudex: submit WARNING: the acceptance is durable but the mailbox mirror could not be rebuilt: %v\n", mirrorErr)
 		return 1
 	}
-	return 0
+	return exit
+}
+
+// classifySubmit maps a submit outcome to the CLI's behavior, so an authoritative receipt
+// accompanying a post-commit/durability error is never dropped:
+//   - success (nil error): emit the receipt, rebuild the mirror, exit 0 (a ReleaseWarning is a
+//     non-fatal warning on an already-committed acceptance);
+//   - receipt-bearing error (durability-unconfirmed accept, or a replay whose state re-confirm
+//     failed): emit the receipt, surface the error, SKIP the mirror (state is unconfirmed; a
+//     replay repairs it), exit 1;
+//   - zero-receipt error: an ordinary receipt-less failure, exit 1.
+//
+// Pure, so the receipt/exit contract is unit-testable against both real result+error shapes.
+func classifySubmit(res transport.SubmitResult, serr error) (emitReceipt bool, warn error, doMirror bool, exit int) {
+	switch {
+	case serr == nil:
+		return true, res.ReleaseWarning, true, 0
+	case res.Receipt != (state.Receipt{}):
+		return true, serr, false, 1
+	default:
+		return false, serr, false, 1
+	}
 }

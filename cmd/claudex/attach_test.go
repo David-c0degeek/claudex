@@ -255,6 +255,38 @@ func TestReplaceResultClassification(t *testing.T) {
 	}
 }
 
+// TestAttachFirstResetsMailbox proves first attach resets the repo-level mailbox to the new
+// run's (empty) projection, so a prior run's stale transcript is never left visible.
+func TestAttachFirstResetsMailbox(t *testing.T) {
+	repo := gitRepo(t)
+	inputs := t.TempDir()
+	task, cfg := taskFile(t, inputs), configFile(t, inputs)
+
+	// A stale transcript from a prior run sits at the repo-level mailbox (.claudex is git-ignored).
+	claudex := filepath.Join(repo, ".claudex")
+	if err := os.MkdirAll(claudex, 0o700); err != nil {
+		t.Fatalf("mkdir .claudex: %v", err)
+	}
+	stale := "STALE PRIOR RUN TRANSCRIPT\n"
+	if err := os.WriteFile(filepath.Join(claudex, "mailbox.md"), []byte(stale), 0o600); err != nil {
+		t.Fatalf("write stale mailbox: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	if code := run(context.Background(),
+		[]string{"attach", "--repo", repo, "--agent", "claude", "--task", task, "--config", cfg, "--operation-id", mintOp(t)},
+		&out, &errb); code != 0 {
+		t.Fatalf("first attach: exit %d, %s", code, errb.String())
+	}
+	md, err := os.ReadFile(filepath.Join(claudex, "mailbox.md"))
+	if err != nil {
+		t.Fatalf("read mailbox after attach: %v", err)
+	}
+	if string(md) == stale {
+		t.Fatal("first attach did not reset the prior run's stale mailbox transcript")
+	}
+}
+
 func indexOf(s []string, v string) int {
 	for i := range s {
 		if s[i] == v {
