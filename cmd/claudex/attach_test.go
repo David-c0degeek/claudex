@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -34,6 +35,13 @@ func TestAttachUsageErrors(t *testing.T) {
 		{"reattach and replace together", []string{"attach", "--reattach", "--replace", "--run", "run-" + strings.Repeat("a", 32), "--agent", "codex", "--role", "pair"}},
 		{"positional arg", []string{"attach", "extra"}},
 		{"unknown flag", []string{"attach", "--nope"}},
+		// Cross-mode: a flag outside the mode's exact allowed set is a usage error, not a
+		// silently-ignored different mode.
+		{"join + --task", []string{"attach", "--run", "run-" + strings.Repeat("a", 32), "--agent", "codex", "--role", "pair", "--operation-id", op, "--task", "ignored.json"}},
+		{"first + --session-id", []string{"attach", "--agent", "claude", "--task", "t", "--config", "c", "--operation-id", op, "--session-id", "sess-" + strings.Repeat("b", 32)}},
+		{"first + --expected-generation", []string{"attach", "--agent", "claude", "--task", "t", "--config", "c", "--operation-id", op, "--expected-generation", "2"}},
+		{"reattach + --operation-id", []string{"attach", "--reattach", "--run", "run-" + strings.Repeat("a", 32), "--session-id", "sess-" + strings.Repeat("b", 32), "--agent", "codex", "--role", "pair", "--operation-id", op}},
+		{"replace + --config", []string{"attach", "--replace", "--run", "run-" + strings.Repeat("a", 32), "--agent", "codex", "--role", "pair", "--expected-generation", "2", "--operation-id", op, "--config", "x"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,47 +127,65 @@ func TestAttachFirstThenJoin(t *testing.T) {
 	repo := gitRepo(t)
 	inputs := t.TempDir() // task/config live OUTSIDE the repo so the tree stays clean for preflight
 	task, cfg := taskFile(t, inputs), configFile(t, inputs)
+	firstOp := mintOp(t)
 
-	var out, errb bytes.Buffer
-	code := run(context.Background(),
-		[]string{"attach", "--repo", repo, "--agent", "claude", "--task", task, "--config", cfg, "--operation-id", mintOp(t)},
-		&out, &errb)
-	if code != 0 {
-		t.Fatalf("first attach exit = %d; stderr=%q", code, errb.String())
-	}
-	var first struct {
+	doFirst := func() struct {
 		Mode        string   `json:"mode"`
 		RunID       string   `json:"run_id"`
 		SessionID   string   `json:"session_id"`
 		Role        string   `json:"role"`
 		Agent       string   `json:"agent"`
 		JoinCommand []string `json:"join_command"`
+	} {
+		var out, errb bytes.Buffer
+		if code := run(context.Background(),
+			[]string{"attach", "--repo", repo, "--agent", "claude", "--task", task, "--config", cfg, "--operation-id", firstOp},
+			&out, &errb); code != 0 {
+			t.Fatalf("first attach exit = %d; stderr=%q", code, errb.String())
+		}
+		var r struct {
+			Mode        string   `json:"mode"`
+			RunID       string   `json:"run_id"`
+			SessionID   string   `json:"session_id"`
+			Role        string   `json:"role"`
+			Agent       string   `json:"agent"`
+			JoinCommand []string `json:"join_command"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+			t.Fatalf("decode first result %q: %v", out.String(), err)
+		}
+		return r
 	}
-	if err := json.Unmarshal(out.Bytes(), &first); err != nil {
-		t.Fatalf("decode first result %q: %v", out.String(), err)
-	}
+
+	first := doFirst()
 	if first.Mode != "first" || !state.IsRunID(first.RunID) || !state.IsSessionID(first.SessionID) || first.Role != "lead" || first.Agent != "claude" {
 		t.Fatalf("first result wrong: %+v", first)
 	}
-	// The join command must name the run, the complement agent+pair role, and carry its own op id.
+	// The join command must be self-contained: run + complement agent + pair role + a frozen op id,
+	// and an absolute repo locator (never `--repo .`).
 	jc := strings.Join(first.JoinCommand, " ")
 	if first.JoinCommand[0] != "attach" || !strings.Contains(jc, "--run "+first.RunID) ||
 		!strings.Contains(jc, "--agent codex") || !strings.Contains(jc, "--role pair") ||
 		!strings.Contains(jc, "--operation-id op-") {
 		t.Fatalf("join_command missing required parts: %v", first.JoinCommand)
 	}
-
-	// Run the emitted join command verbatim (drop the leading "attach"), but point --repo at the
-	// absolute repo so the test's cwd is irrelevant.
-	joinArgs := append([]string(nil), first.JoinCommand...)
-	for i := range joinArgs {
-		if joinArgs[i] == "." && i > 0 && joinArgs[i-1] == "--repo" {
-			joinArgs[i] = repo
-		}
+	if i := indexOf(first.JoinCommand, "--repo"); i < 0 || i+1 >= len(first.JoinCommand) || !filepath.IsAbs(first.JoinCommand[i+1]) {
+		t.Fatalf("join_command --repo is not an absolute locator: %v", first.JoinCommand)
 	}
-	out.Reset()
-	errb.Reset()
-	if code := run(context.Background(), joinArgs, &out, &errb); code != 0 {
+
+	// A same-first-op replay BEFORE the join returns the same run/session and a BYTE-IDENTICAL
+	// join command (the pair join op id is frozen in the intent, not re-minted per call).
+	replayPre := doFirst()
+	if replayPre.RunID != first.RunID || replayPre.SessionID != first.SessionID {
+		t.Fatalf("first-op replay changed identity: %+v vs %+v", replayPre, first)
+	}
+	if !slices.Equal(replayPre.JoinCommand, first.JoinCommand) {
+		t.Fatalf("first-op replay join command drifted:\n %v\n %v", first.JoinCommand, replayPre.JoinCommand)
+	}
+
+	// Run the emitted join command VERBATIM (unchanged argv).
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), first.JoinCommand, &out, &errb); code != 0 {
 		t.Fatalf("join exit = %d; stderr=%q", code, errb.String())
 	}
 	var join struct {
@@ -181,10 +207,17 @@ func TestAttachFirstThenJoin(t *testing.T) {
 		t.Fatalf("pair session id equals the lead's")
 	}
 
-	// An idempotent join replay (same op id) returns the same session.
+	// A same-first-op replay AFTER pair completion STILL advertises the byte-identical join
+	// command (so a lost-response join stays recoverable).
+	replayPost := doFirst()
+	if !slices.Equal(replayPost.JoinCommand, first.JoinCommand) {
+		t.Fatalf("post-join first-op replay join command drifted:\n %v\n %v", first.JoinCommand, replayPost.JoinCommand)
+	}
+
+	// An idempotent join replay (same frozen op id) returns the same pair session.
 	out.Reset()
 	errb.Reset()
-	if code := run(context.Background(), joinArgs, &out, &errb); code != 0 {
+	if code := run(context.Background(), first.JoinCommand, &out, &errb); code != 0 {
 		t.Fatalf("join replay exit = %d; stderr=%q", code, errb.String())
 	}
 	var join2 struct {
@@ -194,4 +227,13 @@ func TestAttachFirstThenJoin(t *testing.T) {
 	if join2.SessionID != join.SessionID {
 		t.Fatalf("idempotent join replay minted a new session: %q -> %q", join.SessionID, join2.SessionID)
 	}
+}
+
+func indexOf(s []string, v string) int {
+	for i := range s {
+		if s[i] == v {
+			return i
+		}
+	}
+	return -1
 }

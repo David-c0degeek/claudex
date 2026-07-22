@@ -47,6 +47,10 @@ func attachCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "claudex: attach takes no positional arguments, got %v\n", fs.Args())
 		return 2
 	}
+	// Track EXPLICITLY set flags so each mode can reject any flag outside its exact allowed
+	// set (a silently-ignored irrelevant flag is a usage error, not a different mode).
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 	if *doReattach && *doReplace {
 		fmt.Fprintln(stderr, "claudex: attach: --reattach and --replace are mutually exclusive")
 		return 2
@@ -54,14 +58,41 @@ func attachCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	switch {
 	case *doReattach:
+		if !enforceFlags(stderr, "--reattach", visited, "reattach", "repo", "run", "session-id", "agent", "role") {
+			return 2
+		}
 		return attachReattach(*repo, *run, *sessionID, *agent, *role, stdout, stderr)
 	case *doReplace:
+		if !enforceFlags(stderr, "--replace", visited, "replace", "repo", "run", "agent", "role", "expected-generation", "operation-id") {
+			return 2
+		}
 		return attachReplace(*repo, *run, *agent, *role, *expectGen, *opID, stdout, stderr)
 	case *run != "":
+		if !enforceFlags(stderr, "(join)", visited, "repo", "run", "agent", "role", "operation-id") {
+			return 2
+		}
 		return attachJoin(*repo, *run, *agent, *role, *opID, stdout, stderr)
 	default:
+		if !enforceFlags(stderr, "(first)", visited, "repo", "agent", "role", "task", "config", "operation-id") {
+			return 2
+		}
 		return attachFirst(ctx, *repo, *agent, *role, *task, *config, *opID, stdout, stderr)
 	}
+}
+
+// enforceFlags rejects any explicitly-set flag outside the mode's exact allowed set.
+func enforceFlags(stderr io.Writer, mode string, visited map[string]bool, allowed ...string) bool {
+	ok := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		ok[a] = true
+	}
+	for name := range visited {
+		if !ok[name] {
+			fmt.Fprintf(stderr, "claudex: attach %s does not accept --%s\n", mode, name)
+			return false
+		}
+	}
+	return true
 }
 
 // --- shared parsing/output helpers ---
@@ -86,17 +117,6 @@ func parseRole(s string, stderr io.Writer) (state.SlotRole, bool) {
 	}
 }
 
-// requireEmpty rejects a flag that must not be set in the current mode (mutual exclusion).
-func requireEmpty(stderr io.Writer, mode string, checks map[string]bool) bool {
-	for name, set := range checks {
-		if set {
-			fmt.Fprintf(stderr, "claudex: attach %s does not accept %s\n", mode, name)
-			return false
-		}
-	}
-	return true
-}
-
 // emitJSON writes v as one line of JSON + newline. A marshal or write failure is exit 1.
 func emitJSON(stdout, stderr io.Writer, v any) int {
 	b, err := json.Marshal(v)
@@ -117,12 +137,10 @@ func readInput(flagName, path string, stderr io.Writer) ([]byte, bool) {
 		fmt.Fprintf(stderr, "claudex: attach (first) requires %s\n", flagName)
 		return nil, false
 	}
-	fi, err := os.Lstat(path)
-	if err != nil {
+	if fi, err := os.Lstat(path); err != nil {
 		fmt.Fprintf(stderr, "claudex: attach: %s: %v\n", flagName, err)
 		return nil, false
-	}
-	if !fi.Mode().IsRegular() {
+	} else if !fi.Mode().IsRegular() {
 		fmt.Fprintf(stderr, "claudex: attach: %s must be a regular file\n", flagName)
 		return nil, false
 	}
@@ -132,6 +150,15 @@ func readInput(flagName, path string, stderr io.Writer) ([]byte, bool) {
 		return nil, false
 	}
 	defer f.Close()
+	// Re-check regularity on the OPENED handle: a symlink/FIFO/device swapped in between the
+	// Lstat and the Open cannot slip through (the size cap alone would not stop a blocking FIFO).
+	if hi, err := f.Stat(); err != nil {
+		fmt.Fprintf(stderr, "claudex: attach: %s: %v\n", flagName, err)
+		return nil, false
+	} else if !hi.Mode().IsRegular() {
+		fmt.Fprintf(stderr, "claudex: attach: %s must be a regular file\n", flagName)
+		return nil, false
+	}
 	b, err := io.ReadAll(io.LimitReader(f, maxInputFile+1))
 	if err != nil {
 		fmt.Fprintf(stderr, "claudex: attach: %s: %v\n", flagName, err)
@@ -147,9 +174,6 @@ func readInput(flagName, path string, stderr io.Writer) ([]byte, bool) {
 // --- first attach ---
 
 func attachFirst(ctx context.Context, repo, agentS, roleS, task, config, opID string, stdout, stderr io.Writer) int {
-	if !requireEmpty(stderr, "(first)", map[string]bool{}) { // no forbidden flags reach here (run/reattach/replace already routed away)
-		return 2
-	}
 	ag, ok := parseAgent(agentS, stderr)
 	if !ok {
 		return 2
@@ -194,30 +218,22 @@ func attachFirst(ctx context.Context, repo, agentS, roleS, task, config, opID st
 		return 1
 	}
 
-	// Mint the PAIR's operation id and fold it into the emitted join command, so a
-	// lost-response join is retryable through the library's idempotent path.
-	pairOp, err := state.MintOperationID(rand.Reader)
-	if err != nil {
-		fmt.Fprintf(stderr, "claudex: attach (first): mint join op id: %v\n", err)
-		return 1
-	}
-	joinCmd := append(append([]string(nil), res.JoinArgv...), "--operation-id", pairOp)
+	// The join command is complete and stable in the library result (the pair join op id is
+	// frozen unguessable in the bootstrap intent, and the repo locator is canonical), so a
+	// same-first-op replay advertises a byte-identical join command. Emit it verbatim.
 	return emitJSON(stdout, stderr, map[string]any{
 		"mode":         "first",
 		"run_id":       res.RunID,
 		"session_id":   res.SessionID,
 		"role":         res.Role,
 		"agent":        res.Agent,
-		"join_command": joinCmd,
+		"join_command": res.JoinArgv,
 	})
 }
 
 // --- join ---
 
 func attachJoin(repo, run, agentS, roleS, opID string, stdout, stderr io.Writer) int {
-	if !requireEmpty(stderr, "(join)", nil) {
-		return 2
-	}
 	ag, ok := parseAgent(agentS, stderr)
 	if !ok {
 		return 2
@@ -334,8 +350,10 @@ func attachReplace(repo, run, agentS, roleS string, expectGen uint64, opID strin
 		"verifier_turn_id": res.VerifierTurnID,
 	}
 	// ErrReplaceOutcomeUnknown: the identity is a RECOVERY CANDIDATE, not proven current —
-	// surface the result AND the warning distinctly, never a receipt-less failure.
-	if errors.Is(rerr, attach.ErrReplaceOutcomeUnknown) {
+	// surface the result AND the warning distinctly, but the command is recovery-required, not
+	// success (exit 1). A proven-committed CommitWarning is an authoritative success-with-warning.
+	unknown := errors.Is(rerr, attach.ErrReplaceOutcomeUnknown)
+	if unknown {
 		out["outcome_unknown"] = true
 		fmt.Fprintf(stderr, "claudex: attach (replace) WARNING: outcome unknown, session is a recovery candidate: %v\n", rerr)
 	}
@@ -343,5 +361,11 @@ func attachReplace(repo, run, agentS, roleS string, expectGen uint64, opID strin
 		out["commit_warning"] = res.CommitWarning.Error()
 		fmt.Fprintf(stderr, "claudex: attach (replace) WARNING: %v\n", res.CommitWarning)
 	}
-	return emitJSON(stdout, stderr, out)
+	if code := emitJSON(stdout, stderr, out); code != 0 {
+		return code // a write/encode failure dominates
+	}
+	if unknown {
+		return 1 // recovery-required, per D6's 0-success/1-operational contract
+	}
+	return 0
 }

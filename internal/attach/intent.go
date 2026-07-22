@@ -42,6 +42,13 @@ type BootstrapIntent struct {
 	Agent       state.Agent `json:"agent"`        // the lead agent
 	CreatedUnix int64       `json:"created_unix"`
 
+	// PairJoinOperationID is the UNGUESSABLE, frozen operation id the pair's join must
+	// present. It is minted here (not by the client) so the emitted join command is
+	// stable across every first-attach replay: a same-first-op retry advertises the SAME
+	// join op id, so a lost-response join stays recoverable through the idempotent path.
+	// Unguessable because a same-op join retry returns the pair's session credential.
+	PairJoinOperationID string `json:"pair_join_operation_id"`
+
 	RelDir string `json:"rel_dir"` // run directory, relative to the repo root
 
 	// Input snapshots: the exact canonical bytes and their run-relative target
@@ -134,6 +141,12 @@ func (in BootstrapIntent) validate() error {
 	}
 	if !state.IsSessionID(in.SessionID) {
 		return fmt.Errorf("attach: intent session_id is not a canonical minted id")
+	}
+	if !state.IsOperationID(in.PairJoinOperationID) {
+		return fmt.Errorf("attach: intent pair_join_operation_id is not a minted operation id")
+	}
+	if in.PairJoinOperationID == in.OperationID {
+		return fmt.Errorf("attach: the pair join operation id must differ from the lead operation id")
 	}
 	if in.Agent != state.AgentClaude && in.Agent != state.AgentCodex {
 		return fmt.Errorf("attach: intent agent is unknown")

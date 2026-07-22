@@ -28,7 +28,8 @@ func validIntent() BootstrapIntent {
 	return BootstrapIntent{
 		RunID: runID, TxnID: "boot-x1", OperationID: opID("c"),
 		SessionID: "sess-" + strings.Repeat("b", 32), Agent: state.AgentClaude, CreatedUnix: 1000,
-		RelDir: ".claudex/runs/" + runID, TaskRelPath: "inputs/task.json",
+		PairJoinOperationID: opID("d"),
+		RelDir:              ".claudex/runs/" + runID, TaskRelPath: "inputs/task.json",
 		TaskDigest: config.Hash(taskBytes()), TaskCanonical: taskBytes(),
 		PolicyRelPath: "inputs/policy.json", PolicyDigest: config.Hash(policyBytes()), PolicyCanonical: policyBytes(),
 		EffectivePolicy: pol, Base: pol.BaseBranch, BaseCommit: strings.Repeat("a", 40),

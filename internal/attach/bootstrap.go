@@ -284,7 +284,7 @@ func FirstAttach(ctx context.Context, req FirstAttachRequest) (FirstAttachResult
 	if _, err := journal.Run(g, plan); err != nil {
 		return FirstAttachResult{}, err
 	}
-	return resultFor(intent), nil
+	return resultFor(lay.repoDir, intent), nil
 }
 
 // hasPendingOrActive lock-free reports whether a pending bootstrap or an active
@@ -364,7 +364,7 @@ func sameOpResult(lay layout, journal *txn.Journal, cur state.CurrentRun) (First
 	if r.Status != state.RegCurrent || r.Role != state.SlotLead || r.Agent != bi.Agent {
 		return FirstAttachResult{}, fmt.Errorf("%w: %s", ErrRunExists, cur.RunID)
 	}
-	return resultFor(bi), nil
+	return resultFor(lay.repoDir, bi), nil
 }
 
 // legacyRepoRefusal refuses a pre-pivot Python run: the repo-level
@@ -408,20 +408,41 @@ func decideFS(res fsclass.Result, pol config.RunPolicy) (class, reason string, a
 	}
 }
 
-func resultFor(in BootstrapIntent) FirstAttachResult {
+func resultFor(repoDir string, in BootstrapIntent) FirstAttachResult {
 	return FirstAttachResult{
 		RunID:     in.RunID,
 		SessionID: in.SessionID,
 		Role:      state.SlotLead,
 		Agent:     in.Agent,
-		JoinArgv:  joinArgv(in.RunID, in.Agent),
+		JoinArgv:  joinArgv(canonicalRepo(repoDir), in.RunID, in.Agent, in.PairJoinOperationID),
 	}
 }
 
-// joinArgv names the EXACT run so the pair joins the right one even once the
-// catalog holds history.
-func joinArgv(runID string, leadAgent state.Agent) []string {
-	return []string{"attach", "--repo", ".", "--run", runID, "--agent", string(complementaryAgent(leadAgent)), "--role", "pair"}
+// canonicalRepo resolves repoDir to a stable, independently-executable absolute path (the
+// same value regardless of the `--repo` string the caller used, so the emitted join command
+// is byte-identical across first-attach replays and does not bake in the pair's cwd). It is
+// computed at result-build time, never frozen in the intent (an absolute path is ephemeral
+// and must not persist in the journal).
+func canonicalRepo(repoDir string) string {
+	abs, err := filepath.Abs(repoDir)
+	if err != nil {
+		return repoDir
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real
+	}
+	return abs
+}
+
+// joinArgv names the EXACT run + the stable repo locator + the frozen unguessable pair join
+// operation id, so the pair joins the right run from anywhere and a lost-response join retry
+// is idempotent.
+func joinArgv(repo, runID string, leadAgent state.Agent, pairJoinOp string) []string {
+	return []string{
+		"attach", "--repo", repo, "--run", runID,
+		"--agent", string(complementaryAgent(leadAgent)), "--role", "pair",
+		"--operation-id", pairJoinOp,
+	}
 }
 
 func complementaryAgent(a state.Agent) state.Agent {
@@ -502,6 +523,13 @@ func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy con
 	if err != nil {
 		return BootstrapIntent{}, err
 	}
+	// The pair's join operation id is minted here and frozen in the intent (unguessable,
+	// stable across first-attach replays), so the emitted join command is byte-identical
+	// on every retry and a lost-response join stays recoverable.
+	pairJoinOp, err := state.MintOperationID(req.RNG)
+	if err != nil {
+		return BootstrapIntent{}, err
+	}
 
 	relDir := wantRelDir(runID)
 	runDir := lay.runDir(relDir)
@@ -530,6 +558,7 @@ func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy con
 		SessionID:               sessionID,
 		Agent:                   req.Agent,
 		CreatedUnix:             req.CreatedUnix,
+		PairJoinOperationID:     pairJoinOp,
 		RelDir:                  relDir,
 		TaskRelPath:             "inputs/task.json",
 		TaskDigest:              config.Hash(req.TaskCanonical),

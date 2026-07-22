@@ -327,3 +327,45 @@ budget), and `pass && blockers` or `fail && no blockers` fails closed.
 **Acceptance:** the pure engine's VERIFY projection rejects partial/reordered
 criteria and a pass verdict that carries any blocker (including a scope
 expansion); a fail verdict with a scope expansion routes to FIX.
+
+## D021 — CLI command surface: five BYO verbs now, gates/operator deferred
+The `attach`/`pull`/`submit`/`wait`/`status` CLI — the named deliverable of
+subjects 02 and 03 that was built LIBRARY-ONLY with zero callers (`findings.md`
+M9; subject-03 box 03.9) — is wired now over the existing library, closing M9 and
+03.9's command-surface test. The `gates`/`operator` verbs are NOT built in this
+effort (no library API — `internal/gates` does not exist) and remain a
+**subject-05 closure dependency**; 03.9's exact-surface test is amended to
+"attach/pull/submit/wait/status + inspect-legacy (+ version/help), gates/operator
+on 05," and 03.9 ticks only after that amended test passes.
+
+Design (ruled with CX):
+- **One aggregate read authority.** `pull`/`wait`/`status` do not independently
+  load the stores. A coordinator-owned read/session façade takes a lock-free,
+  bracketed coherent snapshot: resolve the active-run/bootstrap binding, classify
+  the pair/replacement/commit-txn journal heads and capture the State+Registry
+  generations, read the stores, then re-read the heads/generations and require
+  them unchanged (retry, else recovery-required). Any nonterminal aggregate
+  transaction is recovery-required — `pull` emits no assignment; `wait`/`status`
+  never read a torn cross-store view. `wait` holds no lock; `status` is lock-free.
+- **Caller-stable operation ids.** The mutating attach modes require an
+  `--operation-id` so a lost-response attach is retryable through the idempotent
+  path. The pair's join operation id is minted UNGUESSABLY and frozen in the
+  bootstrap intent, so the emitted join command is byte-identical across every
+  first-attach replay (before and after pair completion).
+- **Close the full M9.** `pull` delivers the validated assignment to the
+  role-addressed session inbox (`SessionStore`) as well as stdout; a
+  successful/idempotent `submit` rebuilds the `.claudex/mailbox.md` transcript
+  mirror (`MailboxStore`) from the durable ledger + artifact store, repairing a
+  mirror a crash missed. A schema-valid wire receipt (`receipt.v1.json`) is
+  emitted, never raw `state.Receipt`.
+- **Contract.** First attach reads `--task`/`--config` through `internal/config`
+  (D016 — no ambient or reinterpreted policy). Discovery (`attach.ActiveRunID`) is
+  convenience only; every discovered or explicit `--run` still passes
+  `ResolveRun`'s active-bootstrap binding. Output is validated canonical JSON, one
+  trailing newline; exit 0 success / 1 operational / 2 usage.
+
+**Acceptance:** an in-process two-terminal e2e over a real git repo drives
+attach → join → pull → submit → wait → status, asserting the session-inbox bytes,
+the mailbox projection, and schema-valid receipt JSON — not only stdout; race
+tests force a replacement, a pair join, an active-run switch, and a pending commit
+journal between the reader's bracket reads.
