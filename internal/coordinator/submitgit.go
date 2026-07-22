@@ -129,13 +129,14 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	if ev, ok := state.LatestGitCommit(rs); ok {
 		parent = ev.Commit
 	}
-	commit, tree, serr := rn.git.SnapshotCommit(ctx, gitx.SnapshotReq{
+	snapReq := gitx.SnapshotReq{
 		RepoDir:          rn.repoDir,
 		Parent:           parent,
 		RunID:            rs.RunID,
 		StartingRevision: rs.Revision,
 		CreatedUnix:      rs.CreatedUnix,
-	})
+	}
+	commit, tree, serr := rn.git.SnapshotCommit(ctx, snapReq)
 	if serr != nil {
 		return transport.SubmitResult{}, serr
 	}
@@ -168,15 +169,16 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 			return transport.SubmitResult{}, herr
 		}
 	}
-	// Pinned pre-PREPARE recheck: re-prove the frozen branch/worktree/index identity
-	// and cancellation immediately before the journal records the intent, so a foreign
+	// Pinned pre-PREPARE recheck: re-prove the FULL frozen identity — the registered
+	// linked worktree with symbolic HEAD on the run branch at the frozen parent, the
+	// frozen worktree tree, the frozen I0, the untampered txn-private target — and
+	// cancellation, immediately before the journal records the intent, so any foreign
 	// change in the snapshot..prepare window fails closed with NO journal record and
-	// NO effect (the worktree HEAD is the run branch, so HEAD==parent re-proves the
-	// ref identity too).
+	// NO effect.
 	if err := ctx.Err(); err != nil {
 		return transport.SubmitResult{}, err
 	}
-	if err := rn.git.ConfirmPreState(ctx, worktree, parent, tree, preDigest); err != nil {
+	if err := rn.git.ConfirmPreState(ctx, snapReq, tree, preDigest, private, targetDigest); err != nil {
 		return transport.SubmitResult{}, err
 	}
 	steps, sterr := rn.commitTxnSteps(ctx, g, plan, txnID)
@@ -269,10 +271,11 @@ func (rn *Run) commitTxnPlanFor(ctx context.Context, g *genstore.Guard) func(txn
 		if plan.RunID != rn.loc.RunID {
 			return txn.Plan{}, fmt.Errorf("coordinator: commit-txn payload run id %q is not the opened run %q", plan.RunID, rn.loc.RunID)
 		}
-		// Recovery must re-read and re-confirm the exact frozen evidence artifact by
-		// key BEFORE any step runs — never re-project it, and never let a transaction
-		// whose artifact vanished or corrupted move the ref/index or accept the turn.
-		if _, err := rn.store.Get(plan.TurnID, plan.Digest); err != nil {
+		// Recovery must re-read AND durably re-confirm the exact frozen evidence
+		// artifact by key BEFORE any step runs — never re-project it, and never let a
+		// transaction whose artifact vanished, corrupted, or was never proven durable
+		// move the ref/index or accept the turn.
+		if err := rn.store.Confirm(plan.TurnID, plan.Digest); err != nil {
 			return txn.Plan{}, fmt.Errorf("coordinator: the frozen evidence artifact is missing or corrupt: %w", err)
 		}
 		steps, err := rn.commitTxnSteps(ctx, g, plan, in.TxnID)
@@ -408,9 +411,10 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 					return err
 				}
 				// The acceptance references the artifact by (turn, digest): re-read and
-				// re-confirm it immediately before the append, so a vanished/corrupted
-				// artifact can never become an accepted receipt.
-				if _, err := rn.store.Get(plan.TurnID, plan.Digest); err != nil {
+				// durably re-confirm it immediately before the append, so a vanished,
+				// corrupted, or durability-unproven artifact can never become an
+				// accepted receipt.
+				if err := rn.store.Confirm(plan.TurnID, plan.Digest); err != nil {
 					return fmt.Errorf("coordinator: the frozen evidence artifact is missing or corrupt: %w", err)
 				}
 				rs, ok, err := rn.state.Load()

@@ -329,6 +329,108 @@ func TestGitTxnForeignStagedIndexPrePrepareFailsClosed(t *testing.T) {
 	}
 }
 
+// A detached HEAD or a same-OID branch switch in the snapshot..PREPARE window must
+// fail the submit closed with no journal/ref/index/state effect: OID equality alone is
+// not the frozen identity — the pre-PREPARE proof re-proves the SYMBOLIC run branch.
+func TestGitTxnSymbolicHeadDriftPrePrepareFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		drift func(t *testing.T, r *gitTxnRig, parent string)
+	}{
+		{"detached at the same parent", func(t *testing.T, r *gitTxnRig, parent string) {
+			// Detach without touching the index: write the worktree HEAD directly.
+			mustGit(t, r.g, r.rn.runWorktree(), nil, "update-ref", "--no-deref", "HEAD", parent)
+		}},
+		{"another branch at the same parent", func(t *testing.T, r *gitTxnRig, parent string) {
+			mustGit(t, r.g, r.repo, nil, "branch", "imposter", parent)
+			mustGit(t, r.g, r.rn.runWorktree(), nil, "symbolic-ref", "HEAD", "refs/heads/imposter")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newGitTxnRig(t)
+			parent := r.branchOID(t)
+			hooks := &submitHooks{beforeGitJournal: func() error {
+				tc.drift(t, r, parent)
+				return nil
+			}}
+			_, err := r.rn.Submit(withHooks(context.Background(), hooks), r.lead, r.implRaw)
+			if err == nil {
+				t.Fatal("a symbolic-HEAD drift in the prepare window must fail the submit")
+			}
+			if _, _, ok := r.journalRecord(t); ok {
+				t.Fatal("a symbolic-HEAD drift still wrote a journal record")
+			}
+			if got := r.branchOID(t); got != parent {
+				t.Fatalf("a symbolic-HEAD drift still moved the run branch to %s", got)
+			}
+			if rs := cur(t, r.rn); rs.Revision != r.preRevision {
+				t.Fatalf("a symbolic-HEAD drift still advanced the state to %d", rs.Revision)
+			}
+		})
+	}
+}
+
+// Tampering with the txn-private target index in the snapshot..PREPARE window must
+// fail the submit closed before the journal records the intent — never PREPARE a
+// transaction whose frozen target bytes are already gone.
+func TestGitTxnPrivateTargetTamperPrePrepareFailsClosed(t *testing.T) {
+	r := newGitTxnRig(t)
+	base := r.branchOID(t)
+	hooks := &submitHooks{beforeGitJournal: func() error {
+		matches, gerr := filepath.Glob(filepath.Join(r.repo, ".git", "worktrees", "*", "index.claudex-target-*"))
+		if gerr != nil || len(matches) != 1 {
+			t.Fatalf("locate private target: %v (%d matches)", gerr, len(matches))
+		}
+		if werr := os.WriteFile(matches[0], []byte("tampered"), 0o600); werr != nil {
+			t.Fatalf("tamper private target: %v", werr)
+		}
+		return nil
+	}}
+	_, err := r.rn.Submit(withHooks(context.Background(), hooks), r.lead, r.implRaw)
+	if !errors.Is(err, gitx.ErrIndexCAS) {
+		t.Fatalf("private-target tamper err = %v, want gitx.ErrIndexCAS", err)
+	}
+	if _, _, ok := r.journalRecord(t); ok {
+		t.Fatal("a private-target tamper still wrote a journal record")
+	}
+	if got := r.branchOID(t); got != base {
+		t.Fatalf("a private-target tamper still moved the ref to %s", got)
+	}
+	if rs := cur(t, r.rn); rs.Revision != r.preRevision {
+		t.Fatalf("a private-target tamper still advanced the state to %d", rs.Revision)
+	}
+}
+
+// A failed durable re-confirmation of the frozen evidence artifact halts recovery
+// BEFORE any effect: pin B requires re-read AND re-confirm, so a visible-but-unproven
+// artifact is never trusted. Healing the barrier lets the same transaction recover.
+func TestGitTxnArtifactConfirmBarrierFailure(t *testing.T) {
+	r := newGitTxnRig(t)
+	base := r.branchOID(t)
+	if _, err := r.rn.Submit(withHooks(context.Background(), oneShotApply("ref-cas")), r.lead, r.implRaw); !errors.Is(err, errCut) {
+		t.Fatalf("cut submit err = %v, want the injected cut", err)
+	}
+	barrierErr := errors.New("artifact barrier fails")
+	r.rn.store.WithSyncInRoot(func(*os.Root, string) error { return barrierErr })
+
+	if _, err := r.rn.Submit(context.Background(), r.lead, r.implRaw); !errors.Is(err, barrierErr) {
+		t.Fatalf("recovery with a failing artifact barrier err = %v, want the barrier failure", err)
+	}
+	if got := r.branchOID(t); got != base {
+		t.Fatalf("a failed artifact barrier still moved the ref to %s", got)
+	}
+	if rec, _, ok := r.journalRecord(t); !ok || rec.Terminal() || rec.StepsDone != 0 {
+		t.Fatalf("a failed artifact barrier still recorded progress: %+v", rec)
+	}
+
+	r.rn.store.WithSyncInRoot(atomicfile.SyncInRoot)
+	res, err := r.rn.Submit(context.Background(), r.lead, r.implRaw)
+	if err != nil {
+		t.Fatalf("healed recovery: %v", err)
+	}
+	r.assertRecovered(t, res)
+}
+
 // After PREPARE, a missing or corrupted frozen evidence artifact fails recovery closed
 // BEFORE any ref/index/state effect: a transaction whose artifact vanished can never
 // become an accepted receipt.
@@ -396,6 +498,25 @@ func TestGitTxnJournalVanishedAfterEvidence(t *testing.T) {
 	// A reopen refuses the run outright.
 	if _, err := OpenRun(r.repo, r.runID, rand.Reader); !errors.Is(err, transport.ErrRecoveryRequired) {
 		t.Fatalf("reopen after journal deletion err = %v, want ErrRecoveryRequired", err)
+	}
+	// The replacement mutator refuses the same corruption, both stores untouched.
+	regBefore, ok, err := r.rn.registry.Load()
+	if err != nil || !ok {
+		t.Fatalf("registry load: ok=%v err=%v", ok, err)
+	}
+	stateBefore := cur(t, r.rn)
+	_, rerr := attach.ReplaceAttach(attach.ReplaceRequest{
+		RepoDir: r.repo, RunID: r.runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: opID("d"), RNG: rand.Reader,
+	})
+	if !errors.Is(rerr, attach.ErrReplaceRecoveryRequired) {
+		t.Fatalf("replace after journal deletion err = %v, want ErrReplaceRecoveryRequired", rerr)
+	}
+	if regAfter, _, _ := r.rn.registry.Load(); regAfter.Revision != regBefore.Revision {
+		t.Fatalf("a refused replacement still mutated the registry (%d -> %d)", regBefore.Revision, regAfter.Revision)
+	}
+	if stateAfter := cur(t, r.rn); stateAfter.Revision != stateBefore.Revision {
+		t.Fatalf("a refused replacement still mutated the run state (%d -> %d)", stateBefore.Revision, stateAfter.Revision)
 	}
 }
 

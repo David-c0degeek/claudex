@@ -50,6 +50,10 @@ var artifactMessageTypes = func() map[string]bool {
 // writes to before recording acceptance.
 type ArtifactStore struct {
 	root *os.Root
+	// syncInRoot is the durable re-confirmation barrier for an EXISTING artifact file
+	// (idempotent Put re-confirm and the recovery-side Confirm). A seam so a test can
+	// prove callers halt on a failed barrier; production wires atomicfile.SyncInRoot.
+	syncInRoot func(root *os.Root, rel string) error
 }
 
 // ArtifactStore is the real ArtifactSink from the submit path.
@@ -64,7 +68,14 @@ func NewArtifactStore(dir string) (*ArtifactStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ArtifactStore{root: r}, nil
+	return &ArtifactStore{root: r, syncInRoot: atomicfile.SyncInRoot}, nil
+}
+
+// WithSyncInRoot overrides the durable re-confirmation seam. Test-only: it exists to
+// inject a barrier failure, never to weaken production durability.
+func (s *ArtifactStore) WithSyncInRoot(fn func(root *os.Root, rel string) error) *ArtifactStore {
+	s.syncInRoot = fn
+	return s
 }
 
 // Close releases the root handle.
@@ -90,9 +101,21 @@ func (s *ArtifactStore) Put(turnID, digest string, canonical []byte) error {
 		if !bytes.Equal(existing, canonical) {
 			return ErrArtifactCollision
 		}
-		return atomicfile.SyncInRoot(s.root, rel) // durably re-confirm the existing file
+		return s.syncInRoot(s.root, rel) // durably re-confirm the existing file
 	}
 	return err // nil, or a committed *PostCommitSyncError the submit path treats as not-durable
+}
+
+// Confirm re-reads an existing artifact by its exact key, re-verifies every key check
+// (digest, canonicalization, redaction, envelope, schema), and durably re-confirms the
+// file — the recovery-side barrier: a vanished, corrupted, or visible-but-durability-
+// unconfirmed artifact is never trusted by a transaction about to make its acceptance
+// durable.
+func (s *ArtifactStore) Confirm(turnID, digest string) error {
+	if _, err := s.Get(turnID, digest); err != nil {
+		return err
+	}
+	return s.syncInRoot(s.root, turnID+"/"+digest+".json")
 }
 
 // Get reads an artifact and re-verifies every key check before returning bytes.

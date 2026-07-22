@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/genstore"
@@ -36,6 +37,12 @@ type GitAcceptPlan struct {
 	// with GitCommit after the snapshot; PrepareGitSubmit leaves them empty.
 	IndexPreDigest    string `json:"index_pre_digest"`
 	IndexTargetDigest string `json:"index_target_digest"`
+	// ExpectedStepIndex/ExpectedCounters freeze the decision-UNCONTROLLED projections
+	// the acceptance must leave untouched (an IMPLEMENT/FIX acceptance changes neither
+	// the cursor nor a counter), so the state participant's Applied is an exact
+	// comparison — a foreign append that drifted them can never read Applied.
+	ExpectedStepIndex *int           `json:"expected_step_index"`
+	ExpectedCounters  state.Counters `json:"expected_counters"`
 }
 
 // GitAcceptState classifies the run against a frozen accept plan for the state-cas step.
@@ -72,9 +79,11 @@ func ObserveGitAccept(rs state.RunState, plan GitAcceptPlan) GitAcceptState {
 // gitAcceptExactlyApplied requires the run to hold EXACTLY the frozen acceptance: the accepted
 // turn (digest, accepted phase, receipt bound to this turn/digest and to the run's current
 // revision — nothing else can move while the transaction is pending), the exact git evidence
-// tuple, the frozen decision's resulting phase, and exactly the issued identities (present iff
-// the plan issued them). A valid-looking foreign append that reused the tuple with a different
-// outcome or assignment is Foreign, so the journal can never terminalize over it.
+// tuple, and the frozen decision's COMPLETE engine effects — the resulting phase, the issued
+// identities bound to the acceptance revision, the verify requirement, the gate/pause shape and
+// lifecycle, the cleared fix-return, and the untouched cursor/counters the plan froze. A
+// valid-looking foreign append that reused the tuple with any drifted effect is Foreign, so the
+// journal can never terminalize over it.
 func gitAcceptExactlyApplied(rs state.RunState, acc state.AcceptedTurn, plan GitAcceptPlan) bool {
 	if acc.ArtifactDigest != plan.Digest || acc.Phase != plan.Phase {
 		return false
@@ -85,24 +94,80 @@ func gitAcceptExactlyApplied(rs state.RunState, acc state.AcceptedTurn, plan Git
 	if acc.Receipt.TurnID != plan.TurnID || acc.Receipt.ArtifactDigest != plan.Digest || acc.Receipt.Revision != rs.Revision {
 		return false
 	}
-	if rs.Phase != plan.Decision.Next {
+	dec := plan.Decision
+	if rs.Phase != dec.Next {
 		return false
 	}
+	// Issued identities: present iff the plan issued them, with the exact id, and
+	// bound to the acceptance revision (the generation that issued them).
 	if plan.IssuedTurnID != "" {
-		if rs.Assignment == nil || rs.Assignment.ID != plan.IssuedTurnID {
+		if rs.Assignment == nil || rs.Assignment.ID != plan.IssuedTurnID || rs.Assignment.IssuedRevision != rs.Revision {
 			return false
 		}
 	} else if rs.Assignment != nil {
 		return false
 	}
 	if plan.IssuedGateID != "" {
-		if rs.Gate == nil || rs.Gate.ID != plan.IssuedGateID {
+		if rs.Gate == nil || rs.Gate.ID != plan.IssuedGateID || rs.Gate.IssuedRevision != rs.Revision {
 			return false
 		}
 	} else if rs.Gate != nil {
 		return false
 	}
+	// The verify requirement is decision-controlled: exactly the frozen one (nil
+	// included), so a foreign FIX->VERIFY append with a different positive threshold
+	// can never read Applied.
+	if !reflect.DeepEqual(rs.Verify, dec.Verify) {
+		return false
+	}
+	// Gate route: the exact pause shape and paused lifecycle; every other route: a
+	// running lifecycle with no pause.
+	if dec.Gate != nil {
+		p := rs.Pause
+		if rs.Lifecycle != state.LifecyclePaused || p == nil {
+			return false
+		}
+		if p.Kind != dec.Gate.Kind || p.OriginPhase != dec.Gate.OriginPhase ||
+			p.ResumePhase != dec.Gate.ResumePhase || p.FixReturn != dec.Gate.FixReturn {
+			return false
+		}
+		if p.Source != (state.EventRef{Digest: plan.Digest, TurnID: plan.TurnID}) {
+			return false
+		}
+		if dec.Gate.Kind == state.PauseQualityBudget {
+			if p.Budget == nil || p.Budget.Kind != dec.Gate.Budget {
+				return false
+			}
+		} else if p.Budget != nil {
+			return false
+		}
+		if !reflect.DeepEqual(p.Verify, dec.Gate.Verify) {
+			return false
+		}
+	} else if rs.Lifecycle != state.LifecycleRunning || rs.Pause != nil {
+		return false
+	}
+	// Post-acceptance the top-level fix-return is always cleared (a gate moves it
+	// into the pause, every other route consumes it; IMPLEMENT never sets it).
+	if rs.FixReturn != "" {
+		return false
+	}
+	// The cursor and counters are frozen as UNCHANGED: an IMPLEMENT/FIX acceptance
+	// touches neither, so any drift is a foreign append.
+	if !equalStepIndex(rs.StepIndex, plan.ExpectedStepIndex) {
+		return false
+	}
+	if !reflect.DeepEqual(rs.Counters, plan.ExpectedCounters) {
+		return false
+	}
 	return true
+}
+
+func equalStepIndex(a, b *int) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || *a == *b
 }
 
 // PrepareGitSubmit runs the shared authorize -> prepare -> publish pipeline for an
@@ -156,6 +221,16 @@ func PrepareGitSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, s
 	if !ok {
 		return GitAcceptPlan{}, nil, fmt.Errorf("%w: the prepared transition carries no engine decision", ErrTransitionInvalid)
 	}
+	// Freeze the projections the acceptance must NOT change, deep-copied from the
+	// authorized pre-state so the frozen plan never aliases live state.
+	var expectedStepIndex *int
+	if auth.rs.StepIndex != nil {
+		v := *auth.rs.StepIndex
+		expectedStepIndex = &v
+	}
+	expectedCounters := auth.rs.Counters
+	expectedCounters.StepFixes = append([]int(nil), auth.rs.Counters.StepFixes...)
+
 	return GitAcceptPlan{
 		RunID:                 auth.rs.RunID,
 		ExpectedStateRevision: auth.rs.Revision,
@@ -166,6 +241,8 @@ func PrepareGitSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, s
 		IssuedTurnID:          pt.IssuedTurnID(),
 		IssuedGateID:          pt.IssuedGateID(),
 		CurrentPairGeneration: auth.curPairGen,
+		ExpectedStepIndex:     expectedStepIndex,
+		ExpectedCounters:      expectedCounters,
 	}, nil, nil
 }
 

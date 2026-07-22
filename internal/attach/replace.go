@@ -188,12 +188,23 @@ func replaceAttach(req ReplaceRequest, seams replaceSeams) (ReplaceResult, error
 	// 0. A pending git commit transaction blocks a session replacement outright: its
 	//    state-cas may still be owed, so the Registry/RunState this replacement would
 	//    mutate are mid-transaction. Only the coordinator's git driver completes it —
-	//    the replacement is recovery-required until the transaction is terminal.
+	//    the replacement is recovery-required until the transaction is terminal. And
+	//    ABSENCE is legal only before any accepted git evidence (the same rule the
+	//    coordinator's aggregate authority applies): a journal that vanished after an
+	//    accepted git tuple is corruption every mutator must refuse.
 	switch ctxn, cterr := ClassifyCommitTxnJournal(runGuard, loc); {
 	case cterr != nil:
 		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, cterr), releaseAll())
 	case ctxn == CommitTxnJournalNonTerminal:
 		return ReplaceResult{}, errors.Join(fmt.Errorf("%w: a git commit transaction is pending", ErrReplaceRecoveryRequired), releaseAll())
+	case ctxn == CommitTxnJournalAbsent:
+		if rs, ok, lerr := runState.Load(); lerr != nil {
+			return ReplaceResult{}, errors.Join(fmt.Errorf("%w: %v", ErrReplaceRecoveryRequired, lerr), releaseAll())
+		} else if ok {
+			if _, has := state.LatestGitCommit(rs); has {
+				return ReplaceResult{}, errors.Join(fmt.Errorf("%w: the commit-txn journal vanished after accepted git evidence", ErrReplaceRecoveryRequired), releaseAll())
+			}
+		}
 	}
 
 	// 1. Recover any pending replacement FIRST, before authorizing a new one. A pending

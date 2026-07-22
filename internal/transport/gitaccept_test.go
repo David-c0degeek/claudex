@@ -70,6 +70,22 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 			rs.AcceptedTurns["turn-1"] = acc
 		},
 		"receipt not the head revision": func(rs *state.RunState) { rs.Revision = 9 },
+		"issued assignment bound to another revision": func(rs *state.RunState) {
+			rs.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: 7}
+		},
+		"unissued verify requirement": func(rs *state.RunState) {
+			rs.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
+		},
+		"counter drift": func(rs *state.RunState) { rs.Counters.PlanRevisions = 1 },
+		"cursor drift": func(rs *state.RunState) {
+			idx := 1
+			rs.StepIndex = &idx
+		},
+		"paused without a gate route": func(rs *state.RunState) {
+			rs.Lifecycle = state.LifecyclePaused
+			rs.Pause = &state.PauseContext{Kind: state.PauseHumanDecision}
+		},
+		"fix-return retained": func(rs *state.RunState) { rs.FixReturn = state.PhaseCheckpoint },
 	}
 	for name, mutate := range foreign {
 		t.Run(name, func(t *testing.T) {
@@ -79,5 +95,30 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 				t.Fatalf("%s = %v, want Foreign", name, got)
 			}
 		})
+	}
+
+	// A FIX->VERIFY acceptance: the frozen verify requirement must match EXACTLY — a
+	// foreign append with a different positive threshold is Foreign.
+	verifyPlan := plan
+	verifyPlan.Phase = state.PhaseFix
+	verifyPlan.IssuedTurnID = ""
+	verifyPlan.Decision = engine.Decision{Next: state.PhaseVerify, Verify: &state.VerifyRequirement{RequiredGeneration: 2}}
+	verifyApplied := func() state.RunState {
+		rs := applied()
+		rs.Assignment = nil
+		rs.Phase = state.PhaseVerify
+		rs.Verify = &state.VerifyRequirement{RequiredGeneration: 2}
+		acc := rs.AcceptedTurns["turn-1"]
+		acc.Phase = state.PhaseFix
+		rs.AcceptedTurns["turn-1"] = acc
+		return rs
+	}
+	if got := ObserveGitAccept(verifyApplied(), verifyPlan); got != GitAcceptApplied {
+		t.Fatalf("exact FIX->VERIFY acceptance = %v, want Applied", got)
+	}
+	drifted := verifyApplied()
+	drifted.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
+	if got := ObserveGitAccept(drifted, verifyPlan); got != GitAcceptForeign {
+		t.Fatalf("drifted verify threshold = %v, want Foreign", got)
 	}
 }

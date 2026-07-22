@@ -210,28 +210,29 @@ func (g *Git) realIndexPath(ctx context.Context, worktree string) (string, error
 	return filepath.Join(admin, "index"), nil
 }
 
-// ConfirmPreState re-proves the frozen pre-transaction identity immediately before the
-// journal PREPARE: the worktree HEAD is still at the frozen parent, the worktree
-// content is still exactly the frozen tree, and the real checked-out index still has
-// the frozen pre-digest I0. Any drift — a foreign staged change, a post-snapshot edit,
-// a moved branch — fails closed BEFORE any journal record or effect exists, so a later
-// index can never be adopted as the transaction's expected old identity.
-func (g *Git) ConfirmPreState(ctx context.Context, worktree, parent, tree, preDigest string) error {
-	head, err := g.revParse(ctx, worktree, "--verify", "HEAD")
-	if err != nil {
+// ConfirmPreState re-proves the FULL frozen pre-transaction identity immediately
+// before the journal PREPARE: the run worktree is still the registered linked worktree
+// of this repository with SYMBOLIC HEAD on the frozen run branch at the frozen parent
+// (the same validateRunWorktree proof the snapshot ran — OID equality alone would not
+// catch a detach or a same-OID branch switch in the snapshot..prepare window), the
+// worktree content is still exactly the frozen tree, the real checked-out index still
+// has the frozen pre-digest I0, and the txn-private target still holds exactly the
+// frozen target bytes. Any drift fails closed BEFORE any journal record or effect
+// exists, so a later identity can never be adopted as the transaction's frozen one.
+func (g *Git) ConfirmPreState(ctx context.Context, req SnapshotReq, tree, preDigest, private, targetDigest string) error {
+	wt := runWorktreeAbs(req.RepoDir, req.RunID)
+	branch := runBranch(req.RunID)
+	if err := g.validateRunWorktree(ctx, req, wt, branch); err != nil {
 		return err
 	}
-	if head != parent {
-		return fmt.Errorf("%w: HEAD moved off the frozen parent before prepare", ErrIndexCAS)
-	}
-	wtTree, err := g.snapshotTree(ctx, worktree, parent)
+	wtTree, err := g.snapshotTree(ctx, wt, req.Parent)
 	if err != nil {
 		return err
 	}
 	if wtTree != tree {
 		return fmt.Errorf("%w: the worktree changed after the snapshot", ErrIndexCAS)
 	}
-	indexPath, err := g.realIndexPath(ctx, worktree)
+	indexPath, err := g.realIndexPath(ctx, wt)
 	if err != nil {
 		return err
 	}
@@ -241,6 +242,11 @@ func (g *Git) ConfirmPreState(ctx context.Context, worktree, parent, tree, preDi
 	}
 	if live != preDigest {
 		return fmt.Errorf("%w: the real index diverged from the frozen pre-identity before prepare", ErrIndexCAS)
+	}
+	if d, err := fileDigest(private); err != nil {
+		return fmt.Errorf("%w: txn-private target: %v", ErrIndexCAS, err)
+	} else if d != targetDigest {
+		return fmt.Errorf("%w: the txn-private target changed before prepare", ErrIndexCAS)
 	}
 	return nil
 }
