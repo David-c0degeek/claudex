@@ -57,6 +57,8 @@ type RunLocation struct {
 	ReplaceDir   string // the dedicated session-replacement transaction journal directory
 	CommitTxnDir string // the dedicated implementation-submit git-commit transaction journal directory
 	ArtifactsDir string // the content-addressed submit-artifact store directory
+	SessionDir   string // the role-addressed session inbox store dir (.claudex/session; SessionStore roots here)
+	MailboxDir   string // the dir holding the rebuildable .claudex/mailbox.md transcript mirror (MailboxStore roots here)
 }
 
 // ResolveRun binds runID to the repository's single active bootstrap allocation and
@@ -89,6 +91,7 @@ func ResolveRun(repoDir, runID string) (RunLocation, error) {
 func runLocationFor(lay layout, runID string) RunLocation {
 	rel := state.RunDirRelFor(runID)
 	runDir := lay.runDir(rel)
+	base := filepath.Join(lay.repoDir, runtimeDirName)
 	return RunLocation{
 		RunID:        runID,
 		RelDir:       rel,
@@ -100,7 +103,34 @@ func runLocationFor(lay layout, runID string) RunLocation {
 		ReplaceDir:   lay.replaceJournalDir(runDir),
 		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
+		// The session inbox and the human-readable mailbox mirror are repo-level per D018
+		// (`.claudex/mailbox.md`), attach-derived so no consumer re-joins the private layout.
+		SessionDir: filepath.Join(base, "session"),
+		MailboxDir: base,
 	}
+}
+
+// ActiveRunID discovers the repository's single active run id from the active-run pointer, for
+// convenience so a CLI need not always pass --run. It is DISCOVERY ONLY: the loaded id is
+// validated through ResolveRun's active-pointer -> catalog -> bootstrap-journal binding (never
+// trusted as raw pointer authority), and the legacy-refusal guard runs first. (false, nil) means
+// no active run; any binding failure is an error, never a silent id.
+func ActiveRunID(repoDir string) (string, bool, error) {
+	if err := legacyRepoRefusal(repoDir); err != nil {
+		return "", false, err
+	}
+	lay := layoutFor(repoDir)
+	cur, ok, err := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if err != nil {
+		return "", false, err
+	}
+	if !ok {
+		return "", false, nil
+	}
+	if _, err := ResolveRun(repoDir, cur.RunID); err != nil {
+		return "", false, err
+	}
+	return cur.RunID, true, nil
 }
 
 // JournalClass is the classification of a run's pair-attach journal head.

@@ -33,8 +33,6 @@ func main() {
 // only to the provided streams. Exit codes: 0 success, 1 operational error
 // (e.g. a failed write to stdout), 2 usage error.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	_ = ctx // reserved for the wait/test-gate commands in later milestones
-
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -60,6 +58,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "attach":
+		return attachCmd(ctx, rest, stdout, stderr)
 	case "inspect-legacy":
 		return inspectLegacy(rest, stdout, stderr)
 	default:
@@ -124,7 +124,8 @@ Usage:
 Commands:
   version          Print version information
   help             Show this help
+  attach           Bootstrap or join a run, or reattach/replace a session
   inspect-legacy   Print a redacted, read-only view of a pre-pivot Python run
                    (state.json); it is never resumed as an attach run
 
-The attach protocol (attach/pull/submit/wait/status) arrives in a later milestone.`
+pull/submit/wait/status are wired incrementally; gates/operator arrive with subject 05.`

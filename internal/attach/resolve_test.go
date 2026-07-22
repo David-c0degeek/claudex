@@ -32,6 +32,8 @@ func TestResolveRunBindsActiveRun(t *testing.T) {
 		ReplaceDir:   lay.replaceJournalDir(runDir),
 		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
+		SessionDir:   filepath.Join(repo, ".claudex", "session"),
+		MailboxDir:   filepath.Join(repo, ".claudex"),
 	}
 	if loc != want {
 		t.Fatalf("location =\n %+v\nwant\n %+v", loc, want)
