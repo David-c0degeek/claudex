@@ -65,36 +65,56 @@ const indexLeaf = "index"
 func TargetIndexName(txnID string) string { return "index.claudex-target-" + txnID }
 
 // adminRoot anchors every index-CAS operation inside the repository's own git metadata: an
-// os.Root at <RepoDir>/.git, a symlink-refusing verified walk of the admin-relative components,
-// and a SUB-ROOT handle opened at the admin directory itself. Every subsequent operation is a
-// single LEAF name on that pinned handle, so an intermediate path component later swapped for a
-// symlink/reparse point cannot redirect the CAS anywhere — the handle still names the original
-// directory object.
+// os.Root at <RepoDir> (the trust anchor), a real-directory .git opened from it, a
+// symlink-refusing verified walk of the admin-relative components, and a SUB-ROOT handle
+// opened at the admin directory itself whose identity is bound back to the verified directory
+// object. Every subsequent operation is a single LEAF name on that pinned handle, so an
+// intermediate path component later swapped for a symlink/reparse point cannot redirect the CAS
+// anywhere — the handle still names the original directory object.
 type adminRoot struct {
 	git *os.Root // <RepoDir>/.git — held open so the verified chain stays pinned
 	fs  *os.Root // the admin directory; every operation is a bare leaf name on this handle
-	abs string   // the verified absolute admin path (for GIT_INDEX_FILE and dir-entry barriers)
+	abs string   // the logical in-repo admin path (for GIT_INDEX_FILE only; barriers stay rooted)
 }
 
 // openAdminRoot resolves the worktree's admin directory, requires it to sit beneath the
-// repository's .git with every intermediate component a real (non-symlink) in-root directory,
-// and returns the pinned root pair. Any escape or redirect fails closed with the typed sentinel.
+// repository's own .git with every intermediate component a real (non-symlink) in-root
+// directory, opens a pinned sub-root at it, and binds that sub-root's identity back to the
+// verified directory object (closing the check/open race: an in-root swap between the walk and
+// the open selects a different object, which the same-file bind then rejects). Any escape or
+// redirect fails closed with the typed sentinel.
 func (g *Git) openAdminRoot(ctx context.Context, repoDir, worktree string) (*adminRoot, error) {
 	if repoDir == "" {
 		return nil, fmt.Errorf("%w: the repository root is required", ErrIndexCAS)
 	}
+	// Anchor .git from an opened repository root, so .git itself being a symlink is refused
+	// rather than silently followed.
+	repoRoot, err := os.OpenRoot(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	if gfi, gerr := repoRoot.Lstat(".git"); gerr != nil {
+		return nil, errors.Join(gerr, repoRoot.Close())
+	} else if gfi.Mode()&os.ModeSymlink != 0 || !gfi.IsDir() {
+		return nil, errors.Join(fmt.Errorf("%w: %s/.git is not a real directory", ErrIndexCAS, repoDir), repoRoot.Close())
+	}
+	gitRoot, err := repoRoot.OpenRoot(".git")
+	closeRepo := repoRoot.Close()
+	if err != nil {
+		return nil, errors.Join(err, closeRepo)
+	}
+	if closeRepo != nil {
+		return nil, errors.Join(closeRepo, gitRoot.Close())
+	}
+
 	common := filepath.Join(repoDir, ".git")
 	admin, err := g.revParse(ctx, worktree, "--absolute-git-dir")
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, gitRoot.Close())
 	}
 	rel, err := filepath.Rel(common, admin)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return nil, fmt.Errorf("%w: the worktree admin dir %q escapes the repository git dir", ErrIndexCAS, admin)
-	}
-	gitRoot, err := os.OpenRoot(common)
-	if err != nil {
-		return nil, err
+		return nil, errors.Join(fmt.Errorf("%w: the worktree admin dir %q escapes the repository git dir", ErrIndexCAS, admin), gitRoot.Close())
 	}
 	if rel != "." {
 		// Prove every intermediate component is a real in-root directory, never a
@@ -112,9 +132,20 @@ func (g *Git) openAdminRoot(ctx context.Context, repoDir, worktree string) (*adm
 			}
 		}
 	}
+	verifiedFI, err := gitRoot.Lstat(rel)
+	if err != nil {
+		return nil, errors.Join(err, gitRoot.Close())
+	}
 	adminFS, err := gitRoot.OpenRoot(rel)
 	if err != nil {
 		return nil, errors.Join(err, gitRoot.Close())
+	}
+	openedFI, err := adminFS.Stat(".")
+	if err != nil {
+		return nil, errors.Join(err, adminFS.Close(), gitRoot.Close())
+	}
+	if !os.SameFile(verifiedFI, openedFI) {
+		return nil, errors.Join(fmt.Errorf("%w: the admin directory changed identity during resolution", ErrIndexCAS), adminFS.Close(), gitRoot.Close())
 	}
 	return &adminRoot{git: gitRoot, fs: adminFS, abs: filepath.Join(common, rel)}, nil
 }
@@ -222,23 +253,19 @@ func (a *adminRoot) releaseOwnedLock(private, lock string, cause error) error {
 	return cause
 }
 
-// syncLeaf forces a leaf's content durable through a handle opened from the PINNED admin root
-// (a writable-handle FlushFileBuffers on Windows, an fsync on POSIX) — never a fresh path
-// traversal. A missing leaf is a no-op.
+// syncLeaf forces a leaf's CONTENT and its directory ENTRY durable entirely through the pinned
+// admin root (atomicfile's rooted machinery: a writable-handle FlushFileBuffers on Windows, an
+// fsync on POSIX, plus the real rooted parent-entry barrier) — never a fresh absolute-path
+// traversal that a later intermediate-component swap could redirect. A MISSING leaf is an error
+// (the index and the private proof must exist through terminality), surfaced as ErrIndexCAS.
 func (a *adminRoot) syncLeaf(leaf string) error {
-	f, err := a.fs.OpenFile(leaf, os.O_RDWR, 0)
-	if err != nil {
+	if err := atomicfile.SyncInRoot(a.fs, leaf); err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return fmt.Errorf("%w: %s is missing", ErrIndexCAS, leaf)
 		}
 		return err
 	}
-	serr := f.Sync()
-	cerr := f.Close()
-	if serr != nil {
-		return serr
-	}
-	return cerr
+	return nil
 }
 
 // probeHardLink proves hard-link support next to the private leaf inside the pinned root.
@@ -269,10 +296,8 @@ func (g *Git) BuildTargetIndex(ctx context.Context, repoDir, worktree, commit, p
 	if err := ar.probeHardLink(privateName); err != nil {
 		return "", fmt.Errorf("%w: hard links unavailable on the index filesystem: %v", ErrIndexCAS, err)
 	}
+	// Content + entry durability, entirely through the pinned root.
 	if err := ar.syncLeaf(privateName); err != nil {
-		return "", err
-	}
-	if err := atomicfile.ParentBarrier(filepath.Join(ar.abs, privateName)); err != nil {
 		return "", err
 	}
 	return ar.digest(privateName)
@@ -390,31 +415,81 @@ func (g *Git) ApplyIndex(ctx context.Context, t IndexTarget) error {
 	return nil
 }
 
-// ConfirmIndex re-proves the applied identity and forces the real index and its directory
-// entry durable — content barriers through handles from the pinned admin root, the dir-entry
-// barrier on the verified admin path.
+// confirmRaceHook is a test-only seam fired inside ConfirmIndex AFTER the standard index.lock
+// is acquired and BEFORE the exact-target re-proof, so a test can inject an index replacement
+// or a private deletion in that window and prove the locked proof still fails closed. Nil in
+// production.
+var confirmRaceHook func() error
+
+// ConfirmIndex is the transaction's durable index proof, executed as ONE lock-protected rooted
+// operation: it acquires the standard index.lock (by the same hard-link/same-file ownership as
+// the CAS) so no concurrent git writer can replace the index underneath it, then — holding the
+// lock — re-proves the EXACT frozen target (HEAD==commit, worktree==tree, clean, the real index
+// digest == the frozen target, the txn-private proof present with the frozen digest) and forces
+// the index content+entry and the private proof durable through the pinned admin root. A missing
+// private, a replaced index, or a foreign lock all fail closed, so the journal never records the
+// index step over an unconfirmed or foreign index. Idempotent and re-runnable on recovery.
 func (g *Git) ConfirmIndex(ctx context.Context, t IndexTarget) error {
-	st, err := g.ObserveIndex(ctx, t)
-	if err != nil {
-		return err
-	}
-	if st != IndexAtTarget {
-		return fmt.Errorf("%w: index is %s, not durably synced", ErrIndexCAS, st)
-	}
 	ar, err := g.openAdminRoot(ctx, t.RepoDir, t.Worktree)
 	if err != nil {
 		return err
 	}
 	defer ar.Close()
-	if err := ar.syncLeaf(indexLeaf); err != nil {
-		return fmt.Errorf("gitx: confirm index content: %w", err)
+	lockLeaf := indexLeaf + ".lock"
+
+	// Acquire the standard index lock as exclusion: while held, a well-behaved git writer
+	// cannot take the index lock to rewrite the index, and a foreign lock fails us closed.
+	owned, err := ar.acquireOwnedLock(t.Private, lockLeaf)
+	if err != nil {
+		return err
 	}
-	if err := atomicfile.ParentBarrier(filepath.Join(ar.abs, indexLeaf)); err != nil { // the admin dir entry
-		return fmt.Errorf("gitx: confirm index entry: %w", err)
+	if !owned {
+		return fmt.Errorf("%w: index.lock is held by a foreign process", ErrIndexCAS)
 	}
-	// Keep the txn-private proof durable through terminality.
-	if err := ar.syncLeaf(t.Private); err != nil {
-		return fmt.Errorf("gitx: confirm target proof: %w", err)
+	// Remove the exclusion lock on every exit (it is a hard link to the private target, never
+	// the published index, so removing it never disturbs the applied index).
+	defer func() { _ = ar.releaseOwnedLock(t.Private, lockLeaf, nil) }()
+
+	if confirmRaceHook != nil {
+		if herr := confirmRaceHook(); herr != nil {
+			return herr
+		}
+	}
+	// Exact-target re-proof UNDER the lock. The rooted BYTE identities come first — they are
+	// deterministic and typed, so a foreign index replacement or a deleted private fails closed
+	// with ErrIndexCAS before a git subprocess would choke on the foreign index.
+	if d, derr := ar.digest(indexLeaf); derr != nil {
+		return fmt.Errorf("%w: index: %v", ErrIndexCAS, derr)
+	} else if d != t.TargetDigest {
+		return fmt.Errorf("%w: the real index is not the frozen target", ErrIndexCAS)
+	}
+	if d, derr := ar.digest(t.Private); derr != nil {
+		return fmt.Errorf("%w: txn-private target: %v", ErrIndexCAS, derr)
+	} else if d != t.TargetDigest {
+		return fmt.Errorf("%w: the txn-private target changed", ErrIndexCAS)
+	}
+	// Then the git identity of the worktree the applied index belongs to.
+	if head, herr := g.revParse(ctx, t.Worktree, "--verify", "HEAD"); herr != nil {
+		return herr
+	} else if head != t.Commit {
+		return fmt.Errorf("%w: HEAD is not the frozen commit", ErrIndexCAS)
+	}
+	if wtTree, terr := g.snapshotTree(ctx, t.Worktree, t.Commit); terr != nil {
+		return terr
+	} else if wtTree != t.Tree {
+		return fmt.Errorf("%w: worktree changed after the snapshot", ErrIndexCAS)
+	}
+	if clean, cerr := g.worktreeClean(ctx, t.Worktree); cerr != nil {
+		return cerr
+	} else if !clean {
+		return fmt.Errorf("%w: worktree is not clean at the applied index", ErrIndexCAS)
+	}
+	// Durability, all through the pinned root; a missing leaf is an error.
+	if serr := ar.syncLeaf(indexLeaf); serr != nil {
+		return fmt.Errorf("gitx: confirm index: %w", serr)
+	}
+	if serr := ar.syncLeaf(t.Private); serr != nil {
+		return fmt.Errorf("gitx: confirm target proof: %w", serr)
 	}
 	return nil
 }

@@ -253,3 +253,55 @@ func TestIndexCASConfirmRejectsUnsynced(t *testing.T) {
 		t.Fatalf("confirm before sync = %v, want ErrIndexCAS", err)
 	}
 }
+
+// Confirm is one lock-protected proof: a foreign index replacement or a private-target
+// deletion injected AFTER Confirm takes the index lock and BEFORE its exact re-proof still
+// fails closed (never certifying foreign or missing bytes durable), so the journal never
+// records the index step over an unconfirmed index.
+func TestIndexCASConfirmRaceFailsClosed(t *testing.T) {
+	t.Cleanup(func() { confirmRaceHook = nil })
+	for _, tc := range []struct {
+		name    string
+		inject  func(t *testing.T, g *Git, wt string, target IndexTarget) error
+		checkWT func(t *testing.T, g *Git, wt string, target IndexTarget)
+	}{
+		{
+			name: "index replaced under the lock",
+			inject: func(t *testing.T, g *Git, wt string, target IndexTarget) error {
+				return os.WriteFile(adminIndex(t, g, wt), []byte("foreign index bytes"), 0o600)
+			},
+			checkWT: func(t *testing.T, g *Git, wt string, target IndexTarget) {
+				if b, _ := os.ReadFile(adminIndex(t, g, wt)); string(b) != "foreign index bytes" {
+					t.Fatal("the foreign index replacement was disturbed")
+				}
+			},
+		},
+		{
+			name: "private deleted under the lock",
+			inject: func(t *testing.T, g *Git, wt string, target IndexTarget) error {
+				return os.Remove(filepath.Join(adminDir(t, g, wt), target.Private))
+			},
+			checkWT: func(t *testing.T, g *Git, wt string, target IndexTarget) {},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, g, wt, target := indexcasSetup(t)
+			if err := g.ApplyIndex(context.Background(), target); err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			fired := false
+			confirmRaceHook = func() error {
+				if fired {
+					return nil
+				}
+				fired = true
+				return tc.inject(t, g, wt, target)
+			}
+			defer func() { confirmRaceHook = nil }()
+			if err := g.ConfirmIndex(context.Background(), target); !errors.Is(err, ErrIndexCAS) {
+				t.Fatalf("confirm with an injected race = %v, want ErrIndexCAS", err)
+			}
+			tc.checkWT(t, g, wt, target)
+		})
+	}
+}
