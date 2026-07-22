@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +85,14 @@ func (g *Git) ObserveIndex(ctx context.Context, t IndexTarget) (IndexState, erro
 	indexPath, err := g.realIndexPath(ctx, t.Worktree)
 	if err != nil {
 		return IndexForeign, err
+	}
+	// The txn-private target must still be the frozen REGULAR object (fileDigest is
+	// symlink-refusing): a vanished, redirected, or byte-drifted private is foreign
+	// interference — Indeterminate, never an ownership anchor to install or adopt.
+	if d, derr := fileDigest(t.Private); derr != nil {
+		return IndexForeign, derr
+	} else if d != t.TargetDigest {
+		return IndexForeign, nil
 	}
 	if head, err := g.revParse(ctx, t.Worktree, "--verify", "HEAD"); err != nil {
 		return IndexForeign, err
@@ -284,17 +293,40 @@ func (g *Git) worktreeClean(ctx context.Context, worktree string) (bool, error) 
 // acquireOwnedLock hard-links private onto lockPath. On success the two names are the same file. On
 // EEXIST it adopts a leftover lock ONLY if same-file identity proves it is our private target;
 // matching bytes without same-file identity are foreign (owned=false, the lock is untouched).
+// Every owned outcome is re-proven as a REGULAR object (proveOwnedLock), so a private name
+// swapped for a symlink under the link race can win the name but never ownership.
 func acquireOwnedLock(private, lockPath string) (owned bool, err error) {
 	if err := os.Link(private, lockPath); err == nil {
-		return true, nil
+		return proveOwnedLock(private, lockPath)
 	} else if !os.IsExist(err) {
 		return false, err
 	}
 	same, err := sameFile(lockPath, private)
+	if err != nil || !same {
+		return false, err
+	}
+	return proveOwnedLock(private, lockPath)
+}
+
+// proveOwnedLock requires BOTH the lock name and the private target to be REGULAR files
+// that are the same filesystem object — ownership binds to that regular object, never to
+// a symlink that redirects reads elsewhere.
+func proveOwnedLock(private, lockPath string) (bool, error) {
+	lfi, err := os.Lstat(lockPath)
 	if err != nil {
 		return false, err
 	}
-	return same, nil
+	if !lfi.Mode().IsRegular() {
+		return false, fmt.Errorf("%w: index.lock is not a regular file", ErrIndexCAS)
+	}
+	pfi, err := os.Lstat(private)
+	if err != nil {
+		return false, err
+	}
+	if !pfi.Mode().IsRegular() {
+		return false, fmt.Errorf("%w: the txn-private target is not a regular file", ErrIndexCAS)
+	}
+	return os.SameFile(lfi, pfi), nil
 }
 
 // releaseOwnedLock removes the same-file-proven owned lock (never a foreign one) and returns cause.
@@ -334,11 +366,34 @@ func probeHardLink(near string) error {
 	return os.Remove(tmp)
 }
 
+// fileDigest hashes the regular file at path with a symlink-refusing, race-free
+// identity proof: the name must Lstat as a REGULAR file, and the opened handle must be
+// that same object (os.SameFile over Lstat/fstat), so a name swapped for a symlink —
+// even one pointing at byte-identical contents — fails closed rather than hashing
+// through the link. Index-CAS identity and ownership bind to regular objects only.
 func fileDigest(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	fi, err := os.Lstat(path)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:]), nil
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s is not a regular file", ErrIndexCAS, filepath.Base(path))
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	hfi, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(fi, hfi) {
+		return "", fmt.Errorf("%w: %s changed identity during the read", ErrIndexCAS, filepath.Base(path))
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

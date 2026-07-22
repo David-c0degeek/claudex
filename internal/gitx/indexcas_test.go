@@ -63,6 +63,50 @@ func TestIndexCASHappyPath(t *testing.T) {
 	}
 }
 
+// A txn-private name swapped for a SYMLINK to byte-identical target contents is never an
+// ownership anchor: Observe classifies it foreign (never NotApplied/Applied), Apply refuses,
+// and the real index is untouched — identity binds to the regular object, not to bytes.
+func TestIndexCASPrivateSymlinkRefused(t *testing.T) {
+	_, g, wt, target := indexcasSetup(t)
+	// Copy the exact frozen bytes elsewhere, then replace the private NAME with a symlink.
+	copyPath := target.Private + ".copy"
+	b, err := os.ReadFile(target.Private)
+	if err != nil {
+		t.Fatalf("read private: %v", err)
+	}
+	if err := os.WriteFile(copyPath, b, 0o600); err != nil {
+		t.Fatalf("write copy: %v", err)
+	}
+	if err := os.Remove(target.Private); err != nil {
+		t.Fatalf("remove private: %v", err)
+	}
+	if err := os.Symlink(copyPath, target.Private); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+
+	liveBefore, err := os.ReadFile(adminIndex(t, g, wt))
+	if err != nil {
+		t.Fatalf("read live index: %v", err)
+	}
+	st, oerr := g.ObserveIndex(context.Background(), target)
+	if st != IndexForeign || !errors.Is(oerr, ErrIndexCAS) {
+		t.Fatalf("Observe over a symlinked private = %v (err %v), want foreign + ErrIndexCAS", st, oerr)
+	}
+	if aerr := g.ApplyIndex(context.Background(), target); !errors.Is(aerr, ErrIndexCAS) {
+		t.Fatalf("Apply over a symlinked private err = %v, want ErrIndexCAS", aerr)
+	}
+	liveAfter, err := os.ReadFile(adminIndex(t, g, wt))
+	if err != nil {
+		t.Fatalf("re-read live index: %v", err)
+	}
+	if string(liveBefore) != string(liveAfter) {
+		t.Fatal("a symlinked private still mutated the real index")
+	}
+	if fi, err := os.Lstat(target.Private); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the foreign symlink was not preserved (mode %v, err %v)", fi.Mode(), err)
+	}
+}
+
 func TestIndexCASIdempotent(t *testing.T) {
 	_, g, _, target := indexcasSetup(t)
 	if err := g.ApplyIndex(context.Background(), target); err != nil {

@@ -401,6 +401,57 @@ func TestGitTxnPrivateTargetTamperPrePrepareFailsClosed(t *testing.T) {
 	}
 }
 
+// A txn-private name swapped for a symlink to byte-identical target contents in the
+// snapshot..PREPARE window must fail the submit closed with no journal/effect: the
+// pre-PREPARE proof binds to the regular object, never to bytes reached through a link.
+func TestGitTxnPrivateSymlinkPrePrepareFailsClosed(t *testing.T) {
+	r := newGitTxnRig(t)
+	base := r.branchOID(t)
+	skipped := false
+	hooks := &submitHooks{beforeGitJournal: func() error {
+		matches, gerr := filepath.Glob(filepath.Join(r.repo, ".git", "worktrees", "*", "index.claudex-target-*"))
+		if gerr != nil || len(matches) != 1 {
+			t.Fatalf("locate private target: %v (%d matches)", gerr, len(matches))
+		}
+		private := matches[0]
+		b, rerr := os.ReadFile(private)
+		if rerr != nil {
+			t.Fatalf("read private: %v", rerr)
+		}
+		copyPath := private + ".copy"
+		if werr := os.WriteFile(copyPath, b, 0o600); werr != nil {
+			t.Fatalf("write copy: %v", werr)
+		}
+		if rerr := os.Remove(private); rerr != nil {
+			t.Fatalf("remove private: %v", rerr)
+		}
+		if serr := os.Symlink(copyPath, private); serr != nil {
+			skipped = true
+			// Restore so the submit proceeds; the host cannot express the attack.
+			if werr := os.WriteFile(private, b, 0o600); werr != nil {
+				t.Fatalf("restore private: %v", werr)
+			}
+		}
+		return nil
+	}}
+	_, err := r.rn.Submit(withHooks(context.Background(), hooks), r.lead, r.implRaw)
+	if skipped {
+		t.Skip("symlinks unavailable on this host")
+	}
+	if !errors.Is(err, gitx.ErrIndexCAS) {
+		t.Fatalf("symlinked-private submit err = %v, want gitx.ErrIndexCAS", err)
+	}
+	if _, _, ok := r.journalRecord(t); ok {
+		t.Fatal("a symlinked private still wrote a journal record")
+	}
+	if got := r.branchOID(t); got != base {
+		t.Fatalf("a symlinked private still moved the ref to %s", got)
+	}
+	if rs := cur(t, r.rn); rs.Revision != r.preRevision {
+		t.Fatalf("a symlinked private still advanced the state to %d", rs.Revision)
+	}
+}
+
 // A failed durable re-confirmation of the frozen evidence artifact halts recovery
 // BEFORE any effect: pin B requires re-read AND re-confirm, so a visible-but-unproven
 // artifact is never trusted. Healing the barrier lets the same transaction recover.
