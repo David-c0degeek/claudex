@@ -23,19 +23,64 @@ is `AGREE` + zero blocking/major, evaluated by the coordinator.
 - **Risks** — ensuring only the turn-owning role advances a phase; deriving faithful transitions from vectors without a Python crutch.
 
 ## Boxes
-- [ ] **03.1** (agent) Run/session bootstrap as a two-step attach sequence (a single call cannot register two terminals): the **first** `attach` enforces the filesystem classification (01.8 — refuse/label `known-unsupported`, apply `unknown` policy) **and calls `legacy.CheckRunDir` before any mutation, failing closed on any existing `<dir>/state.json` — a pre-pivot Python run (`*LegacyRunError` + `Remediation`) or any unrecognized/unknown-schema file (`*UnknownStateError`) — since attach state never lives at `<dir>/state.json` (01.7 refusal seam)**, then atomically creates the run (snapshots task + base, allocates the worktree, chooses the lead), **reserves both agent/role slots**, registers the caller, and returns `run_id` + `session_id` + the exact pair-join command. The **second** `attach` fills the reserved pair slot. PLAN_DRAFT is issued only once both slots are registered. Uses the 01.4 repo-level allocation lock. Test: a `known-unsupported` state dir is refused at bootstrap; first attach reserves both slots + returns join command; second attach fills the pair; PLAN_DRAFT not issued until both present.
-- [ ] **03.2** (agent) `attach --agent claude|codex --role lead|pair` binding + reattach + replacement: bind a terminal to a role in durable state; reject a mid-run role switch. **Reattach must present its existing `session_id`** — an idempotent reattach returns the same session; an attach that supplies no prior identity for an already-filled slot is a conflict and must use explicit **same-role replacement with an expected generation**, minting a new session generation so a crashed/abandoned TUI can be superseded (no leases, but replacement is possible). Auth is out of scope (same-user FS) — state so. Test: reattach with session_id idempotent; identity-less attach on a filled slot conflicts; replacement with expected generation supersedes.
-- [ ] **03.3** (agent) In-transition assignment issuance: the state transition that accepts a submit durably issues the next role's immutable `turn_id`/assignment **before releasing the mutation lock**; the non-owning role's `pull` reads a `waiting` projection and never mutates. Test: after a submit, exactly one role has an actionable assignment and no identity is minted on pull.
-- [ ] **03.4** (agent) Create the authoritative submit-driven **phase transition table + evaluator** in `internal/engine`, written fresh and driven by the harvested phase-order/convergence vectors (D014) — not ported from `phases.py:Orchestrator` (reference-only). Each phase's accepted artifact advances per this table; wrong-phase or wrong-role submit rejected. Test: full PLAN→…→DONE dry run over fake artifacts driven by the new table + the harvested transition vectors.
-- [ ] **03.5** (agent) Convergence evaluation: `AGREE` + zero blocking/major closes a review phase; any blocking/major routes to the lead's fix phase. Reuse `schemas.py` finding categories. Test: mixed findings route correctly.
-- [ ] **03.6** (agent) Lead-response budgets as phase counters: plan revisions, checkpoint fixes/step, test fixes, verify fixes — counters only increase; the threshold transition routes an exhausted budget to a human gate (subject 05 owns cap *policy/UX*; this subject owns the counter + transition). Exhaustion reports a quality-budget stop, not a false disagreement. Test: exhaustion produces the correct stop transition.
-- [ ] **03.7** (agent) Phase edit policy: codify that the lead may mutate the repo **only** during IMPLEMENT/FIX; lead planning turns and **all** pair turns are repo-read-only. BYO attach checks this at `submit` (reject a repo mutation submitted from a read-only phase); managed launch also applies provider read-only flags (subject 07). Test: a mutation from a read-only phase is rejected.
-- [ ] **03.8** (agent) VERIFY blocks for a fresh session generation (D010, single locked behavior — no downgrade branch): the incumbent pair generation is invalid for VERIFY; the phase **blocks until a new same-role session generation attaches**. BYO reports `fresh-session-declared` (the session *generation* is enforced; model-context freshness is not). Managed reports `fresh-process` only when it actually launches a new process. Changing this to allow a downgrade requires a later explicit decision/gate. Test: VERIFY does not proceed on the incumbent generation; a new generation unblocks it; labels match the tier.
+- [x] **03.1** (agent) Run/session bootstrap as a two-step attach sequence (a single call cannot register two terminals): the **first** `attach` enforces the filesystem classification (01.8 — refuse/label `known-unsupported`, apply `unknown` policy) **and calls `legacy.CheckRunDir` before any mutation, failing closed on any existing `<dir>/state.json` — a pre-pivot Python run (`*LegacyRunError` + `Remediation`) or any unrecognized/unknown-schema file (`*UnknownStateError`) — since attach state never lives at `<dir>/state.json` (01.7 refusal seam)**, then atomically creates the run (snapshots task + base, allocates the worktree, chooses the lead), **reserves both agent/role slots**, registers the caller, and returns `run_id` + `session_id` + the exact pair-join command. The **second** `attach` fills the reserved pair slot. PLAN_DRAFT is issued only once both slots are registered. Uses the 01.4 repo-level allocation lock. Test: a `known-unsupported` state dir is refused at bootstrap; first attach reserves both slots + returns join command; second attach fills the pair; PLAN_DRAFT not issued until both present.
+- [x] **03.2** (agent) `attach --agent claude|codex --role lead|pair` binding + reattach + replacement: bind a terminal to a role in durable state; reject a mid-run role switch. **Reattach must present its existing `session_id`** — an idempotent reattach returns the same session; an attach that supplies no prior identity for an already-filled slot is a conflict and must use explicit **same-role replacement with an expected generation**, minting a new session generation so a crashed/abandoned TUI can be superseded (no leases, but replacement is possible). Auth is out of scope (same-user FS) — state so. Test: reattach with session_id idempotent; identity-less attach on a filled slot conflicts; replacement with expected generation supersedes.
+- [x] **03.3** (agent) In-transition assignment issuance: the state transition that accepts a submit durably issues the next role's immutable `turn_id`/assignment **before releasing the mutation lock**; the non-owning role's `pull` reads a `waiting` projection and never mutates. Test: after a submit, exactly one role has an actionable assignment and no identity is minted on pull.
+- [x] **03.4** (agent) Create the authoritative submit-driven **phase transition table + evaluator** in `internal/engine`, written fresh and driven by the harvested phase-order/convergence vectors (D014) — not ported from `phases.py:Orchestrator` (reference-only). Each phase's accepted artifact advances per this table; wrong-phase or wrong-role submit rejected. Test: full PLAN→…→DONE dry run over fake artifacts driven by the new table + the harvested transition vectors.
+- [x] **03.5** (agent) Convergence evaluation: `AGREE` + zero blocking/major closes a review phase; any blocking/major routes to the lead's fix phase. Reuse `schemas.py` finding categories. Test: mixed findings route correctly.
+- [x] **03.6** (agent) Lead-response budgets as phase counters: plan revisions, checkpoint fixes/step, test fixes, verify fixes — counters only increase; the threshold transition routes an exhausted budget to a human gate (subject 05 owns cap *policy/UX*; this subject owns the counter + transition). Exhaustion reports a quality-budget stop, not a false disagreement. Test: exhaustion produces the correct stop transition.
+- [x] **03.7** (agent) Phase edit policy: codify that the lead may mutate the repo **only** during IMPLEMENT/FIX; lead planning turns and **all** pair turns are repo-read-only. BYO attach checks this at `submit` (reject a repo mutation submitted from a read-only phase); managed launch also applies provider read-only flags (subject 07). Test: a mutation from a read-only phase is rejected.
+- [x] **03.8** (agent) VERIFY blocks for a fresh session generation (D010, single locked behavior — no downgrade branch): the incumbent pair generation is invalid for VERIFY; the phase **blocks until a new same-role session generation attaches**. BYO reports `fresh-session-declared` (the session *generation* is enforced; model-context freshness is not). Managed reports `fresh-process` only when it actually launches a new process. Changing this to allow a downgrade requires a later explicit decision/gate. Test: VERIFY does not proceed on the incumbent generation; a new generation unblocks it; labels match the tier.
 - [ ] **03.9** (agent) Invariant: **`attach` is the sole run bootstrap** (03.1) — there is no headless `run` command and no old `pair` driver (greenfield; the Python engine was deleted in 00.3). Assert the exact command surface is the attach protocol (`attach`/`pull`/`submit`/`wait`/`status`/gates/operator) plus the read-only legacy **inspect/export** utility (01.7), and nothing else. Test: the only run-creating command is `attach`; there is no `run`/old-`pair` entrypoint; the legacy inspector is read-only and refuses execution/resume.
 
 ## Hindsight checkpoint
-- [ ] Captain Hindsight review recorded
-- [ ] Verdict is `CLOSE`
+- [x] Captain Hindsight review recorded
+- [ ] Verdict is `CLOSE`  ← **DO NOT CLOSE** pending 03.9 (see the review below)
+
+### Captain Hindsight review — 2026-07-22 (after 04.0 landed 03.1's provisioner + 04.1b/03.7 landed the edit policy)
+
+**Keep.** The phase engine (`internal/engine`: the pure `Evaluate`/`Project`/`Apply` transition
+table, convergence = AGREE + zero blocking/major, budgets as monotone counters) — 03.4/03.5/03.6.
+The attach protocol (`internal/attach`: two-step bootstrap with `legacy.CheckRunDir` before any
+mutation + fs classification + both-slot reservation — 03.1; binding/reattach-by-session-id/
+same-role replacement-with-expected-generation — 03.2; in-transition next-turn issuance before
+lock release — 03.3). The VERIFY fresh-session-generation gate (`Verify.RequiredGeneration` +
+`ErrFreshSessionRequired`) — 03.8. The edit policy — 03.7 — as the pull-time `EditableTurn`
+predicate PLUS the 04.1b submit-time worktree-dirt gate. ~28 CX-AGREED slices, all green
+(build/vet/gofmt/`test -race ./...`/4-target cross-compile, re-confirmed at this session's HEAD).
+
+**Fix before closing.**
+- **03.9 is not satisfiable as written (BLOCKING the subject close).** The box asserts "the exact
+  command surface is the attach protocol (`attach`/`pull`/`submit`/`wait`/`status`/gates/operator)
+  … Test: the only run-creating command is `attach`." But `cmd/claudex/main.go` dispatches only
+  `version`/`help`/`inspect-legacy`; there is NO `attach`/`pull`/`submit`/`wait`/`status` command.
+  The whole attach protocol + engine + coordinator is LIBRARY-ONLY with zero CLI callers (same
+  root as `findings.md` M9, the subject-02 false-tick). The NEGATIVE invariants DO hold (no
+  `run`/old-`pair` entrypoint; one engine; the legacy inspector is read-only) — but the positive
+  "command surface is attach/pull/submit/wait/status" does not. 03.9 stays UNTICKED until the CLI
+  is wired OR 03.9 is re-scoped (decision below).
+- **Plan-reference leakage in shipped code comments** (e.g. `internal/coordinator/coordinator.go`,
+  `internal/gitx/*.go`, `internal/transport/submit.go` cite `04.1b`/`03.7`/`04.2`/`subject 04.5`).
+  Descriptive/architectural, but a strict §7 "plan-agnostic" reading flags them; triage with M10.
+- **Bundled tick-hygiene:** the subject-02 M9 false-tick (02 DONE but its CLI verbs don't exist)
+  and the plan §5 tracker (03 shows TODO) need the same resolution as 03.9's CLI decision.
+
+**Record.** DECISION NEEDED (a §4 decision-log row): where does the `attach`/`pull`/`submit`/`wait`/
+`status` CLI wiring land? It is the named deliverable of subjects 02 + 03 but is unbuilt. Either
+(a) a new CLI-wiring box/subject builds it (and 02/03.9 close on it), or (b) an explicit
+"library-first; the CLI/BYO command surface is deferred to subject 06/07" decision re-scopes 03.9
+to the architectural invariant (which IS met) and satisfies the §7 "wired or disclosed" gate by
+disclosure. LESSON: boxes were ticked/agreed at the library level while the CLI surface was
+disclosed-but-unbuilt; the Hindsight is the catch — a box is DONE only when its named deliverable
+exists OR an explicit deferral decision is recorded.
+
+**Risk.** The attach protocol has zero CLI callers, so it has never been exercised end-to-end as a
+user runs it (only via Go tests). The two-terminal e2e (subject 06's harness) would be its first
+real exercise; until then CLI-level behavior is unverified.
+
+**Verdict: DO NOT CLOSE.** Smallest actions: (1) tick 03.1–03.8 (done — see below); (2) resolve
+the CLI-wiring decision for 03.9 (build vs. re-scope/defer); (3) then tick 03.9 + the CLOSE
+checkbox, and clear the bundled M9/§5/M10 hygiene together.
 
 ## Progress log
 > One line per slice.
