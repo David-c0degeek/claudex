@@ -17,6 +17,11 @@ import (
 // ErrIndexCAS is the sentinel an index-CAS failure wraps.
 var ErrIndexCAS = errors.New("gitx: index CAS failed")
 
+// adminRootRaceHook is a test-only seam fired inside openAdminRoot AFTER .git passes its Lstat
+// as a real directory and BEFORE the OpenRoot + identity bind, so a test can swap .git for an
+// in-root directory symlink and prove the bind rejects it. Nil in production.
+var adminRootRaceHook func()
+
 // IndexState classifies the real checked-out index against a frozen index target.
 type IndexState int
 
@@ -88,23 +93,45 @@ func (g *Git) openAdminRoot(ctx context.Context, repoDir, worktree string) (*adm
 		return nil, fmt.Errorf("%w: the repository root is required", ErrIndexCAS)
 	}
 	// Anchor .git from an opened repository root, so .git itself being a symlink is refused
-	// rather than silently followed.
+	// rather than silently followed — and bind the OPENED .git object back to the verified
+	// directory (same check/open-race close as the admin sub-root below, one level up).
 	repoRoot, err := os.OpenRoot(repoDir)
 	if err != nil {
 		return nil, err
 	}
-	if gfi, gerr := repoRoot.Lstat(".git"); gerr != nil {
-		return nil, errors.Join(gerr, repoRoot.Close())
-	} else if gfi.Mode()&os.ModeSymlink != 0 || !gfi.IsDir() {
+	gfi, err := repoRoot.Lstat(".git")
+	if err != nil {
+		return nil, errors.Join(err, repoRoot.Close())
+	}
+	if gfi.Mode()&os.ModeSymlink != 0 || !gfi.IsDir() {
 		return nil, errors.Join(fmt.Errorf("%w: %s/.git is not a real directory", ErrIndexCAS, repoDir), repoRoot.Close())
 	}
-	gitRoot, err := repoRoot.OpenRoot(".git")
-	closeRepo := repoRoot.Close()
-	if err != nil {
-		return nil, errors.Join(err, closeRepo)
+	if adminRootRaceHook != nil {
+		adminRootRaceHook() // test seam: swap .git between its Lstat and the OpenRoot+bind
 	}
-	if closeRepo != nil {
-		return nil, errors.Join(closeRepo, gitRoot.Close())
+	gitRoot, err := repoRoot.OpenRoot(".git")
+	if err != nil {
+		// os.Root refuses an in-root symlink component here on platforms that do not follow
+		// it (e.g. Windows); platforms that DO follow it are caught by the identity bind
+		// below. Either way it is a typed security refusal.
+		return nil, errors.Join(fmt.Errorf("%w: cannot open .git as a real directory: %v", ErrIndexCAS, err), repoRoot.Close())
+	}
+	gitStat, err := gitRoot.Stat(".")
+	if err != nil {
+		return nil, errors.Join(err, gitRoot.Close(), repoRoot.Close())
+	}
+	// Re-Lstat .git at the bind point: it must STILL be a real directory (a symlink pointing
+	// back at the same object would pass SameFile but violates symlink-refusal), and the opened
+	// object must be exactly the verified one.
+	reGfi, err := repoRoot.Lstat(".git")
+	if err != nil {
+		return nil, errors.Join(err, gitRoot.Close(), repoRoot.Close())
+	}
+	if reGfi.Mode()&os.ModeSymlink != 0 || !reGfi.IsDir() || !os.SameFile(gfi, gitStat) || !os.SameFile(reGfi, gitStat) {
+		return nil, errors.Join(fmt.Errorf("%w: %s/.git changed identity during resolution", ErrIndexCAS, repoDir), gitRoot.Close(), repoRoot.Close())
+	}
+	if cerr := repoRoot.Close(); cerr != nil {
+		return nil, errors.Join(cerr, gitRoot.Close())
 	}
 
 	common := filepath.Join(repoDir, ".git")
@@ -138,7 +165,9 @@ func (g *Git) openAdminRoot(ctx context.Context, repoDir, worktree string) (*adm
 	}
 	adminFS, err := gitRoot.OpenRoot(rel)
 	if err != nil {
-		return nil, errors.Join(err, gitRoot.Close())
+		// As with .git above: an in-root symlink component os.Root refuses to traverse is a
+		// typed security refusal (platforms that would follow it are caught by the bind below).
+		return nil, errors.Join(fmt.Errorf("%w: cannot open the admin dir as a real directory: %v", ErrIndexCAS, err), gitRoot.Close())
 	}
 	openedFI, err := adminFS.Stat(".")
 	if err != nil {

@@ -254,6 +254,77 @@ func TestIndexCASConfirmRejectsUnsynced(t *testing.T) {
 	}
 }
 
+// The .git anchor has the same check/open identity race the admin sub-root closes: a .git
+// swapped for an in-root directory symlink (to a different dir, or back to the same object)
+// between its Lstat and the OpenRoot must be rejected by the identity bind, so the CAS never
+// operates on an alternate metadata tree.
+func TestIndexCASGitDirRaceFailsClosed(t *testing.T) {
+	t.Cleanup(func() { adminRootRaceHook = nil })
+	for _, tc := range []struct {
+		name string
+		swap func(t *testing.T, gitPath string) (alt string)
+	}{
+		{
+			name: "symlink to a different dir",
+			swap: func(t *testing.T, gitPath string) string {
+				moved := gitPath + ".real"
+				if err := os.Rename(gitPath, moved); err != nil {
+					t.Fatalf("rename .git: %v", err)
+				}
+				alt := gitPath + ".alt"
+				if err := os.Mkdir(alt, 0o700); err != nil {
+					t.Fatalf("mkdir alt: %v", err)
+				}
+				if err := os.Symlink(alt, gitPath); err != nil {
+					t.Skipf("directory symlinks unavailable on this host: %v", err)
+				}
+				return alt
+			},
+		},
+		{
+			name: "symlink to the same object",
+			swap: func(t *testing.T, gitPath string) string {
+				moved := gitPath + ".real"
+				if err := os.Rename(gitPath, moved); err != nil {
+					t.Fatalf("rename .git: %v", err)
+				}
+				if err := os.Symlink(moved, gitPath); err != nil {
+					t.Skipf("directory symlinks unavailable on this host: %v", err)
+				}
+				return moved
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, g, _, target := indexcasSetup(t)
+			gitPath := filepath.Join(repo, ".git")
+			var alt string
+			fired := false
+			adminRootRaceHook = func() {
+				if fired {
+					return
+				}
+				fired = true
+				alt = tc.swap(t, gitPath)
+			}
+			defer func() { adminRootRaceHook = nil }()
+
+			st, oerr := g.ObserveIndex(context.Background(), target)
+			if st != IndexForeign || !errors.Is(oerr, ErrIndexCAS) {
+				t.Fatalf("Observe through a swapped .git = %v (err %v), want foreign + ErrIndexCAS", st, oerr)
+			}
+			// Apply must also fail closed and leave no lock in the alternate tree.
+			fired = false
+			if aerr := g.ApplyIndex(context.Background(), target); !errors.Is(aerr, ErrIndexCAS) {
+				t.Fatalf("Apply through a swapped .git err = %v, want ErrIndexCAS", aerr)
+			}
+			if _, err := os.Lstat(filepath.Join(alt, "index.lock")); !os.IsNotExist(err) {
+				t.Fatalf("a swapped .git still created index.lock in the alternate tree (err %v)", err)
+			}
+		})
+	}
+}
+
 // Confirm is one lock-protected proof: a foreign index replacement or a private-target
 // deletion injected AFTER Confirm takes the index lock and BEFORE its exact re-proof still
 // fails closed (never certifying foreign or missing bytes durable), so the journal never
