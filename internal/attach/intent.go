@@ -15,6 +15,7 @@ package attach
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 
@@ -24,6 +25,19 @@ import (
 
 // intentKind is the txn kind for a first-attach bootstrap.
 const intentKind = "bootstrap"
+
+// bootstrapIntentVersion is the bootstrap PAYLOAD schema version, independent of the txn
+// envelope version. It is bumped whenever the persisted BootstrapIntent shape changes in a way
+// an older reader cannot honor (per D017: a durable required-field change is a version change).
+// Version 1 is the first explicitly-versioned shape and carries PairJoinOperationID; a payload
+// with any other version (including a pre-versioning payload that decodes to 0) is refused.
+const bootstrapIntentVersion = 1
+
+// ErrBootstrapIntentVersion means a bootstrap journal payload is not the current schema version.
+// Migration of an older bootstrap is intentionally out of scope: the run must be re-bootstrapped
+// (the pre-pivot legacy path already refuses execution; a stale in-scheme bootstrap is a
+// fail-closed recovery, not a silent reinterpretation).
+var ErrBootstrapIntentVersion = errors.New("attach: bootstrap intent is not the current schema version; re-bootstrap the run")
 
 // maxSnapshotBytes bounds an embedded input snapshot so both snapshots plus the
 // rest of the intent stay under the journal's payload limit. It equals config's
@@ -35,12 +49,16 @@ const maxSnapshotBytes = config.MaxContractBytes
 // transaction's life. It carries every value the participants need, so no step
 // resolves fresh identity after a mutation and recovery is exact.
 type BootstrapIntent struct {
-	RunID       string      `json:"run_id"`
-	TxnID       string      `json:"txn_id"`
-	OperationID string      `json:"operation_id"` // caller-stable idempotency key
-	SessionID   string      `json:"session_id"`   // the lead's minted session
-	Agent       state.Agent `json:"agent"`        // the lead agent
-	CreatedUnix int64       `json:"created_unix"`
+	// SchemaVersion is the payload schema version (bootstrapIntentVersion); it is checked
+	// FIRST on decode so a stale-shape payload is classified by version, not by a downstream
+	// missing-field error.
+	SchemaVersion int         `json:"schema_version"`
+	RunID         string      `json:"run_id"`
+	TxnID         string      `json:"txn_id"`
+	OperationID   string      `json:"operation_id"` // caller-stable idempotency key
+	SessionID     string      `json:"session_id"`   // the lead's minted session
+	Agent         state.Agent `json:"agent"`        // the lead agent
+	CreatedUnix   int64       `json:"created_unix"`
 
 	// PairJoinOperationID is the UNGUESSABLE, frozen operation id the pair's join must
 	// present. It is minted here (not by the client) so the emitted join command is
@@ -130,6 +148,11 @@ func decodeIntent(payload json.RawMessage) (BootstrapIntent, error) {
 // writes outside the run's own directory. Every path is required to be exactly
 // the value derived from the run id — not merely "some local path".
 func (in BootstrapIntent) validate() error {
+	// Version FIRST: a stale-shape payload (including a pre-versioning one that decodes to 0)
+	// is classified by version and refused with the typed sentinel, never silently reused.
+	if in.SchemaVersion != bootstrapIntentVersion {
+		return fmt.Errorf("%w: got version %d, want %d", ErrBootstrapIntentVersion, in.SchemaVersion, bootstrapIntentVersion)
+	}
 	if !state.IsRunID(in.RunID) {
 		return fmt.Errorf("attach: intent run_id is not canonical")
 	}

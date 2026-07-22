@@ -26,7 +26,8 @@ func validIntent() BootstrapIntent {
 	runID := "run-" + strings.Repeat("a", 32)
 	pol, _ := config.ParseRunPolicy(policyBytes())
 	return BootstrapIntent{
-		RunID: runID, TxnID: "boot-x1", OperationID: opID("c"),
+		SchemaVersion: bootstrapIntentVersion,
+		RunID:         runID, TxnID: "boot-x1", OperationID: opID("c"),
 		SessionID: "sess-" + strings.Repeat("b", 32), Agent: state.AgentClaude, CreatedUnix: 1000,
 		PairJoinOperationID: opID("d"),
 		RelDir:              ".claudex/runs/" + runID, TaskRelPath: "inputs/task.json",
@@ -388,6 +389,49 @@ func TestForgedIntentRejected(t *testing.T) {
 				t.Fatalf("%s should be rejected", name)
 			}
 		})
+	}
+}
+
+// The bootstrap payload is explicitly versioned: the current shape round-trips through
+// marshal/decode, and a stale-shape payload — a pre-versioning one with no schema_version,
+// or any wrong version — is refused with the typed ErrBootstrapIntentVersion (migration is
+// out of scope; the run must be re-bootstrapped), classified by version BEFORE any
+// missing-field error.
+func TestBootstrapIntentVersioned(t *testing.T) {
+	in := validIntent()
+	if in.SchemaVersion != bootstrapIntentVersion {
+		t.Fatalf("validIntent schema version = %d, want %d", in.SchemaVersion, bootstrapIntentVersion)
+	}
+	// The current shape round-trips.
+	payload, err := in.marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := decodeIntent(payload); err != nil {
+		t.Fatalf("current-version payload should decode: %v", err)
+	}
+
+	// A pre-versioning payload (no schema_version, and — as those payloads were — no
+	// pair_join_operation_id) is refused by version, not by the missing field.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		t.Fatalf("unmarshal to map: %v", err)
+	}
+	delete(obj, "schema_version")
+	delete(obj, "pair_join_operation_id")
+	old, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("marshal old shape: %v", err)
+	}
+	if _, err := decodeIntent(old); !errors.Is(err, ErrBootstrapIntentVersion) {
+		t.Fatalf("pre-versioning payload err = %v, want ErrBootstrapIntentVersion", err)
+	}
+
+	// A wrong explicit version is likewise refused.
+	bumped := validIntent()
+	bumped.SchemaVersion = bootstrapIntentVersion + 1
+	if err := bumped.validate(); !errors.Is(err, ErrBootstrapIntentVersion) {
+		t.Fatalf("wrong-version validate err = %v, want ErrBootstrapIntentVersion", err)
 	}
 }
 

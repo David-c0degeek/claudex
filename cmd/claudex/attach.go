@@ -340,7 +340,23 @@ func attachReplace(repo, run, agentS, roleS string, expectGen uint64, opID strin
 		fmt.Fprintf(stderr, "claudex: attach (replace): %v\n", rerr)
 		return 1
 	}
-	out := map[string]any{
+	out, warnings, postEmitExit := classifyReplaceResult(res, rerr)
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "claudex: attach (replace) WARNING: %s\n", w)
+	}
+	if code := emitJSON(stdout, stderr, out); code != 0 {
+		return code // a write/encode failure dominates
+	}
+	return postEmitExit
+}
+
+// classifyReplaceResult maps a replace outcome to its emitted JSON, the distinct stderr
+// warnings, and the post-emit exit code. ErrReplaceOutcomeUnknown is recovery-required
+// (exit 1 after emitting the candidate), per D6's 0-success/1-operational contract; a
+// proven-committed CommitWarning is an authoritative success-with-warning (exit 0). Pure, so
+// the exit/output contract is unit-testable without a real replace.
+func classifyReplaceResult(res attach.ReplaceResult, rerr error) (out map[string]any, warnings []string, postEmitExit int) {
+	out = map[string]any{
 		"mode":             "replace",
 		"run_id":           res.RunID,
 		"session_id":       res.SessionID,
@@ -349,23 +365,14 @@ func attachReplace(repo, run, agentS, roleS string, expectGen uint64, opID strin
 		"generation":       res.Generation,
 		"verifier_turn_id": res.VerifierTurnID,
 	}
-	// ErrReplaceOutcomeUnknown: the identity is a RECOVERY CANDIDATE, not proven current —
-	// surface the result AND the warning distinctly, but the command is recovery-required, not
-	// success (exit 1). A proven-committed CommitWarning is an authoritative success-with-warning.
-	unknown := errors.Is(rerr, attach.ErrReplaceOutcomeUnknown)
-	if unknown {
+	if errors.Is(rerr, attach.ErrReplaceOutcomeUnknown) {
 		out["outcome_unknown"] = true
-		fmt.Fprintf(stderr, "claudex: attach (replace) WARNING: outcome unknown, session is a recovery candidate: %v\n", rerr)
+		warnings = append(warnings, fmt.Sprintf("outcome unknown, session is a recovery candidate: %v", rerr))
+		postEmitExit = 1
 	}
 	if res.CommitWarning != nil {
 		out["commit_warning"] = res.CommitWarning.Error()
-		fmt.Fprintf(stderr, "claudex: attach (replace) WARNING: %v\n", res.CommitWarning)
+		warnings = append(warnings, res.CommitWarning.Error())
 	}
-	if code := emitJSON(stdout, stderr, out); code != 0 {
-		return code // a write/encode failure dominates
-	}
-	if unknown {
-		return 1 // recovery-required, per D6's 0-success/1-operational contract
-	}
-	return 0
+	return out, warnings, postEmitExit
 }

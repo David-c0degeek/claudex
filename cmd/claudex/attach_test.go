@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -226,6 +228,30 @@ func TestAttachFirstThenJoin(t *testing.T) {
 	_ = json.Unmarshal(out.Bytes(), &join2)
 	if join2.SessionID != join.SessionID {
 		t.Fatalf("idempotent join replay minted a new session: %q -> %q", join.SessionID, join2.SessionID)
+	}
+}
+
+// TestReplaceResultClassification pins the replace exit/output contract without a real
+// replace: an unknown outcome emits its candidate and exits 1 (recovery-required); a clean
+// outcome exits 0; a proven-committed CommitWarning is a success-with-warning (exit 0).
+func TestReplaceResultClassification(t *testing.T) {
+	base := attach.ReplaceResult{RunID: "run-x", SessionID: "sess-x", Role: state.SlotPair, Agent: state.AgentCodex, Generation: 2}
+
+	out, warns, exit := classifyReplaceResult(base, attach.ErrReplaceOutcomeUnknown)
+	if exit != 1 || out["outcome_unknown"] != true || len(warns) != 1 {
+		t.Fatalf("unknown outcome: exit=%d out=%v warns=%v, want exit 1 + outcome_unknown + 1 warning", exit, out, warns)
+	}
+
+	out, warns, exit = classifyReplaceResult(base, nil)
+	if exit != 0 || out["outcome_unknown"] != nil || len(warns) != 0 {
+		t.Fatalf("clean outcome: exit=%d out=%v warns=%v, want exit 0 + no warning", exit, out, warns)
+	}
+
+	withWarn := base
+	withWarn.CommitWarning = errors.New("guard release failed")
+	out, warns, exit = classifyReplaceResult(withWarn, nil)
+	if exit != 0 || out["commit_warning"] != "guard release failed" || len(warns) != 1 {
+		t.Fatalf("commit-warning outcome: exit=%d out=%v warns=%v, want exit 0 + commit_warning + 1 warning", exit, out, warns)
 	}
 }
 

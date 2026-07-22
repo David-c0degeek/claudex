@@ -552,6 +552,7 @@ func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy con
 	}
 
 	in := BootstrapIntent{
+		SchemaVersion:           bootstrapIntentVersion,
 		RunID:                   runID,
 		TxnID:                   txnID,
 		OperationID:             req.OperationID,
