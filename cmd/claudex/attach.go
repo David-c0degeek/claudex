@@ -225,7 +225,7 @@ func attachFirst(ctx context.Context, repo, agentS, roleS, task, config, opID st
 	// continue, since the first submit will rebuild it anyway.
 	if loc, rerr := attach.ResolveRun(repo, res.RunID); rerr != nil {
 		fmt.Fprintf(stderr, "claudex: attach (first) WARNING: could not resolve the run to reset the mailbox: %v\n", rerr)
-	} else if merr := coordinator.RebuildMailbox(loc); merr != nil {
+	} else if merr := coordinator.RebuildMailbox(repo, loc); merr != nil {
 		fmt.Fprintf(stderr, "claudex: attach (first) WARNING: could not reset the mailbox mirror: %v\n", merr)
 	}
 

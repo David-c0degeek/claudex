@@ -371,32 +371,18 @@ func (rn *Run) precomputeTestOutcome(pass bool, expectedRevision uint64) (transp
 // MirrorMailbox rebuilds the human-readable .claudex/mailbox.md transcript from the run's
 // durable ledger and immutable artifacts (D018: a rebuildable, re-validated projection,
 // atomically replaced). It is idempotent — every submit rebuilds it, so a mirror a crash left
-// stale or missing is repaired by the next successful or replayed submit. It runs UNDER the run
-// guard and loads the ledger INSIDE that serialization boundary, so a slow writer can never
-// atomically replace the transcript last with an older, shorter render than a concurrent
-// submit already published: whoever writes last has loaded the latest ledger. (Only one run is
-// active per repo, so the per-run guard serializes every writer of the repo-level mirror.) The
-// mailbox directory is attach-derived (RunLocation.MailboxDir); the artifact loader is the
-// run's own verifying store.
+// stale or missing is repaired by the next successful or replayed submit. It serializes on the
+// REPOSITORY lock and binds to the current active-run pointer inside that boundary (see
+// mirrorRepoMailbox), so neither a concurrent same-run submit nor a delayed writer of a
+// superseded run can leave the shared mirror stale. The mailbox directory is attach-derived
+// (RunLocation.MailboxDir); the artifact loader is the run's own verifying store.
 func (rn *Run) MirrorMailbox() error {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
 	if rn.closed {
 		return ErrClosed
 	}
-	for attempt := 0; attempt < submitGitMaxAttempts; attempt++ {
-		g, ok, aerr := genstore.Acquire(rn.loc.RunLock)
-		if aerr != nil {
-			return aerr
-		}
-		if !ok {
-			time.Sleep(submitGitBackoff)
-			continue
-		}
-		err := rn.mirrorLocked(g)
-		return errors.Join(err, g.Release())
-	}
-	return fmt.Errorf("coordinator: mailbox mirror did not acquire the run lock after %d attempts: %w", submitGitMaxAttempts, genstore.ErrBusy)
+	return mirrorRepoMailbox(rn.repoDir, rn.loc, rn.store.Get)
 }
 
 // RebuildMailbox rebuilds the repo-level mailbox mirror from a run's durable ledger + artifacts
@@ -404,10 +390,33 @@ func (rn *Run) MirrorMailbox() error {
 // transcript to the new run's projection, so a freshly bootstrapped run never leaves the prior
 // terminal run's mailbox visible before its first submit. A brand-new run has an empty ledger, so
 // this writes an empty transcript; the same call on a run that has progressed rebuilds its real
-// transcript (idempotent). Serialized on the run lock, loading the ledger inside that boundary.
-func RebuildMailbox(loc attach.RunLocation) error {
+// transcript (idempotent). It opens the run's own artifact store for the render.
+func RebuildMailbox(repoDir string, loc attach.RunLocation) error {
+	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return mirrorRepoMailbox(repoDir, loc, store.Get)
+}
+
+// mirrorPostLoadHook is a test-only seam fired inside the repo-guarded mirror AFTER the ledger
+// load and BEFORE the write, while the repo guard is held, so a test can prove the load->write
+// window is serialized. Nil in production.
+var mirrorPostLoadHook func()
+
+// mirrorRepoMailbox rebuilds the repo-level .claudex/mailbox.md transcript, serialized on the
+// REPOSITORY lock — because the mirror is repo-scoped and shared across runs, a per-run lock is
+// NOT sufficient at an active-run switch. Under the held repo lock it binds the requested run to
+// the CURRENT active-run pointer: a run that is no longer active (superseded by a newer bootstrap)
+// is a no-op, so a delayed writer of a terminal run can never overwrite the current run's
+// projection. Only the active run's writer proceeds, and it loads the latest ledger inside the
+// boundary, so serialized writers converge on the newest render. (Single lock; no repo/run order
+// concern — the ledger Load is lock-free and consistent under the held repo lock.)
+func mirrorRepoMailbox(repoDir string, loc attach.RunLocation, load func(turnID, digest string) ([]byte, error)) error {
+	repoLock := attach.RepoLock(repoDir)
 	for attempt := 0; attempt < submitGitMaxAttempts; attempt++ {
-		g, ok, aerr := genstore.Acquire(loc.RunLock)
+		g, ok, aerr := genstore.Acquire(repoLock)
 		if aerr != nil {
 			return aerr
 		}
@@ -415,42 +424,22 @@ func RebuildMailbox(loc attach.RunLocation) error {
 			time.Sleep(submitGitBackoff)
 			continue
 		}
-		err := rebuildMailboxAt(loc)
+		err := mirrorRepoMailboxLocked(repoDir, loc, load)
 		return errors.Join(err, g.Release())
 	}
-	return fmt.Errorf("coordinator: mailbox rebuild did not acquire the run lock after %d attempts: %w", submitGitMaxAttempts, genstore.ErrBusy)
+	return fmt.Errorf("coordinator: mailbox mirror did not acquire the repo lock after %d attempts: %w", submitGitMaxAttempts, genstore.ErrBusy)
 }
 
-// rebuildMailboxAt opens the run's own stores and rebuilds the mirror from its current ledger.
-func rebuildMailboxAt(loc attach.RunLocation) error {
+func mirrorRepoMailboxLocked(repoDir string, loc attach.RunLocation, load func(turnID, digest string) ([]byte, error)) error {
+	// Active-run bind: only the CURRENT active run may write the shared repo-level mirror.
+	active, ok, err := attach.ActiveRunPointer(repoDir)
+	if err != nil {
+		return err
+	}
+	if !ok || active != loc.RunID {
+		return nil // superseded / not the active run: never overwrite the current run's projection
+	}
 	rs, ok, err := state.Open(loc.StateDir, loc.RunLock).Load()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return transport.ErrNoRun
-	}
-	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	mb, err := transport.NewMailboxStore(loc.MailboxDir)
-	if err != nil {
-		return err
-	}
-	defer mb.Close()
-	return mb.Write(state.Ledger(rs), store.Get)
-}
-
-// mirrorPostLoadHook is a test-only seam fired inside mirrorLocked AFTER the ledger load and
-// BEFORE the mirror write, while the run guard is held, so a test can prove the load->write
-// window is serialized. Nil in production.
-var mirrorPostLoadHook func()
-
-// mirrorLocked loads the latest ledger under the held guard and atomically rebuilds the mirror.
-func (rn *Run) mirrorLocked(_ *genstore.Guard) error {
-	rs, ok, err := rn.state.Load()
 	if mirrorPostLoadHook != nil {
 		mirrorPostLoadHook()
 	}
@@ -460,12 +449,12 @@ func (rn *Run) mirrorLocked(_ *genstore.Guard) error {
 	if !ok {
 		return transport.ErrNoRun
 	}
-	mb, err := transport.NewMailboxStore(rn.loc.MailboxDir)
+	mb, err := transport.NewMailboxStore(loc.MailboxDir)
 	if err != nil {
 		return err
 	}
 	defer mb.Close()
-	return mb.Write(state.Ledger(rs), rn.store.Get)
+	return mb.Write(state.Ledger(rs), load)
 }
 
 // Close releases the artifact store and the git handle. It waits for in-flight

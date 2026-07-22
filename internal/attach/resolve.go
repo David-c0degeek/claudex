@@ -110,6 +110,29 @@ func runLocationFor(lay layout, runID string) RunLocation {
 	}
 }
 
+// RepoLock is the repository-level allocation lock (`.claudex/repo.lock`) — the guard that
+// serializes bootstrap/active-pointer switches. A repo-scoped projection (the shared
+// `.claudex/mailbox.md` transcript, which any run may write) must serialize its writers on THIS
+// lock, not a per-run lock, so a delayed writer of a superseded run cannot overwrite the current
+// active run's projection.
+func RepoLock(repoDir string) string { return layoutFor(repoDir).repoLock }
+
+// ActiveRunPointer returns the raw active-run pointer identity (RunID + whether a run is
+// currently active), WITHOUT the ResolveRun binding walk. A caller holding RepoLock uses it to
+// bind a repo-level projection write to the current active run: the pointer cannot change under
+// the held repo lock (bootstrap mutates it only under that lock). (false) means no active run.
+func ActiveRunPointer(repoDir string) (runID string, active bool, err error) {
+	lay := layoutFor(repoDir)
+	cur, ok, err := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load()
+	if err != nil {
+		return "", false, err
+	}
+	if !ok || !cur.Active {
+		return "", false, nil
+	}
+	return cur.RunID, true, nil
+}
+
 // ActiveRunID discovers the repository's single active run id from the active-run pointer, for
 // convenience so a CLI need not always pass --run. It is DISCOVERY ONLY: the loaded id is
 // validated through ResolveRun's active-pointer -> catalog -> bootstrap-journal binding (never
