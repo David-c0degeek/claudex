@@ -262,6 +262,9 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Sink:     rn.store,
 		Prepare:  prepare,
+		// The read-only-phase edit-policy gate (03.7/04.1b): transport invokes it under the
+		// run guard only for a genuinely authorized new acceptance in a non-editable turn.
+		WorktreeClean: func() (bool, error) { return rn.git.WorktreeClean(ctx, rn.runWorktree()) },
 	}, sessionID, raw)
 }
 

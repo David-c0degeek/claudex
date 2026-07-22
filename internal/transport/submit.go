@@ -50,11 +50,28 @@ var (
 	// generation does not meet the retained fresh-session threshold. It never exposes a
 	// session id.
 	ErrFreshSessionRequired = errors.New("transport: VERIFY requires a fresh pair session generation")
+	// ErrRepoMutationInReadOnlyPhase means an authorized submit in a read-only turn
+	// (any turn that is not an editable lead IMPLEMENT_STEP/FIX, per EditableTurn) was
+	// made against a DIRTY run worktree — a protocol violation: only an editable turn
+	// may mutate the repository. It is raised only after the exact locked turn is
+	// authorized and only for a genuine new acceptance, never for a replay.
+	ErrRepoMutationInReadOnlyPhase = errors.New("transport: a repository mutation was submitted from a read-only turn")
+	// ErrWorktreeUnobserved means the read-only-phase clean gate could not observe the
+	// worktree (e.g. git status failed). It fails the submit closed BEFORE any sink or
+	// state effect, and is distinct from ErrRepoMutationInReadOnlyPhase — an unobservable
+	// worktree is never reported as an observed mutation.
+	ErrWorktreeUnobserved = errors.New("transport: could not observe the read-only worktree")
 )
 
 const (
-	submitMaxAttempts = 64
-	submitBackoff     = 200 * time.Microsecond
+	// The submit critical section is held across real I/O — the artifact publish and two
+	// store fsyncs, plus (for a read-only-phase submit) a git-status observation — so a
+	// contending submit must out-wait a full I/O-bearing hold, not a memory-only one. The
+	// budget (attempts * backoff ~= 2s) is patience under contention only; an uncontended
+	// submit acquires on the first attempt and never waits. A genuinely stuck foreign lock
+	// still resolves to ErrBusy once the budget is spent.
+	submitMaxAttempts = 2000
+	submitBackoff     = 1 * time.Millisecond
 )
 
 // StaleError reports that a submission was prepared against a superseded state.
@@ -174,14 +191,26 @@ func (p PreparedTransition) IssuedGateID() string { return p.issuedGateID }
 // the snapshot is a copy), perform I/O, or mint identities under the guard.
 type Prepare func(snapshot state.RunState, prepared PreparedSubmit) (PreparedTransition, error)
 
+// WorktreeClean observes whether the run worktree is clean (no tracked, staged, or
+// untracked changes). It is the OPTIONAL, guard-time read-only-phase gate: transport
+// calls it only after the exact locked turn is authorized, only for a genuine new
+// acceptance in a read-only turn (`!EditableTurn`), and only before any sink/state
+// effect. The coordinator supplies the git I/O. A (false, nil) result is an observed
+// mutation (ErrRepoMutationInReadOnlyPhase); a non-nil error is an unobservable
+// worktree (ErrWorktreeUnobserved) — the two are never conflated. The successful clean
+// observation is the policy linearization point; the run guard does not lock external
+// filesystem writers, so dirt appearing afterward is future dirt (04.4's concern).
+type WorktreeClean func() (clean bool, err error)
+
 // SubmitDeps are the injected, lock-sharing dependencies of a submit.
 type SubmitDeps struct {
-	Store     *state.Store
-	Registry  *state.RegistryStore
-	Journal   JournalReader
-	Sink      ArtifactSink
-	Prepare   Prepare
-	Preflight Authorizer // optional
+	Store         *state.Store
+	Registry      *state.RegistryStore
+	Journal       JournalReader
+	Sink          ArtifactSink
+	Prepare       Prepare
+	Preflight     Authorizer    // optional
+	WorktreeClean WorktreeClean // optional: the read-only-phase clean gate
 }
 
 func (d SubmitDeps) validate() error {
@@ -510,6 +539,26 @@ func preparePublish(ctx context.Context, deps SubmitDeps, auth submitAuthorized,
 	return pt, nil
 }
 
+// readOnlyWorktreeGate enforces the 03.7 edit policy for a single authorized new
+// acceptance: if the turn is not an editable one (per the role+phase EditableTurn
+// predicate) and a clean gate is wired, the run worktree must be observed clean. An
+// unobservable worktree fails closed as ErrWorktreeUnobserved (never mislabeled a
+// mutation); an observed-dirty worktree is ErrRepoMutationInReadOnlyPhase. An editable
+// turn, or a submit with no gate wired, is a no-op.
+func readOnlyWorktreeGate(deps SubmitDeps, auth submitAuthorized) error {
+	if deps.WorktreeClean == nil || EditableTurn(auth.spec.Role, auth.rs.Phase) {
+		return nil
+	}
+	clean, err := deps.WorktreeClean()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrWorktreeUnobserved, err)
+	}
+	if !clean {
+		return ErrRepoMutationInReadOnlyPhase
+	}
+	return nil
+}
+
 // lockedSubmit runs the whole authorize -> publish -> accept sequence under the held
 // guard g, which it releases exactly once on every path.
 func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessionID string, raw, canonRedacted []byte, digest string, env submitEnvelope) (SubmitResult, error) {
@@ -548,6 +597,16 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 	// implementation turn the state store would reject (or worse, accept bare).
 	if gitEvidencePhase(auth.rs.Phase) {
 		return reject(ErrGitParticipantRequired)
+	}
+
+	// Read-only-phase edit policy (03.7/04.1b): a genuinely authorized NEW acceptance in
+	// a turn that is not an editable lead IMPLEMENT_STEP/FIX must be made against a CLEAN
+	// worktree — the authority is the role+phase predicate, not the phase alone. Bound to
+	// the exact locked turn, resolved AFTER authorization and the replay return, BEFORE any
+	// sink/state effect. A replay never reaches here; an unauthorized/stale/wrong-turn
+	// request already returned its authorization error above.
+	if err := readOnlyWorktreeGate(deps, auth); err != nil {
+		return reject(err)
 	}
 
 	pt, perr := preparePublish(ctx, deps, auth, raw, canonRedacted, digest, env)

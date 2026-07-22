@@ -20,8 +20,12 @@ import (
 )
 
 const (
-	submitGitMaxAttempts = 64
-	submitGitBackoff     = 200 * time.Microsecond
+	// The git submit holds the run guard across the whole commit transaction (snapshot,
+	// target-index build, ref/index/state CAS, fsyncs), so a contending submit needs even
+	// more patience than the standalone path. attempts * backoff ~= 2s; an uncontended
+	// submit acquires immediately, and a genuinely stuck lock still resolves to ErrBusy.
+	submitGitMaxAttempts = 2000
+	submitGitBackoff     = 1 * time.Millisecond
 )
 
 // submitGit drives one IMPLEMENT_STEP/FIX submit through the git commit transaction:

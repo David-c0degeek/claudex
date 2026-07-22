@@ -583,3 +583,11 @@ func (g *Git) worktreeClean(ctx context.Context, worktree string) (bool, error) 
 	}
 	return len(strings.TrimRight(string(out), "\x00")) == 0, nil
 }
+
+// WorktreeClean reports whether the run worktree has no tracked, staged, or untracked
+// changes (`.claudex` is git-ignored, so the run's own metadata never trips it). It is
+// the single worktree-dirt definition shared by the index-CAS and the read-only-phase
+// edit-policy gate (03.7/04.1b).
+func (g *Git) WorktreeClean(ctx context.Context, worktree string) (bool, error) {
+	return g.worktreeClean(ctx, worktree)
+}
