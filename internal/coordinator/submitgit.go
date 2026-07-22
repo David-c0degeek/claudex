@@ -156,6 +156,11 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	if merr != nil {
 		return transport.SubmitResult{}, merr
 	}
+	if h := hooksFrom(ctx); h != nil && h.beforeGitJournal != nil {
+		if herr := h.beforeGitJournal(); herr != nil {
+			return transport.SubmitResult{}, herr
+		}
+	}
 	steps, sterr := rn.commitTxnSteps(ctx, g, plan, txnID)
 	if sterr != nil {
 		return transport.SubmitResult{}, sterr
@@ -184,6 +189,31 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 		}
 	}
 	return transport.SubmitResult{}, fmt.Errorf("coordinator: committed git submit could not be reconciled")
+}
+
+// recoverCommitTxn acquires the run guard and drives any pending commit
+// transaction to completion from its journalled plan. It is the recovery entry for
+// a transaction whose state-cas already became visible (the phase has advanced, so
+// no submit routes through the git driver again); a no-op when the journal is
+// absent or terminal.
+func (rn *Run) recoverCommitTxn(ctx context.Context) error {
+	for attempt := 0; attempt < submitGitMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		g, ok, aerr := genstore.Acquire(rn.loc.RunLock)
+		if aerr != nil {
+			return aerr
+		}
+		if !ok {
+			time.Sleep(submitGitBackoff)
+			continue
+		}
+		journal := txn.Open(rn.loc.CommitTxnDir, rn.loc.RunLock)
+		_, _, rerr := journal.Recover(g, rn.commitTxnPlanFor(ctx, g))
+		return errors.Join(rerr, g.Release())
+	}
+	return fmt.Errorf("coordinator: commit-txn recovery did not acquire the run lock after %d attempts: %w", submitGitMaxAttempts, genstore.ErrBusy)
 }
 
 // runWorktree is the run's canonical linked-worktree path (the same derivation the
@@ -241,6 +271,22 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 	if err != nil {
 		return nil, err
 	}
+	// Crash-cut seams (nil in production): fire at the start of a step's Apply and
+	// ConfirmDurable, so a test halts the transaction with exactly the durable state
+	// a power cut at that point would leave.
+	hooks := hooksFrom(ctx)
+	cutApply := func(step string) error {
+		if hooks != nil && hooks.stepApply != nil {
+			return hooks.stepApply(step)
+		}
+		return nil
+	}
+	cutConfirm := func(step string) error {
+		if hooks != nil && hooks.stepConfirm != nil {
+			return hooks.stepConfirm(step)
+		}
+		return nil
+	}
 	refT := gitx.RefTarget{
 		Branch: "claudex/" + rn.loc.RunID,
 		Parent: plan.GitCommit.Parent,
@@ -272,8 +318,18 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 					return txn.StatusIndeterminate, nil
 				}
 			},
-			Apply:          func() error { return rn.git.ApplyRef(ctx, rn.repoDir, refT) },
-			ConfirmDurable: func() error { return rn.git.ConfirmRef(ctx, rn.repoDir, refT) },
+			Apply: func() error {
+				if err := cutApply("ref-cas"); err != nil {
+					return err
+				}
+				return rn.git.ApplyRef(ctx, rn.repoDir, refT)
+			},
+			ConfirmDurable: func() error {
+				if err := cutConfirm("ref-cas"); err != nil {
+					return err
+				}
+				return rn.git.ConfirmRef(ctx, rn.repoDir, refT)
+			},
 		},
 		{
 			Name: "index-cas",
@@ -291,8 +347,18 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 					return txn.StatusIndeterminate, nil
 				}
 			},
-			Apply:          func() error { return rn.git.ApplyIndex(ctx, idxT) },
-			ConfirmDurable: func() error { return rn.git.ConfirmIndex(ctx, idxT) },
+			Apply: func() error {
+				if err := cutApply("index-cas"); err != nil {
+					return err
+				}
+				return rn.git.ApplyIndex(ctx, idxT)
+			},
+			ConfirmDurable: func() error {
+				if err := cutConfirm("index-cas"); err != nil {
+					return err
+				}
+				return rn.git.ConfirmIndex(ctx, idxT)
+			},
 		},
 		{
 			Name: "state-cas",
@@ -314,6 +380,9 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 				}
 			},
 			Apply: func() error {
+				if err := cutApply("state-cas"); err != nil {
+					return err
+				}
 				rs, ok, err := rn.state.Load()
 				if err != nil {
 					return err
@@ -326,7 +395,12 @@ func (rn *Run) commitTxnSteps(ctx context.Context, g *genstore.Guard, plan trans
 				})
 				return merr
 			},
-			ConfirmDurable: func() error { return rn.state.ConfirmDurable(g) },
+			ConfirmDurable: func() error {
+				if err := cutConfirm("state-cas"); err != nil {
+					return err
+				}
+				return rn.state.ConfirmDurable(g)
+			},
 		},
 	}, nil
 }

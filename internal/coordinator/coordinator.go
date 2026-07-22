@@ -35,6 +35,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
+	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
 var (
@@ -76,9 +77,19 @@ type Run struct {
 // production. afterFacts fires inside precompute once fact preparation is done (or
 // skipped) and before minting; afterPrecompute fires after precompute and before
 // transport acquires the run lock. Both run while the submit holds its read lock.
+// The three git-transaction seams inject crash CUTS for the 04.2 crash matrix: a
+// non-nil returned error halts the submit at exactly that point, leaving the
+// durable state a real power cut would (beforeGitJournal: artifact published and
+// commit/target-index objects built, but no journal record; stepApply: the journal
+// prepare/progress durable, the step's effect not yet applied; stepConfirm: the
+// step's effect durably applied, its progress not yet recorded). A retry with a
+// hook-free context is the recovery.
 type submitHooks struct {
-	afterFacts      func()
-	afterPrecompute func()
+	afterFacts       func()
+	afterPrecompute  func()
+	beforeGitJournal func() error
+	stepApply        func(step string) error
+	stepConfirm      func(step string) error
 }
 
 type hooksKey struct{}
@@ -200,6 +211,17 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 	defer rn.mu.RUnlock()
 	if rn.closed {
 		return transport.SubmitResult{}, ErrClosed
+	}
+
+	// A pending git commit transaction is recovered FIRST, whatever the incoming
+	// artifact: a crash after its state-cas became visible advances the phase past
+	// IMPLEMENT/FIX, so the phase routing below would never reach the git driver —
+	// the only mutator that can complete the transaction. The lock-free read only
+	// routes; the recovery re-reads authoritatively under the held guard.
+	if rec, ok, jerr := txn.Open(rn.loc.CommitTxnDir, rn.loc.RunLock).Latest(); jerr == nil && ok && !rec.Terminal() {
+		if rerr := rn.recoverCommitTxn(ctx); rerr != nil {
+			return transport.SubmitResult{}, rerr
+		}
 	}
 
 	// An IMPLEMENT_STEP/FIX submit routes through the git commit transaction — its
