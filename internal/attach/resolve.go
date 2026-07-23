@@ -189,6 +189,15 @@ func ClassifyPairJournal(g *genstore.Guard, loc RunLocation) (JournalClass, erro
 	return classifyPairRecord(rec, ok, loc.RunID)
 }
 
+// ClassifyPairRecord is the PURE, lock-free domain classification of a pair-attach journal head
+// already read (via txn.Latest) by a caller that cannot hold the run guard — a read-only reader
+// bracketing a coherent snapshot. It binds the present head's kind/version/envelope/payload/run
+// identity before considering it complete, so an aborted, pending, or misbound head is
+// NonTerminal/error (recovery-required), never mistaken for a completed pairing.
+func ClassifyPairRecord(rec txn.Record, ok bool, runID string) (JournalClass, error) {
+	return classifyPairRecord(rec, ok, runID)
+}
+
 func classifyPairRecord(rec txn.Record, ok bool, runID string) (JournalClass, error) {
 	if !ok {
 		return JournalAbsent, nil
@@ -249,6 +258,12 @@ func ClassifyReplaceJournal(g *genstore.Guard, loc RunLocation) (ReplaceJournalC
 		return ReplaceJournalAbsent, err
 	}
 	return classifyReplaceRecord(rec, ok, loc.RunID)
+}
+
+// ClassifyReplaceRecord is the PURE, lock-free domain classification of a session-replacement
+// journal head (see ClassifyPairRecord): aborted/pending/misbound → NonTerminal/error.
+func ClassifyReplaceRecord(rec txn.Record, ok bool, runID string) (ReplaceJournalClass, error) {
+	return classifyReplaceRecord(rec, ok, runID)
 }
 
 func classifyReplaceRecord(rec txn.Record, ok bool, runID string) (ReplaceJournalClass, error) {

@@ -59,6 +59,12 @@ func ClassifyCommitTxnJournal(g *genstore.Guard, loc RunLocation) (CommitTxnJour
 	return classifyCommitTxnRecord(rec, ok, loc.RunID)
 }
 
+// ClassifyCommitTxnRecord is the PURE, lock-free domain classification of a commit-transaction
+// journal head (see ClassifyPairRecord): aborted/pending/misbound → NonTerminal/error.
+func ClassifyCommitTxnRecord(rec txn.Record, ok bool, runID string) (CommitTxnJournalClass, error) {
+	return classifyCommitTxnRecord(rec, ok, runID)
+}
+
 func classifyCommitTxnRecord(rec txn.Record, ok bool, runID string) (CommitTxnJournalClass, error) {
 	if !ok {
 		return CommitTxnJournalAbsent, nil
