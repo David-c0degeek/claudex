@@ -80,6 +80,18 @@ func (g *Git) Close() error {
 // GIT_AUTHOR_*) onto the scrubbed environment. A non-zero exit wraps ErrGit with the redacted,
 // bounded stderr. The context governs cancellation and timeout.
 func (g *Git) Run(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]byte, error) {
+	raw, err := g.RunRaw(ctx, dir, extraEnv, args...)
+	if err != nil {
+		return nil, err
+	}
+	// Run is for command output (oids, status, tokens): trim trailing newline(s).
+	return bytes.TrimRight(raw, "\n"), nil
+}
+
+// RunRaw runs git and returns its stdout VERBATIM — no trailing-newline trimming — bounded by the
+// same output cap as Run. Use it to read object CONTENT (e.g. `cat-file blob`), where trimming would
+// silently corrupt bytes; command output that is a token/oid should use Run.
+func (g *Git) RunRaw(ctx context.Context, dir string, extraEnv map[string]string, args ...string) ([]byte, error) {
 	stdout, stderr, code, err := g.exec(ctx, dir, extraEnv, args...)
 	if err != nil {
 		return nil, err
@@ -239,7 +251,9 @@ func (g *Git) exec(ctx context.Context, dir string, extraEnv map[string]string, 
 	cmd.Stderr = &errb
 
 	runErr := cmd.Run()
-	stdout = bytes.TrimRight(out.Bytes(), "\n")
+	// Return stdout VERBATIM; Run trims trailing newlines for token callers, RunRaw preserves bytes
+	// for object content, and RunCode's only caller ignores stdout.
+	stdout = out.Bytes()
 	stderr = errb.Bytes()
 	if runErr == nil {
 		return stdout, stderr, 0, nil
