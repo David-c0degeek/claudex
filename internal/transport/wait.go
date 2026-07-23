@@ -46,8 +46,12 @@ var (
 	ErrWaitRecoveryRequired = errors.New("transport: wait requires recovery before an event can be served")
 )
 
+// MaxWaitTimeout is the largest allowed wait timeout. It is exported so a caller (the CLI) can
+// reject an out-of-range timeout as a usage error BEFORE any run discovery or I/O, keeping usage
+// precedence over operational failure.
+const MaxWaitTimeout = time.Hour
+
 const (
-	maxWaitTimeout  = time.Hour
 	waitPollInitial = 25 * time.Millisecond
 	waitPollMax     = 250 * time.Millisecond
 )
@@ -172,7 +176,7 @@ func waitWithClock(ctx context.Context, sinceRevision uint64, timeout time.Durat
 	if poll == nil {
 		return WaitEvent{}, ErrMissingSeam
 	}
-	if timeout <= 0 || timeout > maxWaitTimeout {
+	if timeout <= 0 || timeout > MaxWaitTimeout {
 		return WaitEvent{}, ErrInvalidTimeout
 	}
 

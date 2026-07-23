@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
@@ -95,6 +96,29 @@ func TestWaitRecoveryRequired(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("recovery-required wait still wrote an event: %q", out.String())
+	}
+}
+
+// TestWaitUsageBeforeDiscovery: session grammar and the full timeout range are validated BEFORE
+// run discovery/I/O, so a malformed session or out-of-range timeout is usage exit 2 even in a repo
+// with NO active run (where discovery would otherwise fail operationally at exit 1).
+func TestWaitUsageBeforeDiscovery(t *testing.T) {
+	repo := gitRepo(t) // git init only — no attach, so no active run
+	validSession := "sess-" + strings.Repeat("a", 32)
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"empty session", []string{"wait", "--repo", repo}},
+		{"malformed session", []string{"wait", "--repo", repo, "--session", "bad id"}},
+		{"zero timeout, valid session", []string{"wait", "--repo", repo, "--session", validSession, "--timeout", "0"}},
+		{"over-max timeout, valid session", []string{"wait", "--repo", repo, "--session", validSession, "--timeout", "2h"}},
+	}
+	for _, tc := range cases {
+		var out, errb bytes.Buffer
+		if code := run(context.Background(), tc.args, &out, &errb); code != 2 {
+			t.Fatalf("%s: exit %d, want 2 (usage precedence over no-active-run); stderr=%q", tc.name, code, errb.String())
+		}
 	}
 }
 

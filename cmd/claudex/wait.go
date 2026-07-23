@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/David-c0degeek/claudex/internal/coordinator"
+	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 )
 
@@ -32,8 +33,15 @@ func waitCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "claudex: wait takes no positional arguments, got %v\n", fs.Args())
 		return 2
 	}
-	if *session == "" {
-		fmt.Fprintln(stderr, "claudex: wait requires --session")
+	// Validate every caller input (session grammar AND the full timeout range) BEFORE any run
+	// discovery or I/O, so a usage error always takes precedence over an operational one — a
+	// malformed session or out-of-range timeout is exit 2 even in a repo with no active run.
+	if !state.IsSessionID(*session) {
+		fmt.Fprintln(stderr, "claudex: wait requires a canonical --session id")
+		return 2
+	}
+	if *timeout <= 0 || *timeout > transport.MaxWaitTimeout {
+		fmt.Fprintf(stderr, "claudex: wait --timeout must be > 0 and <= %s\n", transport.MaxWaitTimeout)
 		return 2
 	}
 	runID, code := resolveRunID(*repo, *run, stderr)

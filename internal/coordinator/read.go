@@ -60,9 +60,12 @@ type coherenceSnap struct {
 	stateOK     bool
 	regRev      uint64
 	regOK       bool
-	pair        journalSnap
-	repl        journalSnap
-	ctxn        journalSnap
+	// identityCorrupt is set when a PRESENT State or Registry names a run other than loc.RunID —
+	// a cross-wired store that coherently passes the generation bracket but must still fail closed.
+	identityCorrupt bool
+	pair            journalSnap
+	repl            journalSnap
+	ctxn            journalSnap
 }
 
 // readSnap captures the aggregate-authority snapshot lock-free from the resolved run location.
@@ -105,6 +108,12 @@ func readSnap(repoDir string, loc attach.RunLocation) (coherenceSnap, state.RunS
 		return s, state.RunState{}, err
 	}
 	s.regOK, s.regRev = gok, reg.Revision
+
+	// Central cross-store identity bind: state.Registry's documented invariant (Registry.RunID ==
+	// RunState.RunID) PLUS the resolved location — every present State and Registry must name
+	// loc.RunID, and therefore each other. Binding it here (not independently in each consumer)
+	// means a coherently cross-wired store fails closed as recovery/corruption for status AND wait.
+	s.identityCorrupt = (sok && rs.RunID != loc.RunID) || (gok && reg.RunID != loc.RunID)
 	return s, rs, nil
 }
 
@@ -112,6 +121,9 @@ func readSnap(repoDir string, loc attach.RunLocation) (coherenceSnap, state.RunS
 // coherent read: any journal DOMAIN-classified recovery-required (aborted/pending/misbound), or a
 // commit-txn journal that VANISHED after the run accepted git evidence (corruption).
 func (s coherenceSnap) recoveryRequired(rs state.RunState) bool {
+	if s.identityCorrupt {
+		return true
+	}
 	if s.pair.recover || s.repl.recover || s.ctxn.recover {
 		return true
 	}

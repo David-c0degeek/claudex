@@ -1,11 +1,14 @@
 package coordinator
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/genstore"
@@ -103,6 +106,39 @@ func TestReadRefusesMisboundTerminalHead(t *testing.T) {
 
 	if _, err := Status(repo, runID); !errors.Is(err, ErrReadRecoveryRequired) {
 		t.Fatalf("status over a misbound terminal head = %v, want ErrReadRecoveryRequired", err)
+	}
+}
+
+// A coherently cross-wired State store (run B's state, with RunID=B, planted into run A's StateDir)
+// must fail closed for BOTH status and wait: the generations bracket cleanly, but the central
+// identity bind (RunState.RunID == Registry.RunID == loc.RunID) refuses it — no projection/event.
+func TestReadRefusesCrossWiredStateIdentity(t *testing.T) {
+	repoA := t.TempDir()
+	runA, leadA, _ := newPairedRun(t, repoA)
+	repoB := t.TempDir()
+	runB, _, _ := newPairedRun(t, repoB)
+	locA, err := attach.ResolveRun(repoA, runA)
+	if err != nil {
+		t.Fatalf("resolve A: %v", err)
+	}
+	locB, err := attach.ResolveRun(repoB, runB)
+	if err != nil {
+		t.Fatalf("resolve B: %v", err)
+	}
+	// Replace A's state store with B's, so a coherent state store names a DIFFERENT run in A's
+	// StateDir. A's Registry (RunID=A) is untouched — only the cross-store identity is wrong.
+	if err := os.RemoveAll(locA.StateDir); err != nil {
+		t.Fatalf("rm A state: %v", err)
+	}
+	if err := os.CopyFS(locA.StateDir, os.DirFS(locB.StateDir)); err != nil {
+		t.Fatalf("copy B state into A: %v", err)
+	}
+
+	if _, err := Status(repoA, runA); !errors.Is(err, ErrReadRecoveryRequired) {
+		t.Fatalf("status over a cross-wired state = %v, want ErrReadRecoveryRequired", err)
+	}
+	if _, err := Wait(context.Background(), repoA, runA, leadA, 0, 150*time.Millisecond); !errors.Is(err, ErrReadRecoveryRequired) {
+		t.Fatalf("wait over a cross-wired state = %v, want ErrReadRecoveryRequired", err)
 	}
 }
 
