@@ -22,6 +22,42 @@ func mutate(t *testing.T, store *state.Store, expected uint64, fn func(gen uint6
 	return r.Revision
 }
 
+// SessionInput / SessionViewer are TEST-LOCAL mirrors of the pre-seam viewer: the
+// production seam is now a Poller supplying a coherent (State, View) pair, but the
+// classification tests are still cleanest expressed as a role/replacement view over
+// loaded state. pollFor adapts such a viewer into a Poller by loading the store and
+// building the SessionInput from it — the exact plumbing the coordinator does inside
+// its readCoherent bracket.
+type SessionInput struct {
+	Revision     uint64
+	Phase        state.Phase
+	Lifecycle    state.Lifecycle
+	ActiveTurnID string // "" when no turn is assigned
+}
+
+type SessionViewer func(in SessionInput, sessionID string) (SessionView, error)
+
+func pollFor(store *state.Store, sessionID string, view SessionViewer) Poller {
+	return func() (PollObservation, error) {
+		rs, ok, err := store.Load()
+		if err != nil {
+			return PollObservation{}, err
+		}
+		if !ok {
+			return PollObservation{}, ErrNoRun
+		}
+		in := SessionInput{Revision: rs.Revision, Phase: rs.Phase, Lifecycle: rs.Lifecycle}
+		if rs.Assignment != nil {
+			in.ActiveTurnID = rs.Assignment.ID
+		}
+		v, verr := view(in, sessionID)
+		if verr != nil {
+			return PollObservation{}, verr
+		}
+		return PollObservation{State: rs, View: v}, nil
+	}
+}
+
 // fakeClock lets a test fire the poll/timeout channels deterministically and
 // observe when Wait requests each, so no test sleeps.
 type fakeClock struct {
@@ -68,7 +104,7 @@ func toPairTurn(gen uint64, n *state.RunState) {
 func TestWaitWakesOnMyTurn(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	next := mutate(t, store, rev, toPairTurn)
-	ev, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -101,7 +137,7 @@ func TestWaitStopPriority(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store, rev := newRunWithActiveTurn(t)
 			mutate(t, store, rev, tc.mut)
-			ev, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+			ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 			if err != nil {
 				t.Fatalf("wait: %v", err)
 			}
@@ -122,7 +158,7 @@ func TestWaitFailedCarriesProjection(t *testing.T) {
 		n.Assignment = nil
 		n.Failure = &state.Projection{Code: "test_gate_failed", Reason: "tests failed", NextAction: "fix and resubmit", AtRevision: r}
 	})
-	ev, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -136,7 +172,7 @@ func TestWaitRecoveryCarriesRedactedProjection(t *testing.T) {
 	mutate(t, store, rev, func(r uint64, n *state.RunState) {
 		n.Recovery = &state.Projection{Code: "torn_generation", Reason: "torn at token=sk-ant-abcdefghijklmnopqrstuvwx", NextAction: "run recover", AtRevision: r}
 	})
-	ev, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -154,7 +190,7 @@ func TestWaitRecoveryCarriesRedactedProjection(t *testing.T) {
 func TestWaitReplacementDominatesOwnTurn(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	mutate(t, store, rev, toPairTurn)
-	ev, err := Wait(context.Background(), store, "old-pair", rev, time.Second, viewForRole(RolePair, map[string]uint64{"old-pair": 9}))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "old-pair", viewForRole(RolePair, map[string]uint64{"old-pair": 9})))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -170,7 +206,7 @@ func TestWaitTerminalBeatsReplacement(t *testing.T) {
 		n.Lifecycle = state.LifecycleCancelled
 		n.Assignment = nil
 	})
-	ev, err := Wait(context.Background(), store, "old-pair", rev, time.Second, viewForRole(RolePair, map[string]uint64{"old-pair": 9}))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "old-pair", viewForRole(RolePair, map[string]uint64{"old-pair": 9})))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -181,32 +217,40 @@ func TestWaitTerminalBeatsReplacement(t *testing.T) {
 
 // --- adversarial / trust tests ---
 
-func TestWaitViewerError(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t)
-	mutate(t, store, rev, toPairTurn)
-	failing := func(SessionInput, string) (SessionView, error) {
-		return SessionView{}, errors.New("registration lookup failed for token=sk-ant-abcdefghijklmnopqrstuvwx")
-	}
-	_, err := Wait(context.Background(), store, "pair", rev, time.Second, failing)
-	if !errors.Is(err, ErrSessionView) {
-		t.Fatalf("err = %v, want ErrSessionView", err)
-	}
-	if strings.Contains(err.Error(), "sk-ant-") {
-		t.Fatalf("viewer error leaked a secret: %v", err)
+// Wait no longer runs the viewer, so it no longer sanitizes an arbitrary viewer
+// error: the Poller owns error hygiene and Wait surfaces its error unchanged.
+func TestWaitPropagatesPollError(t *testing.T) {
+	sentinel := errors.New("boom")
+	_, err := Wait(context.Background(), 0, time.Second, func() (PollObservation, error) { return PollObservation{}, sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the poll error propagated", err)
 	}
 }
 
-func TestWaitViewerInvalidReplacement(t *testing.T) {
+// The value-free guarantee now lives in ResolveSessionView: an unknown session
+// fails closed with the fixed ErrSessionView sentinel, never echoing the (possibly
+// secret-bearing) session id.
+func TestResolveSessionViewUnknownIsValueFree(t *testing.T) {
+	_, err := ResolveSessionView(state.Registry{}, state.PhaseCheckpoint, "turn-2", "sk-ant-abcdefghijklmnopqrstuvwx")
+	if !errors.Is(err, ErrSessionView) {
+		t.Fatalf("unknown session err = %v, want ErrSessionView", err)
+	}
+	if strings.Contains(err.Error(), "sk-ant-") {
+		t.Fatalf("ResolveSessionView leaked the session id: %v", err)
+	}
+}
+
+func TestWaitRejectsContradictoryView(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	mutate(t, store, rev, toPairTurn)
 	// Replaced with generation 0.
 	bad := func(SessionInput, string) (SessionView, error) { return SessionView{Replaced: true}, nil }
-	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, bad); !errors.Is(err, ErrSessionView) {
+	if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", bad)); !errors.Is(err, ErrSessionView) {
 		t.Fatalf("replaced+gen0 err = %v, want ErrSessionView", err)
 	}
 	// Not replaced but a generation set.
 	bad2 := func(SessionInput, string) (SessionView, error) { return SessionView{ReplacementGeneration: 5}, nil }
-	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, bad2); !errors.Is(err, ErrSessionView) {
+	if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", bad2)); !errors.Is(err, ErrSessionView) {
 		t.Fatalf("!replaced+gen5 err = %v, want ErrSessionView", err)
 	}
 }
@@ -216,32 +260,21 @@ func TestWaitViewerInvalidReplacement(t *testing.T) {
 // unrepresentable — the state layer enforces the four-way gate equivalence, so such
 // a generation can never be persisted or loaded. See state's gate-coherence tests.
 
-// The seam runs on every poll, so an unknown session fails immediately even at
-// the caller's current revision, and a registration-only replacement wakes.
+// The view is resolved on every poll, so an unknown/failed session fails
+// immediately even at the caller's current revision, and a registration-only
+// replacement wakes.
 func TestWaitSeamAtSameRevision(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	// Viewer error at since == current: immediate failure, not a timeout.
-	failing := func(SessionInput, string) (SessionView, error) { return SessionView{}, errors.New("boom") }
-	if _, err := Wait(context.Background(), store, "lead", rev, time.Second, failing); !errors.Is(err, ErrSessionView) {
-		t.Fatalf("viewer error at same revision err = %v, want ErrSessionView", err)
+	// Session-view failure at since == current: immediate failure, not a timeout.
+	failing := func(SessionInput, string) (SessionView, error) { return SessionView{}, ErrSessionView }
+	if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, "lead", failing)); !errors.Is(err, ErrSessionView) {
+		t.Fatalf("view failure at same revision err = %v, want ErrSessionView", err)
 	}
 	// Replacement at since == current (no run mutation): immediate wake.
 	repl := viewForRole(RoleLead, map[string]uint64{"lead": 7})
-	ev, err := Wait(context.Background(), store, "lead", rev, time.Second, repl)
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "lead", repl))
 	if err != nil || ev.Kind != WaitSessionReplaced || ev.ReplacementGeneration == nil || *ev.ReplacementGeneration != 7 {
 		t.Fatalf("replacement at same revision ev=%+v err=%v", ev, err)
-	}
-}
-
-// The viewer's arbitrary error text must not cross the boundary (redaction only
-// catches known secret patterns, not emails/paths/ids).
-func TestWaitViewerErrorValueFree(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t)
-	leak := "user@example.com at /home/dave/registry rec=abc123"
-	failing := func(SessionInput, string) (SessionView, error) { return SessionView{}, errors.New(leak) }
-	_, err := Wait(context.Background(), store, "lead", rev, time.Second, failing)
-	if !errors.Is(err, ErrSessionView) || strings.Contains(err.Error(), "example.com") || strings.Contains(err.Error(), "/home/") {
-		t.Fatalf("viewer error leaked arbitrary text: %v", err)
 	}
 }
 
@@ -263,9 +296,92 @@ func TestWaitSeamContradictions(t *testing.T) {
 	})
 	after, _, _ := store.Load()
 	for name, view := range cases {
-		if _, err := Wait(context.Background(), store, "pair", after.Revision-1, time.Second, view); !errors.Is(err, ErrSessionView) {
+		if _, err := Wait(context.Background(), after.Revision-1, time.Second, pollFor(store, "pair", view)); !errors.Is(err, ErrSessionView) {
 			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
 		}
+	}
+}
+
+// --- aggregate recovery: ride-over transient, surface persistent ---
+
+// A transient nonterminal aggregate (a healthy peer submit's brief window) is
+// ridden over: wait keeps polling and returns the real event once it clears.
+func TestWaitRidesOverTransientRecovery(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	next := mutate(t, store, rev, toPairTurn)
+	clk := newFakeClock()
+
+	// The first two polls report recovery-required; the third is coherent and wakes.
+	calls := 0
+	poll := func() (PollObservation, error) {
+		calls++
+		if calls <= 2 {
+			return PollObservation{RecoveryRequired: true}, nil
+		}
+		return pollFor(store, "pair", viewForRole(RolePair, nil))()
+	}
+	ch := make(chan WaitEvent, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ev, err := waitWithClock(context.Background(), rev, time.Second, poll, clk)
+		ch <- ev
+		errCh <- err
+	}()
+	<-clk.timeoutAsked        // first (recovery) poll ran; we are in the loop
+	clk.pollCh <- time.Time{} // second poll: recovery, ridden over
+	clk.pollCh <- time.Time{} // third poll: coherent wake
+	if err := <-errCh; err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if ev := <-ch; ev.Kind != WaitAssignment || ev.Revision != next {
+		t.Fatalf("ev = %+v, want the assignment after riding over recovery", ev)
+	}
+}
+
+// A nonterminal aggregate that persists to the deadline surfaces as recovery-required.
+func TestWaitPersistentRecoveryAtTimeout(t *testing.T) {
+	_, rev := newRunWithActiveTurn(t)
+	clk := newFakeClock()
+	poll := func() (PollObservation, error) { return PollObservation{RecoveryRequired: true}, nil }
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := waitWithClock(context.Background(), rev, time.Second, poll, clk)
+		errCh <- err
+	}()
+	<-clk.timeoutAsked
+	clk.timeoutCh <- time.Time{} // deadline: final poll still recovery
+	if err := <-errCh; !errors.Is(err, ErrWaitRecoveryRequired) {
+		t.Fatalf("err = %v, want ErrWaitRecoveryRequired", err)
+	}
+}
+
+// A recovery observed only on the initial poll, cleared by the deadline, returns
+// the coherent event rather than recovery-required.
+func TestWaitInitialRecoveryClearsByDeadline(t *testing.T) {
+	store, rev := newRunWithActiveTurn(t)
+	clk := newFakeClock()
+	calls := 0
+	poll := func() (PollObservation, error) {
+		calls++
+		if calls == 1 {
+			return PollObservation{RecoveryRequired: true}, nil
+		}
+		return pollFor(store, "pair", viewForRole(RolePair, nil))()
+	}
+	ch := make(chan WaitEvent, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ev, err := waitWithClock(context.Background(), rev, time.Second, poll, clk)
+		ch <- ev
+		errCh <- err
+	}()
+	<-clk.timeoutAsked           // initial recovery poll done; in the loop
+	clk.timeoutCh <- time.Time{} // deadline: final poll is coherent-unchanged
+	if err := <-errCh; err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if ev := <-ch; ev.Kind != WaitUnchanged || ev.Revision != rev {
+		t.Fatalf("ev = %+v, want unchanged after the transient cleared", ev)
 	}
 }
 
@@ -276,7 +392,7 @@ func TestWaitUnchangedOnTimeout(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)
 	go func() {
-		ev, _ := waitWithClock(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil), clk)
+		ev, _ := waitWithClock(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)), clk)
 		ch <- ev
 	}()
 	<-clk.timeoutAsked
@@ -291,7 +407,7 @@ func TestWaitCatchesEventAtBoundary(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)
 	go func() {
-		ev, _ := waitWithClock(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil), clk)
+		ev, _ := waitWithClock(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)), clk)
 		ch <- ev
 	}()
 	<-clk.timeoutAsked
@@ -312,7 +428,7 @@ func TestWaitIgnoresOtherRoleTurn(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)
 	go func() {
-		ev, _ := waitWithClock(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil), clk)
+		ev, _ := waitWithClock(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)), clk)
 		ch <- ev
 	}()
 	<-clk.timeoutAsked
@@ -324,7 +440,7 @@ func TestWaitIgnoresOtherRoleTurn(t *testing.T) {
 
 func TestWaitClientAhead(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
-	_, err := Wait(context.Background(), store, "pair", rev+5, time.Second, viewForRole(RolePair, nil))
+	_, err := Wait(context.Background(), rev+5, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	var ca *ClientAheadError
 	if !errors.As(err, &ca) || ca.CurrentRevision != rev {
 		t.Fatalf("err = %v, want *ClientAheadError at %d", err, rev)
@@ -337,7 +453,7 @@ func TestWaitContextCancelled(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan error, 1)
 	go func() {
-		_, err := waitWithClock(ctx, store, "pair", rev, time.Second, viewForRole(RolePair, nil), clk)
+		_, err := waitWithClock(ctx, rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)), clk)
 		ch <- err
 	}()
 	<-clk.timeoutAsked
@@ -350,20 +466,20 @@ func TestWaitContextCancelled(t *testing.T) {
 func TestWaitInvalidTimeout(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	for _, to := range []time.Duration{0, -time.Second, 2 * time.Hour} {
-		if _, err := Wait(context.Background(), store, "pair", rev, to, viewForRole(RolePair, nil)); !errors.Is(err, ErrInvalidTimeout) {
+		if _, err := Wait(context.Background(), rev, to, pollFor(store, "pair", viewForRole(RolePair, nil))); !errors.Is(err, ErrInvalidTimeout) {
 			t.Fatalf("timeout %v err = %v, want ErrInvalidTimeout", to, err)
 		}
 	}
 }
 
 func TestWaitMissingSeamAndNoRun(t *testing.T) {
-	store, rev := newRunWithActiveTurn(t)
-	if _, err := Wait(context.Background(), store, "pair", rev, time.Second, nil); !errors.Is(err, ErrMissingSeam) {
-		t.Fatalf("nil view want ErrMissingSeam, got %v", err)
+	_, rev := newRunWithActiveTurn(t)
+	if _, err := Wait(context.Background(), rev, time.Second, nil); !errors.Is(err, ErrMissingSeam) {
+		t.Fatalf("nil poll want ErrMissingSeam, got %v", err)
 	}
 	dir := t.TempDir()
 	empty := state.Open(dir+"/state", dir+"/run.lock")
-	if _, err := Wait(context.Background(), empty, "pair", 0, time.Second, viewForRole(RolePair, nil)); !errors.Is(err, ErrNoRun) {
+	if _, err := Wait(context.Background(), 0, time.Second, pollFor(empty, "pair", viewForRole(RolePair, nil))); !errors.Is(err, ErrNoRun) {
 		t.Fatalf("empty store want ErrNoRun, got %v", err)
 	}
 }
@@ -376,7 +492,7 @@ func TestWaitDoesNotHoldLock(t *testing.T) {
 		t.Fatalf("hold lock: %v", err)
 	}
 	defer g.Release()
-	ev, err := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	if err != nil || ev.Kind != WaitAssignment || ev.Revision != next {
 		t.Fatalf("wait under held lock: ev=%+v err=%v", ev, err)
 	}
@@ -387,7 +503,7 @@ func TestWaitDoesNotHoldLock(t *testing.T) {
 func TestWaitEventMarshalsAndValidates(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	mutate(t, store, rev, toPairTurn)
-	ev, _ := Wait(context.Background(), store, "pair", rev, time.Second, viewForRole(RolePair, nil))
+	ev, _ := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
 	canon, err := ev.Marshal()
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

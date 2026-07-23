@@ -59,7 +59,7 @@ func viewCurrentPairOwner(gen uint64) SessionViewer {
 // and it is a standing condition: it wakes even at the same revision.
 func TestWaitFreshSessionRequiredForIncumbent(t *testing.T) {
 	store, rev := runAtOwnerlessVerify(t, 3)
-	ev, err := Wait(context.Background(), store, sessPair, rev, time.Second, viewCurrentPair(2))
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, sessPair, viewCurrentPair(2)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestWaitFreshSessionLeadUnchanged(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)
 	go func() {
-		ev, _ := waitWithClock(context.Background(), store, sessLead, rev, time.Second, viewNotPair(), clk)
+		ev, _ := waitWithClock(context.Background(), rev, time.Second, pollFor(store, sessLead, viewNotPair()), clk)
 		ch <- ev
 	}()
 	<-clk.timeoutAsked
@@ -96,7 +96,7 @@ func TestWaitFreshSessionReplacementPriority(t *testing.T) {
 	repl := func(SessionInput, string) (SessionView, error) {
 		return SessionView{Replaced: true, ReplacementGeneration: 4}, nil
 	}
-	ev, err := Wait(context.Background(), store, sessPair, rev, time.Second, repl)
+	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, sessPair, repl))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -109,10 +109,10 @@ func TestWaitFreshSessionReplacementPriority(t *testing.T) {
 // ownerless is a seam/state contradiction, not unchanged or a downgrade.
 func TestWaitFreshSessionQualifyingContradiction(t *testing.T) {
 	store, rev := runAtOwnerlessVerify(t, 3)
-	if _, err := Wait(context.Background(), store, sessPair, rev, time.Second, viewCurrentPair(3)); !errors.Is(err, ErrSessionView) {
+	if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, sessPair, viewCurrentPair(3))); !errors.Is(err, ErrSessionView) {
 		t.Fatalf("qualifying incumbent at ownerless VERIFY err = %v, want ErrSessionView", err)
 	}
-	if _, err := Wait(context.Background(), store, sessPair, rev, time.Second, viewCurrentPair(9)); !errors.Is(err, ErrSessionView) {
+	if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, sessPair, viewCurrentPair(9))); !errors.Is(err, ErrSessionView) {
 		t.Fatalf("above-threshold incumbent at ownerless VERIFY err = %v, want ErrSessionView", err)
 	}
 }
@@ -120,7 +120,7 @@ func TestWaitFreshSessionQualifyingContradiction(t *testing.T) {
 // An ACTIVE VERIFY is an ordinary pair-owned turn for the current qualifying pair.
 func TestWaitActiveVerifyIsAssignment(t *testing.T) {
 	store, rev := runAtActiveVerify(t, 3)
-	ev, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewCurrentPairOwner(3))
+	ev, err := Wait(context.Background(), rev-1, time.Second, pollFor(store, sessPair, viewCurrentPairOwner(3)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestWaitActiveVerifyOwnershipContradictions(t *testing.T) {
 		"below-threshold current pair without owner": viewCurrentPair(2),
 	}
 	for name, v := range cases {
-		if _, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, v); !errors.Is(err, ErrSessionView) {
+		if _, err := Wait(context.Background(), rev-1, time.Second, pollFor(store, sessPair, v)); !errors.Is(err, ErrSessionView) {
 			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
 		}
 	}
@@ -154,7 +154,7 @@ func TestWaitActiveVerifyLeadUnchanged(t *testing.T) {
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)
 	go func() {
-		ev, _ := waitWithClock(context.Background(), store, sessLead, rev-1, time.Second, viewNotPair(), clk)
+		ev, _ := waitWithClock(context.Background(), rev-1, time.Second, pollFor(store, sessLead, viewNotPair()), clk)
 		ch <- ev
 	}()
 	<-clk.timeoutAsked
@@ -167,7 +167,7 @@ func TestWaitActiveVerifyLeadUnchanged(t *testing.T) {
 // A required recovery outranks the fresh-session wait.
 func TestWaitFreshSessionRecoveryDominates(t *testing.T) {
 	store, rev := runAtOwnerlessVerifyRecovering(t, 3)
-	ev, err := Wait(context.Background(), store, sessPair, rev-1, time.Second, viewCurrentPair(2))
+	ev, err := Wait(context.Background(), rev-1, time.Second, pollFor(store, sessPair, viewCurrentPair(2)))
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestWaitFreshSessionViewContradictions(t *testing.T) {
 		},
 	}
 	for name, v := range cases {
-		if _, err := Wait(context.Background(), store, sessPair, rev, time.Second, v); !errors.Is(err, ErrSessionView) {
+		if _, err := Wait(context.Background(), rev, time.Second, pollFor(store, sessPair, v)); !errors.Is(err, ErrSessionView) {
 			t.Fatalf("%s err = %v, want ErrSessionView", name, err)
 		}
 	}

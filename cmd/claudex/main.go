@@ -64,6 +64,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return submitCmd(ctx, rest, stdout, stderr)
 	case "status":
 		return statusCmd(ctx, rest, stdout, stderr)
+	case "wait":
+		return waitCmd(ctx, rest, stdout, stderr)
 	case "inspect-legacy":
 		return inspectLegacy(rest, stdout, stderr)
 	default:
@@ -131,7 +133,8 @@ Commands:
   attach           Bootstrap or join a run, or reattach/replace a session
   submit           Submit an artifact for the caller's turn
   status           Print the run's status projection
+  wait             Long-poll for the next event relevant to a session
   inspect-legacy   Print a redacted, read-only view of a pre-pivot Python run
                    (state.json); it is never resumed as an attach run
 
-pull/wait are wired incrementally; gates/operator arrive with subject 05.`
+pull is wired incrementally; gates/operator arrive with subject 05.`

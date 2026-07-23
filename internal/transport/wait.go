@@ -39,6 +39,11 @@ var (
 	ErrCorruptState = errors.New("transport: run state is internally inconsistent")
 	// ErrSessionView means the session seam failed or returned invalid facts.
 	ErrSessionView = errors.New("transport: session view")
+	// ErrWaitRecoveryRequired means a wait observed a nonterminal aggregate
+	// transaction that PERSISTED to the poll deadline — the run needs recovery
+	// before a coherent event can be served. A transient one (a healthy peer
+	// submit's brief window) is ridden over and never surfaces this.
+	ErrWaitRecoveryRequired = errors.New("transport: wait requires recovery before an event can be served")
 )
 
 const (
@@ -77,24 +82,15 @@ type WaitEvent struct {
 	NextAction            *string         `json:"next_action"`
 }
 
-// SessionInput is the immutable, value-only projection handed to the session
-// seam, so the seam cannot alias or mutate authoritative state.
-type SessionInput struct {
-	Revision     uint64
-	Phase        state.Phase
-	Lifecycle    state.Lifecycle
-	ActiveTurnID string // "" when no turn is assigned
-}
-
-// SessionView is the fact projection the seam returns. Wait constructs the
-// authoritative event; the seam only reports registration facts about this
-// session: whether it owns the active turn, whether it has been replaced (with
-// the superseding generation), and — for the ownerless-VERIFY fresh-generation
-// boundary — whether it is the pair slot's CURRENT session and that session's
-// generation. IsCurrentPair/PairGeneration are the minimum durable role facts
-// wait needs to decide the incumbent pair session must bring a fresh generation;
-// they are false/zero for lead, unknown, and replaced sessions. The seam resolves
-// them from the durable Registry (never a session's own claim).
+// SessionView is the fact projection resolved from the durable Registry for one
+// session. Wait constructs the authoritative event; the view only reports
+// registration facts about this session: whether it owns the active turn,
+// whether it has been replaced (with the superseding generation), and — for the
+// ownerless-VERIFY fresh-generation boundary — whether it is the pair slot's
+// CURRENT session and that session's generation. IsCurrentPair/PairGeneration are
+// the minimum durable role facts wait needs to decide the incumbent pair session
+// must bring a fresh generation; they are false/zero for lead, unknown, and
+// replaced sessions.
 type SessionView struct {
 	OwnsActiveTurn        bool
 	Replaced              bool
@@ -103,10 +99,52 @@ type SessionView struct {
 	PairGeneration        uint64
 }
 
-// SessionViewer answers the session-specific facts from durable registration. It
-// MUST be pure and side-effect-free and return value-free errors. An unknown or
-// corrupt session registration must return an error so wait fails closed.
-type SessionViewer func(in SessionInput, sessionID string) (SessionView, error)
+// PollObservation is ONE coherent poll of a run for a fixed session: the
+// authoritative run state AND the session view, captured together by the caller
+// inside a single aggregate bracket (State + Registry + journal heads + active
+// pointer) so no cross-store view is torn. RecoveryRequired means that bracket
+// saw a nonterminal aggregate transaction this instant — the observation is not
+// serviceable and State/View are ignored.
+type PollObservation struct {
+	State            state.RunState
+	View             SessionView
+	RecoveryRequired bool
+}
+
+// Poller supplies one coherent PollObservation per poll. Wait calls it on EVERY
+// poll (it never loads state itself), so every observation passes through the
+// caller's aggregate authority. It MUST return value-free errors.
+type Poller func() (PollObservation, error)
+
+// ResolveSessionView projects the durable Registry into the session's view facts,
+// coherently with the run facts read in the same bracket. It is pure and
+// value-free: an unknown session fails closed with ErrSessionView. The turn-role
+// ownership mirrors the submit authorizer — the current session of the phase's
+// turn role owns the active turn.
+func ResolveSessionView(reg state.Registry, phase state.Phase, assignmentID, sessionID string) (SessionView, error) {
+	r := reg.Resolve(sessionID)
+	switch r.Status {
+	case state.RegUnknown:
+		return SessionView{}, fmt.Errorf("%w: session is not registered for the run", ErrSessionView)
+	case state.RegReplaced:
+		// A superseded session owns nothing and is not the current pair; it only
+		// learns the generation that replaced it.
+		return SessionView{Replaced: true, ReplacementGeneration: r.CurrentGeneration}, nil
+	}
+	v := SessionView{}
+	if r.Role == state.SlotPair {
+		v.IsCurrentPair = true
+		v.PairGeneration = r.CurrentGeneration
+	}
+	if assignmentID != "" {
+		if spec, ok := TurnSpec(phase); ok {
+			if want, ok := slotForRole(spec.Role); ok && r.Role == want {
+				v.OwnsActiveTurn = true
+			}
+		}
+	}
+	return v, nil
+}
 
 type waitClock interface {
 	timeout(d time.Duration) <-chan time.Time
@@ -120,27 +158,32 @@ func (realClock) poll(d time.Duration) <-chan time.Time    { return time.After(d
 
 // Wait is a bounded, lock-free long-poll returning the next event relevant to a
 // session, or WaitUnchanged on timeout. It never acquires the mutation lock and
-// never mutates. Missing/corrupt state and a client-ahead cursor are typed
-// errors; every returned event is fully validated against its schema.
-func Wait(ctx context.Context, store *state.Store, sessionID string, sinceRevision uint64, timeout time.Duration, view SessionViewer) (WaitEvent, error) {
-	return waitWithClock(ctx, store, sessionID, sinceRevision, timeout, view, realClock{})
+// never mutates: every observation comes from the caller-supplied Poller, which
+// must bracket State+Registry+journal heads+active pointer into one coherent
+// PollObservation. A transient nonterminal aggregate (a healthy peer submit) is
+// ridden over; one that persists to the deadline is ErrWaitRecoveryRequired.
+// Missing/corrupt state and a client-ahead cursor are typed errors; every
+// returned event is fully validated against its schema.
+func Wait(ctx context.Context, sinceRevision uint64, timeout time.Duration, poll Poller) (WaitEvent, error) {
+	return waitWithClock(ctx, sinceRevision, timeout, poll, realClock{})
 }
 
-func waitWithClock(ctx context.Context, store *state.Store, sessionID string, sinceRevision uint64, timeout time.Duration, view SessionViewer, clk waitClock) (WaitEvent, error) {
-	if view == nil {
+func waitWithClock(ctx context.Context, sinceRevision uint64, timeout time.Duration, poll Poller, clk waitClock) (WaitEvent, error) {
+	if poll == nil {
 		return WaitEvent{}, ErrMissingSeam
 	}
 	if timeout <= 0 || timeout > maxWaitTimeout {
 		return WaitEvent{}, ErrInvalidTimeout
 	}
 
-	last, wake, err := pollOnce(store, sessionID, sinceRevision, view)
+	ev, wake, _, err := pollOnce(poll, sinceRevision)
 	if err != nil {
 		return WaitEvent{}, err
 	}
 	if wake {
-		return last, nil
+		return ev, nil
 	}
+	last := ev // WaitUnchanged, or a zero event if the first poll was recovery-required
 
 	deadline := clk.timeout(timeout)
 	interval := waitPollInitial
@@ -149,59 +192,82 @@ func waitWithClock(ctx context.Context, store *state.Store, sessionID string, si
 		case <-ctx.Done():
 			return WaitEvent{}, ctx.Err()
 		case <-deadline:
-			ev, _, err := pollOnce(store, sessionID, sinceRevision, view)
+			ev, _, recovery, err := pollOnce(poll, sinceRevision)
 			if err != nil {
 				return WaitEvent{}, err
 			}
+			if recovery {
+				// A nonterminal aggregate that persisted to the deadline is recovery-
+				// required (a transient one would have cleared on an earlier poll).
+				return WaitEvent{}, ErrWaitRecoveryRequired
+			}
 			return ev, nil
 		case <-clk.poll(interval):
-			ev, wake, err := pollOnce(store, sessionID, sinceRevision, view)
+			ev, wake, recovery, err := pollOnce(poll, sinceRevision)
 			if err != nil {
 				return WaitEvent{}, err
+			}
+			if recovery {
+				// Ride over a transient nonterminal aggregate (a healthy peer submit
+				// holds one briefly): back off and keep polling. Persistence surfaces
+				// at the deadline.
+				interval = backoff(interval)
+				continue
 			}
 			if wake {
 				return ev, nil
 			}
 			if ev.Revision != last.Revision {
 				interval = waitPollInitial
-			} else if interval < waitPollMax {
-				interval *= 2
-				if interval > waitPollMax {
-					interval = waitPollMax
-				}
+			} else {
+				interval = backoff(interval)
 			}
 			last = ev
 		}
 	}
 }
 
-// pollOnce reads state once (lock-free), classifies it, and validates the
-// resulting event so every wait return is a valid wire message.
-func pollOnce(store *state.Store, sessionID string, since uint64, view SessionViewer) (WaitEvent, bool, error) {
-	rs, ok, err := store.Load()
+// backoff doubles the poll interval up to the ceiling.
+func backoff(interval time.Duration) time.Duration {
+	if interval >= waitPollMax {
+		return waitPollMax
+	}
+	if interval *= 2; interval > waitPollMax {
+		return waitPollMax
+	}
+	return interval
+}
+
+// pollOnce takes one coherent observation from the Poller, classifies it, and
+// validates the resulting event so every wait return is a valid wire message. The
+// returned recovery flag means the observation saw a nonterminal aggregate (State
+// was not serviceable this instant); the caller decides ride-over vs surface.
+func pollOnce(poll Poller, since uint64) (ev WaitEvent, wake, recovery bool, err error) {
+	obs, err := poll()
 	if err != nil {
-		return WaitEvent{}, false, err
+		return WaitEvent{}, false, false, err
 	}
-	if !ok {
-		return WaitEvent{}, false, ErrNoRun
+	if obs.RecoveryRequired {
+		return WaitEvent{}, false, true, nil
 	}
+	rs := obs.State
 	if rs.Revision < since {
-		return WaitEvent{}, false, &ClientAheadError{SinceRevision: since, CurrentRevision: rs.Revision, Phase: rs.Phase, Lifecycle: rs.Lifecycle}
+		return WaitEvent{}, false, false, &ClientAheadError{SinceRevision: since, CurrentRevision: rs.Revision, Phase: rs.Phase, Lifecycle: rs.Lifecycle}
 	}
 
 	facts := captureFacts(rs)
-	classified, wake, cerr := classify(facts, sessionID, since, view)
+	classified, wake, cerr := classify(facts, since, obs.View)
 	if cerr != nil {
-		return WaitEvent{}, false, cerr
+		return WaitEvent{}, false, false, cerr
 	}
-	ev := classified
+	ev = classified
 	if !wake {
 		ev = newEvent(WaitUnchanged, facts)
 	}
-	if err := ev.validate(); err != nil {
-		return WaitEvent{}, false, fmt.Errorf("transport: constructed wait event is invalid: %w", err)
+	if verr := ev.validate(); verr != nil {
+		return WaitEvent{}, false, false, fmt.Errorf("transport: constructed wait event is invalid: %w", verr)
 	}
-	return ev, wake, nil
+	return ev, wake, false, nil
 }
 
 // runFacts is the authoritative snapshot captured before the seam runs, so the
@@ -250,15 +316,9 @@ func captureFacts(rs state.RunState) runFacts {
 // which is registration-driven and wakes even at the same run revision; then the
 // revision-gated run-state events (terminal, gate, budget/rate pause, recovery,
 // own assignment).
-func classify(f runFacts, sessionID string, since uint64, view SessionViewer) (WaitEvent, bool, error) {
+func classify(f runFacts, since uint64, v SessionView) (WaitEvent, bool, error) {
 	if err := coherenceCheck(f); err != nil {
 		return WaitEvent{}, false, err
-	}
-
-	v, err := view(SessionInput{Revision: f.revision, Phase: f.phase, Lifecycle: f.lifecycle, ActiveTurnID: f.assignmentID}, sessionID)
-	if err != nil {
-		// The viewer's error string is arbitrary; surface only the stable sentinel.
-		return WaitEvent{}, false, ErrSessionView
 	}
 	if err := validateView(v, f.assignmentID); err != nil {
 		return WaitEvent{}, false, err
