@@ -83,6 +83,12 @@ func validateManifest(m manifest) error {
 		return fmt.Errorf("%w: manifest lists no entries", ErrVerify)
 	}
 	seen := make(map[string]bool, len(m.Entries))
+	// Two paths may legitimately share one content-addressed blob (identical content is stored once),
+	// but then they describe the SAME bytes and must claim the same size. Without this, a manifest can
+	// list a digest twice with different sizes: only one survives the per-blob check, so the other
+	// entry's declared size is never verified against anything, and the packet would report a false
+	// size for a real path while still passing the digest, bounds, and inventory checks.
+	sizeOf := make(map[string]int64, len(m.Entries))
 	for i, e := range m.Entries {
 		if !isRawGitPath(e.GitPath) {
 			return fmt.Errorf("%w: entry %d is not a valid repository path", ErrVerify, i)
@@ -91,8 +97,8 @@ func validateManifest(m manifest) error {
 			return fmt.Errorf("%w: entry %d duplicates an earlier repository path", ErrVerify, i)
 		}
 		seen[e.GitPath] = true
-		if !isGitMode(e.Mode) {
-			return fmt.Errorf("%w: entry %d mode %q is not a canonical git mode", ErrVerify, i, e.Mode)
+		if !isEntryMode(e.Kind, e.Mode) {
+			return fmt.Errorf("%w: entry %d mode %q is not a git mode a %q entry can carry", ErrVerify, i, e.Mode, e.Kind)
 		}
 		switch e.Kind {
 		case EntryDeletion:
@@ -106,6 +112,10 @@ func validateManifest(m manifest) error {
 			if e.Size < 0 {
 				return fmt.Errorf("%w: file entry %d has a negative size", ErrVerify, i)
 			}
+			if prev, ok := sizeOf[e.SHA256]; ok && prev != e.Size {
+				return fmt.Errorf("%w: file entry %d shares a blob with an earlier entry but claims size %d, not %d", ErrVerify, i, e.Size, prev)
+			}
+			sizeOf[e.SHA256] = e.Size
 		default:
 			return fmt.Errorf("%w: entry %d has an unknown kind %q", ErrVerify, i, e.Kind)
 		}

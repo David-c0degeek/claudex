@@ -69,18 +69,17 @@ func stageBytes(evRoot *os.Root, turnID, name string, data []byte) error {
 	return atomicfile.InstallInRoot(evRoot, rel, data, blobPerm)
 }
 
-// discardStaged removes an unusable staging entry. Staged files are published read-only (0o400), and
-// on Windows a read-only attribute alone can refuse the delete, so a failed removal is retried once
-// after restoring write permission rather than left to poison every later attempt.
+// discardStaged removes an unusable staging entry, failing closed if it cannot.
+//
+// It deliberately does NOT try to chmod its way past a refusal. A staged file that has already been
+// committed is the SAME INODE as the packet entry that hard-links it, and a file's permission bits
+// (on Windows, the read-only attribute) live on the inode, not on the directory entry: relaxing them
+// through the staging name would make the COMMITTED packet payload writable. Removing a directory
+// entry never needs write permission on the file it names — POSIX unlink is governed by the parent
+// directory, and os.Root.Remove deletes a read-only file on Windows — so a refusal here is a real
+// filesystem fault, not a permission detail to work around.
 func discardStaged(evRoot *os.Root, rel string) error {
-	err := evRoot.Remove(rel)
-	if err == nil || errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if cerr := evRoot.Chmod(rel, 0o600); cerr != nil {
-		return fmt.Errorf("%w: unusable staging entry %q could not be discarded: %v", ErrCorrupt, rel, err)
-	}
-	if err = evRoot.Remove(rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := evRoot.Remove(rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: unusable staging entry %q could not be discarded: %v", ErrCorrupt, rel, err)
 	}
 	return nil
@@ -148,9 +147,17 @@ func requireInventory(evRoot *os.Root, turnID string, want map[string]bool) erro
 	return nil
 }
 
-// sweepStaging removes a turn's staging area best-effort (it is outside every committed packet
-// inventory, so leftover staging never affects verification; this only reclaims space). It is safe
-// to call under the run guard while the manifest is absent OR after a successful publish.
+// sweepStaging reclaims a turn's staging area. Every entry is a hard link to an inode the packet
+// already owns (or to bytes nothing kept), so removing the staging NAME frees the directory entry
+// without touching the committed payload — and it must never relax permissions to do so, since the
+// bits are shared with the committed link (see discardStaged).
+//
+// It is best-effort by design, not by oversight: staging lies outside every committed inventory, so
+// a leftover entry is invisible to verification and is reclaimed by the next produce for this turn.
+// Failing a fully published, fully verified packet over unreclaimed scratch would be strictly worse.
+// The case that must NOT be silently tolerated — a staged entry that cannot be discarded when it has
+// to be REPLACED — is fatal in discardStaged. It is safe to call under the run guard while the
+// manifest is absent or after a successful publish.
 func sweepStaging(evRoot *os.Root, turnID string) {
 	dir := path.Join(stagingDir, turnID)
 	entries, err := readDirNames(evRoot, dir)

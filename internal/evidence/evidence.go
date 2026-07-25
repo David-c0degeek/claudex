@@ -173,8 +173,8 @@ func (r Recipe) validate() error {
 			return fmt.Errorf("%w: entry %d duplicates an earlier repository path", ErrRecipe, i)
 		}
 		seen[e.GitPath] = true
-		if !isGitMode(e.Mode) {
-			return fmt.Errorf("%w: entry %d mode %q is not a canonical git mode", ErrRecipe, i, e.Mode)
+		if !isEntryMode(e.Kind, e.Mode) {
+			return fmt.Errorf("%w: entry %d mode %q is not a git mode a %q entry can carry", ErrRecipe, i, e.Mode, e.Kind)
 		}
 		switch e.Kind {
 		case EntryDeletion:
@@ -271,16 +271,23 @@ func IsSelectorPath(p string) bool {
 	return true
 }
 
-// isGitMode reports whether s is a canonical six-digit octal Git mode (100644, 100755, 120000,
-// 160000, 040000). Every entry carries one, including a deletion, which records its pre-image mode.
-func isGitMode(s string) bool {
-	if len(s) != 6 {
+// isEntryMode reports whether mode is a Git mode this entry KIND can legitimately carry. It is an
+// exact set, not an octal-shaped token: an arbitrary six-digit octal string is not a Git mode, and a
+// manifest that records one is not recording the original object's mode.
+//
+//   - A materialized payload (EntryFile) is a blob whose bytes the packet holds: a regular file, an
+//     executable file, or a symlink, whose blob content is its target path. A gitlink (160000) names
+//     a commit in another repository and has no blob object to materialize, and a tree (040000) is
+//     not a leaf, so neither can be a file entry.
+//   - A deletion records a PRE-IMAGE mode and materializes no bytes, so it additionally admits
+//     160000: a deleted path may legitimately have been a submodule. A tree is still not a leaf.
+func isEntryMode(kind EntryKind, mode string) bool {
+	switch mode {
+	case "100644", "100755", "120000":
+		return true
+	case "160000":
+		return kind == EntryDeletion
+	default:
 		return false
 	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '7' {
-			return false
-		}
-	}
-	return true
 }

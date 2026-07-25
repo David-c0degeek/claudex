@@ -141,6 +141,12 @@ func verifyPacket(evRoot *os.Root, turnID string, bounds Bounds, expect Expectat
 			return manifest{}, nil, fmt.Errorf("%w: file entry %d size %d over the %d file limit", ErrVerify, i, e.Size, bounds.MaxFileBytes)
 		}
 		payloadTotal += e.Size
+		// Entries sharing a blob must agree on its size (validateManifest proved this, and this fold
+		// re-proves it locally): a silent overwrite here would verify one entry's claimed size and
+		// leave the other's unchecked, so EVERY logical entry's size is covered by the single re-hash.
+		if prev, ok := blobs[e.SHA256]; ok && prev != e.Size {
+			return manifest{}, nil, fmt.Errorf("%w: file entry %d claims size %d for a blob an earlier entry sized %d", ErrVerify, i, e.Size, prev)
+		}
 		blobs[e.SHA256] = e.Size
 	}
 	if total := int64(len(canon)) + payloadTotal; total > bounds.MaxTotalBytes {

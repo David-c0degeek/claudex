@@ -2,6 +2,10 @@ package evidence
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -72,10 +76,25 @@ func TestProduceVerifyRoundTrip(t *testing.T) {
 	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	// The packet root holds exactly the manifest + the 3 unique blobs; staging is gone.
+	// The packet root holds exactly the manifest + the 3 unique blobs.
 	names := dirNames(t, filepath.Join(dir, "turn-1"))
 	if len(names) != 4 || !names[ManifestName] {
 		t.Fatalf("packet inventory = %v, want manifest + 3 blobs", names)
+	}
+	// Ordinary success reclaims the turn's staging area: the read-only staged links are removed
+	// WITHOUT relaxing the permissions they share with the committed packet payload.
+	if _, serr := os.Lstat(filepath.Join(dir, "staging", "turn-1")); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("staging/turn-1 survived a successful publish (lstat err = %v)", serr)
+	}
+	for n := range names {
+		if n == ManifestName {
+			continue
+		}
+		f, oerr := os.OpenFile(filepath.Join(dir, "turn-1", n), os.O_WRONLY, 0)
+		if oerr == nil {
+			f.Close()
+			t.Fatalf("committed packet blob %s is writable after publication", n)
+		}
 	}
 }
 
@@ -195,6 +214,90 @@ func TestVerifyRejectsStructurallyEmptyManifest(t *testing.T) {
 	expect := Expectation{RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT", Source: SourceObject{Commit: oid(100), Tree: oid(101)}}
 	if err := VerifyRef(dir, ref, testBounds, expect); !errors.Is(err, ErrVerify) {
 		t.Fatalf("structurally empty manifest verify = %v, want ErrVerify", err)
+	}
+}
+
+// Two paths MAY share one content-addressed blob — identical content is stored once — but then they
+// describe the same bytes and must claim the same size. A manifest listing a digest twice with
+// different sizes would otherwise pass: only one size survives the per-blob fold, so the other
+// entry's declared size is verified against nothing while the digest, bounds, and inventory checks
+// all succeed. Both halves are built here through the wire encoder, so the bytes are canonical and
+// only the size rule can distinguish them.
+func TestVerifySharedBlobSizes(t *testing.T) {
+	content := []byte("ab") // 2 bytes
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	plant := func(t *testing.T, sizeA, sizeB int64) (string, EvidenceRef, Expectation) {
+		t.Helper()
+		dir := t.TempDir()
+		mustMkdirAll(t, filepath.Join(dir, "turn-1"))
+		writeFile(t, filepath.Join(dir, "turn-1", digest), content)
+		// Entries in canonical order (sorted by raw path bytes), encoded exactly as canonical() does.
+		w := wireManifest{
+			SchemaVersion: manifestSchemaVersion,
+			RunID:         "run-1",
+			TurnID:        "turn-1",
+			Phase:         "PLAN_DRAFT",
+			Source:        SourceObject{Commit: oid(100), Tree: oid(101)},
+			Entries: []wireEntry{
+				{PathB64: base64.StdEncoding.EncodeToString([]byte("a")), Mode: "100644", Kind: EntryFile, SHA256: digest, Size: sizeA},
+				{PathB64: base64.StdEncoding.EncodeToString([]byte("b")), Mode: "100644", Kind: EntryFile, SHA256: digest, Size: sizeB},
+			},
+		}
+		raw, err := json.Marshal(w)
+		if err != nil {
+			t.Fatalf("marshal wire manifest: %v", err)
+		}
+		writeFile(t, filepath.Join(dir, "turn-1", ManifestName), raw)
+		ref := EvidenceRef{ManifestRelPath: packetManifestRel("turn-1"), RootDigest: rootDigest(raw)}
+		expect := Expectation{RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT", Source: SourceObject{Commit: oid(100), Tree: oid(101)}}
+		return dir, ref, expect
+	}
+
+	// Agreeing sizes: legitimate dedup, must verify. This proves the adversarial half below is
+	// rejected for the size disagreement and not for some unrelated reason.
+	dir, ref, expect := plant(t, 2, 2)
+	if err := VerifyRef(dir, ref, testBounds, expect); err != nil {
+		t.Fatalf("shared blob with agreeing sizes = %v, want success", err)
+	}
+	// Disagreeing sizes: the first entry's claimed size is false, so the packet fails closed.
+	dir, ref, expect = plant(t, 1, 2)
+	if err := VerifyRef(dir, ref, testBounds, expect); !errors.Is(err, ErrVerify) {
+		t.Fatalf("shared blob with disagreeing sizes = %v, want ErrVerify", err)
+	}
+}
+
+// A manifest records an ORIGINAL Git mode, not an arbitrary octal-shaped token, and what is legal
+// depends on the entry kind: a materialized payload must be a blob the packet can hold, while a
+// deletion records only a pre-image and may name a submodule.
+func TestEntryModesAreTheRealGitSet(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		kind EntryKind
+		ok   bool
+	}{
+		{"100644", EntryFile, true},
+		{"100755", EntryFile, true},
+		{"120000", EntryFile, true},     // symlink: the blob content is the target path
+		{"160000", EntryFile, false},    // gitlink: names a commit, there is no blob to materialize
+		{"160000", EntryDeletion, true}, // a deleted path may have been a submodule
+		{"040000", EntryFile, false},    // a tree is not a leaf
+		{"040000", EntryDeletion, false},
+		{"000000", EntryFile, false}, // octal-shaped, not a Git mode
+		{"777777", EntryFile, false},
+		{"644", EntryFile, false},
+	} {
+		if got := isEntryMode(tc.kind, tc.mode); got != tc.ok {
+			t.Errorf("isEntryMode(%q, %q) = %v, want %v", tc.kind, tc.mode, got, tc.ok)
+		}
+	}
+	// The recipe validator refuses one end to end, before any durable effect.
+	reader := fakeReader{}
+	r := planDraftRecipe(reader)
+	r.Entries[0].Mode = "777777"
+	if _, err := Produce(context.Background(), t.TempDir(), r, reader); !errors.Is(err, ErrRecipe) {
+		t.Fatalf("bogus mode produce = %v, want ErrRecipe", err)
 	}
 }
 
