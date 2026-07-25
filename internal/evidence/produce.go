@@ -24,6 +24,11 @@ type staged struct {
 // authoring/bounds failures (a missing/oversize blob, a request or total-bytes breach) surface
 // BEFORE any packet-root commit, so a failed produce leaves the committed packet untouched (only
 // staging, which is outside every packet inventory, may hold partial bytes).
+//
+// Publication is self-checking end to end: a pre-existing staged file is trusted only after its
+// bytes are compared, a manifest-absent packet root is refused unless it is exactly a prefix of THIS
+// packet, and the finished packet is re-verified against the recipe's expectation before the ref is
+// returned. Produce therefore never returns a ref that VerifyRef would reject.
 func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectReader) (EvidenceRef, error) {
 	if err := r.validate(); err != nil {
 		return EvidenceRef{}, err
@@ -42,7 +47,8 @@ func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectRea
 		}
 		b, err := materialize(ctx, e, r.Bounds, reader)
 		if err != nil {
-			return EvidenceRef{}, fmt.Errorf("entry %d (%s): %w", i, e.GitPath, err)
+			// Reported by index only: the path is caller-supplied and never echoed.
+			return EvidenceRef{}, fmt.Errorf("entry %d: %w", i, err)
 		}
 		sum := sha256.Sum256(b)
 		digest := hex.EncodeToString(sum[:])
@@ -61,6 +67,7 @@ func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectRea
 		return EvidenceRef{}, fmt.Errorf("%w: packet is %d bytes over the %d total limit", ErrBounds, total-r.Bounds.MaxTotalBytes, r.Bounds.MaxTotalBytes)
 	}
 	ref := EvidenceRef{ManifestRelPath: packetManifestRel(r.TurnID), RootDigest: rootDigest(canon)}
+	expect := r.Expectation()
 
 	evRoot, err := os.OpenRoot(evidenceDir)
 	if err != nil {
@@ -71,7 +78,7 @@ func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectRea
 	// 3. Idempotent: a committed manifest means the packet is already published — re-verify it fully
 	//    equals what this recipe expects, then return (never rewrite an immutable packet).
 	if _, err := evRoot.Lstat(ref.ManifestRelPath); err == nil {
-		if verr := verifyExpected(evRoot, r.TurnID, r.Bounds, canon, ref.RootDigest); verr != nil {
+		if verr := verifyExpected(evRoot, r.TurnID, r.Bounds, canon, ref.RootDigest, expect); verr != nil {
 			return EvidenceRef{}, verr
 		}
 		sweepStaging(evRoot, r.TurnID)
@@ -98,7 +105,21 @@ func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectRea
 		}
 		linked[it.digest] = true
 	}
+
+	// 5. The packet root now holds this recipe's complete blob set. It must hold NOTHING ELSE before
+	//    the commit point: a manifest-absent root is a recoverable prefix of THIS packet only, and a
+	//    foreign entry has to be refused now — once the manifest is linked the packet is immutable and
+	//    the stray would make it unverifiable forever.
+	if err := requireInventory(evRoot, r.TurnID, linked); err != nil {
+		return EvidenceRef{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
 	if err := commitManifest(evRoot, r.TurnID, canon); err != nil {
+		return EvidenceRef{}, err
+	}
+
+	// 6. The commit point is published; prove the ref about to be returned is one this package's own
+	//    verifier accepts. Produce never hands back a ref whose packet would fail VerifyRef.
+	if err := verifyExpected(evRoot, r.TurnID, r.Bounds, canon, ref.RootDigest, expect); err != nil {
 		return EvidenceRef{}, err
 	}
 	sweepStaging(evRoot, r.TurnID)

@@ -69,7 +69,7 @@ func TestProduceVerifyRoundTrip(t *testing.T) {
 	if ref.ManifestRelPath != "turn-1/"+ManifestName || !isOID64(ref.RootDigest) {
 		t.Fatalf("ref = %+v", ref)
 	}
-	if err := VerifyRef(dir, ref, testBounds); err != nil {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	// The packet root holds exactly the manifest + the 3 unique blobs; staging is gone.
@@ -100,14 +100,15 @@ func TestProduceIdempotentAndDeterministic(t *testing.T) {
 func TestVerifyRejectsTamperedManifest(t *testing.T) {
 	dir := t.TempDir()
 	reader := fakeReader{}
-	ref := mustProduce(t, dir, planDraftRecipe(reader), reader)
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
 
 	mp := filepath.Join(dir, ref.ManifestRelPath)
 	b, _ := os.ReadFile(mp)
 	tampered := strings.Replace(string(b), "PLAN_DRAFT", "CHECKPOINT", 1)
 	os.Remove(mp)                      // the committed packet is read-only; replace it
 	writeFile(t, mp, []byte(tampered)) // same length, different content -> different root digest
-	if err := VerifyRef(dir, ref, testBounds); !errors.Is(err, ErrVerify) {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
 		t.Fatalf("tampered manifest verify = %v, want ErrVerify", err)
 	}
 }
@@ -115,9 +116,10 @@ func TestVerifyRejectsTamperedManifest(t *testing.T) {
 func TestVerifyRejectsWrongRoot(t *testing.T) {
 	dir := t.TempDir()
 	reader := fakeReader{}
-	ref := mustProduce(t, dir, planDraftRecipe(reader), reader)
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
 	ref.RootDigest = oid(2) + oid(2)[:24] // a different 64-hex digest
-	if err := VerifyRef(dir, ref, testBounds); !errors.Is(err, ErrVerify) {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
 		t.Fatalf("wrong-root verify = %v, want ErrVerify", err)
 	}
 }
@@ -125,13 +127,14 @@ func TestVerifyRejectsWrongRoot(t *testing.T) {
 func TestVerifyRejectsUnlistedAndMissing(t *testing.T) {
 	dir := t.TempDir()
 	reader := fakeReader{}
-	ref := mustProduce(t, dir, planDraftRecipe(reader), reader)
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
 
 	// A foreign entry planted INSIDE the committed packet root (including a crash-temp sibling) is
 	// unlisted -> fail closed.
 	foreign := filepath.Join(dir, "turn-1", ".claudex-tmp-foreign")
 	writeFile(t, foreign, []byte("junk"))
-	if err := VerifyRef(dir, ref, testBounds); !errors.Is(err, ErrVerify) {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
 		t.Fatalf("unlisted-entry verify = %v, want ErrVerify", err)
 	}
 	os.Remove(foreign)
@@ -144,8 +147,104 @@ func TestVerifyRejectsUnlistedAndMissing(t *testing.T) {
 			break
 		}
 	}
-	if err := VerifyRef(dir, ref, testBounds); !errors.Is(err, ErrVerify) {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
 		t.Fatalf("missing-blob verify = %v, want ErrVerify", err)
+	}
+}
+
+// A packet that is internally self-consistent is NOT enough: verification is held to the identity
+// the caller independently expects, so a packet cut from another run, turn, phase, or source object
+// fails closed even though its own digest matches.
+func TestVerifyRejectsForeignIdentity(t *testing.T) {
+	dir := t.TempDir()
+	reader := fakeReader{}
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
+
+	for name, mutate := range map[string]func(x *Expectation){
+		"run":    func(x *Expectation) { x.RunID = "run-2" },
+		"phase":  func(x *Expectation) { x.Phase = "CHECKPOINT" },
+		"commit": func(x *Expectation) { x.Source.Commit = oid(200) },
+		"tree":   func(x *Expectation) { x.Source.Tree = oid(201) },
+	} {
+		expect := r.Expectation()
+		mutate(&expect)
+		if err := VerifyRef(dir, ref, testBounds, expect); !errors.Is(err, ErrVerify) {
+			t.Fatalf("wrong-%s expectation verify = %v, want ErrVerify", name, err)
+		}
+	}
+	// A ref whose derived path names a different turn than the expectation is refused before any read.
+	otherTurn := EvidenceRef{ManifestRelPath: packetManifestRel("turn-9"), RootDigest: ref.RootDigest}
+	if err := VerifyRef(dir, otherTurn, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
+		t.Fatalf("turn-mismatch verify = %v, want ErrVerify", err)
+	}
+}
+
+// A canonical manifest that carries the right turn and hashes to the digest it is checked against is
+// still refused unless it is STRUCTURALLY complete. Without this, an empty-identity packet with no
+// entries would verify purely because it agreed with itself.
+func TestVerifyRejectsStructurallyEmptyManifest(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdirAll(t, filepath.Join(dir, "turn-1"))
+	// Exactly what canonical() would emit for a zero-valued manifest with only a turn id: field
+	// order, compact encoding, and a null entry list.
+	empty := []byte(`{"schema_version":1,"run_id":"","turn_id":"turn-1","phase":"","source":{"commit":"","tree":""},"entries":null}`)
+	writeFile(t, filepath.Join(dir, "turn-1", ManifestName), empty)
+
+	ref := EvidenceRef{ManifestRelPath: packetManifestRel("turn-1"), RootDigest: rootDigest(empty)}
+	expect := Expectation{RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT", Source: SourceObject{Commit: oid(100), Tree: oid(101)}}
+	if err := VerifyRef(dir, ref, testBounds, expect); !errors.Is(err, ErrVerify) {
+		t.Fatalf("structurally empty manifest verify = %v, want ErrVerify", err)
+	}
+}
+
+// Repository paths are arbitrary byte strings. encoding/json would coerce them to valid UTF-8 and
+// collapse distinct paths onto U+FFFD, so the manifest stores them losslessly: two paths differing
+// only in an invalid byte must stay distinct entries and must produce distinct packet digests.
+func TestManifestPathsAreLossless(t *testing.T) {
+	pathA, pathB := "dir/x\x80", "dir/x\x81"
+	recipeFor := func(turnID string, paths ...string) Recipe {
+		r := Recipe{
+			RunID:  "run-1",
+			TurnID: turnID,
+			Phase:  "PLAN_DRAFT",
+			Source: SourceObject{Commit: oid(100), Tree: oid(101)},
+			Bounds: testBounds,
+		}
+		for _, p := range paths {
+			r.Entries = append(r.Entries, RecipeEntry{
+				GitPath: p, Mode: "100644", Kind: EntryFile,
+				Source: BlobSource{Inline: []byte("same bytes\n")},
+			})
+		}
+		return r
+	}
+
+	// Both paths in ONE packet: they must survive as two distinct entries. A lossy encoding would
+	// decode back to a single duplicated path and fail verification.
+	dir := t.TempDir()
+	both := recipeFor("turn-1", pathA, pathB)
+	ref := mustProduce(t, dir, both, nil)
+	if err := VerifyRef(dir, ref, testBounds, both.Expectation()); err != nil {
+		t.Fatalf("verify lossless packet: %v", err)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, ref.ManifestRelPath))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	m, _, err := parseCanonical(stored)
+	if err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if len(m.Entries) != 2 || m.Entries[0].GitPath != pathA || m.Entries[1].GitPath != pathB {
+		t.Fatalf("paths did not round-trip: %q", []string{m.Entries[0].GitPath, m.Entries[1].GitPath})
+	}
+
+	// The two paths must not alias: identical content under either path yields a different digest.
+	refA := mustProduce(t, t.TempDir(), recipeFor("turn-1", pathA), nil)
+	refB := mustProduce(t, t.TempDir(), recipeFor("turn-1", pathB), nil)
+	if refA.RootDigest == refB.RootDigest {
+		t.Fatalf("distinct paths produced the same packet digest %s", refA.RootDigest)
 	}
 }
 
@@ -185,7 +284,7 @@ func TestRecoveryPrefixAndStagingTemp(t *testing.T) {
 	ref := mustProduce(t, dir, r, reader)
 
 	// Simulate the crash halt: remove the committed manifest (blobs remain) and plant a leftover
-	// staging temp AND a leftover staged manifest source (the real linked-target-plus-source halt).
+	// staging temp.
 	os.Remove(filepath.Join(dir, ref.ManifestRelPath))
 	mustMkdirAll(t, filepath.Join(dir, "staging", "turn-1"))
 	writeFile(t, filepath.Join(dir, "staging", "turn-1", ".claudex-tmp-leftover"), []byte("temp"))
@@ -197,8 +296,73 @@ func TestRecoveryPrefixAndStagingTemp(t *testing.T) {
 	if ref2 != ref {
 		t.Fatalf("recovery ref changed: %+v vs %+v", ref2, ref)
 	}
-	if err := VerifyRef(dir, ref, testBounds); err != nil {
+	if err := VerifyRef(dir, ref, testBounds, r.Expectation()); err != nil {
 		t.Fatalf("post-recovery verify: %v", err)
+	}
+}
+
+// The physical halt that a name-only staging check would mishandle: the crash left FINALIZED staging
+// sources (not temps) holding the WRONG bytes under the exact names the publisher is about to link —
+// including manifest.v1.json, whose name is fixed rather than content-addressed. Trusting the name
+// would hard-link stale bytes in as the packet's commit point and return a digest of different
+// content. Recovery must re-read, discard, and restage, so the returned ref verifies.
+func TestRecoveryFinalizedStagingSourceReplaced(t *testing.T) {
+	dir := t.TempDir()
+	reader := fakeReader{}
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
+
+	// Halt the packet just before its commit point, then plant finalized staging sources with wrong
+	// content: one for the manifest, one under a real blob's content-addressed name.
+	blobName := ""
+	for n := range dirNames(t, filepath.Join(dir, "turn-1")) {
+		if n != ManifestName {
+			blobName = n
+			break
+		}
+	}
+	if blobName == "" {
+		t.Fatal("no committed blob to model")
+	}
+	os.Remove(filepath.Join(dir, ref.ManifestRelPath))
+	os.Remove(filepath.Join(dir, "turn-1", blobName)) // this blob's link never happened
+	staging := filepath.Join(dir, "staging", "turn-1")
+	mustMkdirAll(t, staging)
+	// Staged files are published read-only, so recovery must be able to discard a 0o400 entry (on
+	// Windows the read-only attribute alone refuses the delete).
+	writeFilePerm(t, filepath.Join(staging, ManifestName), []byte(`{"schema_version":1,"stale":true}`), 0o400)
+	writeFilePerm(t, filepath.Join(staging, blobName), []byte("not the bytes this digest names"), 0o400)
+
+	ref2, err := Produce(context.Background(), dir, r, reader)
+	if err != nil {
+		t.Fatalf("recovery re-produce: %v", err)
+	}
+	if ref2 != ref {
+		t.Fatalf("recovery ref changed: %+v vs %+v", ref2, ref)
+	}
+	if err := VerifyRef(dir, ref2, testBounds, r.Expectation()); err != nil {
+		t.Fatalf("post-recovery verify: %v", err)
+	}
+}
+
+// A manifest-absent packet root is a recoverable prefix of THIS packet only. A foreign entry in it
+// must be refused BEFORE the manifest is linked: after that commit point the packet is immutable, so
+// a stray committed alongside it would make the packet unverifiable forever.
+func TestForeignPacketPrefixFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	reader := fakeReader{}
+	r := planDraftRecipe(reader)
+	ref := mustProduce(t, dir, r, reader)
+
+	os.Remove(filepath.Join(dir, ref.ManifestRelPath))
+	writeFile(t, filepath.Join(dir, "turn-1", "foreign-entry"), []byte("from some other packet"))
+
+	if _, err := Produce(context.Background(), dir, r, reader); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("foreign prefix produce = %v, want ErrCorrupt", err)
+	}
+	// The commit point was never reached.
+	if _, err := os.Lstat(filepath.Join(dir, ref.ManifestRelPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest was committed over a foreign prefix (lstat err = %v)", err)
 	}
 }
 
@@ -219,7 +383,12 @@ func dirNames(t *testing.T, dir string) map[string]bool {
 
 func writeFile(t *testing.T, path string, data []byte) {
 	t.Helper()
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	writeFilePerm(t, path, data, 0o644)
+}
+
+func writeFilePerm(t *testing.T, path string, data []byte, perm os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, data, perm); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }

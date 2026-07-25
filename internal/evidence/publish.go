@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -38,19 +39,49 @@ func ensureDir(evRoot *os.Root, rel string) error {
 	return nil
 }
 
-// stageBytes writes data as a content-addressed staging blob staging/<turn>/<digest>, entirely
-// within the owning staging area (so its atomicfile temp never enters a committed packet root). It
-// is idempotent: an already-present staged blob (content-addressed, same bytes) is re-confirmed
-// durable rather than rewritten.
-func stageBytes(evRoot *os.Root, turnID, digest string, data []byte) error {
-	rel := path.Join(stagingDir, turnID, digest)
-	if err := atomicfile.InstallInRoot(evRoot, rel, data, blobPerm); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			// A complete prior stage exists (content-addressed name == content hash); re-confirm its
-			// directory entry durable without reopening the read-only file RW.
-			return atomicfile.ConfirmParentInRoot(evRoot, rel)
-		}
+// stageBytes writes data as staging/<turn>/<name>, entirely within the owning staging area (so its
+// atomicfile temp never enters a committed packet root). It is idempotent AND self-correcting: a
+// pre-existing staged file is trusted ONLY after its bytes are re-read and compared equal. A NAME is
+// never accepted as proof of content — not even a content-addressed one, since a crash can leave a
+// truncated file, and the manifest stages under a fixed name whose stale contents would otherwise be
+// hard-linked in as the packet's commit point. Anything that disagrees is discarded and rewritten:
+// staging is owned scratch outside every committed inventory, so replacing it is always safe.
+func stageBytes(evRoot *os.Root, turnID, name string, data []byte) error {
+	rel := path.Join(stagingDir, turnID, name)
+	err := atomicfile.InstallInRoot(evRoot, rel, data, blobPerm)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, fs.ErrExist) {
 		return err
+	}
+	// Read one byte past the expected length so an oversize file is detected rather than truncated
+	// into a false match; a non-regular or over-limit entry surfaces as an error and is discarded.
+	got, rerr := atomicfile.ReadInRoot(evRoot, rel, int64(len(data))+1)
+	if rerr == nil && bytes.Equal(got, data) {
+		// A complete, byte-identical prior stage: re-confirm its directory entry durable without
+		// reopening the read-only file RW (which Windows rejects).
+		return atomicfile.ConfirmParentInRoot(evRoot, rel)
+	}
+	if derr := discardStaged(evRoot, rel); derr != nil {
+		return derr
+	}
+	return atomicfile.InstallInRoot(evRoot, rel, data, blobPerm)
+}
+
+// discardStaged removes an unusable staging entry. Staged files are published read-only (0o400), and
+// on Windows a read-only attribute alone can refuse the delete, so a failed removal is retried once
+// after restoring write permission rather than left to poison every later attempt.
+func discardStaged(evRoot *os.Root, rel string) error {
+	err := evRoot.Remove(rel)
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if cerr := evRoot.Chmod(rel, 0o600); cerr != nil {
+		return fmt.Errorf("%w: unusable staging entry %q could not be discarded: %v", ErrCorrupt, rel, err)
+	}
+	if err = evRoot.Remove(rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: unusable staging entry %q could not be discarded: %v", ErrCorrupt, rel, err)
 	}
 	return nil
 }
@@ -93,6 +124,28 @@ func linkIntoPacket(evRoot *os.Root, turnID, name string) error {
 // committedRegular reads a committed packet file (regular-file-only, bounded), for verification.
 func committedRegular(evRoot *os.Root, turnID, name string, maxBytes int64) ([]byte, error) {
 	return atomicfile.ReadInRoot(evRoot, path.Join(turnID, name), maxBytes)
+}
+
+// requireInventory fails closed unless the packet root's entries are exactly want. It is the single
+// inventory authority: the verifier holds a committed packet to {manifest} ∪ {listed blobs}, and the
+// producer holds a manifest-ABSENT prefix to exactly the blobs this recipe expects. A prefix is
+// recoverable only if it is a prefix of THIS packet — a foreign blob, a stray file, or a temp that
+// should never be in a packet root must be refused BEFORE the manifest commit point, because after
+// that point the packet is immutable and would fail verification forever.
+func requireInventory(evRoot *os.Root, turnID string, want map[string]bool) error {
+	names, err := readDirNames(evRoot, turnID)
+	if err != nil {
+		return fmt.Errorf("packet root unreadable: %v", err)
+	}
+	for _, n := range names {
+		if !want[n] {
+			return fmt.Errorf("unlisted packet entry %q", n)
+		}
+	}
+	if len(names) != len(want) {
+		return fmt.Errorf("packet holds %d entries, expected %d", len(names), len(want))
+	}
+	return nil
 }
 
 // sweepStaging removes a turn's staging area best-effort (it is outside every committed packet

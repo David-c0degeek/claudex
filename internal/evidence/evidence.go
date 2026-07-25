@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode/utf8"
 )
 
 // ManifestName is the canonical manifest leaf published last as a packet's commit point.
@@ -88,9 +89,10 @@ type BlobSource struct {
 	Inline        []byte
 }
 
-// RecipeEntry is one fully-resolved, deterministic selection. GitPath is the lossless logical Git
-// path (recorded, never recreated on disk); Mode is the original Git mode; the content is
-// content-addressed by sha256 in the packet.
+// RecipeEntry is one fully-resolved, deterministic selection. GitPath holds the EXACT repository
+// path bytes (a Go string is a byte string, so a non-UTF-8 Git path is carried verbatim); it is
+// recorded losslessly in the manifest and never recreated on disk. Mode is the original Git mode;
+// the content is content-addressed by sha256 in the packet.
 type RecipeEntry struct {
 	GitPath string
 	Mode    string
@@ -162,15 +164,17 @@ func (r Recipe) validate() error {
 	}
 	seen := make(map[string]bool, len(r.Entries))
 	for i, e := range r.Entries {
-		if !isGitPath(e.GitPath) {
-			return fmt.Errorf("%w: entry %d path %q is not a canonical git path", ErrRecipe, i, e.GitPath)
+		// Entry paths are reported by index only, never echoed: a repository path is
+		// caller-supplied, may carry non-UTF-8 bytes, and could name something sensitive.
+		if !isRawGitPath(e.GitPath) {
+			return fmt.Errorf("%w: entry %d is not a valid repository path", ErrRecipe, i)
 		}
 		if seen[e.GitPath] {
-			return fmt.Errorf("%w: entry %d duplicates path %q", ErrRecipe, i, e.GitPath)
+			return fmt.Errorf("%w: entry %d duplicates an earlier repository path", ErrRecipe, i)
 		}
 		seen[e.GitPath] = true
-		if strings.TrimSpace(e.Mode) == "" {
-			return fmt.Errorf("%w: entry %d has no mode", ErrRecipe, i)
+		if !isGitMode(e.Mode) {
+			return fmt.Errorf("%w: entry %d mode %q is not a canonical git mode", ErrRecipe, i, e.Mode)
 		}
 		switch e.Kind {
 		case EntryDeletion:
@@ -220,15 +224,17 @@ func isOID(s string) bool {
 	return true
 }
 
-// isGitPath is a platform-INDEPENDENT canonical git-path grammar (not filepath.IsLocal, whose answer
-// varies by host): a nonempty, bounded, forward-slash relative path with no traversal, no backslash,
-// no drive colon, no NUL, and no empty/dot segments. It is the same rule the task-contract v2
-// relevant_repo_paths use and that the lossless representation of discovered diff paths satisfies.
-func isGitPath(p string) bool {
+// isRawGitPath is the LOSSLESS repository-path grammar every materialized entry must satisfy. A Git
+// path is an arbitrary byte string in which only '/' is structural: backslash, colon, and non-UTF-8
+// bytes are all legal filename content, and a discovered diff path must round-trip them EXACTLY.
+// Packet payloads are content-addressed by sha256 and the original path is never recreated on disk,
+// so no platform-name restriction belongs here — only the structural rules that make a path a path:
+// nonempty, bounded, relative, no NUL, and no empty or dot segments.
+func isRawGitPath(p string) bool {
 	if p == "" || len(p) > 4096 {
 		return false
 	}
-	if strings.ContainsAny(p, "\\:\x00") {
+	if strings.IndexByte(p, 0) >= 0 {
 		return false
 	}
 	if strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
@@ -236,6 +242,43 @@ func isGitPath(p string) bool {
 	}
 	for _, seg := range strings.Split(p, "/") {
 		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSelectorPath is the STRICTER grammar for an AUTHOR-DECLARED selector (task-contract v2's
+// relevant_repo_paths), which is a different thing from a discovered path: a human writes it, it is
+// compared for exact-leaf equality against the source tree, and it must mean the same thing on every
+// host. It is therefore a platform-INDEPENDENT canonical UTF-8 subset of isRawGitPath (never
+// filepath.IsLocal, whose answer varies by host): valid UTF-8, no backslash or drive colon (both of
+// which read as separators on some platforms and would make a selector ambiguous), and no control
+// characters. U+FFFD is refused as well, so no selector can be spelled as the replacement character
+// that a lossy encoder would have produced from invalid bytes.
+func IsSelectorPath(p string) bool {
+	if !isRawGitPath(p) || !utf8.ValidString(p) {
+		return false
+	}
+	if strings.ContainsAny(p, "\\:") {
+		return false
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f || r == utf8.RuneError {
+			return false
+		}
+	}
+	return true
+}
+
+// isGitMode reports whether s is a canonical six-digit octal Git mode (100644, 100755, 120000,
+// 160000, 040000). Every entry carries one, including a deletion, which records its pre-image mode.
+func isGitMode(s string) bool {
+	if len(s) != 6 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '7' {
 			return false
 		}
 	}

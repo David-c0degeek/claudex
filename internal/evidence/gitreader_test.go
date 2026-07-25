@@ -62,7 +62,7 @@ func TestReadsFromCommitNotWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
-	if err := VerifyRef(evDir, ref, testBounds); err != nil {
+	if err := VerifyRef(evDir, ref, testBounds, r.Expectation()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 
