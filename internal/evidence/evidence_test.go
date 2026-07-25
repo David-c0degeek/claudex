@@ -502,3 +502,29 @@ func mustMkdirAll(t *testing.T, dir string) {
 		t.Fatalf("mkdirall %s: %v", dir, err)
 	}
 }
+
+// The packet holds frozen RUN inputs and repository content in ONE manifest path space, so the
+// context entries need names no repository selector can also produce. The reservation lives in the
+// selector grammar, which makes the collision impossible by construction rather than a duplicate
+// discovered late inside packet validation.
+func TestSelectorPathReservesTheContextNamespace(t *testing.T) {
+	for _, p := range []string{
+		ReservedContextPrefix + "task.json",
+		ReservedContextPrefix + "policy.json",
+		ReservedContextPrefix + "anything/else",
+	} {
+		if IsSelectorPath(p) {
+			t.Errorf("IsSelectorPath(%q) = true, want the reserved namespace refused", p)
+		}
+		// The reserved paths are still valid ENTRY paths — the producer records context under them.
+		if !isRawGitPath(p) {
+			t.Errorf("isRawGitPath(%q) = false, want the producer able to record context there", p)
+		}
+	}
+	// A similarly-named path outside the reserved prefix stays selectable.
+	for _, p := range []string{".claudexrc", "docs/.claudex/notes.md", ".claudex"} {
+		if !IsSelectorPath(p) {
+			t.Errorf("IsSelectorPath(%q) = false, want a non-reserved path accepted", p)
+		}
+	}
+}

@@ -115,6 +115,14 @@ func gitAcceptExactlyApplied(rs state.RunState, acc state.AcceptedTurn, plan Git
 	} else if rs.Assignment != nil {
 		return false
 	}
+	// The review-evidence binding is part of the issued identity, not an incidental field: an
+	// otherwise-exact acceptance that bound a DIFFERENT packet is a foreign append, and reading it as
+	// Applied would let recovery terminalize over review material this plan never published. The
+	// comparison is complete (turn, revision, path, root) and requires exact ABSENCE on a route that
+	// issues no turn.
+	if !evidenceMatchesPlan(rs.Evidence, plan, rs.Revision) {
+		return false
+	}
 	if plan.IssuedGateID != "" {
 		if rs.Gate == nil || rs.Gate.ID != plan.IssuedGateID || rs.Gate.IssuedRevision != rs.Revision {
 			return false
@@ -292,4 +300,18 @@ func FinalizeGitAccept(rs state.RunState, gen uint64, next *state.RunState, plan
 		GitCommit:      &gc,
 	}
 	return nil
+}
+
+// evidenceMatchesPlan reports whether rs carries EXACTLY the review-evidence binding this plan
+// froze. A plan that issues no turn, or issues one into a repo-edit phase, must leave no binding at
+// all; any other plan must bind precisely the packet it published, at the acceptance revision.
+func evidenceMatchesPlan(ev *state.AssignmentEvidence, plan GitAcceptPlan, rev uint64) bool {
+	if plan.IssuedTurnID == "" || plan.EvidenceManifestRelPath == "" {
+		return ev == nil
+	}
+	return ev != nil &&
+		ev.TurnID == plan.IssuedTurnID &&
+		ev.IssuedRevision == rev &&
+		ev.ManifestRelPath == plan.EvidenceManifestRelPath &&
+		ev.RootDigest == plan.EvidenceRootDigest
 }

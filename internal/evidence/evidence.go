@@ -257,19 +257,34 @@ func isRawGitPath(p string) bool {
 	return true
 }
 
+// ReservedContextPrefix is the packet's reserved logical namespace. A packet records frozen RUN
+// inputs (the task and policy snapshots) alongside repository content, and both live in one manifest
+// path space, so those entries need names no repository selector can also produce — otherwise a task
+// declaring the same path would collide with the context entry and surface as a confusing duplicate
+// deep inside packet validation.
+//
+// It is the runtime directory claudex already owns in a repository, and which the definite-new-run
+// preflight requires to be git-ignored — so a selector naming it could never resolve from a
+// committed tree anyway. Reserving it in the grammar turns that into a clear, early refusal.
+const ReservedContextPrefix = ".claudex/"
+
 // IsSelectorPath is the STRICTER grammar for an AUTHOR-DECLARED selector (task-contract v2's
 // relevant_repo_paths), which is a different thing from a discovered path: a human writes it, it is
 // compared for exact-leaf equality against the source tree, and it must mean the same thing on every
 // host. It is therefore a platform-INDEPENDENT canonical UTF-8 subset of isRawGitPath (never
 // filepath.IsLocal, whose answer varies by host): valid UTF-8, no backslash or drive colon (both of
-// which read as separators on some platforms and would make a selector ambiguous), and no control
-// characters. U+FFFD is refused as well, so no selector can be spelled as the replacement character
-// that a lossy encoder would have produced from invalid bytes.
+// which read as separators on some platforms and would make a selector ambiguous), no control
+// characters, and never the reserved context namespace. U+FFFD is refused as well, so no selector
+// can be spelled as the replacement character that a lossy encoder would have produced from invalid
+// bytes.
 func IsSelectorPath(p string) bool {
 	if !isRawGitPath(p) || !utf8.ValidString(p) {
 		return false
 	}
 	if strings.ContainsAny(p, "\\:") {
+		return false
+	}
+	if strings.HasPrefix(p, ReservedContextPrefix) {
 		return false
 	}
 	for _, r := range p {

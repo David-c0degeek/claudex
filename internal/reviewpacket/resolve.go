@@ -3,9 +3,9 @@ package reviewpacket
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/gitx"
@@ -23,13 +23,13 @@ var ErrResolve = fmt.Errorf("reviewpacket: cannot resolve the review-evidence re
 // before it is read into memory rather than after.
 const maxSnapshotBytes = config.MaxContractBytes
 
-// contextPath is the in-manifest repository path recorded for a frozen run input. These are not
-// repository blobs, so they get reserved paths under a namespace no real selector can collide with:
-// a selector is validated by evidence.IsSelectorPath, which rejects the leading dot segment that
-// makes these names distinct.
+// The in-manifest logical paths recorded for the frozen run inputs. These are not repository blobs,
+// so they live in evidence.ReservedContextPrefix — the one namespace IsSelectorPath refuses, which is
+// what makes a collision with a task-declared selector impossible by construction rather than a
+// duplicate discovered late inside packet validation.
 const (
-	taskContextPath   = ".claudex/task.json"
-	policyContextPath = ".claudex/policy.json"
+	taskContextPath   = evidence.ReservedContextPrefix + "task.json"
+	policyContextPath = evidence.ReservedContextPrefix + "policy.json"
 )
 
 // contextMode is the mode recorded for a materialized frozen input. They are ordinary file content,
@@ -70,8 +70,11 @@ func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, ph
 	if state.RepoEditPhase(phase) {
 		return evidence.Recipe{}, fmt.Errorf("%w: %s carries a worktree, not an evidence packet", ErrResolve, phase)
 	}
-	if !evidence.IsObjectID(src.Commit) || !evidence.IsObjectID(src.Tree) {
-		return evidence.Recipe{}, fmt.Errorf("%w: source is not a pair of proven object ids", ErrResolve)
+	// The packet binds the COMPLETE source identity, so the pair must be PROVEN consistent, not
+	// merely two well-formed ids: content is read from src.Commit while src.Tree is what the manifest
+	// records, so an unchecked pair could publish bytes from one commit while binding another's tree.
+	if err := proveSourcePair(ctx, d, src); err != nil {
+		return evidence.Recipe{}, err
 	}
 	taskBytes, err := readSnapshot(d.RunDir, rs.TaskSnapshot, "task")
 	if err != nil {
@@ -126,25 +129,49 @@ func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, ph
 // a reviewer always sees the state the run actually agreed to, never an unaccepted one.
 func resolveSource(ctx context.Context, d Deps, rs state.RunState) (evidence.SourceObject, error) {
 	if latest, ok := state.LatestGitCommit(rs); ok {
-		if !evidence.IsObjectID(latest.Commit) || !evidence.IsObjectID(latest.Tree) {
-			return evidence.SourceObject{}, fmt.Errorf("%w: accepted git evidence is not a pair of object ids", ErrResolve)
-		}
+		// Returned as-is; ResolveAt proves the pair against the object store, so the accepted tuple
+		// gets exactly the same proof a caller-supplied source does.
 		return evidence.SourceObject{Commit: latest.Commit, Tree: latest.Tree}, nil
 	}
 	if rs.BaseCommit == "" {
 		return evidence.SourceObject{}, fmt.Errorf("%w: run has no base commit", ErrResolve)
 	}
-	// Resolve AND prove the base commit's tree rather than assuming it: the packet binds the complete
-	// source identity, so the tree is read from the object store, not inferred.
-	tree, err := d.Git.Run(ctx, d.RepoDir, nil, "rev-parse", "--verify", "--quiet", rs.BaseCommit+"^{tree}")
+	// Read the base commit's tree from the object store rather than inferring it; ResolveAt then
+	// re-proves the pair, so this path and the accepted-tuple path are held to one rule.
+	tree, err := commitTree(ctx, d, rs.BaseCommit)
 	if err != nil {
-		return evidence.SourceObject{}, fmt.Errorf("%w: base commit %s has no readable tree: %v", ErrResolve, rs.BaseCommit, err)
+		return evidence.SourceObject{}, err
 	}
-	src := evidence.SourceObject{Commit: rs.BaseCommit, Tree: string(tree)}
+	return evidence.SourceObject{Commit: rs.BaseCommit, Tree: tree}, nil
+}
+
+// proveSourcePair requires src.Tree to be exactly the tree src.Commit points at. Both halves are
+// checked for grammar first so a malformed id is never handed to git.
+func proveSourcePair(ctx context.Context, d Deps, src evidence.SourceObject) error {
 	if !evidence.IsObjectID(src.Commit) || !evidence.IsObjectID(src.Tree) {
-		return evidence.SourceObject{}, fmt.Errorf("%w: base source is not a pair of object ids", ErrResolve)
+		return fmt.Errorf("%w: source is not a pair of object ids", ErrResolve)
 	}
-	return src, nil
+	tree, err := commitTree(ctx, d, src.Commit)
+	if err != nil {
+		return err
+	}
+	if tree != src.Tree {
+		return fmt.Errorf("%w: source commit %s names tree %s, not the bound %s", ErrResolve, src.Commit, tree, src.Tree)
+	}
+	return nil
+}
+
+// commitTree resolves a commit's tree from the object store.
+func commitTree(ctx context.Context, d Deps, commit string) (string, error) {
+	out, err := d.Git.Run(ctx, d.RepoDir, nil, "rev-parse", "--verify", "--quiet", commit+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("%w: commit %s has no readable tree: %v", ErrResolve, commit, err)
+	}
+	tree := string(out)
+	if !evidence.IsObjectID(tree) {
+		return "", fmt.Errorf("%w: commit %s resolved to a malformed tree id", ErrResolve, commit)
+	}
+	return tree, nil
 }
 
 // resolveBlob resolves one declared selector to its blob id and original mode in the source tree.
@@ -174,28 +201,40 @@ func resolveBlob(ctx context.Context, d Deps, commit, sel string) (oid, mode str
 	return rec.oid, rec.mode, nil
 }
 
-// readSnapshot reads a frozen run input, confined to the run directory and bounded. It only asserts
-// presence and size; the packet binds the exact bytes, and state independently owns the digest.
+// readSnapshot reads a frozen run input and proves it is the EXACT bytes the run froze.
+//
+// SnapshotRef is defined as "relative local path plus the exact digest of the bytes", so the digest
+// is the authority and the path alone is not: without the check, replacing a task snapshot with
+// different but still-valid v2 JSON would change the declared selectors and therefore the packet,
+// while immutable run state still named the old digest. The packet would be internally consistent
+// and bound to a task the run never agreed to.
+//
+// The read is regular-only and bounded (atomicfile.ReadInRoot), not a plain rooted Open: an in-root
+// symlink would otherwise be followed to another file, and a FIFO could block the resolution
+// indefinitely.
 func readSnapshot(runDir string, ref state.SnapshotRef, what string) ([]byte, error) {
 	if ref.RelPath == "" {
 		return nil, fmt.Errorf("%w: run has no %s snapshot", ErrResolve, what)
+	}
+	if !state.IsHex64(ref.Digest) {
+		return nil, fmt.Errorf("%w: the %s snapshot digest is not a sha256", ErrResolve, what)
 	}
 	root, err := os.OpenRoot(runDir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
-	f, err := root.Open(ref.RelPath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s snapshot: %v", ErrResolve, what, err)
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxSnapshotBytes+1))
+	// One byte past the ceiling, so an oversize snapshot is detected rather than silently truncated
+	// into a digest mismatch that reads like tampering.
+	data, err := atomicfile.ReadInRoot(root, ref.RelPath, maxSnapshotBytes+1)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s snapshot: %v", ErrResolve, what, err)
 	}
 	if len(data) > maxSnapshotBytes {
 		return nil, fmt.Errorf("%w: %s snapshot exceeds %d bytes", ErrResolve, what, maxSnapshotBytes)
+	}
+	if got := config.Hash(data); got != ref.Digest {
+		return nil, fmt.Errorf("%w: the %s snapshot does not match the digest the run froze", ErrResolve, what)
 	}
 	return data, nil
 }

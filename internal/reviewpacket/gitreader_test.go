@@ -79,3 +79,80 @@ func TestReadsFromCommitNotWorktree(t *testing.T) {
 		t.Fatalf("packet blob = %q, want the committed content %q (not the worktree edit)", got, committed)
 	}
 }
+
+// The packet binds the COMPLETE source identity, so {commit, tree} must be a PROVEN pair, not two
+// independently well-formed ids: content is read from the commit while the tree is what the manifest
+// records, so an unchecked pair could publish bytes from one commit while binding another's tree.
+func TestResolveAtRejectsAnInconsistentSourcePair(t *testing.T) {
+	repo := t.TempDir()
+	g := gitEnv(t, repo)
+
+	commitA, treeA := commitFile(t, g, repo, "a.txt", "first\n")
+	_, treeB := commitFile(t, g, repo, "b.txt", "second\n")
+	if treeA == treeB {
+		t.Fatal("the two commits must have different trees for this test to mean anything")
+	}
+
+	d := Deps{RunDir: t.TempDir(), RepoDir: repo, Git: g}
+	// The matched pair proves.
+	if err := proveSourcePair(context.Background(), d, evidence.SourceObject{Commit: commitA, Tree: treeA}); err != nil {
+		t.Fatalf("matched pair rejected: %v", err)
+	}
+	// Commit A with commit B's tree: both ids exist and are well-formed, but they are not a pair.
+	err := proveSourcePair(context.Background(), d, evidence.SourceObject{Commit: commitA, Tree: treeB})
+	if err == nil || !strings.Contains(err.Error(), "not the bound") {
+		t.Fatalf("mismatched pair err = %v, want a pair refusal", err)
+	}
+	// A well-formed id that names no object fails closed too.
+	if err := proveSourcePair(context.Background(), d, evidence.SourceObject{Commit: strings.Repeat("0", 40), Tree: treeA}); err == nil {
+		t.Fatal("an unknown commit must fail closed")
+	}
+}
+
+// gitEnv opens a gitx handle on a fresh repository.
+func gitEnv(t *testing.T, repo string) *gitx.Git {
+	t.Helper()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	g, err := gitx.New()
+	if err != nil {
+		t.Fatalf("gitx.New: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	return g
+}
+
+// commitFile writes a file, commits it, and returns the resulting {commit, tree}.
+func commitFile(t *testing.T, g *gitx.Git, repo, name, body string) (commit, tree string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", name}, {"commit", "-q", "-m", "c-" + name}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	ctx := context.Background()
+	c, err := g.Run(ctx, repo, nil, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	tr, err := g.Run(ctx, repo, nil, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		t.Fatalf("rev-parse tree: %v", err)
+	}
+	return string(c), string(tr)
+}

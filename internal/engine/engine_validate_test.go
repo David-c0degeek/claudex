@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/config"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -44,6 +45,20 @@ func TestApplyNoPartialWriteOnReject(t *testing.T) {
 			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteDraftAccepted}, assign("n")},
 		"running with a gate id": {baseNext(6),
 			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview}, Ids{AssignmentTurnID: "n", GateID: "g"}},
+		// Evidence is validated BEFORE the first write, so each of these rejects with next untouched
+		// rather than after the phase and route fields have already moved.
+		"read-only turn with no evidence packet": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview}, assignEdit("n")},
+		"read-only turn with an undevised packet path": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview},
+			Ids{AssignmentTurnID: "n", Evidence: &EvidencePacket{ManifestRelPath: "elsewhere/manifest.v1.json", RootDigest: testDigest("n")}}},
+		"read-only turn with a malformed packet root": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview},
+			Ids{AssignmentTurnID: "n", Evidence: &EvidencePacket{ManifestRelPath: evidence.PacketManifestRel("n"), RootDigest: "not-a-digest"}}},
+		"gate route carrying an evidence packet": {baseNext(6),
+			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhaseAwaitGuidance, Route: RouteGate,
+				Gate: &GateSpec{Kind: state.PauseHumanDecision, OriginPhase: state.PhasePlanCritique, ResumePhase: state.PhasePlanCritique}},
+			Ids{GateID: "g", Evidence: testPacket("g")}},
 		"reissue consumed turn": {baseNext(6),
 			Decision{FromPhase: state.PhasePlanCritique, ExpectedStateRevision: 5, Source: src(), Next: state.PhasePlanCritique, Route: RouteRetryReview}, assign("t")},
 		"non-canonical assignment id (path)": {baseNext(6),

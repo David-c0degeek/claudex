@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/engine"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -22,12 +23,17 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 		Decision:     engine.Decision{Next: state.PhaseCheckpoint},
 		IssuedTurnID: "turn-2",
 		GitCommit:    ev,
+		// The CHECKPOINT turn this acceptance issues is read-only, so the plan freezes the packet it
+		// published; recovery must re-bind exactly this one.
+		EvidenceManifestRelPath: evidence.PacketManifestRel("turn-2"),
+		EvidenceRootDigest:      testRootDigest("turn-2"),
 	}
 	applied := func() state.RunState {
 		e := ev
 		return state.RunState{
 			Revision: 8, Phase: state.PhaseCheckpoint, Lifecycle: state.LifecycleRunning,
 			Assignment: &state.Ref{ID: "turn-2", IssuedRevision: 8},
+			Evidence:   testBinding("turn-2", 8),
 			AcceptedTurns: map[string]state.AcceptedTurn{
 				"turn-1": {
 					ArtifactDigest: dig("4"),
@@ -48,8 +54,24 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 			rs.Assignment = &state.Ref{ID: "turn-x", IssuedRevision: 8}
 			bindEvidence(rs, 8)
 		},
-		"missing issued assignment": func(rs *state.RunState) { rs.Assignment = nil },
-		"different resulting phase": func(rs *state.RunState) { rs.Phase = state.PhaseTests },
+		"missing issued assignment": func(rs *state.RunState) { rs.Assignment, rs.Evidence = nil, nil },
+		// The binding is part of the issued identity: an otherwise-exact acceptance that bound a
+		// DIFFERENT packet is a foreign append, and reading it as Applied would let recovery
+		// terminalize over review material this plan never published.
+		"evidence bound to another packet root": func(rs *state.RunState) {
+			b := testBinding("turn-2", 8)
+			b.RootDigest = testRootDigest("some-other-packet")
+			rs.Evidence = b
+		},
+		"evidence bound to another packet path": func(rs *state.RunState) {
+			b := testBinding("turn-2", 8)
+			b.ManifestRelPath = evidence.PacketManifestRel("turn-9")
+			rs.Evidence = b
+		},
+		"evidence bound to another turn":     func(rs *state.RunState) { rs.Evidence = testBinding("turn-9", 8) },
+		"evidence bound to another revision": func(rs *state.RunState) { rs.Evidence = testBinding("turn-2", 7) },
+		"evidence missing entirely":          func(rs *state.RunState) { rs.Evidence = nil },
+		"different resulting phase":          func(rs *state.RunState) { rs.Phase = state.PhaseTests },
 		"unissued gate present": func(rs *state.RunState) {
 			rs.Gate = &state.Ref{ID: "gate-x", IssuedRevision: 8}
 		},

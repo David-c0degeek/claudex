@@ -21,6 +21,7 @@ import (
 	"sort"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -568,9 +569,7 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 	case RouteDraftAccepted:
 		next.CandidatePlan = copyPlanRef(dec.Plan)
 		next.CandidateChecks = copyCheckSet(dec.Checks)
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RoutePromote:
 		next.AgreedPlan = &state.PlanAgreement{
 			Plan:           *next.CandidatePlan,
@@ -584,42 +583,28 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		next.Counters.StepFixes = make([]int, next.AgreedPlan.Plan.StepCount)
 		idx := 0
 		next.StepIndex = &idx
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteToRevise:
 		next.CandidateChecks = copyCheckSet(dec.Checks)
 		next.PendingFindings = copyFindings(dec.Findings)
 		next.Counters.PlanRevisions++
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteRetryReview:
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteReviseAccepted:
 		next.CandidatePlan = copyPlanRef(dec.Plan)
 		next.PendingFindings = nil // preserve checks, clear findings
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteToCheckpoint:
 		next.FixReturn = "" // clears when leaving FIX; a no-op from IMPLEMENT
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteNextStep:
 		*next.StepIndex++
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteToFix:
 		next.Counters.StepFixes[*next.StepIndex]++
 		next.FixReturn = state.PhaseCheckpoint
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteToTests:
 		// Ownerless: from the final CHECKPOINT (cursor at last step) or a FIX return.
 		next.FixReturn = ""
@@ -632,16 +617,12 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 	case RouteTestsFix:
 		next.Counters.TestFixes++
 		next.FixReturn = state.PhaseTests
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteVerifyFix:
 		next.Counters.VerifyFixes++
 		next.FixReturn = state.PhaseVerify
 		next.Verify = nil // leaving VERIFY for FIX clears the requirement
-		if err := issue(next, ids, gen); err != nil {
-			return err
-		}
+		issue(next, ids, gen)
 	case RouteToDone:
 		next.Verify = nil
 		next.Lifecycle = state.LifecycleCompleted // terminal: no assignment, no gate
@@ -701,9 +682,15 @@ func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, 
 		if !state.IsRunID(ids.GateID) || ids.AssignmentTurnID != "" {
 			return fmt.Errorf("%w: a gate requires exactly a canonical gate id", ErrBadDecision)
 		}
+		if ids.Evidence != nil {
+			return fmt.Errorf("%w: a gate issues no turn and takes no evidence packet", ErrBadDecision)
+		}
 	case IDAssignment:
 		if !state.IsRunID(ids.AssignmentTurnID) || ids.GateID != "" {
 			return fmt.Errorf("%w: a running edge requires exactly a canonical assignment id", ErrBadDecision)
+		}
+		if err := validateIssuedEvidence(dec.Next, ids); err != nil {
+			return err
 		}
 		if !ownerless && ids.AssignmentTurnID == submitted.TurnID {
 			return fmt.Errorf("%w: the next assignment reuses the consumed turn", ErrBadDecision)
@@ -714,6 +701,9 @@ func validateApply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, 
 	case IDNone:
 		if ids.AssignmentTurnID != "" || ids.GateID != "" {
 			return fmt.Errorf("%w: an ownerless edge issues no identity", ErrBadDecision)
+		}
+		if ids.Evidence != nil {
+			return fmt.Errorf("%w: an ownerless edge issues no turn and takes no evidence packet", ErrBadDecision)
 		}
 	default:
 		return fmt.Errorf("%w: unknown id kind %d", ErrBadDecision, idKind)
@@ -1172,18 +1162,39 @@ func copyFindings(f *state.FindingObligations) *state.FindingObligations {
 // binding have exactly the same lifetime, so no generation can exist in which one moved without the
 // other. The resulting revision is stamped into the binding here because the CAS is the first point
 // at which it is known.
-func issue(next *state.RunState, ids Ids, gen uint64) error {
-	// next.Phase is already the resulting phase, so the requirement is decidable here — and it is
-	// checked rather than assumed: an adapter that forgot to publish a packet, or supplied one for a
-	// worktree turn, is a wiring bug that must fail at the transition rather than produce a state
-	// only the store validator would catch.
-	readOnly := !state.RepoEditPhase(next.Phase)
-	if readOnly && ids.Evidence == nil {
-		return fmt.Errorf("%w: a read-only %s assignment requires a published evidence packet", ErrBadDecision, next.Phase)
+// validateIssuedEvidence proves the packet an assignment-issuing edge carries is exactly right for
+// the phase it lands in, BEFORE Apply writes anything. It runs inside validateApply rather than at
+// the point of use so a rejected Apply never partially mutates next — the documented contract — and
+// so a malformed-but-present packet is refused rather than persisted.
+func validateIssuedEvidence(nextPhase state.Phase, ids Ids) error {
+	if state.RepoEditPhase(nextPhase) {
+		if ids.Evidence != nil {
+			return fmt.Errorf("%w: a %s assignment carries a worktree and must have no evidence packet", ErrBadDecision, nextPhase)
+		}
+		return nil
 	}
-	if !readOnly && ids.Evidence != nil {
-		return fmt.Errorf("%w: a %s assignment carries a worktree and must have no evidence packet", ErrBadDecision, next.Phase)
+	ev := ids.Evidence
+	if ev == nil {
+		return fmt.Errorf("%w: a read-only %s assignment requires a published evidence packet", ErrBadDecision, nextPhase)
 	}
+	// The packet must be the DERIVED manifest for the turn being issued: state enforces the same rule
+	// on the persisted binding, and catching it here means Apply cannot mint a state the store would
+	// then refuse.
+	if ev.ManifestRelPath != evidence.PacketManifestRel(ids.AssignmentTurnID) {
+		return fmt.Errorf("%w: the evidence packet path is not the derived manifest for the issued turn", ErrBadDecision)
+	}
+	if !state.IsHex64(ev.RootDigest) {
+		return fmt.Errorf("%w: the evidence packet root digest is not a sha256", ErrBadDecision)
+	}
+	return nil
+}
+
+// issue writes the assignment and, for a read-only turn, the evidence binding that makes it
+// actionable. The two are written together and cleared together, so no generation exists in which
+// one moved without the other. validateApply has already proven the packet is present exactly when
+// required and well-formed, so this only writes. The resulting revision is stamped here because the
+// CAS is the first point at which it is known.
+func issue(next *state.RunState, ids Ids, gen uint64) {
 	next.Assignment = &state.Ref{ID: ids.AssignmentTurnID, IssuedRevision: gen}
 	next.Evidence = nil
 	if ids.Evidence != nil {
@@ -1194,7 +1205,6 @@ func issue(next *state.RunState, ids Ids, gen uint64) error {
 			RootDigest:      ids.Evidence.RootDigest,
 		}
 	}
-	return nil
 }
 
 func applyGate(g *GateSpec, source state.EventRef, gateID string, gen uint64, next *state.RunState) {
