@@ -102,6 +102,7 @@ func TestSubmitRefusesNonLiveRunBeforeSink(t *testing.T) {
 		rc, err := store.Mutate(rev, func(_ uint64, next *state.RunState) error {
 			next.Lifecycle = state.LifecycleCancelled
 			next.Assignment = nil
+			next.Evidence = nil // the binding is consumed with the turn it authorized
 			return nil
 		})
 		if err != nil {

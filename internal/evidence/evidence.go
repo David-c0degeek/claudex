@@ -4,10 +4,12 @@
 // identity and never mutates run state; its callers (the issuance authorities) bind the resulting
 // EvidenceRef into the state transition, and pull re-verifies + projects it.
 //
-// Slice 1 (this file set) is the producer + complete verifier + the serializable recipe/payload
-// types + the rooted durable-link publication, provable standalone with no RunState change. The
-// phase-specific SELECTION that resolves a Recipe from run state / the task contract, and the state
-// v7 binding, are the integration slices.
+// This package is the packet AUTHORITY and nothing else: it produces, publishes, and verifies
+// exactly the Recipe it is handed, and knows nothing about runs, phases, or Git. Deciding WHAT
+// belongs in a packet — resolving a Recipe from run state, the frozen task contract, and the
+// repository's committed history — is internal/reviewpacket's job. That split is deliberate: it
+// keeps this package a leaf, which is what lets run state validate a persisted evidence binding
+// against PacketManifestRel without dragging a Git dependency into the state layer.
 //
 // Publication topology (resolves the atomicfile linked-temp cut): all atomicfile writes happen in an
 // owning per-turn STAGING directory OUTSIDE any committed packet root, so every .claudex-tmp-* and
@@ -136,9 +138,11 @@ type ObjectReader interface {
 	Blob(ctx context.Context, oid string) ([]byte, error)
 }
 
-// packetManifestRel is the derived, deterministic manifest path (relative to the evidence root) for
-// a turn's packet. It is the single source of the ManifestRelPath binding.
-func packetManifestRel(turnID string) string { return path.Join(turnID, ManifestName) }
+// PacketManifestRel is the derived, deterministic manifest path (relative to the evidence root) for
+// a turn's packet. It is the SINGLE source of the ManifestRelPath binding: the producer publishes
+// there, the verifier reads there, and run state validates a persisted binding against it, so a
+// stored path is never free-form text that could point at another turn's packet.
+func PacketManifestRel(turnID string) string { return path.Join(turnID, ManifestName) }
 
 // validate checks a recipe is structurally sound before any materialization. Identity fields must be
 // nonempty and free of path separators (they become directory/blob names); every entry must carry a
@@ -209,6 +213,11 @@ func isPacketName(s string) bool {
 	c := s[0]
 	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
 }
+
+// IsObjectID reports whether s is a 40- or 64-char lower-hex git object id (sha-1 or sha-256). It is
+// exported so a caller resolving a recipe can reject a malformed object id before asking this package
+// to materialize it.
+func IsObjectID(s string) bool { return isOID(s) }
 
 // isOID reports whether s is a 40- or 64-char lower-hex git object id.
 func isOID(s string) bool {

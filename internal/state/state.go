@@ -42,8 +42,14 @@ import (
 // semantic format change: an older v5 generation is rejected outright (no implicit
 // migration; a missing IMPLEMENT/FIX tuple is never treated as valid). An older
 // generation is missing a required field, so it fails with version remediation,
-// not a vague error (see checkSchemaVersion).
-const RunStateVersion = 6
+// not a vague error (see checkSchemaVersion). v7 added the review-evidence binding
+// (Evidence) that makes a read-only turn actionable: an assignment for a phase the
+// lead cannot edit in EXISTS if and only if a hash-bound evidence packet was
+// published for it. That is a global invariant, not an optional field, so v7 landed
+// atomically with every issuance authority — no generation can exist in a
+// half-upgraded shape where some read-only assignments carry a binding and others
+// do not.
+const RunStateVersion = 7
 
 // stateRetention{Keep,Trigger} configure the state stores' pre-append hysteresis compaction
 // (genstore.WithRetention): each generation is a full self-sufficient snapshot, so recovery
@@ -96,6 +102,20 @@ const (
 	PhaseDone          Phase = "DONE"
 )
 
+// repoEditPhases are the phases whose assignment carries a MUTABLE repository worktree. State owns
+// this set because the evidence invariant is a state invariant: a turn either edits the repository
+// or reviews a hash-bound evidence packet, never both and never neither. transport's role-aware
+// EditableTurn is defined in terms of this same set, so the pull-time workspace decision and the
+// persisted invariant cannot drift apart.
+var repoEditPhases = map[Phase]bool{
+	PhaseImplementStep: true,
+	PhaseFix:           true,
+}
+
+// RepoEditPhase reports whether an assignment issued in this phase carries a mutable worktree
+// (and therefore no evidence binding) rather than a read-only evidence packet.
+func RepoEditPhase(p Phase) bool { return repoEditPhases[p] }
+
 // SnapshotRef points at a hashed, copied input inside the run directory (relative
 // local path + exact digest of the bytes), never the live source.
 type SnapshotRef struct {
@@ -122,6 +142,20 @@ type Counters struct {
 type Ref struct {
 	ID             string `json:"id"`
 	IssuedRevision uint64 `json:"issued_revision"`
+}
+
+// AssignmentEvidence binds the live assignment to the immutable review-evidence packet that makes
+// its turn actionable. State owns this type: the packet manifest binds run/turn/phase/source, and
+// this wrapper supplies the one fact the off-lock producer cannot know — the exact revision the
+// assignment was issued at, which is only decided at the state CAS.
+//
+// It exists if and only if a read-only actionable assignment exists (see validateEvidenceBinding).
+// An IMPLEMENT_STEP/FIX assignment has a mutable worktree instead and carries none.
+type AssignmentEvidence struct {
+	TurnID          string `json:"turn_id"`
+	IssuedRevision  uint64 `json:"issued_revision"`
+	ManifestRelPath string `json:"manifest_rel_path"`
+	RootDigest      string `json:"root_digest"`
 }
 
 // Receipt is the durable acknowledgement of an accepted submit.
@@ -280,6 +314,7 @@ type RunState struct {
 	RunBranch       string                  `json:"run_branch"`
 	Counters        Counters                `json:"counters"`
 	Assignment      *Ref                    `json:"assignment,omitempty"`
+	Evidence        *AssignmentEvidence     `json:"evidence,omitempty"`
 	FirstTurn       *Ref                    `json:"first_turn,omitempty"`
 	Gate            *Ref                    `json:"gate,omitempty"`
 	CandidatePlan   *PlanRef                `json:"candidate_plan,omitempty"`
@@ -454,6 +489,10 @@ func cloneForNext(prev *RunState) *RunState {
 	if prev.Assignment != nil {
 		a := *prev.Assignment
 		n.Assignment = &a
+	}
+	if prev.Evidence != nil {
+		e := *prev.Evidence
+		n.Evidence = &e
 	}
 	if prev.FirstTurn != nil {
 		f := *prev.FirstTurn

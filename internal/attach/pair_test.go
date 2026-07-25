@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -34,6 +35,7 @@ func joinRequest(repo, runID, op string, seed byte) JoinAttachRequest {
 		Role:        state.SlotPair,
 		Now:         2000,
 		RNG:         bytes.NewReader(bytes.Repeat([]byte{seed, 0x5b, 0xc6, 0xd7}, 32)),
+		Evidence:    &stubIssuer{},
 	}
 }
 
@@ -239,7 +241,15 @@ func TestJoinAttachRecoversAfterDownstreamAccept(t *testing.T) {
 		}
 		emptyDigest, _ := canonjson.Digest([]byte("[]"))
 		n.CandidateChecks = &state.CheckSetRef{Keys: []string{}, Digest: emptyDigest}
+		// PLAN_CRITIQUE is read-only, so the reissued assignment carries its own evidence binding;
+		// the invariant refuses a state where one moved without the other.
 		n.Assignment = &state.Ref{ID: "turn-critique", IssuedRevision: gen}
+		n.Evidence = &state.AssignmentEvidence{
+			TurnID:          "turn-critique",
+			IssuedRevision:  gen,
+			ManifestRelPath: evidence.PacketManifestRel("turn-critique"),
+			RootDigest:      stubDigest("turn-critique"),
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("downstream accept: %v", err)
@@ -372,7 +382,9 @@ func TestJoinAttachRecoversAfterCancel(t *testing.T) {
 	rs, _, _ := st.Load()
 	if _, err := st.Mutate(rs.Revision, func(_ uint64, n *state.RunState) error {
 		n.Lifecycle = state.LifecycleCancelled
+		// A cancel consumes the turn, and the evidence binding has the assignment's lifetime.
 		n.Assignment = nil
+		n.Evidence = nil
 		return nil
 	}); err != nil {
 		t.Fatalf("cancel: %v", err)

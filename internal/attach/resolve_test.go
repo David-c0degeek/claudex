@@ -32,6 +32,7 @@ func TestResolveRunBindsActiveRun(t *testing.T) {
 		ReplaceDir:   lay.replaceJournalDir(runDir),
 		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
+		EvidenceDir:  filepath.Join(runDir, "evidence"),
 		SessionDir:   filepath.Join(repo, ".claudex", "session"),
 		MailboxDir:   filepath.Join(repo, ".claudex"),
 	}

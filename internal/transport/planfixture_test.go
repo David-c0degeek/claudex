@@ -37,6 +37,7 @@ func driveAgreedImplement(t *testing.T, store *state.Store, initRev uint64) uint
 		ref := &state.Ref{ID: "plan-turn", IssuedRevision: rev}
 		n.Phase = state.PhasePlanDraft
 		n.Assignment = ref
+		bindEvidence(n, rev)
 		n.FirstTurn = ref
 		n.StartedUnix = n.CreatedUnix
 		n.DeadlineUnix = n.CreatedUnix + n.EffectivePolicy.Limits.MaxWallSeconds
@@ -48,12 +49,15 @@ func driveAgreedImplement(t *testing.T, store *state.Store, initRev uint64) uint
 			Phase:          state.PhasePlanDraft,
 		}
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
+		n.Evidence = nil // consumed with the turn
 		n.Phase = state.PhasePlanCritique
 		n.CandidatePlan = &state.PlanRef{Source: state.EventRef{Digest: dig("1"), TurnID: "plan-turn"}, Digest: dig("2"), StepCount: 1}
 		n.CandidateChecks = emptyChecks()
 	})
 	critAssigned := mutate(t, store, critique, func(rev uint64, n *state.RunState) {
 		n.Assignment = &state.Ref{ID: "crit-turn", IssuedRevision: rev}
+		bindEvidence(n, rev)
 	})
 	return mutate(t, store, critAssigned, func(rev uint64, n *state.RunState) {
 		n.AcceptedTurns["crit-turn"] = state.AcceptedTurn{
@@ -62,6 +66,8 @@ func driveAgreedImplement(t *testing.T, store *state.Store, initRev uint64) uint
 			Phase:          state.PhasePlanCritique,
 		}
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
+		n.Evidence = nil // consumed with the turn
 		plan := *n.CandidatePlan
 		checks := *n.CandidateChecks
 		n.AgreedPlan = &state.PlanAgreement{
@@ -115,4 +121,5 @@ func humanGate(n *state.RunState, gen uint64, originPhase state.Phase, sourceTur
 	n.Phase = state.PhaseAwaitGuidance
 	n.Lifecycle = state.LifecyclePaused
 	n.Assignment = nil
+	n.Evidence = nil // the binding is consumed with the turn it authorized
 }

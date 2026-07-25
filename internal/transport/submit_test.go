@@ -99,6 +99,7 @@ func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {
 	implRev := driveAgreedImplement(t, store, r1.Revision)
 	implAssigned, err := store.Mutate(implRev, func(gen uint64, n *state.RunState) error {
 		n.Assignment = &state.Ref{ID: "impl-turn", IssuedRevision: gen}
+		bindEvidence(n, gen)
 		return nil
 	})
 	if err != nil {
@@ -112,6 +113,7 @@ func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {
 			GitCommit:      &state.GitCommitEvidence{Parent: n.BaseCommit, Tree: strings.Repeat("1", 40), Commit: strings.Repeat("2", 40)},
 		}
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 		n.Phase = state.PhaseCheckpoint
 		return nil
 	})
@@ -120,6 +122,7 @@ func newRunWithActiveTurn(t *testing.T) (*state.Store, uint64) {
 	}
 	r2, err := store.Mutate(atCheckpoint.Revision, func(gen uint64, n *state.RunState) error {
 		n.Assignment = &state.Ref{ID: "turn-1", IssuedRevision: gen}
+		bindEvidence(n, gen)
 		return nil
 	})
 	if err != nil {
@@ -257,6 +260,7 @@ func TestStaleBeatsWrongTurnOnReissue(t *testing.T) {
 	// Reissue turn-2 at rev+1 without accepting turn-1 (staying at CHECKPOINT).
 	if _, err := store.Mutate(rev, func(gen uint64, n *state.RunState) error {
 		n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		bindEvidence(n, gen)
 		return nil
 	}); err != nil {
 		t.Fatalf("reissue: %v", err)
@@ -346,6 +350,7 @@ func TestTransitionReissuingSameTurnRejected(t *testing.T) {
 	store, rev := newRunWithActiveTurn(t)
 	sameTurn := prepareIssuing("turn-1", "", func(gen uint64, next *state.RunState) error {
 		next.Assignment = &state.Ref{ID: "turn-1", IssuedRevision: gen}
+		bindEvidence(next, gen)
 		return nil
 	})
 	if _, err := submit(store, newMemSink(), "sess-2", report("turn-1", rev, "x"), ownerAuth("sess-2"), sameTurn); !errors.Is(err, ErrTransitionInvalid) {
@@ -361,6 +366,7 @@ func TestTransitionCannotEraseAcceptance(t *testing.T) {
 		delete(next.AcceptedTurns, "turn-1")
 		next.Phase = state.PhaseCheckpoint
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		bindEvidence(next, gen)
 		return nil
 	})
 	res, err := submit(store, sink, "sess-2", report("turn-1", rev, "x"), ownerAuth("sess-2"), malicious)
@@ -381,6 +387,7 @@ func TestTransitionReceivesPreparedSubmit(t *testing.T) {
 		return NewPreparedTransition("turn-2", "", func(gen uint64, next *state.RunState) error {
 			next.Phase = state.PhaseCheckpoint
 			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			bindEvidence(next, gen)
 			return nil
 		}), nil
 	}
@@ -439,6 +446,7 @@ func TestClearToTerminalAccepted(t *testing.T) {
 		idx := 1 // the single step is done
 		next.StepIndex = &idx
 		next.Assignment = nil
+		next.Evidence = nil // the binding is consumed with the turn it authorized
 		return nil
 	})
 	if _, err := submit(store, newMemSink(), "sess-2", report("turn-1", rev, "x"), ownerAuth("sess-2"), toDone); err != nil {
@@ -453,6 +461,7 @@ func TestOwnerlessShapesRejected(t *testing.T) {
 		"init + nil": prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
 			next.Phase = state.PhaseInit
 			next.Assignment = nil
+			next.Evidence = nil // the binding is consumed with the turn it authorized
 			return nil
 		}),
 		"await-guidance without a gate": prepareIssuing("", "", func(_ uint64, next *state.RunState) error {
@@ -464,11 +473,13 @@ func TestOwnerlessShapesRejected(t *testing.T) {
 			next.Phase = state.PhaseCheckpoint
 			next.Lifecycle = state.LifecycleCompleted
 			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			bindEvidence(next, gen)
 			return nil
 		}),
 		"assignment in a non-agent phase": prepareIssuing("turn-2", "", func(gen uint64, next *state.RunState) error {
 			next.Phase = state.PhaseDone
 			next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+			bindEvidence(next, gen)
 			return nil
 		}),
 	}

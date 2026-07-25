@@ -46,6 +46,7 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 	foreign := map[string]func(rs *state.RunState){
 		"different next assignment": func(rs *state.RunState) {
 			rs.Assignment = &state.Ref{ID: "turn-x", IssuedRevision: 8}
+			bindEvidence(rs, 8)
 		},
 		"missing issued assignment": func(rs *state.RunState) { rs.Assignment = nil },
 		"different resulting phase": func(rs *state.RunState) { rs.Phase = state.PhaseTests },
@@ -72,6 +73,7 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 		"receipt not the head revision": func(rs *state.RunState) { rs.Revision = 9 },
 		"issued assignment bound to another revision": func(rs *state.RunState) {
 			rs.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: 7}
+			bindEvidence(rs, 7)
 		},
 		"unissued verify requirement": func(rs *state.RunState) {
 			rs.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
@@ -106,6 +108,7 @@ func TestObserveGitAcceptExactness(t *testing.T) {
 	verifyApplied := func() state.RunState {
 		rs := applied()
 		rs.Assignment = nil
+		rs.Evidence = nil // the binding is consumed with the turn it authorized
 		rs.Phase = state.PhaseVerify
 		rs.Verify = &state.VerifyRequirement{RequiredGeneration: 2}
 		acc := rs.AcceptedTurns["turn-1"]

@@ -1,4 +1,4 @@
-package evidence
+package reviewpacket
 
 import (
 	"context"
@@ -10,11 +10,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/gitx"
 )
 
 // The packet materializes bytes from the COMMITTED object and is byte-stable regardless of later
 // worktree edits — the core 04.3 invariant.
+var testBounds = evidence.Bounds{MaxTotalBytes: 262144, MaxFileBytes: 98304, MaxRequests: 8}
+
 func TestReadsFromCommitNotWorktree(t *testing.T) {
 	repo := t.TempDir()
 	git := func(args ...string) string {
@@ -52,17 +55,17 @@ func TestReadsFromCommitNotWorktree(t *testing.T) {
 	defer g.Close()
 
 	evDir := t.TempDir()
-	r := Recipe{
+	r := evidence.Recipe{
 		RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT",
-		Source:  SourceObject{Commit: commitOID, Tree: treeOID},
-		Entries: []RecipeEntry{{GitPath: "file.txt", Mode: "100644", Kind: EntryFile, Source: BlobSource{CommitBlobOID: blobOID}}},
+		Source:  evidence.SourceObject{Commit: commitOID, Tree: treeOID},
+		Entries: []evidence.RecipeEntry{{GitPath: "file.txt", Mode: "100644", Kind: evidence.EntryFile, Source: evidence.BlobSource{CommitBlobOID: blobOID}}},
 		Bounds:  testBounds,
 	}
-	ref, err := Produce(context.Background(), evDir, r, NewGitObjectReader(g, repo))
+	ref, err := evidence.Produce(context.Background(), evDir, r, NewGitObjectReader(g, repo))
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
-	if err := VerifyRef(evDir, ref, testBounds, r.Expectation()); err != nil {
+	if err := evidence.VerifyRef(evDir, ref, testBounds, r.Expectation()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 

@@ -164,6 +164,9 @@ func TestReadChurnExhaustionIsRecoveryRequired(t *testing.T) {
 		}
 		if _, err := rn.state.Mutate(cur.Revision, func(nextRevision uint64, next *state.RunState) error {
 			next.Assignment = &state.Ref{ID: cur.Assignment.ID, IssuedRevision: nextRevision}
+			if next.Evidence != nil {
+				next.Evidence.IssuedRevision = nextRevision // rebound with the turn it authorizes
+			}
 			return nil
 		}); err != nil {
 			t.Errorf("churn mutation failed: %v", err)

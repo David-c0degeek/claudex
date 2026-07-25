@@ -95,7 +95,7 @@ func writeF(t *testing.T, path, body string) {
 func taskFile(t *testing.T, dir string) string {
 	t.Helper()
 	p := filepath.Join(dir, "task.json")
-	writeF(t, p, `{"schema_version":1,"goal":"drive the pairing loop","current_behavior":"none","desired_behavior":"two terminals converge","scope":"cli e2e","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	writeF(t, p, `{"schema_version":2,"goal":"drive the pairing loop","current_behavior":"none","desired_behavior":"two terminals converge","scope":"cli e2e","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 	return p
 }
 

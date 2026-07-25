@@ -21,6 +21,7 @@ func runAtTests(t *testing.T, pairGen uint64) (*state.Store, uint64) {
 		*n.StepIndex = n.AgreedPlan.Plan.StepCount
 		n.Phase = state.PhaseTests
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 	registryPairGen(t, store, pairGen)
 	return store, rev
@@ -40,6 +41,7 @@ func prepFn(turn, gate string, apply func(gen uint64, next *state.RunState, p Pr
 func passToVerify() TestPrepare {
 	return prepFn("", "", func(_ uint64, next *state.RunState, p PreparedTestOutcome) error {
 		next.Assignment = nil
+		next.Evidence = nil // the binding is consumed with the turn it authorized
 		next.Phase = state.PhaseVerify
 		next.Verify = &state.VerifyRequirement{RequiredGeneration: p.CurrentPairGeneration + 1}
 		return nil
@@ -48,6 +50,7 @@ func passToVerify() TestPrepare {
 
 func passApply(next *state.RunState, p PreparedTestOutcome) {
 	next.Assignment = nil
+	next.Evidence = nil // the binding is consumed with the turn it authorized
 	next.Phase = state.PhaseVerify
 	next.Verify = &state.VerifyRequirement{RequiredGeneration: p.CurrentPairGeneration + 1}
 }
@@ -57,6 +60,7 @@ func failToFixApply(gen uint64, next *state.RunState, _ PreparedTestOutcome) err
 	next.FixReturn = state.PhaseTests
 	next.Counters.TestFixes++
 	next.Assignment = &state.Ref{ID: "t-turn", IssuedRevision: gen}
+	bindEvidence(next, gen)
 	return nil
 }
 
@@ -66,6 +70,7 @@ func failToFix() TestPrepare {
 		next.FixReturn = state.PhaseTests
 		next.Counters.TestFixes++
 		next.Assignment = &state.Ref{ID: "fix-turn", IssuedRevision: gen}
+		bindEvidence(next, gen)
 		return nil
 	})
 }
@@ -78,6 +83,7 @@ func runAtTestsBudget(t *testing.T) (*state.Store, uint64) {
 		*n.StepIndex = n.AgreedPlan.Plan.StepCount
 		n.Phase = state.PhaseTests
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 		n.Counters.TestFixes = n.EffectivePolicy.Budgets.TestRounds
 	})
 	registryPairGen(t, store, 2)
@@ -88,6 +94,7 @@ func runAtTestsBudget(t *testing.T) (*state.Store, uint64) {
 func gatePrep(source state.EventRef) TestPrepare {
 	return prepFn("", "gate-turn", func(gen uint64, next *state.RunState, _ PreparedTestOutcome) error {
 		next.Assignment = nil
+		next.Evidence = nil // the binding is consumed with the turn it authorized
 		next.Phase = state.PhaseAwaitGuidance
 		next.Lifecycle = state.LifecyclePaused
 		next.Gate = &state.Ref{ID: "gate-turn", IssuedRevision: gen}
@@ -197,6 +204,7 @@ func TestTestOutcomeJournalBeforeRegistry(t *testing.T) {
 		*n.StepIndex = n.AgreedPlan.Plan.StepCount
 		n.Phase = state.PhaseTests
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 	d := testOutcomeDeps(store, passToVerify())
 	d.Journal = fakeJournal{lockPath: store.LockPath(), head: JournalNonterminal}
@@ -240,6 +248,7 @@ func TestTestOutcomeNoRunMismatchNoPair(t *testing.T) {
 			*n.StepIndex = n.AgreedPlan.Plan.StepCount
 			n.Phase = state.PhaseTests
 			n.Assignment = nil
+			n.Evidence = nil // the binding is consumed with the turn it authorized
 		})
 		if _, err := SubmitTestOutcome(context.Background(), testOutcomeDeps(store, passToVerify()), rev, evDigest); !errors.Is(err, ErrRunMismatch) {
 			t.Fatalf("err = %v, want ErrRunMismatch", err)
@@ -250,6 +259,7 @@ func TestTestOutcomeNoRunMismatchNoPair(t *testing.T) {
 			*n.StepIndex = n.AgreedPlan.Plan.StepCount
 			n.Phase = state.PhaseTests
 			n.Assignment = nil
+			n.Evidence = nil // the binding is consumed with the turn it authorized
 		})
 		// A lead-only registry: the pair generation cannot be derived.
 		if _, err := openRunRegistry(store).Mutate(0, func(gen uint64, n *state.Registry) error {
@@ -309,6 +319,7 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				*n.StepIndex = n.AgreedPlan.Plan.StepCount
 				n.Phase = state.PhaseTests
 				n.Assignment = &state.Ref{ID: "stray", IssuedRevision: gen}
+				bindEvidence(n, gen)
 			})
 			registryPairGen(t, store, 2)
 			return testOutcomeDeps(store, passToVerify()), rev
@@ -358,6 +369,7 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				next.Phase = state.PhaseVerify
 				next.Verify = &state.VerifyRequirement{RequiredGeneration: p.CurrentPairGeneration + 1}
 				next.Assignment = &state.Ref{ID: "v-turn", IssuedRevision: gen}
+				bindEvidence(next, gen)
 				return nil
 			})), rev
 		}, ErrTransitionInvalid},
@@ -373,6 +385,7 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 			store, rev := runAtTests(t, 2)
 			return testOutcomeDeps(store, prepFn("", "", func(_ uint64, next *state.RunState, _ PreparedTestOutcome) error {
 				next.Assignment = nil
+				next.Evidence = nil // the binding is consumed with the turn it authorized
 				next.Phase = state.PhaseDone
 				next.Lifecycle = state.LifecycleCompleted
 				return nil
@@ -399,6 +412,7 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				next.FixReturn = state.PhaseTests
 				next.Counters.TestFixes++
 				next.Assignment = &state.Ref{ID: "plan-turn", IssuedRevision: gen}
+				bindEvidence(next, gen)
 				return nil
 			})), rev
 		}, ErrTransitionInvalid},
@@ -413,6 +427,7 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				next.FixReturn = state.PhaseTests
 				next.Counters.TestFixes++
 				next.Assignment = &state.Ref{ID: "applied-other", IssuedRevision: gen}
+				bindEvidence(next, gen)
 				return nil
 			})), rev
 		}, ErrTransitionInvalid},

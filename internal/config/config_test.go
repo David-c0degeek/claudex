@@ -8,7 +8,7 @@ import (
 // fullTask returns a complete task contract with every field present.
 func fullTask() map[string]any {
 	return map[string]any{
-		"schema_version":      1,
+		"schema_version":      TaskContractVersion,
 		"goal":                "Build the attach protocol",
 		"current_behavior":    "headless subprocess driver",
 		"desired_behavior":    "two terminals converge by agreement",
@@ -18,6 +18,7 @@ func fullTask() map[string]any {
 		"acceptance_criteria": []string{"pull returns an assignment", "submit advances state"},
 		"required_tests":      []string{},
 		"relevant_files":      []string{},
+		"relevant_repo_paths": []string{"internal/config/config.go"},
 		"open_questions":      []string{},
 	}
 }
@@ -46,7 +47,7 @@ func TestParseTaskContractValid(t *testing.T) {
 }
 
 func TestParseTaskContractRequiresFullShape(t *testing.T) {
-	for _, missing := range []string{"non_goals", "constraints", "required_tests", "relevant_files", "open_questions", "current_behavior", "scope"} {
+	for _, missing := range []string{"non_goals", "constraints", "required_tests", "relevant_files", "relevant_repo_paths", "open_questions", "current_behavior", "scope"} {
 		t.Run("missing_"+missing, func(t *testing.T) {
 			m := fullTask()
 			delete(m, missing)
@@ -238,5 +239,49 @@ func TestRunPolicyBudgetCeiling(t *testing.T) {
 		if err := over.Validate(); err == nil {
 			t.Fatalf("%s above the ceiling should be rejected", f.name)
 		}
+	}
+}
+
+// Task-contract v2 resolves relevant_repo_paths against the committed source tree, so the grammar is
+// strict and platform-independent: what a selector means must not depend on the host it is read on.
+func TestRelevantRepoPathsGrammar(t *testing.T) {
+	bad := map[string][]string{
+		"empty":            {},
+		"traversal":        {"../outside"},
+		"absolute":         {"/etc/passwd"},
+		"backslash":        {`dir\file.go`},
+		"drive colon":      {"C:/file.go"},
+		"trailing slash":   {"dir/"},
+		"dot segment":      {"dir/./file.go"},
+		"duplicate":        {"a.go", "a.go"},
+		"invalid utf-8":    {"dir/x\x80"},
+		"control byte":     {"dir/\x01file"},
+		"replacement rune": {"dir/\ufffd"},
+	}
+	for name, paths := range bad {
+		t.Run(name, func(t *testing.T) {
+			m := fullTask()
+			m["relevant_repo_paths"] = paths
+			if _, err := ParseTaskContract(mustJSON(t, m)); err == nil {
+				t.Fatalf("%s selector accepted", name)
+			}
+		})
+	}
+	// A nested, exact-leaf path is the normal case and must be accepted.
+	m := fullTask()
+	m["relevant_repo_paths"] = []string{"internal/config/config.go", "README"}
+	if _, err := ParseTaskContract(mustJSON(t, m)); err != nil {
+		t.Fatalf("valid selectors rejected: %v", err)
+	}
+}
+
+// A v1 document declares no machine-resolvable selection at all, so it is refused by the version
+// check rather than silently treated as "select nothing".
+func TestTaskContractV1Refused(t *testing.T) {
+	m := fullTask()
+	m["schema_version"] = 1
+	delete(m, "relevant_repo_paths")
+	if _, err := ParseTaskContract(mustJSON(t, m)); err == nil {
+		t.Fatal("a v1 task contract must fail the version check")
 	}
 }

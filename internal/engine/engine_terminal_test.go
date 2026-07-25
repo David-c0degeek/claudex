@@ -17,7 +17,7 @@ var acceptanceCriteria = []string{"criterion one", "criterion two"}
 // taskContractBytes is a valid frozen task contract whose acceptance_criteria are
 // acceptanceCriteria; the run's TaskSnapshot digest is config.Hash of these bytes.
 func taskContractBytes() []byte {
-	return []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["criterion one","criterion two"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	return []byte(`{"schema_version":2,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["criterion one","criterion two"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 }
 
 func oneStepPlan() planFixture {
@@ -36,7 +36,7 @@ func reachTests(t *testing.T, store *state.Store) state.RunState {
 	f := oneStepPlan()
 	draft := bootstrapPlanDraft(t, store, "t-plan")
 	rs := mustStep(t, store, ProjectionFacts{}, planArtifact(t, "t-plan", draft.Revision, false, f), assign("t-crit"))
-	rs = mustStep(t, store, ProjectionFacts{CandidatePlan: f.canonicalPlan()}, critiqueArtifact(t, "t-crit", rs.Revision, "AGREE", false, nil, nil, nil), assign("t-impl"))
+	rs = mustStep(t, store, ProjectionFacts{CandidatePlan: f.canonicalPlan()}, critiqueArtifact(t, "t-crit", rs.Revision, "AGREE", false, nil, nil, nil), assignEdit("t-impl"))
 	rs = mustStep(t, store, ProjectionFacts{}, implReport(t, "t-impl", rs.Revision, false), assign("t-chk"))
 	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk", rs.Revision, "AGREE", false, true, nil, nil), Ids{})
 	if rs.Phase != state.PhaseTests {
@@ -72,7 +72,9 @@ func issueVerifier(t *testing.T, store *state.Store, turnID string) state.RunSta
 	t.Helper()
 	cur, _, _ := store.Load()
 	next, err := store.Mutate(cur.Revision, func(gen uint64, n *state.RunState) error {
+		// VERIFY is read-only, so the replacement binds the packet with the turn.
 		n.Assignment = &state.Ref{ID: turnID, IssuedRevision: gen}
+		n.Evidence = testBinding(turnID, gen)
 		return nil
 	})
 	if err != nil {
@@ -148,7 +150,7 @@ func TestTerminalDryRun(t *testing.T) {
 	}
 
 	// TESTS fail -> FIX (TestFixes 0 -> 1), returning to TESTS.
-	rs, err := applyTests(t, store, false, RuntimeFacts{}, assign("t-fix1"))
+	rs, err := applyTests(t, store, false, RuntimeFacts{}, assignEdit("t-fix1"))
 	if err != nil {
 		t.Fatalf("tests fail: %v", err)
 	}
@@ -176,7 +178,7 @@ func TestTerminalDryRun(t *testing.T) {
 
 	// A replacement issues the verifier; the verifier FAILS -> FIX (VerifyFixes 1).
 	rs = issueVerifier(t, store, "t-verify1")
-	rs, err = verify(t, store, "t-verify1", "fail", false, true, nil, nil, assign("t-fix2"))
+	rs, err = verify(t, store, "t-verify1", "fail", false, true, nil, nil, assignEdit("t-fix2"))
 	if err != nil {
 		t.Fatalf("verify fail: %v", err)
 	}
@@ -211,7 +213,7 @@ func TestTestsBudgetGate(t *testing.T) {
 	reachTests(t, store)
 	// TestRounds default is 2; drive two real fixes, then the third fail gates.
 	for i := 0; i < 2; i++ {
-		rs, err := applyTests(t, store, false, RuntimeFacts{}, assign("t-fix"+string(rune('a'+i))))
+		rs, err := applyTests(t, store, false, RuntimeFacts{}, assignEdit("t-fix"+string(rune('a'+i))))
 		if err != nil {
 			t.Fatalf("tests fail %d: %v", i, err)
 		}
@@ -264,7 +266,7 @@ func TestVerifyBudgetGate(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		rs = issueVerifier(t, store, "t-vfail"+string(rune('a'+i)))
 		var err error
-		rs, err = verify(t, store, "t-vfail"+string(rune('a'+i)), "fail", false, true, nil, nil, assign("t-vfix"+string(rune('a'+i))))
+		rs, err = verify(t, store, "t-vfail"+string(rune('a'+i)), "fail", false, true, nil, nil, assignEdit("t-vfix"+string(rune('a'+i))))
 		if err != nil {
 			t.Fatalf("verify fail %d: %v", i, err)
 		}
@@ -339,7 +341,7 @@ func TestVerifyProjectionRejects(t *testing.T) {
 	// A verdict-fail WITH a scope expansion is a legitimate FIX route (not a contradiction).
 	t.Run("fail with scope expansion routes to FIX", func(t *testing.T) {
 		store := reach(t)
-		rs, err := verify(t, store, "t-v", "fail", true, true, []string{"extra"}, nil, assign("t-vfix"))
+		rs, err := verify(t, store, "t-v", "fail", true, true, []string{"extra"}, nil, assignEdit("t-vfix"))
 		if err != nil {
 			t.Fatalf("verify fail+scope: %v", err)
 		}
@@ -380,7 +382,7 @@ func TestVerifyTaskContractBinding(t *testing.T) {
 		t.Fatalf("malformed contract: err = %v", err)
 	}
 	// A hash-matching contract with duplicate criteria fails the parser.
-	dup := []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	dup := []byte(`{"schema_version":2,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 	if err := proj(t, dup, config.Hash(dup), []string{"same", "same"}); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("duplicate criteria: err = %v", err)
 	}
@@ -401,7 +403,7 @@ func TestVerifyThresholdZeroOverflow(t *testing.T) {
 	reachTests(t, store)
 	applyTests(t, store, true, RuntimeFacts{CurrentPairGeneration: 2}, Ids{})
 	issueVerifier(t, store, "t-v")
-	verify(t, store, "t-v", "fail", false, true, nil, nil, assign("t-fix"))
+	verify(t, store, "t-v", "fail", false, true, nil, nil, assignEdit("t-fix"))
 	if _, err := stepRT(t, store, ProjectionFacts{}, RuntimeFacts{CurrentPairGeneration: 0}, "implementation_report", fixReport(t, store, "t-fix"), Ids{}); !errors.Is(err, ErrSemantic) {
 		t.Fatalf("fix->verify with a zero pair gen: err = %v, want ErrSemantic", err)
 	}

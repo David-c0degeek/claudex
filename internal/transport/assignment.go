@@ -76,19 +76,17 @@ func TurnSpec(p state.Phase) (TurnSpecEntry, bool) {
 	return e, ok
 }
 
-// editPhases are the phases in which the lead may mutate the repository. This is
-// the single source for the repo-edit policy, shared with the submit-time edit
-// check so the two never drift.
-var editPhases = map[state.Phase]bool{
-	state.PhaseImplementStep: true,
-	state.PhaseFix:           true,
-}
-
 // EditableTurn reports whether an assignment for this role and phase carries a
-// mutable worktree: only a lead turn in an edit phase does. The submit path
-// calls this to enforce the same predicate when accepting a repo mutation.
+// mutable worktree: only a lead turn in an edit phase does. The submit path calls
+// this to enforce the same predicate when accepting a repo mutation.
+//
+// The phase half of the predicate is state.RepoEditPhase, not a second table here:
+// run state enforces the same split as a persisted invariant (an edit-phase
+// assignment carries a worktree and no evidence binding; every other assignment
+// carries a binding and no worktree), so the pull-time workspace decision and the
+// stored invariant are the same rule read from one place.
 func EditableTurn(role Role, p state.Phase) bool {
-	return role == RoleLead && editPhases[p]
+	return role == RoleLead && state.RepoEditPhase(p)
 }
 
 // EvidenceRef is a hash-bound, immutable evidence locator for a read-only phase:

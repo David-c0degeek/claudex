@@ -139,6 +139,7 @@ func TestWorkspaceMismatchRejected(t *testing.T) {
 func TestPullNeverMints(t *testing.T) {
 	rs := runStateAt(state.PhaseImplementStep)
 	rs.Assignment = nil
+	rs.Evidence = nil // the binding is consumed with the turn it authorized
 	if _, err := BuildAssignment(rs, editInputs()); !errors.Is(err, ErrNoActiveTurn) {
 		t.Fatalf("err = %v, want ErrNoActiveTurn", err)
 	}

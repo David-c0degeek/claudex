@@ -265,9 +265,19 @@ func attachJoin(repo, run, agentS, roleS, opID string, stdout, stderr io.Writer)
 		fmt.Fprintln(stderr, "claudex: attach (join) requires --operation-id op-<32 lower-hex>")
 		return 2
 	}
+	// A join issues the lead's read-only PLAN_DRAFT turn, so it must publish that turn's review
+	// packet. The issuer is built here, at the edge, and passed into attach as a seam so the attach
+	// protocol itself stays free of any Git dependency.
+	issuer, closeIssuer, ierr := newEvidenceIssuer(repo, run)
+	if ierr != nil {
+		fmt.Fprintf(stderr, "claudex: attach (join): %v\n", ierr)
+		return 1
+	}
+	defer closeIssuer()
 	res, err := attach.JoinAttach(attach.JoinAttachRequest{
 		RepoDir: repo, RunID: run, OperationID: opID,
 		Agent: ag, Role: state.SlotPair, Now: time.Now().Unix(), RNG: rand.Reader,
+		Evidence: issuer,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "claudex: attach (join): %v\n", err)
@@ -343,9 +353,18 @@ func attachReplace(repo, run, agentS, roleS string, expectGen uint64, opID strin
 		fmt.Fprintln(stderr, "claudex: attach --replace requires --operation-id op-<32 lower-hex>")
 		return 2
 	}
+	// A pair replacement that activates an ownerless VERIFY issues the read-only verifier turn, so
+	// it needs the same evidence seam. An ordinary supersession issues no turn and never uses it.
+	issuer, closeIssuer, ierr := newEvidenceIssuer(repo, run)
+	if ierr != nil {
+		fmt.Fprintf(stderr, "claudex: attach (replace): %v\n", ierr)
+		return 1
+	}
+	defer closeIssuer()
 	res, rerr := attach.ReplaceAttach(attach.ReplaceRequest{
 		RepoDir: repo, RunID: run, Role: r, Agent: ag,
 		ExpectedGeneration: expectGen, OperationID: opID, RNG: rand.Reader,
+		Evidence: issuer,
 	})
 	if rerr != nil && !errors.Is(rerr, attach.ErrReplaceOutcomeUnknown) {
 		fmt.Fprintf(stderr, "claudex: attach (replace): %v\n", rerr)

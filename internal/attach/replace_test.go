@@ -29,6 +29,7 @@ func replaceReq(repo, runID string, role state.SlotRole, agent state.Agent, gen 
 		RepoDir: repo, RunID: runID, Role: role, Agent: agent, ExpectedGeneration: gen,
 		OperationID: replaceOp(seed),
 		RNG:         bytes.NewReader(bytes.Repeat([]byte{seed, 0x11, 0x22, 0x33}, 32)),
+		Evidence:    &stubIssuer{},
 	}
 }
 

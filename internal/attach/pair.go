@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -43,6 +44,15 @@ type PairAttachIntent struct {
 
 	LeadDigest      string `json:"lead_digest"`       // digest of the frozen lead slot
 	BaseStateDigest string `json:"base_state_digest"` // digest of the frozen INIT run state
+
+	// The review-evidence packet published for the PLAN_DRAFT turn this attach issues, frozen here
+	// BEFORE the transaction opens. Producing it can fail deterministically (a selector missing from
+	// the source tree, a bounds breach), and such a failure must leave the Registry, the journal, and
+	// RunState untouched — so materialization, verification, and this freeze all happen during the
+	// locked authorized preparation, and a recovered transaction re-binds exactly this packet rather
+	// than re-deriving one.
+	EvidenceManifestRelPath string `json:"evidence_manifest_rel_path"`
+	EvidenceRootDigest      string `json:"evidence_root_digest"`
 }
 
 func (in PairAttachIntent) marshal() (json.RawMessage, error) { return json.Marshal(in) }
@@ -82,6 +92,14 @@ func (in PairAttachIntent) validate() error {
 	if !state.IsHex64(in.LeadDigest) || !state.IsHex64(in.BaseStateDigest) {
 		return fmt.Errorf("attach: pair intent baseline digests are not sha256")
 	}
+	// The frozen packet must be the derived manifest for exactly the turn this intent issues, so a
+	// decoded intent can never bind the PLAN_DRAFT assignment to another turn's evidence.
+	if in.EvidenceManifestRelPath != evidence.PacketManifestRel(in.FirstTurnID) {
+		return fmt.Errorf("attach: pair intent evidence path is not the derived packet manifest for its first turn")
+	}
+	if !state.IsHex64(in.EvidenceRootDigest) {
+		return fmt.Errorf("attach: pair intent evidence root digest is not sha256")
+	}
 	return nil
 }
 
@@ -96,6 +114,10 @@ type JoinAttachRequest struct {
 	Role        state.SlotRole
 	Now         int64
 	RNG         io.Reader
+	// Evidence publishes the PLAN_DRAFT turn's review packet. Required for a NEW pair fill (that
+	// attach issues a read-only assignment); a recovery or idempotent retry never needs it, because
+	// the frozen intent already carries the binding the original authorization published.
+	Evidence EvidenceIssuer
 }
 
 // JoinAttachResult is what the pair receives: its session and the lead's first
@@ -131,6 +153,9 @@ func (req JoinAttachRequest) validateForNewPair() error {
 	}
 	if req.Now <= 0 || req.RNG == nil {
 		return fmt.Errorf("attach: a clock and RNG are required")
+	}
+	if req.Evidence == nil {
+		return fmt.Errorf("attach: a new pair fill issues a read-only PLAN_DRAFT turn and requires an evidence issuer")
 	}
 	return nil
 }
@@ -333,7 +358,14 @@ func requireJoinableInitShape(runID string, cur state.CurrentRun, reg state.Regi
 }
 
 // preparePair freezes the pair-attach intent read-only under the run guard,
-// including digests of the exact lead slot and INIT run-state baseline.
+// including digests of the exact lead slot and INIT run-state baseline, and PUBLISHES the review
+// packet for the PLAN_DRAFT turn it is about to issue.
+//
+// Publishing here — under the guard, before the caller opens the transaction — is what makes a
+// deterministic packet failure harmless: a missing selector or a bounds breach returns an error from
+// this function, so no journal record is written, the Registry never fills, and RunState never moves.
+// The packet itself is content-addressed and idempotent, so an orphan left by a later failure is
+// re-verified rather than rewritten on retry.
 func preparePair(req JoinAttachRequest, reg state.Registry, rs state.RunState) (PairAttachIntent, error) {
 	// The clock must not precede the run's creation, or the frozen transaction would
 	// be permanently rejected by state validation after Registry already filled.
@@ -361,6 +393,13 @@ func preparePair(req JoinAttachRequest, reg state.Registry, rs state.RunState) (
 	if err != nil {
 		return PairAttachIntent{}, err
 	}
+	// The PLAN_DRAFT assignment this attach issues is read-only, so it is actionable only through a
+	// published packet. Resolution reads the frozen inputs and the run's BASE COMMIT — never the
+	// worktree — so the result is deterministic for this run state.
+	manifestRel, rootDigest, err := req.Evidence.IssueEvidence(firstTurn, state.PhasePlanDraft, rs)
+	if err != nil {
+		return PairAttachIntent{}, err
+	}
 	in := PairAttachIntent{
 		RunID:                    req.RunID,
 		TxnID:                    txnID,
@@ -374,6 +413,8 @@ func preparePair(req JoinAttachRequest, reg state.Registry, rs state.RunState) (
 		DeadlineUnix:             req.Now + rs.EffectivePolicy.Limits.MaxWallSeconds,
 		LeadDigest:               leadDigest,
 		BaseStateDigest:          baseDigest,
+		EvidenceManifestRelPath:  manifestRel,
+		EvidenceRootDigest:       rootDigest,
 	}
 	if err := in.validate(); err != nil {
 		return PairAttachIntent{}, err

@@ -18,6 +18,7 @@ func TestLedgerProjectsAcceptedArtifactsInOrder(t *testing.T) {
 	final = assignAt(t, s, final, "t1")
 	final = acceptTurnAdvance(t, s, final, "t1", hex64("c"), func(rev uint64, next *RunState) {
 		next.Assignment = &Ref{ID: "t2", IssuedRevision: rev} // issue the next agent turn
+		// The run stays at IMPLEMENT_STEP, an edit phase: the turn carries a worktree, not a packet.
 	})
 	final = acceptTurnAdvance(t, s, final, "t2", hex64("d"), func(_ uint64, next *RunState) {
 		idx := 1

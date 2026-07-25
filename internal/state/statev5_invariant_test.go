@@ -107,6 +107,7 @@ func TestV5PhaseFamilyShapes(t *testing.T) {
 	rejects(t, s, init, "implement without agreement", func(rev uint64, n *RunState) {
 		n.Phase = PhaseImplementStep
 		n.Assignment = &Ref{ID: "t1", IssuedRevision: rev}
+		n.Evidence = testBinding("t1", rev)
 	})
 
 	// TESTS/VERIFY/DONE require the cursor at the plan end.
@@ -179,6 +180,7 @@ func TestV5VerifyPresenceAndTransfer(t *testing.T) {
 		"pausing VERIFY must preserve the verify requirement", func(rev uint64, n *RunState) {
 			n.AcceptedTurns["v-turn"] = AcceptedTurn{ArtifactDigest: hex64("8"), Receipt: Receipt{TurnID: "v-turn", Revision: rev, ArtifactDigest: hex64("8")}, Phase: PhaseVerify}
 			n.Assignment = nil
+			n.Evidence = nil // consumed with the turn, so only the transfer rule can refuse this state
 			n.Pause = &PauseContext{
 				Kind: PauseHumanDecision, OriginPhase: PhaseVerify, ResumePhase: PhaseVerify,
 				Source: EventRef{Digest: hex64("8"), TurnID: "v-turn"},
@@ -215,6 +217,7 @@ func TestV5VerifyPresenceAndTransfer(t *testing.T) {
 		n.Phase = PhaseVerify
 		n.Lifecycle = LifecycleRunning
 		n.Assignment = &Ref{ID: "v-turn-2", IssuedRevision: rev}
+		n.Evidence = testBinding("v-turn-2", rev)
 		return nil
 	})
 	if err != nil {

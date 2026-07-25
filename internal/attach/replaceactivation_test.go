@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
 )
@@ -35,6 +36,8 @@ func sampleActivatedIntent(runID string, stateRev uint64, baseline string) Repla
 		Activation: &ReplaceActivation{
 			ExpectedStateRevision: stateRev, StateBaselineDigest: baseline,
 			VerifierTurnID: verifierTurn, RequiredGeneration: 2,
+			EvidenceManifestRelPath: evidence.PacketManifestRel(verifierTurn),
+			EvidenceRootDigest:      stubDigest(verifierTurn),
 		},
 	}
 }
@@ -70,6 +73,7 @@ func TestClassifyActivation(t *testing.T) {
 	applied := base
 	applied.Revision = 6
 	applied.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6}
+	applied.Evidence = activationBinding(in, 6)
 	if st, _ := classifyActivation(applied, true, in); st != txn.StatusApplied {
 		t.Fatalf("applied status = %q, want applied", st)
 	}
@@ -81,6 +85,7 @@ func TestClassifyActivation(t *testing.T) {
 	gap := base
 	gap.Revision = 7
 	gap.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 7}
+	gap.Evidence = activationBinding(in, 7)
 	if st, _ := classifyActivation(gap, true, in); st != txn.StatusApplied {
 		t.Fatalf("gap-append status = %q, want applied", st)
 	}
@@ -169,7 +174,8 @@ func TestApplyActivation(t *testing.T) {
 	runID := "run-" + strings.Repeat("a", 32)
 	base := sampleOwnerlessVerify(runID, 5, 2)
 	baseline, _ := canonDigest(base)
-	a := &ReplaceActivation{ExpectedStateRevision: 5, StateBaselineDigest: baseline, VerifierTurnID: verifierTurn, RequiredGeneration: 2}
+	a := &ReplaceActivation{ExpectedStateRevision: 5, StateBaselineDigest: baseline, VerifierTurnID: verifierTurn, RequiredGeneration: 2,
+		EvidenceManifestRelPath: evidence.PacketManifestRel(verifierTurn), EvidenceRootDigest: stubDigest(verifierTurn)}
 
 	next := base
 	next.Revision = 6 // the generation builder sets the appended revision BEFORE applyActivation
@@ -213,7 +219,8 @@ func TestApplyActivation(t *testing.T) {
 	if err := applyActivation(&recovering, a, 6); err == nil {
 		t.Fatal("a recovering pre-state must be rejected")
 	}
-	lower := &ReplaceActivation{ExpectedStateRevision: 5, StateBaselineDigest: baseline, VerifierTurnID: verifierTurn, RequiredGeneration: 1}
+	lower := &ReplaceActivation{ExpectedStateRevision: 5, StateBaselineDigest: baseline, VerifierTurnID: verifierTurn, RequiredGeneration: 1,
+		EvidenceManifestRelPath: evidence.PacketManifestRel(verifierTurn), EvidenceRootDigest: stubDigest(verifierTurn)}
 	clean := base
 	if err := applyActivation(&clean, lower, 6); err == nil {
 		t.Fatal("an intent whose threshold undercuts the live state must be rejected")
@@ -240,6 +247,7 @@ func TestActivationLineageIntact(t *testing.T) {
 	current := base
 	current.Revision = 6
 	current.Assignment = &state.Ref{ID: verifierTurn, IssuedRevision: 6}
+	current.Evidence = activationBinding(in, 6)
 	if !activationLineageIntact(current, true, in) {
 		t.Fatal("an applied (still-current) activation is intact lineage")
 	}
@@ -320,6 +328,8 @@ func TestActivationRejectsAcceptedVerifierID(t *testing.T) {
 	}
 	in := sampleActivatedIntent(runID, 5, baseline)
 	in.Activation.VerifierTurnID = "plan-turn" // a pre-existing accepted id (validRunID accepts it)
+	in.Activation.EvidenceManifestRelPath = evidence.PacketManifestRel("plan-turn")
+	in.Activation.EvidenceRootDigest = stubDigest("plan-turn")
 	if err := in.validate(); err != nil {
 		t.Fatalf("the reuse intent should still validate structurally: %v", err)
 	}
@@ -430,5 +440,16 @@ func TestBindReplaceHeadActivation(t *testing.T) {
 				t.Fatalf("%s should be rejected", name)
 			}
 		})
+	}
+}
+
+// activationBinding is the evidence binding a completed activation writes: the frozen packet, bound
+// to the turn it issued at the revision it landed on.
+func activationBinding(in ReplaceIntent, rev uint64) *state.AssignmentEvidence {
+	return &state.AssignmentEvidence{
+		TurnID:          in.Activation.VerifierTurnID,
+		IssuedRevision:  rev,
+		ManifestRelPath: in.Activation.EvidenceManifestRelPath,
+		RootDigest:      in.Activation.EvidenceRootDigest,
 	}
 }

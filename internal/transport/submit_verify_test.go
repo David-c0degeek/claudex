@@ -142,6 +142,7 @@ func runAtActiveVerify(t *testing.T, requiredGen uint64) (*state.Store, uint64) 
 		n.Phase = state.PhaseVerify
 		n.Verify = &state.VerifyRequirement{RequiredGeneration: requiredGen}
 		n.Assignment = &state.Ref{ID: "verify-turn", IssuedRevision: gen}
+		bindEvidence(n, gen)
 	})
 }
 
@@ -152,6 +153,7 @@ func runAtFixReturningVerify(t *testing.T) (*state.Store, uint64) {
 		n.Phase = state.PhaseFix
 		n.FixReturn = state.PhaseVerify
 		n.Assignment = &state.Ref{ID: "fix-turn", IssuedRevision: gen}
+		bindEvidence(n, gen)
 	})
 }
 
@@ -179,6 +181,7 @@ func (c *capturedPrep) prep() Prepare {
 // verifyToDone is a valid VERIFY -> DONE transition.
 func verifyToDone(_ uint64, next *state.RunState) error {
 	next.Assignment = nil
+	next.Evidence = nil // the binding is consumed with the turn it authorized
 	next.Phase = state.PhaseDone
 	next.Lifecycle = state.LifecycleCompleted
 	next.Verify = nil
@@ -242,6 +245,7 @@ func TestVerifyForgedTransitionsRejected(t *testing.T) {
 			next.FixReturn = ""
 			next.Verify = &state.VerifyRequirement{RequiredGeneration: 3}
 			next.Assignment = &state.Ref{ID: "forged-verify", IssuedRevision: gen}
+			bindEvidence(next, gen)
 			return nil
 		}}
 		_, err := Submit(context.Background(), submitDeps(store, newMemSink(), cp.prep()), pairSess, report("turn-1", rev, "fixed"))

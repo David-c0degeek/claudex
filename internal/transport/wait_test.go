@@ -97,6 +97,7 @@ func viewForRole(role Role, replaced map[string]uint64) SessionViewer {
 func toPairTurn(gen uint64, n *state.RunState) {
 	n.Phase = state.PhaseCheckpoint
 	n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+	bindEvidence(n, gen)
 }
 
 // --- immediate-return wake tests ---
@@ -119,13 +120,17 @@ func TestWaitStopPriority(t *testing.T) {
 		mut  func(gen uint64, n *state.RunState)
 		want WaitKind
 	}{
-		{"cancelled", func(_ uint64, n *state.RunState) { n.Lifecycle = state.LifecycleCancelled; n.Assignment = nil }, WaitCancelled},
+		{"cancelled", func(_ uint64, n *state.RunState) {
+			n.Lifecycle = state.LifecycleCancelled
+			n.Assignment, n.Evidence = nil, nil // the binding is consumed with the turn it authorized
+		}, WaitCancelled},
 		{"completed", func(_ uint64, n *state.RunState) {
 			n.Lifecycle = state.LifecycleCompleted
 			n.Phase = state.PhaseDone
 			idx := 1 // the single step is done
 			n.StepIndex = &idx
 			n.Assignment = nil
+			n.Evidence = nil // the binding is consumed with the turn it authorized
 		}, WaitCompleted},
 		{"gate", func(gen uint64, n *state.RunState) {
 			acceptAndHumanGate(n, gen, state.PhaseCheckpoint, "turn-1", dig("7"), "gate-1")
@@ -156,6 +161,7 @@ func TestWaitFailedCarriesProjection(t *testing.T) {
 	mutate(t, store, rev, func(r uint64, n *state.RunState) {
 		n.Lifecycle = state.LifecycleFailedRetryable
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 		n.Failure = &state.Projection{Code: "test_gate_failed", Reason: "tests failed", NextAction: "fix and resubmit", AtRevision: r}
 	})
 	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "pair", viewForRole(RolePair, nil)))
@@ -205,6 +211,7 @@ func TestWaitTerminalBeatsReplacement(t *testing.T) {
 	mutate(t, store, rev, func(_ uint64, n *state.RunState) {
 		n.Lifecycle = state.LifecycleCancelled
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 	ev, err := Wait(context.Background(), rev, time.Second, pollFor(store, "old-pair", viewForRole(RolePair, map[string]uint64{"old-pair": 9})))
 	if err != nil {
@@ -293,6 +300,7 @@ func TestWaitSeamContradictions(t *testing.T) {
 		idx := 1 // TESTS sits at the plan end
 		n.StepIndex = &idx
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 	after, _, _ := store.Load()
 	for name, view := range cases {
@@ -424,6 +432,7 @@ func TestWaitIgnoresOtherRoleTurn(t *testing.T) {
 		// Advance to IMPLEMENT_STEP (a lead turn) so the pair waiter has nothing.
 		n.Phase = state.PhaseImplementStep
 		n.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		bindEvidence(n, gen)
 	})
 	clk := newFakeClock()
 	ch := make(chan WaitEvent, 1)

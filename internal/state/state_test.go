@@ -482,6 +482,7 @@ func TestFirstTurnIssuance(t *testing.T) {
 	r2, err := s.Mutate(r1.Revision, func(gen uint64, next *RunState) error {
 		next.Phase = PhasePlanDraft
 		next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.Evidence = testBinding("turn-1", gen)
 		next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
 		next.StartedUnix = 2000
 		next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
@@ -510,6 +511,7 @@ func TestFirstTurnIssuanceRejections(t *testing.T) {
 		"wrong phase": func(gen uint64, next *RunState) {
 			next.Phase = PhaseImplementStep
 			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.Evidence = testBinding("turn-1", gen)
 			next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
 			next.StartedUnix = 2000
 			next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
@@ -517,6 +519,7 @@ func TestFirstTurnIssuanceRejections(t *testing.T) {
 		"first_turn != assignment": func(gen uint64, next *RunState) {
 			next.Phase = PhasePlanDraft
 			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.Evidence = testBinding("turn-1", gen)
 			next.FirstTurn = &Ref{ID: "turn-other", IssuedRevision: gen}
 			next.StartedUnix = 2000
 			next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
@@ -524,6 +527,7 @@ func TestFirstTurnIssuanceRejections(t *testing.T) {
 		"first_turn without clock": func(gen uint64, next *RunState) {
 			next.Phase = PhasePlanDraft
 			next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+			next.Evidence = testBinding("turn-1", gen)
 			next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
 		},
 		"first_turn in INIT": func(gen uint64, next *RunState) {
@@ -547,6 +551,7 @@ func TestFirstTurnRequiresPristineInit(t *testing.T) {
 	issue := func(gen uint64, next *RunState) {
 		next.Phase = PhasePlanDraft
 		next.Assignment = &Ref{ID: "turn-1", IssuedRevision: gen}
+		next.Evidence = testBinding("turn-1", gen)
 		next.FirstTurn = &Ref{ID: "turn-1", IssuedRevision: gen}
 		next.StartedUnix = 2000
 		next.DeadlineUnix = 2000 + next.EffectivePolicy.Limits.MaxWallSeconds
@@ -558,6 +563,7 @@ func TestFirstTurnRequiresPristineInit(t *testing.T) {
 		},
 		"pre-existing assignment": func(rev uint64, next *RunState) {
 			next.Assignment = &Ref{ID: "turn-early", IssuedRevision: rev}
+			next.Evidence = testBinding("turn-early", rev)
 		},
 		"non-running init": func(_ uint64, next *RunState) {
 			next.Lifecycle = LifecycleCancelled

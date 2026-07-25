@@ -59,6 +59,7 @@ func TestStatusTerminalHasNoOwner(t *testing.T) {
 		n.Phase = state.PhaseCheckpoint
 		n.Lifecycle = state.LifecycleCancelled
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 	s, err := Status(store, byoHonesty())
 	if err != nil {
@@ -78,7 +79,7 @@ func TestStatusOwnershipFailsClosed(t *testing.T) {
 	}
 	// Running agent phase with no assignment.
 	store2, rev2 := newRunWithActiveTurn(t)
-	mutate(t, store2, rev2, func(_ uint64, n *state.RunState) { n.Assignment = nil }) // IMPLEMENT_STEP, running, no assignment
+	mutate(t, store2, rev2, func(_ uint64, n *state.RunState) { n.Assignment, n.Evidence = nil, nil }) // IMPLEMENT_STEP, running, no assignment
 	if _, err := Status(store2, byoHonesty()); !errors.Is(err, ErrCorruptState) {
 		t.Fatalf("running agent phase without assignment err = %v, want ErrCorruptState", err)
 	}
@@ -103,6 +104,7 @@ func TestStatusStopProjection(t *testing.T) {
 	mutate(t, store, rev, func(r uint64, n *state.RunState) {
 		n.Lifecycle = state.LifecycleFailedTerminal
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 		n.Failure = &state.Projection{Code: "boom", Reason: "leaked token=sk-ant-abcdefghijklmnopqrstuvwx", NextAction: "inspect", AtRevision: r}
 	})
 	s, err := Status(store, byoHonesty())

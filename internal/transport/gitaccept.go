@@ -37,6 +37,14 @@ type GitAcceptPlan struct {
 	// with GitCommit after the snapshot; PrepareGitSubmit leaves them empty.
 	IndexPreDigest    string `json:"index_pre_digest"`
 	IndexTargetDigest string `json:"index_target_digest"`
+	// EvidenceManifestRelPath/EvidenceRootDigest freeze the review packet published for the
+	// CHECKPOINT turn this acceptance issues. It cannot be produced during PrepareGitSubmit: the
+	// packet is cut from the commit this transaction is about to CREATE, so the driver publishes it
+	// after SnapshotCommit (still before the journal opens, so a deterministic packet failure leaves
+	// nothing durable) and freezes the ref here. A recovered transaction re-binds exactly this
+	// packet rather than re-deriving one against a state that has since moved.
+	EvidenceManifestRelPath string `json:"evidence_manifest_rel_path"`
+	EvidenceRootDigest      string `json:"evidence_root_digest"`
 	// ExpectedStepIndex/ExpectedCounters freeze the decision-UNCONTROLLED projections
 	// the acceptance must leave untouched (an IMPLEMENT/FIX acceptance changes neither
 	// the cursor nor a counter), so the state participant's Applied is an exact
@@ -251,7 +259,16 @@ func PrepareGitSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, s
 // the expected revision); next is the generation being built (gen). It reuses the same live-owner,
 // issued-id, and VERIFY-threshold guards the standalone accept enforces.
 func FinalizeGitAccept(rs state.RunState, gen uint64, next *state.RunState, plan GitAcceptPlan) error {
-	if err := engine.Apply(plan.Decision, plan.Decision.Source, engine.Ids{AssignmentTurnID: plan.IssuedTurnID, GateID: plan.IssuedGateID}, gen, next); err != nil {
+	ids := engine.Ids{AssignmentTurnID: plan.IssuedTurnID, GateID: plan.IssuedGateID}
+	// An IMPLEMENT/FIX acceptance that issues a turn issues a READ-ONLY one (CHECKPOINT), so it binds
+	// the packet the driver froze in this plan. An edge that issues no turn binds nothing.
+	if plan.IssuedTurnID != "" && plan.EvidenceManifestRelPath != "" {
+		ids.Evidence = &engine.EvidencePacket{
+			ManifestRelPath: plan.EvidenceManifestRelPath,
+			RootDigest:      plan.EvidenceRootDigest,
+		}
+	}
+	if err := engine.Apply(plan.Decision, plan.Decision.Source, ids, gen, next); err != nil {
 		return err
 	}
 	if next.AcceptedTurns == nil {

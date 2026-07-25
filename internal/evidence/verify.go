@@ -186,7 +186,7 @@ func turnIDFromManifestRel(rel string) (string, error) {
 		return "", fmt.Errorf("%w: manifest rel path %q is not a packet manifest", ErrVerify, rel)
 	}
 	turnID := path.Dir(rel)
-	if !isPacketName(turnID) || packetManifestRel(turnID) != rel {
+	if !isPacketName(turnID) || PacketManifestRel(turnID) != rel {
 		return "", fmt.Errorf("%w: manifest rel path %q is not a derived packet path", ErrVerify, rel)
 	}
 	return turnID, nil

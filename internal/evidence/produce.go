@@ -66,7 +66,7 @@ func Produce(ctx context.Context, evidenceDir string, r Recipe, reader ObjectRea
 	if total := int64(len(canon)) + payloadTotal; total > r.Bounds.MaxTotalBytes {
 		return EvidenceRef{}, fmt.Errorf("%w: packet is %d bytes over the %d total limit", ErrBounds, total-r.Bounds.MaxTotalBytes, r.Bounds.MaxTotalBytes)
 	}
-	ref := EvidenceRef{ManifestRelPath: packetManifestRel(r.TurnID), RootDigest: rootDigest(canon)}
+	ref := EvidenceRef{ManifestRelPath: PacketManifestRel(r.TurnID), RootDigest: rootDigest(canon)}
 	expect := r.Expectation()
 
 	evRoot, err := os.OpenRoot(evidenceDir)

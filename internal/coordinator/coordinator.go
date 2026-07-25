@@ -32,8 +32,10 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/engine"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/gitx"
+	"github.com/David-c0degeek/claudex/internal/reviewpacket"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -639,6 +641,20 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 		switch idKind {
 		case engine.IDAssignment:
 			ids.AssignmentTurnID, issuedTurn = turnCand, turnCand
+			// A read-only turn is actionable only through a published review packet, and it is
+			// published HERE — inside the authorized, locked preparation, before the state CAS — so a
+			// deterministic packet failure refuses the submit with nothing durable moved.
+			//
+			// The IMPLEMENT_STEP/FIX route is deliberately excluded: its packet is cut from the commit
+			// the git transaction is about to CREATE, which does not exist yet at this point. That
+			// route publishes after SnapshotCommit and freezes the ref in its acceptance plan.
+			if !state.RepoEditPhase(snapshot.Phase) && !state.RepoEditPhase(dec.Next) {
+				manifestRel, rootDigest, eerr := rn.issueEvidence(ctx, turnCand, dec.Next, snapshot)
+				if eerr != nil {
+					return transport.PreparedTransition{}, eerr
+				}
+				ids.Evidence = &engine.EvidencePacket{ManifestRelPath: manifestRel, RootDigest: rootDigest}
+			}
 		case engine.IDGate:
 			ids.GateID, issuedGate = gateCand, gateCand
 		case engine.IDNone:
@@ -813,4 +829,19 @@ func takenSet(s state.RunState) map[string]bool {
 
 func isPlanningPhase(p state.Phase) bool {
 	return p == state.PhasePlanDraft || p == state.PhasePlanCritique || p == state.PhasePlanRevise
+}
+
+// issueEvidence publishes the review packet for a read-only turn this run is about to issue. It is
+// the run's single evidence-issuing entry point: attach reaches the same producer through its own
+// seam, so every issuance authority in the system publishes packets one way.
+func (rn *Run) issueEvidence(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState) (string, string, error) {
+	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir)
+	return iss.IssueEvidence(turnID, phase, snapshot)
+}
+
+// issueEvidenceAt is issueEvidence against an explicitly stated source object, for the commit
+// transaction, whose reviewable commit is not yet part of the run's accepted history.
+func (rn *Run) issueEvidenceAt(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState, src evidence.SourceObject) (string, string, error) {
+	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir)
+	return iss.IssueEvidenceAt(turnID, phase, snapshot, src)
 }

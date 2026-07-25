@@ -57,6 +57,7 @@ type RunLocation struct {
 	ReplaceDir   string // the dedicated session-replacement transaction journal directory
 	CommitTxnDir string // the dedicated implementation-submit git-commit transaction journal directory
 	ArtifactsDir string // the content-addressed submit-artifact store directory
+	EvidenceDir  string // the immutable review-evidence packet root (internal/evidence roots here)
 	SessionDir   string // the role-addressed session inbox store dir (.claudex/session; SessionStore roots here)
 	MailboxDir   string // the dir holding the rebuildable .claudex/mailbox.md transcript mirror (MailboxStore roots here)
 }
@@ -103,6 +104,7 @@ func runLocationFor(lay layout, runID string) RunLocation {
 		ReplaceDir:   lay.replaceJournalDir(runDir),
 		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
+		EvidenceDir:  filepath.Join(runDir, "evidence"),
 		// The session inbox and the human-readable mailbox mirror are repo-level per D018
 		// (`.claudex/mailbox.md`), attach-derived so no consumer re-joins the private layout.
 		SessionDir: filepath.Join(base, "session"),

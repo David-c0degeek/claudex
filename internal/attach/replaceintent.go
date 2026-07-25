@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -38,6 +39,12 @@ type ReplaceActivation struct {
 	StateBaselineDigest   string `json:"state_baseline_digest"` // canonDigest of the frozen ownerless VERIFY RunState
 	VerifierTurnID        string `json:"verifier_turn_id"`
 	RequiredGeneration    uint64 `json:"required_generation"` // the retained threshold; NewGeneration >= this
+
+	// The review-evidence packet published for the verifier turn, frozen BEFORE the transaction
+	// opens. VERIFY is read-only, so the assignment this activation issues is actionable only
+	// through it; a recovered activation re-binds exactly this packet rather than re-deriving one.
+	EvidenceManifestRelPath string `json:"evidence_manifest_rel_path"`
+	EvidenceRootDigest      string `json:"evidence_root_digest"`
 }
 
 // ReplaceIntent is the frozen, bounded target of an explicit same-role session
@@ -123,6 +130,14 @@ func (in ReplaceIntent) validate() error {
 		}
 		if a.RequiredGeneration == 0 || in.NewGeneration < a.RequiredGeneration {
 			return fmt.Errorf("attach: activation new_generation does not meet the retained threshold")
+		}
+		// The frozen packet must be the derived manifest for exactly the turn being issued, so a
+		// decoded intent can never bind the verifier assignment to another turn's evidence.
+		if a.EvidenceManifestRelPath != evidence.PacketManifestRel(a.VerifierTurnID) {
+			return fmt.Errorf("attach: activation evidence path is not the derived packet manifest for its verifier turn")
+		}
+		if !state.IsHex64(a.EvidenceRootDigest) {
+			return fmt.Errorf("attach: activation evidence root digest is not sha256")
 		}
 	}
 	return nil
@@ -272,6 +287,13 @@ func applyActivation(next *state.RunState, a *ReplaceActivation, nextRev uint64)
 		return fmt.Errorf("attach: activation pre-state is not the frozen ownerless VERIFY baseline")
 	}
 	next.Assignment = &state.Ref{ID: a.VerifierTurnID, IssuedRevision: nextRev}
+	// VERIFY is read-only: the assignment and the packet that makes it actionable are bound together.
+	next.Evidence = &state.AssignmentEvidence{
+		TurnID:          a.VerifierTurnID,
+		IssuedRevision:  nextRev,
+		ManifestRelPath: a.EvidenceManifestRelPath,
+		RootDigest:      a.EvidenceRootDigest,
+	}
 	return nil
 }
 
@@ -431,8 +453,15 @@ func classifyActivation(rs state.RunState, ok bool, in ReplaceIntent) (txn.StepS
 	// revision reset to the frozen expected) normalizes back to the frozen baseline.
 	if rs.Revision > a.ExpectedStateRevision &&
 		rs.Assignment != nil && rs.Assignment.ID == a.VerifierTurnID && rs.Assignment.IssuedRevision == rs.Revision {
+		if rs.Evidence == nil || rs.Evidence.TurnID != a.VerifierTurnID ||
+			rs.Evidence.IssuedRevision != rs.Revision ||
+			rs.Evidence.ManifestRelPath != a.EvidenceManifestRelPath ||
+			rs.Evidence.RootDigest != a.EvidenceRootDigest {
+			return txn.StatusIndeterminate, nil // the assignment is here but not bound to THIS frozen packet
+		}
 		norm := rs
 		norm.Assignment = nil
+		norm.Evidence = nil
 		norm.Revision = a.ExpectedStateRevision
 		base, berr := activationBaselineOK(norm, a)
 		if berr != nil {

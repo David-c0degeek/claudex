@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/David-c0degeek/claudex/internal/attach"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -160,6 +161,24 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 	plan.GitCommit = state.GitCommitEvidence{Parent: parent, Tree: tree, Commit: commit}
 	plan.IndexPreDigest = preDigest
 	plan.IndexTargetDigest = targetDigest
+
+	// Publish the review packet for the CHECKPOINT turn this acceptance will issue. It is cut from
+	// the commit just created — the state the pair is being asked to review — which is why it cannot
+	// be produced during PrepareGitSubmit. It still happens BEFORE the journal opens, so a
+	// deterministic packet failure (a selector absent from the new tree, a bounds breach) fails the
+	// submit with no journal record, no ref move, and no state advance.
+	if plan.IssuedTurnID != "" && !state.RepoEditPhase(plan.Decision.Next) {
+		// The source is stated explicitly rather than derived from run state: the commit this
+		// acceptance is about to record is not in AcceptedTurns yet, and the reviewer must see
+		// exactly the commit being checkpointed, not the previous accepted one.
+		src := evidence.SourceObject{Commit: commit, Tree: tree}
+		manifestRel, rootDigest, eerr := rn.issueEvidenceAt(ctx, plan.IssuedTurnID, plan.Decision.Next, rs, src)
+		if eerr != nil {
+			return transport.SubmitResult{}, eerr
+		}
+		plan.EvidenceManifestRelPath = manifestRel
+		plan.EvidenceRootDigest = rootDigest
+	}
 
 	payload, merr := json.Marshal(plan)
 	if merr != nil {

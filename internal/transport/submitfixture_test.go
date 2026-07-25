@@ -30,6 +30,7 @@ func prepareErr(err error) Prepare {
 func checkpointApply(gen uint64, next *state.RunState) error {
 	next.Phase = state.PhaseImplementStep
 	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+	bindEvidence(next, gen)
 	return nil
 }
 

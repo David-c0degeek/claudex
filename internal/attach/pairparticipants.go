@@ -205,6 +205,14 @@ func planDraftStep(store *state.Store, g *genstore.Guard, in PairAttachIntent) t
 			_, err := store.MutateLocked(g, in.ExpectedStateRevision, func(gen uint64, next *state.RunState) error {
 				next.Phase = state.PhasePlanDraft
 				next.Assignment = &state.Ref{ID: in.FirstTurnID, IssuedRevision: gen}
+				// PLAN_DRAFT is read-only, so the assignment is actionable only through the packet the
+				// intent froze before this transaction opened. Bound together with the assignment.
+				next.Evidence = &state.AssignmentEvidence{
+					TurnID:          in.FirstTurnID,
+					IssuedRevision:  gen,
+					ManifestRelPath: in.EvidenceManifestRelPath,
+					RootDigest:      in.EvidenceRootDigest,
+				}
 				next.FirstTurn = &state.Ref{ID: in.FirstTurnID, IssuedRevision: gen} // write-once issuance proof
 				next.StartedUnix = in.StartedUnix
 				next.DeadlineUnix = in.DeadlineUnix
@@ -256,6 +264,10 @@ func normalizeToBaseline(rs state.RunState, in PairAttachIntent) state.RunState 
 	rs.Lifecycle = state.LifecycleRunning
 	rs.Phase = state.PhaseInit
 	rs.Assignment = nil
+	// The evidence binding has exactly the assignment's lifetime, so like the assignment it is
+	// mutable state a legitimate downstream transition replaces; it is normalized away rather than
+	// compared, keeping this observation monotonic.
+	rs.Evidence = nil
 	rs.FirstTurn = nil
 	rs.Gate = nil
 	rs.Recovery = nil

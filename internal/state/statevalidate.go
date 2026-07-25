@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
@@ -114,6 +115,9 @@ func validate(rs *RunState) error {
 	if err := validateRef("assignment", rs.Assignment, rs.Revision); err != nil {
 		return err
 	}
+	if err := validateEvidenceBinding(rs); err != nil {
+		return err
+	}
 	if err := validateRef("first_turn", rs.FirstTurn, rs.Revision); err != nil {
 		return err
 	}
@@ -141,6 +145,65 @@ func validate(rs *RunState) error {
 	return nil
 }
 
+// validateEvidenceBinding enforces the v7 global invariant in both directions: a live assignment for
+// a phase the lead cannot edit in is actionable ONLY through a hash-bound review-evidence packet, so
+// the binding exists if and only if such an assignment exists.
+//
+//   - a read-only actionable assignment REQUIRES a binding — otherwise the turn would be handed out
+//     with no defined, verifiable thing to review;
+//   - an IMPLEMENT_STEP/FIX assignment must have NONE — that turn carries a mutable worktree, and a
+//     packet alongside it would be a second, disagreeing source of what the turn may see;
+//   - no assignment means no binding — an ownerless, gated, or terminal state reviews nothing, and a
+//     stale binding left behind would outlive the turn that authorized it.
+//
+// The bound turn/revision must equal the assignment's, and the path must be the DERIVED packet
+// manifest for that turn, so a persisted binding can never point at another turn's packet.
+func validateEvidenceBinding(rs *RunState) error {
+	ev := rs.Evidence
+	if rs.Assignment == nil {
+		if ev != nil {
+			return fmt.Errorf("evidence binding present with no assignment")
+		}
+		return nil
+	}
+	if RepoEditPhase(rs.Phase) {
+		if ev != nil {
+			return fmt.Errorf("evidence binding present for a %s assignment, which carries a worktree", rs.Phase)
+		}
+		return nil
+	}
+	if ev == nil {
+		return fmt.Errorf("read-only %s assignment has no evidence binding", rs.Phase)
+	}
+	if ev.TurnID != rs.Assignment.ID {
+		return fmt.Errorf("evidence binding names turn %q, not the assigned %q", ev.TurnID, rs.Assignment.ID)
+	}
+	if ev.IssuedRevision != rs.Assignment.IssuedRevision {
+		return fmt.Errorf("evidence binding was issued at revision %d, not the assignment's %d", ev.IssuedRevision, rs.Assignment.IssuedRevision)
+	}
+	if ev.ManifestRelPath != evidence.PacketManifestRel(ev.TurnID) {
+		return fmt.Errorf("evidence binding path is not the derived packet manifest for turn %q", ev.TurnID)
+	}
+	if !isSHA256Hex(ev.RootDigest) {
+		return fmt.Errorf("evidence binding root digest is not a sha256")
+	}
+	return nil
+}
+
+// isSHA256Hex reports whether s is a 64-character lower-hex digest.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // validateInit adds the requirements specific to the first generation.
 func validateInit(rs *RunState) error {
 	if rs.Revision != 1 {
@@ -155,8 +218,8 @@ func validateInit(rs *RunState) error {
 	if len(rs.AcceptedTurns) != 0 {
 		return fmt.Errorf("initial state must have no accepted turns")
 	}
-	if rs.Assignment != nil || rs.Gate != nil || rs.Recovery != nil || rs.Failure != nil {
-		return fmt.Errorf("initial state must have no assignment, gate, recovery, or failure")
+	if rs.Assignment != nil || rs.Evidence != nil || rs.Gate != nil || rs.Recovery != nil || rs.Failure != nil {
+		return fmt.Errorf("initial state must have no assignment, evidence, gate, recovery, or failure")
 	}
 	if rs.Counters.PlanRevisions != 0 || rs.Counters.TestFixes != 0 || rs.Counters.VerifyFixes != 0 || len(rs.Counters.StepFixes) != 0 {
 		return fmt.Errorf("initial state must have zero counters and no step fixes")
@@ -300,6 +363,9 @@ func validateTransition(old, next *RunState) error {
 	if err := refBindsToRevision("assignment", old.Assignment, next.Assignment, next.Revision); err != nil {
 		return err
 	}
+	if err := validateEvidenceTransition(old, next); err != nil {
+		return err
+	}
 	if err := refBindsToRevision("gate", old.Gate, next.Gate, next.Revision); err != nil {
 		return err
 	}
@@ -312,6 +378,28 @@ func validateTransition(old, next *RunState) error {
 	}
 	if err := validateV5Transition(old, next); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateEvidenceTransition holds the binding to the assignment's own lifetime: a new or changed
+// binding must be bound to the RESULTING revision, exactly as a newly-issued ref is.
+//
+// Together with the steady-state invariant (which ties a present binding's revision to the
+// assignment's), this is what makes the packet unswappable underneath a live turn. Re-pointing a
+// live turn at different review material would need a changed binding on an unchanged assignment —
+// but an unchanged assignment still carries its original issued revision, so the rebound packet
+// would have to carry that same older revision, and this rule refuses it. There is deliberately no
+// separate "changed without reissuing" check: it could never fire.
+func validateEvidenceTransition(old, next *RunState) error {
+	if next.Evidence == nil {
+		return nil
+	}
+	if old.Evidence != nil && *old.Evidence == *next.Evidence {
+		return nil // unchanged
+	}
+	if next.Evidence.IssuedRevision != next.Revision {
+		return fmt.Errorf("evidence binding was set/changed but bound to revision %d, not the resulting %d", next.Evidence.IssuedRevision, next.Revision)
 	}
 	return nil
 }

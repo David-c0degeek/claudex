@@ -21,6 +21,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/fsclass"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/gitx"
+	"github.com/David-c0degeek/claudex/internal/reviewpacket"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -76,7 +77,7 @@ func policyBytesWith(planRounds, checkpointRounds int) []byte {
 }
 
 func taskBytes() []byte {
-	return []byte(`{"schema_version":1,"goal":"drive the pairing loop","current_behavior":"none","desired_behavior":"two terminals converge","scope":"coordinator core","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	return []byte(`{"schema_version":2,"goal":"drive the pairing loop","current_behavior":"none","desired_behavior":"two terminals converge","scope":"coordinator core","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 }
 
 // initGitRepo turns the empty repo dir into a real one-commit repository on branch
@@ -156,11 +157,30 @@ func newPairedRunWithPolicy(t *testing.T, repo string, pol []byte) (runID, lead,
 	ja, err := attach.JoinAttach(attach.JoinAttachRequest{
 		RepoDir: repo, RunID: fa.RunID, OperationID: opID("b"),
 		Agent: state.AgentCodex, Role: state.SlotPair, Now: 2000, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, fa.RunID),
 	})
 	if err != nil {
 		t.Fatalf("join attach: %v", err)
 	}
 	return fa.RunID, fa.SessionID, ja.SessionID
+}
+
+// testIssuer builds the REAL review-packet issuer for a test run. The coordinator suite drives real
+// linked worktrees and real commits, so it exercises genuine packet production end to end rather
+// than a stub: every read-only turn these tests issue publishes a packet resolved from the committed
+// source object.
+func testIssuer(t *testing.T, repo, runID string) attach.EvidenceIssuer {
+	t.Helper()
+	loc, err := attach.ResolveRun(repo, runID)
+	if err != nil {
+		t.Fatalf("resolve run for the evidence issuer: %v", err)
+	}
+	g, err := gitx.New()
+	if err != nil {
+		t.Fatalf("gitx.New: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	return reviewpacket.NewIssuer(context.Background(), g, repo, loc.RunDir, loc.EvidenceDir)
 }
 
 // --- artifact builders (schema-complete; the store canonicalizes) ---
@@ -724,7 +744,12 @@ func TestE2EStalePrecomputeRace(t *testing.T) {
 		}
 		defer g.Release()
 		if _, merr := rn.state.MutateLocked(g, staleRev, func(gen uint64, next *state.RunState) error {
+			// Reissuing the turn reissues its evidence binding with it: the two share a lifetime, so
+			// a re-pull that rebinds one must rebind the other at the same revision.
 			next.Assignment = &state.Ref{ID: next.Assignment.ID, IssuedRevision: gen}
+			if next.Evidence != nil {
+				next.Evidence.IssuedRevision = gen
+			}
 			return nil
 		}); merr != nil {
 			t.Errorf("advance: %v", merr)
@@ -1082,7 +1107,9 @@ func TestE2EReplacedSessionUnauthorized(t *testing.T) {
 		t.Fatalf("mint operation id: %v", err)
 	}
 	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
-		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex, ExpectedGeneration: 1, OperationID: replOp, RNG: rand.Reader,
+		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
+		ExpectedGeneration: 1, OperationID: replOp, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	})
 	if err != nil {
 		t.Fatalf("replace pair session: %v", err)
@@ -1202,6 +1229,7 @@ func TestE2EActivationAtOwnerlessVerify(t *testing.T) {
 	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	})
 	if err != nil {
 		t.Fatalf("activate: %v", err)
@@ -1320,6 +1348,7 @@ func TestActivationIdempotentRetry(t *testing.T) {
 	req := attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	}
 	rep1, err := attach.ReplaceAttach(req)
 	if err != nil {
@@ -1388,6 +1417,7 @@ func TestActivationBindsAcrossStateGap(t *testing.T) {
 	req := attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	}
 	rep, err := attach.ReplaceAttach(req)
 	if err != nil {
@@ -1438,6 +1468,7 @@ func TestActivationRecoversPendingSameOp(t *testing.T) {
 	req := attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	}
 	if _, err := attach.ReplaceAttachWith(req, attach.ReplaceStores{StateMutate: ambiguousState}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
 		t.Fatalf("ambiguous activation err = %v, want ErrReplaceOutcomeUnknown", err)
@@ -1502,6 +1533,7 @@ func TestActivationAppliedButUnrecordedRetry(t *testing.T) {
 	req := attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	}
 	if _, err := attach.ReplaceAttachWith(req, attach.ReplaceStores{StateMutate: applyThenAmbiguousState}); !errors.Is(err, attach.ErrReplaceOutcomeUnknown) {
 		t.Fatalf("applied-but-unrecorded err = %v, want ErrReplaceOutcomeUnknown", err)
@@ -1552,6 +1584,7 @@ func activateRun(t *testing.T, repo string) (*Run, attach.ReplaceRequest, state.
 	req := attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	}
 	if _, err := attach.ReplaceAttach(req); err != nil {
 		t.Fatalf("activate: %v", err)
@@ -1603,6 +1636,8 @@ func TestActivationRolledBackStateRequiresRecovery(t *testing.T) {
 	// ownerless VERIFY at a later revision — the activation effect is gone.
 	if _, err := rn.state.Mutate(activated.Revision, func(_ uint64, next *state.RunState) error {
 		next.Assignment = nil
+		next.Evidence = nil // the binding is consumed with the turn it authorized
+		next.Evidence = nil // the binding is consumed with the turn it authorized
 		return nil
 	}); err != nil {
 		t.Fatalf("roll back the activation effect: %v", err)
@@ -1650,6 +1685,7 @@ func verifyReadyRun(t *testing.T, repo string) (*Run, string, state.RunState) {
 	rep, err := attach.ReplaceAttach(attach.ReplaceRequest{
 		RepoDir: repo, RunID: runID, Role: state.SlotPair, Agent: state.AgentCodex,
 		ExpectedGeneration: 1, OperationID: op, RNG: rand.Reader,
+		Evidence: testIssuer(t, repo, runID),
 	})
 	if err != nil {
 		t.Fatalf("activate: %v", err)

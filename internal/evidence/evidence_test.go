@@ -193,7 +193,7 @@ func TestVerifyRejectsForeignIdentity(t *testing.T) {
 		}
 	}
 	// A ref whose derived path names a different turn than the expectation is refused before any read.
-	otherTurn := EvidenceRef{ManifestRelPath: packetManifestRel("turn-9"), RootDigest: ref.RootDigest}
+	otherTurn := EvidenceRef{ManifestRelPath: PacketManifestRel("turn-9"), RootDigest: ref.RootDigest}
 	if err := VerifyRef(dir, otherTurn, testBounds, r.Expectation()); !errors.Is(err, ErrVerify) {
 		t.Fatalf("turn-mismatch verify = %v, want ErrVerify", err)
 	}
@@ -210,7 +210,7 @@ func TestVerifyRejectsStructurallyEmptyManifest(t *testing.T) {
 	empty := []byte(`{"schema_version":1,"run_id":"","turn_id":"turn-1","phase":"","source":{"commit":"","tree":""},"entries":null}`)
 	writeFile(t, filepath.Join(dir, "turn-1", ManifestName), empty)
 
-	ref := EvidenceRef{ManifestRelPath: packetManifestRel("turn-1"), RootDigest: rootDigest(empty)}
+	ref := EvidenceRef{ManifestRelPath: PacketManifestRel("turn-1"), RootDigest: rootDigest(empty)}
 	expect := Expectation{RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT", Source: SourceObject{Commit: oid(100), Tree: oid(101)}}
 	if err := VerifyRef(dir, ref, testBounds, expect); !errors.Is(err, ErrVerify) {
 		t.Fatalf("structurally empty manifest verify = %v, want ErrVerify", err)
@@ -250,7 +250,7 @@ func TestVerifySharedBlobSizes(t *testing.T) {
 			t.Fatalf("marshal wire manifest: %v", err)
 		}
 		writeFile(t, filepath.Join(dir, "turn-1", ManifestName), raw)
-		ref := EvidenceRef{ManifestRelPath: packetManifestRel("turn-1"), RootDigest: rootDigest(raw)}
+		ref := EvidenceRef{ManifestRelPath: PacketManifestRel("turn-1"), RootDigest: rootDigest(raw)}
 		expect := Expectation{RunID: "run-1", TurnID: "turn-1", Phase: "PLAN_DRAFT", Source: SourceObject{Commit: oid(100), Tree: oid(101)}}
 		return dir, ref, expect
 	}

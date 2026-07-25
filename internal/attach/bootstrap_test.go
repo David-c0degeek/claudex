@@ -108,7 +108,7 @@ func policyBytes() []byte {
 }
 
 func taskBytes() []byte {
-	return []byte(`{"schema_version":1,"goal":"build the attach protocol","current_behavior":"none","desired_behavior":"two terminals converge","scope":"coordinator core","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	return []byte(`{"schema_version":2,"goal":"build the attach protocol","current_behavior":"none","desired_behavior":"two terminals converge","scope":"coordinator core","non_goals":[],"constraints":[],"acceptance_criteria":["it works"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 }
 
 func newRequest(t *testing.T, repoDir string, wt WorktreeProvisioner) FirstAttachRequest {
@@ -288,7 +288,7 @@ func TestFirstAttachRefusesDuplicateCriteria(t *testing.T) {
 	wt := &fakeWorktree{}
 	req := newRequest(t, repo, wt)
 	req.Base = base
-	req.TaskCanonical = []byte(`{"schema_version":1,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"open_questions":[]}`)
+	req.TaskCanonical = []byte(`{"schema_version":2,"goal":"g","current_behavior":"c","desired_behavior":"d","scope":"s","non_goals":[],"constraints":[],"acceptance_criteria":["same","same"],"required_tests":[],"relevant_files":[],"relevant_repo_paths":["README"],"open_questions":[]}`)
 
 	if _, err := FirstAttach(context.Background(), req); err == nil {
 		t.Fatalf("duplicate acceptance_criteria should be refused")

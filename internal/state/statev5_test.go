@@ -23,6 +23,7 @@ func issueFirstTurn(t *testing.T, s *Store, init RunState, turnID string) RunSta
 		ref := &Ref{ID: turnID, IssuedRevision: rev}
 		next.Phase = PhasePlanDraft
 		next.Assignment = ref
+		next.Evidence = testBinding(turnID, rev)
 		next.FirstTurn = ref
 		next.StartedUnix = next.CreatedUnix
 		next.DeadlineUnix = next.CreatedUnix + next.EffectivePolicy.Limits.MaxWallSeconds
@@ -40,6 +41,11 @@ func assignAt(t *testing.T, s *Store, prev RunState, turnID string) RunState {
 	t.Helper()
 	rs, err := s.Mutate(prev.Revision, func(rev uint64, next *RunState) error {
 		next.Assignment = &Ref{ID: turnID, IssuedRevision: rev}
+		// An edit-phase turn carries a worktree and no packet; every other phase is read-only.
+		next.Evidence = nil
+		if !RepoEditPhase(next.Phase) {
+			next.Evidence = testBinding(turnID, rev)
+		}
 		return nil
 	})
 	if err != nil {
@@ -59,7 +65,10 @@ func acceptTurnAdvance(t *testing.T, s *Store, prev RunState, turnID, digest str
 			Phase:          prev.Phase,
 			GitCommit:      evidenceFor(prev.Phase, next),
 		}
+		// The turn is consumed, and its evidence binding is consumed with it; adv may then reissue
+		// both for the next turn.
 		next.Assignment = nil
+		next.Evidence = nil
 		adv(rev, next)
 		return nil
 	})

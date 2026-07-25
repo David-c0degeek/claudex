@@ -49,6 +49,10 @@ type ReplaceRequest struct {
 	Role               state.SlotRole
 	Agent              state.Agent
 	ExpectedGeneration uint64
+	// Evidence publishes the verifier turn's review packet. It is required only when this
+	// replacement ACTIVATES an ownerless VERIFY (that is the one path that issues a read-only
+	// assignment); an ordinary Registry-only supersession issues no turn and never uses it.
+	Evidence EvidenceIssuer
 	// OperationID is a mandatory, caller-stable idempotency key ("op-" + 32 lower-hex).
 	// Idempotency is head-scoped: while this operation is the latest journalled
 	// replacement (pending or complete), a retry with the SAME id reconciles to the
@@ -390,11 +394,23 @@ func prepareReplace(req ReplaceRequest, runState *state.Store, reg state.Registr
 			if terr != nil {
 				return ReplaceIntent{}, terr
 			}
+			if req.Evidence == nil {
+				return ReplaceIntent{}, fmt.Errorf("attach: activating the verifier turn issues a read-only assignment and requires an evidence issuer")
+			}
+			// Publish the verifier turn's review packet HERE, under the guard and before the
+			// transaction opens: a deterministic packet failure must refuse the replacement outright,
+			// leaving the Registry, the journal, and RunState untouched.
+			manifestRel, rootDigest, eerr := req.Evidence.IssueEvidence(verifierTurn, state.PhaseVerify, rs)
+			if eerr != nil {
+				return ReplaceIntent{}, eerr
+			}
 			in.Activation = &ReplaceActivation{
-				ExpectedStateRevision: rs.Revision,
-				StateBaselineDigest:   baseline,
-				VerifierTurnID:        verifierTurn,
-				RequiredGeneration:    rs.Verify.RequiredGeneration,
+				ExpectedStateRevision:   rs.Revision,
+				StateBaselineDigest:     baseline,
+				VerifierTurnID:          verifierTurn,
+				RequiredGeneration:      rs.Verify.RequiredGeneration,
+				EvidenceManifestRelPath: manifestRel,
+				EvidenceRootDigest:      rootDigest,
 			}
 		}
 	}

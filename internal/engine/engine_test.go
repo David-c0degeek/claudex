@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/config"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/protocol"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -272,6 +273,7 @@ func bootstrapPlanDraft(t *testing.T, store *state.Store, turnID string) state.R
 		ref := &state.Ref{ID: turnID, IssuedRevision: rev}
 		n.Phase = state.PhasePlanDraft
 		n.Assignment = ref
+		n.Evidence = testBinding(turnID, rev)
 		n.FirstTurn = ref
 		n.StartedUnix = n.CreatedUnix
 		n.DeadlineUnix = n.CreatedUnix + n.EffectivePolicy.Limits.MaxWallSeconds
@@ -283,7 +285,41 @@ func bootstrapPlanDraft(t *testing.T, store *state.Store, turnID string) state.R
 	return draft
 }
 
-func assign(turn string) Ids  { return Ids{AssignmentTurnID: turn} }
+// assign issues a READ-ONLY turn, so it carries the evidence packet the invariant requires. What a
+// packet contains is internal/evidence's and internal/reviewpacket's contract; the engine's own
+// obligation is only to bind one to every read-only assignment and none to a worktree assignment.
+func assign(turn string) Ids {
+	return Ids{AssignmentTurnID: turn, Evidence: testPacket(turn)}
+}
+
+// assignEdit issues an IMPLEMENT_STEP/FIX turn, which carries a mutable worktree and therefore NO
+// evidence binding.
+func assignEdit(turn string) Ids { return Ids{AssignmentTurnID: turn} }
+
+func testPacket(turn string) *EvidencePacket {
+	return &EvidencePacket{ManifestRelPath: evidence.PacketManifestRel(turn), RootDigest: testDigest(turn)}
+}
+
+func testBinding(turn string, rev uint64) *state.AssignmentEvidence {
+	return &state.AssignmentEvidence{
+		TurnID:          turn,
+		IssuedRevision:  rev,
+		ManifestRelPath: evidence.PacketManifestRel(turn),
+		RootDigest:      testDigest(turn),
+	}
+}
+
+// testDigest is a stable 64-hex value derived from the turn id, so re-issuing the same turn agrees
+// exactly as a real content-addressed packet would.
+func testDigest(turn string) string {
+	var sum uint64 = 1469598103934665603
+	for i := 0; i < len(turn); i++ {
+		sum ^= uint64(turn[i])
+		sum *= 1099511628211
+	}
+	return fmt.Sprintf("%016x%016x%016x%016x", sum, sum^0xffffffffffffffff, sum*3, sum*7)
+}
+
 func gate(id string) Ids      { return Ids{GateID: id} }
 func strptr(s string) *string { return &s }
 
@@ -352,7 +388,7 @@ func TestDryRunPlanThroughCheckpointFix(t *testing.T) {
 	}
 
 	// PLAN_CRITIQUE AGREE (target valid) -> IMPLEMENT_STEP (promote).
-	rs = mustStep(t, store, withCheck, critiqueArtifact(t, "t-crit2", rs.Revision, "AGREE", false, nil, nil, nil), assign("t-impl1"))
+	rs = mustStep(t, store, withCheck, critiqueArtifact(t, "t-crit2", rs.Revision, "AGREE", false, nil, nil, nil), assignEdit("t-impl1"))
 	if rs.Phase != state.PhaseImplementStep || rs.AgreedPlan == nil || rs.StepIndex == nil || *rs.StepIndex != 0 || len(rs.Counters.StepFixes) != 2 {
 		t.Fatalf("after promote: %+v", rs)
 	}
@@ -363,7 +399,7 @@ func TestDryRunPlanThroughCheckpointFix(t *testing.T) {
 	}
 
 	// CHECKPOINT REVISE (blocking) -> FIX.
-	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk1", rs.Revision, "REVISE", false, true, []string{"blocking"}, nil), assign("t-fix1"))
+	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk1", rs.Revision, "REVISE", false, true, []string{"blocking"}, nil), assignEdit("t-fix1"))
 	if rs.Phase != state.PhaseFix || rs.FixReturn != state.PhaseCheckpoint || rs.Counters.StepFixes[0] != 1 {
 		t.Fatalf("after checkpoint-fix: %+v", rs)
 	}
@@ -374,7 +410,7 @@ func TestDryRunPlanThroughCheckpointFix(t *testing.T) {
 	}
 
 	// CHECKPOINT AGREE on the non-final step -> next IMPLEMENT_STEP (cursor 1).
-	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk2", rs.Revision, "AGREE", false, true, nil, nil), assign("t-impl2"))
+	rs = mustStep(t, store, ProjectionFacts{}, checkpointArtifact(t, "t-chk2", rs.Revision, "AGREE", false, true, nil, nil), assignEdit("t-impl2"))
 	if rs.Phase != state.PhaseImplementStep || *rs.StepIndex != 1 {
 		t.Fatalf("after next step: %+v", rs)
 	}

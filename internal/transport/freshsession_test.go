@@ -17,6 +17,7 @@ func runAtOwnerlessVerify(t *testing.T, requiredGen uint64) (*state.Store, uint6
 		n.Phase = state.PhaseVerify
 		n.Verify = &state.VerifyRequirement{RequiredGeneration: requiredGen}
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 	})
 }
 
@@ -27,6 +28,7 @@ func runAtOwnerlessVerifyRecovering(t *testing.T, requiredGen uint64) (*state.St
 		n.Phase = state.PhaseVerify
 		n.Verify = &state.VerifyRequirement{RequiredGeneration: requiredGen}
 		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
 		n.Recovery = &state.Projection{Code: "torn_generation", Reason: "torn", NextAction: "recover", AtRevision: gen}
 	})
 }
@@ -420,6 +422,7 @@ func TestPullVerifyFreshSessionGate(t *testing.T) {
 func TestPullOwnerlessVerifyNoTurn(t *testing.T) {
 	rs := runStateAt(state.PhaseVerify)
 	rs.Assignment = nil
+	rs.Evidence = nil // the binding is consumed with the turn it authorized
 	in := evidenceInputs(RolePair)
 	in.CurrentPairGeneration = 4
 	if _, err := BuildAssignment(rs, in); !errors.Is(err, ErrNoActiveTurn) {

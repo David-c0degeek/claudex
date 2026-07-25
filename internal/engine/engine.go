@@ -212,9 +212,26 @@ type Decision struct {
 
 // Ids are the prepared identities the adapter minted before the CAS loop. Apply
 // requires exactly the id the Decision issues.
+//
+// Evidence is the review-evidence packet the adapter published for the assignment
+// it is about to issue, frozen before the CAS. It is required for every read-only
+// assignment and forbidden for an IMPLEMENT_STEP/FIX one; the state validator
+// enforces that invariant, and Apply only binds what the adapter proved. Its
+// IssuedRevision is filled in here, at the CAS, because the resulting revision is
+// the one fact the off-lock producer cannot know.
 type Ids struct {
 	AssignmentTurnID string
 	GateID           string
+	Evidence         *EvidencePacket
+}
+
+// EvidencePacket is the published packet's locator, minus the revision binding.
+// It is the value the adapter freezes in its serializable plan or intent, so a
+// recovered transaction re-binds exactly the packet the original authorization
+// published rather than re-deriving one.
+type EvidencePacket struct {
+	ManifestRelPath string
+	RootDigest      string
 }
 
 // --- evaluate: the sole phase-edge/convergence table ---
@@ -532,7 +549,11 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		return err
 	}
 
-	next.Assignment = nil // consume the submitted turn
+	// Consume the submitted turn. The evidence binding is cleared with it: it authorized exactly that
+	// assignment, so it must not outlive it — every route below either reissues both through issue()
+	// or leaves the state ownerless with neither.
+	next.Assignment = nil
+	next.Evidence = nil
 	next.Phase = dec.Next
 
 	switch dec.Route {
@@ -547,7 +568,9 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 	case RouteDraftAccepted:
 		next.CandidatePlan = copyPlanRef(dec.Plan)
 		next.CandidateChecks = copyCheckSet(dec.Checks)
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RoutePromote:
 		next.AgreedPlan = &state.PlanAgreement{
 			Plan:           *next.CandidatePlan,
@@ -561,28 +584,42 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 		next.Counters.StepFixes = make([]int, next.AgreedPlan.Plan.StepCount)
 		idx := 0
 		next.StepIndex = &idx
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteToRevise:
 		next.CandidateChecks = copyCheckSet(dec.Checks)
 		next.PendingFindings = copyFindings(dec.Findings)
 		next.Counters.PlanRevisions++
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteRetryReview:
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteReviseAccepted:
 		next.CandidatePlan = copyPlanRef(dec.Plan)
 		next.PendingFindings = nil // preserve checks, clear findings
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteToCheckpoint:
 		next.FixReturn = "" // clears when leaving FIX; a no-op from IMPLEMENT
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteNextStep:
 		*next.StepIndex++
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteToFix:
 		next.Counters.StepFixes[*next.StepIndex]++
 		next.FixReturn = state.PhaseCheckpoint
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteToTests:
 		// Ownerless: from the final CHECKPOINT (cursor at last step) or a FIX return.
 		next.FixReturn = ""
@@ -595,12 +632,16 @@ func Apply(dec Decision, submitted state.EventRef, ids Ids, gen uint64, next *st
 	case RouteTestsFix:
 		next.Counters.TestFixes++
 		next.FixReturn = state.PhaseTests
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteVerifyFix:
 		next.Counters.VerifyFixes++
 		next.FixReturn = state.PhaseVerify
 		next.Verify = nil // leaving VERIFY for FIX clears the requirement
-		issue(next, ids, gen)
+		if err := issue(next, ids, gen); err != nil {
+			return err
+		}
 	case RouteToDone:
 		next.Verify = nil
 		next.Lifecycle = state.LifecycleCompleted // terminal: no assignment, no gate
@@ -1126,8 +1167,34 @@ func copyFindings(f *state.FindingObligations) *state.FindingObligations {
 	return &out
 }
 
-func issue(next *state.RunState, ids Ids, gen uint64) {
+// issue binds the newly assigned turn and, for a read-only turn, the review-evidence packet that
+// makes it actionable. The two are written together and cleared together: an assignment and its
+// binding have exactly the same lifetime, so no generation can exist in which one moved without the
+// other. The resulting revision is stamped into the binding here because the CAS is the first point
+// at which it is known.
+func issue(next *state.RunState, ids Ids, gen uint64) error {
+	// next.Phase is already the resulting phase, so the requirement is decidable here — and it is
+	// checked rather than assumed: an adapter that forgot to publish a packet, or supplied one for a
+	// worktree turn, is a wiring bug that must fail at the transition rather than produce a state
+	// only the store validator would catch.
+	readOnly := !state.RepoEditPhase(next.Phase)
+	if readOnly && ids.Evidence == nil {
+		return fmt.Errorf("%w: a read-only %s assignment requires a published evidence packet", ErrBadDecision, next.Phase)
+	}
+	if !readOnly && ids.Evidence != nil {
+		return fmt.Errorf("%w: a %s assignment carries a worktree and must have no evidence packet", ErrBadDecision, next.Phase)
+	}
 	next.Assignment = &state.Ref{ID: ids.AssignmentTurnID, IssuedRevision: gen}
+	next.Evidence = nil
+	if ids.Evidence != nil {
+		next.Evidence = &state.AssignmentEvidence{
+			TurnID:          ids.AssignmentTurnID,
+			IssuedRevision:  gen,
+			ManifestRelPath: ids.Evidence.ManifestRelPath,
+			RootDigest:      ids.Evidence.RootDigest,
+		}
+	}
+	return nil
 }
 
 func applyGate(g *GateSpec, source state.EventRef, gateID string, gen uint64, next *state.RunState) {

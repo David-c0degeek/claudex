@@ -22,6 +22,7 @@ import (
 func advApply(gen uint64, next *state.RunState) error {
 	next.Phase = state.PhaseCheckpoint
 	next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+	bindEvidence(next, gen)
 	return nil
 }
 
@@ -286,6 +287,7 @@ func TestSubmitImplementationRequiresGitParticipant(t *testing.T) {
 		}
 		r2, err := store.Mutate(implRev, func(gen uint64, n *state.RunState) error {
 			n.Assignment = &state.Ref{ID: "turn-1", IssuedRevision: gen}
+			bindEvidence(n, gen)
 			return nil
 		})
 		if err != nil {
@@ -386,6 +388,7 @@ func TestSubmitTransitionNilsAcceptedMap(t *testing.T) {
 		next.AcceptedTurns = nil
 		next.Phase = state.PhaseCheckpoint
 		next.Assignment = &state.Ref{ID: "turn-2", IssuedRevision: gen}
+		bindEvidence(next, gen)
 		return nil
 	})
 	deps := depsWith(store, sink, terminalJournal(store), openRunRegistry(store), nilMap)

@@ -17,12 +17,19 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/David-c0degeek/claudex/internal/evidence"
 )
 
 // Supported schema versions. A supplied document MUST declare its version
 // explicitly; a missing or different version fails closed.
+// Task-contract v2 added the REQUIRED relevant_repo_paths selection. It is
+// meaning-compatible with v1 but not wire-compatible: a v1 document declares no
+// machine-resolvable selection at all, and silently treating that as "select
+// nothing" would issue read-only review turns with no repository content to
+// review. A v1 document therefore fails the version check outright.
 const (
-	TaskContractVersion = 1
+	TaskContractVersion = 2
 	RunPolicyVersion    = 1
 )
 
@@ -50,8 +57,14 @@ type TaskContract struct {
 	Constraints        []string `json:"constraints"`
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 	RequiredTests      []string `json:"required_tests"`
-	RelevantFiles      []string `json:"relevant_files"`
-	OpenQuestions      []string `json:"open_questions"`
+	// RelevantFiles is descriptive human guidance and is never resolved against the repository.
+	RelevantFiles []string `json:"relevant_files"`
+	// RelevantRepoPaths is the STRICT machine-resolved selection: the exact repository paths a
+	// read-only review turn's evidence packet materializes from the committed source object. Each is
+	// an exact leaf blob path validated by evidence.IsSelectorPath, so it means the same thing on
+	// every host, and a selector absent from the source tree fails packet production closed.
+	RelevantRepoPaths []string `json:"relevant_repo_paths"`
+	OpenQuestions     []string `json:"open_questions"`
 }
 
 // UnknownFSPolicy is what to do when the state filesystem classifies as Unknown.
@@ -129,7 +142,7 @@ func DefaultRunPolicy() RunPolicy {
 var taskContractKeys = []string{
 	"schema_version", "goal", "current_behavior", "desired_behavior", "scope",
 	"non_goals", "constraints", "acceptance_criteria", "required_tests",
-	"relevant_files", "open_questions",
+	"relevant_files", "relevant_repo_paths", "open_questions",
 }
 
 // ParseTaskContract decodes and validates a task-contract document.
@@ -180,12 +193,16 @@ func ParseTaskContract(data []byte) (TaskContract, error) {
 		{"acceptance_criteria", tc.AcceptanceCriteria},
 		{"required_tests", tc.RequiredTests},
 		{"relevant_files", tc.RelevantFiles},
+		{"relevant_repo_paths", tc.RelevantRepoPaths},
 		{"open_questions", tc.OpenQuestions},
 	}
 	for _, a := range arrays {
 		if err := noBlankElements(a.name, a.v); err != nil {
 			return TaskContract{}, err
 		}
+	}
+	if err := validateRepoPaths(tc.RelevantRepoPaths); err != nil {
+		return TaskContract{}, err
 	}
 	if len(tc.AcceptanceCriteria) == 0 {
 		return TaskContract{}, fmt.Errorf("task contract: at least one acceptance_criteria is required")
@@ -418,6 +435,31 @@ func noBlankElements(field string, ss []string) error {
 		if strings.TrimSpace(s) == "" {
 			return fmt.Errorf("task contract: %s[%d] is blank", field, i)
 		}
+	}
+	return nil
+}
+
+// validateRepoPaths holds relevant_repo_paths to the exact-leaf selector grammar the evidence packet
+// resolves against the committed source tree. At least one is required: a read-only review turn is
+// actionable only through materialized repository content, so a task that names none could never
+// produce an actionable packet. Selectors must be exactly unique (byte-for-byte, case-sensitive) —
+// a duplicate would consume a second logical entry and a second slice of the request budget while
+// naming the same blob. Offending selectors are reported by index only, since the value is
+// caller-supplied and could name something sensitive.
+func validateRepoPaths(paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("task contract: at least one relevant_repo_paths entry is required")
+	}
+	seen := make(map[string]int, len(paths))
+	for i, p := range paths {
+		if !evidence.IsSelectorPath(p) {
+			return fmt.Errorf("task contract: relevant_repo_paths[%d] is not a canonical repository path "+
+				"(forward-slash relative, no traversal, no backslash or drive colon, canonical UTF-8, exact bytes)", i)
+		}
+		if first, ok := seen[p]; ok {
+			return fmt.Errorf("task contract: relevant_repo_paths[%d] duplicates relevant_repo_paths[%d]", i, first)
+		}
+		seen[p] = i
 	}
 	return nil
 }
