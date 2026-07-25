@@ -25,10 +25,10 @@ type Issuer struct {
 
 // NewIssuer binds an issuer to one run: the repository whose committed objects supply content, the
 // run directory holding the frozen inputs, and the run's evidence packet root.
-func NewIssuer(ctx context.Context, g *gitx.Git, repoDir, runDir, evidenceDir string) *Issuer {
+func NewIssuer(ctx context.Context, g *gitx.Git, repoDir, runDir, evidenceDir string, artifacts ArtifactReader) *Issuer {
 	return &Issuer{
 		ctx:         ctx,
-		deps:        Deps{RunDir: runDir, RepoDir: repoDir, Git: g},
+		deps:        Deps{RunDir: runDir, RepoDir: repoDir, Git: g, Artifacts: artifacts},
 		evidenceDir: evidenceDir,
 	}
 }
@@ -38,17 +38,28 @@ func NewIssuer(ctx context.Context, g *gitx.Git, repoDir, runDir, evidenceDir st
 // packet and returns the same locator, so a recovered transaction re-binds exactly what the original
 // authorization published.
 func (i *Issuer) IssueEvidence(turnID string, phase state.Phase, rs state.RunState) (string, string, error) {
-	r, err := Resolve(i.ctx, i.deps, rs, turnID, phase)
+	r, err := Resolve(i.ctx, i.deps, rs, turnID, phase, nil)
 	if err != nil {
 		return "", "", err
 	}
 	return i.publish(r)
 }
 
-// IssueEvidenceAt is IssueEvidence against an explicitly stated source object, for the commit
+// IssuePending resolves against the run state PLUS the acceptance in flight, for a transition whose
+// next turn must see the artifact being accepted right now (a critique reviewing the plan this
+// submit establishes, a revision answering this critique).
+func (i *Issuer) IssuePending(turnID string, phase state.Phase, rs state.RunState, pending *Pending) (string, string, error) {
+	r, err := Resolve(i.ctx, i.deps, rs, turnID, phase, pending)
+	if err != nil {
+		return "", "", err
+	}
+	return i.publish(r)
+}
+
+// IssueEvidenceAt is IssuePending against an explicitly stated source object, for the commit
 // transaction, whose reviewable commit does not exist in run state yet.
-func (i *Issuer) IssueEvidenceAt(turnID string, phase state.Phase, rs state.RunState, src evidence.SourceObject) (string, string, error) {
-	r, err := ResolveAt(i.ctx, i.deps, rs, turnID, phase, src)
+func (i *Issuer) IssueEvidenceAt(turnID string, phase state.Phase, rs state.RunState, src evidence.SourceObject, pending *Pending) (string, string, error) {
+	r, err := ResolveAt(i.ctx, i.deps, rs, turnID, phase, src, pending)
 	if err != nil {
 		return "", "", err
 	}

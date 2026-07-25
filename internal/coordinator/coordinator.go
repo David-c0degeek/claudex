@@ -649,7 +649,11 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 			// the git transaction is about to CREATE, which does not exist yet at this point. That
 			// route publishes after SnapshotCommit and freezes the ref in its acceptance plan.
 			if !state.RepoEditPhase(snapshot.Phase) && !state.RepoEditPhase(dec.Next) {
-				manifestRel, rootDigest, eerr := rn.issueEvidence(ctx, turnCand, dec.Next, snapshot)
+				// The next turn is usually a RESPONSE to the turn being accepted right now, which is not
+				// in the accepted history yet (the packet is published before the state CAS). Passing the
+				// acceptance in flight is what lets a critique see the plan this submit establishes.
+				pending := &reviewpacket.Pending{Phase: snapshot.Phase, Plan: dec.Plan, Body: []byte(prepared.CanonicalJSON)}
+				manifestRel, rootDigest, eerr := rn.issueEvidence(ctx, turnCand, dec.Next, snapshot, pending)
 				if eerr != nil {
 					return transport.PreparedTransition{}, eerr
 				}
@@ -834,14 +838,14 @@ func isPlanningPhase(p state.Phase) bool {
 // issueEvidence publishes the review packet for a read-only turn this run is about to issue. It is
 // the run's single evidence-issuing entry point: attach reaches the same producer through its own
 // seam, so every issuance authority in the system publishes packets one way.
-func (rn *Run) issueEvidence(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState) (string, string, error) {
-	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir)
-	return iss.IssueEvidence(turnID, phase, snapshot)
+func (rn *Run) issueEvidence(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState, pending *reviewpacket.Pending) (string, string, error) {
+	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir, rn.store)
+	return iss.IssuePending(turnID, phase, snapshot, pending)
 }
 
 // issueEvidenceAt is issueEvidence against an explicitly stated source object, for the commit
 // transaction, whose reviewable commit is not yet part of the run's accepted history.
-func (rn *Run) issueEvidenceAt(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState, src evidence.SourceObject) (string, string, error) {
-	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir)
-	return iss.IssueEvidenceAt(turnID, phase, snapshot, src)
+func (rn *Run) issueEvidenceAt(ctx context.Context, turnID string, phase state.Phase, snapshot state.RunState, src evidence.SourceObject, pending *reviewpacket.Pending) (string, string, error) {
+	iss := reviewpacket.NewIssuer(ctx, rn.git, rn.repoDir, rn.loc.RunDir, rn.loc.EvidenceDir, rn.store)
+	return iss.IssueEvidenceAt(turnID, phase, snapshot, src, pending)
 }

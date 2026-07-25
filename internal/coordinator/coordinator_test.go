@@ -1,8 +1,10 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/engine"
+	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/fsclass"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/gitx"
@@ -180,7 +183,61 @@ func testIssuer(t *testing.T, repo, runID string) attach.EvidenceIssuer {
 		t.Fatalf("gitx.New: %v", err)
 	}
 	t.Cleanup(func() { g.Close() })
-	return reviewpacket.NewIssuer(context.Background(), g, repo, loc.RunDir, loc.EvidenceDir)
+	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
+	if err != nil {
+		t.Fatalf("open artifact store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return reviewpacket.NewIssuer(context.Background(), g, repo, loc.RunDir, loc.EvidenceDir, store)
+}
+
+// assertCheckpointPacket verifies the packet bound to a live CHECKPOINT turn and checks it contains
+// what a step reviewer needs. It re-verifies through the real verifier, so the assertion covers the
+// binding, the packet, and its content together.
+func assertCheckpointPacket(t *testing.T, rn *Run, rs state.RunState) {
+	t.Helper()
+	if rs.Evidence == nil {
+		t.Fatal("a CHECKPOINT assignment must carry an evidence binding")
+	}
+	src, ok := state.LatestGitCommit(rs)
+	if !ok {
+		t.Fatal("a CHECKPOINT follows an accepted implementation commit")
+	}
+	expect := evidence.Expectation{
+		RunID: rs.RunID, TurnID: rs.Assignment.ID, Phase: string(rs.Phase),
+		Source: evidence.SourceObject{Commit: src.Commit, Tree: src.Tree},
+	}
+	ref := evidence.EvidenceRef{ManifestRelPath: rs.Evidence.ManifestRelPath, RootDigest: rs.Evidence.RootDigest}
+	lim := rs.EffectivePolicy.Limits
+	bounds := evidence.Bounds{
+		MaxTotalBytes: lim.EvidenceMaxTotalBytes,
+		MaxFileBytes:  lim.EvidenceMaxFileBytes,
+		MaxRequests:   lim.EvidenceMaxRequests,
+	}
+	if err := evidence.VerifyRef(rn.loc.EvidenceDir, ref, bounds, expect); err != nil {
+		t.Fatalf("the bound CHECKPOINT packet does not verify: %v", err)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(rn.loc.EvidenceDir, rs.Evidence.ManifestRelPath))
+	if err != nil {
+		t.Fatalf("read packet manifest: %v", err)
+	}
+	// Paths are stored losslessly as base64, so assert on the encoded form.
+	for _, want := range []string{
+		evidence.ReservedContextPrefix + "agreed-plan.json",
+		evidence.ReservedContextPrefix + "implementation-report.json",
+		"work.txt", // the file editWorktree changed for this step
+	} {
+		enc := base64.StdEncoding.EncodeToString([]byte(want))
+		if !bytes.Contains(manifest, []byte(`"path_b64":"`+enc+`"`)) {
+			t.Fatalf("CHECKPOINT packet is missing %q", want)
+		}
+	}
+	// The step review is scoped to the change: the run's declared relevant_repo_paths (README) belong
+	// to the PLANNING packet, not this one.
+	if enc := base64.StdEncoding.EncodeToString([]byte("README")); bytes.Contains(manifest, []byte(`"path_b64":"`+enc+`"`)) {
+		t.Fatal("CHECKPOINT packet should carry the step change, not the task-declared plan selection")
+	}
 }
 
 // --- artifact builders (schema-complete; the store canonicalizes) ---
@@ -370,6 +427,10 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 	if rs.Phase != state.PhaseCheckpoint {
 		t.Fatalf("not at CHECKPOINT: %s", rs.Phase)
 	}
+	// The CHECKPOINT packet must actually carry the step under review: the agreed plan, the
+	// implementation report, and the CHANGED file's committed bytes — not the whole tree, and not
+	// the worktree.
+	assertCheckpointPacket(t, rn, rs)
 
 	// CHECKPOINT reviewer retry: REVISE, only a nit, tests adequate -> stays CHECKPOINT.
 	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"nit"}))

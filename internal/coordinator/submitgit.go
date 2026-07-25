@@ -15,6 +15,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/genstore"
 	"github.com/David-c0degeek/claudex/internal/gitx"
+	"github.com/David-c0degeek/claudex/internal/reviewpacket"
 	"github.com/David-c0degeek/claudex/internal/state"
 	"github.com/David-c0degeek/claudex/internal/transport"
 	"github.com/David-c0degeek/claudex/internal/txn"
@@ -172,7 +173,13 @@ func (rn *Run) lockedSubmitGit(ctx context.Context, deps transport.SubmitDeps, g
 		// acceptance is about to record is not in AcceptedTurns yet, and the reviewer must see
 		// exactly the commit being checkpointed, not the previous accepted one.
 		src := evidence.SourceObject{Commit: commit, Tree: tree}
-		manifestRel, rootDigest, eerr := rn.issueEvidenceAt(ctx, plan.IssuedTurnID, plan.Decision.Next, rs, src)
+		// The implementation report the CHECKPOINT reviews is the artifact this transaction is
+		// accepting; it is not in the accepted history until the state-cas step runs.
+		pending := &reviewpacket.Pending{
+			Ref:   state.EventRef{Digest: plan.Digest, TurnID: plan.TurnID},
+			Phase: plan.Phase,
+		}
+		manifestRel, rootDigest, eerr := rn.issueEvidenceAt(ctx, plan.IssuedTurnID, plan.Decision.Next, rs, src, pending)
 		if eerr != nil {
 			return transport.SubmitResult{}, eerr
 		}

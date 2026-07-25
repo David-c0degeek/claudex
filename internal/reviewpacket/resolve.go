@@ -45,6 +45,9 @@ type Deps struct {
 	RepoDir string
 	// Git runs the object reads. It is never used to touch the worktree.
 	Git *gitx.Git
+	// Artifacts reads the accepted artifacts a review turn must see (the plan under critique, the
+	// agreed plan, the implementation report). Required for every phase past PLAN_DRAFT.
+	Artifacts ArtifactReader
 }
 
 // Resolve builds the fully-resolved, deterministic recipe for the read-only turn a transition is
@@ -54,19 +57,19 @@ type Deps struct {
 // Every failure it can return is deterministic and repeatable for a given run state: a caller runs
 // it during locked authorization, BEFORE opening a transaction, so a bad selection refuses the turn
 // rather than stranding a half-applied one.
-func Resolve(ctx context.Context, d Deps, rs state.RunState, turnID string, phase state.Phase) (evidence.Recipe, error) {
+func Resolve(ctx context.Context, d Deps, rs state.RunState, turnID string, phase state.Phase, pending *Pending) (evidence.Recipe, error) {
 	src, err := resolveSource(ctx, d, rs)
 	if err != nil {
 		return evidence.Recipe{}, err
 	}
-	return ResolveAt(ctx, d, rs, turnID, phase, src)
+	return ResolveAt(ctx, d, rs, turnID, phase, src, pending)
 }
 
 // ResolveAt is Resolve with the source object stated explicitly. The git commit transaction needs
 // it: the commit a CHECKPOINT turn must review is the one that transaction is about to record, which
 // is not yet in the run's accepted history, so deriving the source from state would bind the packet
 // to the PREVIOUS accepted commit and show the reviewer the wrong tree.
-func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, phase state.Phase, src evidence.SourceObject) (evidence.Recipe, error) {
+func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, phase state.Phase, src evidence.SourceObject, pending *Pending) (evidence.Recipe, error) {
 	if state.RepoEditPhase(phase) {
 		return evidence.Recipe{}, fmt.Errorf("%w: %s carries a worktree, not an evidence packet", ErrResolve, phase)
 	}
@@ -76,37 +79,9 @@ func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, ph
 	if err := proveSourcePair(ctx, d, src); err != nil {
 		return evidence.Recipe{}, err
 	}
-	taskBytes, err := readSnapshot(d.RunDir, rs.TaskSnapshot, "task")
+	entries, err := phaseEntries(ctx, d, rs, phase, src, pending)
 	if err != nil {
 		return evidence.Recipe{}, err
-	}
-	policyBytes, err := readSnapshot(d.RunDir, rs.PolicySnapshot, "policy")
-	if err != nil {
-		return evidence.Recipe{}, err
-	}
-	tc, err := config.ParseTaskContract(taskBytes)
-	if err != nil {
-		return evidence.Recipe{}, fmt.Errorf("%w: frozen task snapshot: %v", ErrResolve, err)
-	}
-
-	// The frozen inputs come first: they define what the turn is FOR, and they are materialized
-	// inline because they are already durable run content, not repository objects.
-	entries := []evidence.RecipeEntry{
-		{GitPath: taskContextPath, Mode: contextMode, Kind: evidence.EntryFile, Source: evidence.BlobSource{Inline: taskBytes}},
-		{GitPath: policyContextPath, Mode: contextMode, Kind: evidence.EntryFile, Source: evidence.BlobSource{Inline: policyBytes}},
-	}
-	// Then the task-declared repository selection, read from the PROVEN source object. A selector the
-	// source tree does not contain fails closed: silently dropping it would hand the reviewer a packet
-	// that is quietly missing what the task said mattered.
-	for _, sel := range tc.RelevantRepoPaths {
-		oid, mode, rerr := resolveBlob(ctx, d, src.Commit, sel)
-		if rerr != nil {
-			return evidence.Recipe{}, rerr
-		}
-		entries = append(entries, evidence.RecipeEntry{
-			GitPath: sel, Mode: mode, Kind: evidence.EntryFile,
-			Source: evidence.BlobSource{CommitBlobOID: oid},
-		})
 	}
 
 	lim := rs.EffectivePolicy.Limits

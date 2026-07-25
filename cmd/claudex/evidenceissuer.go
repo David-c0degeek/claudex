@@ -7,6 +7,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/attach"
 	"github.com/David-c0degeek/claudex/internal/gitx"
 	"github.com/David-c0degeek/claudex/internal/reviewpacket"
+	"github.com/David-c0degeek/claudex/internal/transport"
 )
 
 // newEvidenceIssuer builds the review-packet issuer for a run and returns it with its cleanup. The
@@ -21,6 +22,13 @@ func newEvidenceIssuer(repoDir, runID string) (attach.EvidenceIssuer, func(), er
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("review evidence: %w", err)
 	}
-	return reviewpacket.NewIssuer(context.Background(), g, repoDir, loc.RunDir, loc.EvidenceDir),
-		func() { g.Close() }, nil
+	// A review turn past PLAN_DRAFT materializes accepted artifacts (the plan under critique, the
+	// agreed plan, the implementation report), so the packet resolver needs the run's artifact store.
+	store, err := transport.NewArtifactStore(loc.ArtifactsDir)
+	if err != nil {
+		g.Close()
+		return nil, func() {}, fmt.Errorf("review evidence: %w", err)
+	}
+	cleanup := func() { store.Close(); g.Close() }
+	return reviewpacket.NewIssuer(context.Background(), g, repoDir, loc.RunDir, loc.EvidenceDir, store), cleanup, nil
 }
