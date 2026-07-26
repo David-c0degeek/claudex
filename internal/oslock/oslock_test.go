@@ -158,3 +158,115 @@ func waitFor(cond func() bool, timeout time.Duration) bool {
 	}
 	return cond()
 }
+
+// --- rooted acquire and probe (the attempt lease) ---
+
+func testRoot(t *testing.T) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { root.Close() })
+	return root
+}
+
+func TestRootedAcquireAndRelease(t *testing.T) {
+	root := testRoot(t)
+	l, ok, err := TryAcquireInRoot(root, "lease")
+	if err != nil || !ok {
+		t.Fatalf("TryAcquireInRoot: ok=%v err=%v", ok, err)
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	l2, ok, err := TryAcquireInRoot(root, "lease")
+	if err != nil || !ok {
+		t.Fatalf("reacquire after release: ok=%v err=%v", ok, err)
+	}
+	_ = l2.Release()
+}
+
+// TestProbeSeesTheSamePrimitiveIsTheWholePoint. flock and OFD locks do not contend with each other, so
+// a probe written against a different family would report a live lease as unheld and a second attempt
+// would start over a running one. Acquire and probe must therefore share one implementation.
+func TestProbeSeesAHeldRootedLease(t *testing.T) {
+	root := testRoot(t)
+	held, err := ProbeInRoot(root, "lease")
+	if err != nil {
+		t.Fatalf("probe on a free lease: %v", err)
+	}
+	if held {
+		t.Fatal("an unheld lease was reported held")
+	}
+
+	l, ok, err := TryAcquireInRoot(root, "lease")
+	if err != nil || !ok {
+		t.Fatalf("TryAcquireInRoot: ok=%v err=%v", ok, err)
+	}
+	held, err = ProbeInRoot(root, "lease")
+	if err != nil {
+		t.Fatalf("probe on a held lease: %v", err)
+	}
+	if !held {
+		t.Fatal("a held lease was reported unheld; acquire and probe are not contending")
+	}
+
+	if err := l.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	held, err = ProbeInRoot(root, "lease")
+	if err != nil {
+		t.Fatalf("probe after release: %v", err)
+	}
+	if held {
+		t.Fatal("a released lease was still reported held")
+	}
+}
+
+// TestProbeDoesNotRetainTheLock: a probe that kept the lock would make the next acquire fail and look
+// like a live owner.
+func TestProbeDoesNotRetainTheLock(t *testing.T) {
+	root := testRoot(t)
+	for i := 0; i < 3; i++ {
+		if held, err := ProbeInRoot(root, "lease"); err != nil || held {
+			t.Fatalf("probe %d: held=%v err=%v", i, held, err)
+		}
+	}
+	l, ok, err := TryAcquireInRoot(root, "lease")
+	if err != nil || !ok {
+		t.Fatalf("acquire after probes: ok=%v err=%v", ok, err)
+	}
+	_ = l.Release()
+}
+
+// TestProbeFailsClosed: on any error the probe reports HELD, so a caller that ignores the error treats
+// "we could not tell" as "someone is running" rather than starting a second attempt over a live one.
+func TestProbeFailsClosed(t *testing.T) {
+	root := testRoot(t)
+	// A directory at the lease name cannot be opened for writing, so the probe errors.
+	if err := os.Mkdir(filepath.Join(rootDir(t, root), "lease"), 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	held, err := ProbeInRoot(root, "lease")
+	if err == nil {
+		t.Fatal("probe succeeded against an unopenable lease")
+	}
+	if !held {
+		t.Fatal("probe reported unheld on error; a caller ignoring the error would start a second attempt")
+	}
+}
+
+// rootDir recovers the directory a root was opened on, for fixtures that must act outside it.
+func rootDir(t *testing.T, root *os.Root) string {
+	t.Helper()
+	return root.Name()
+}
+
+// TestRootedLeaseIsConfined: the lease cannot be steered out of the attempt directory.
+func TestRootedLeaseIsConfined(t *testing.T) {
+	root := testRoot(t)
+	if _, _, err := TryAcquireInRoot(root, "../escaped"); err == nil {
+		t.Fatal("the root permitted a lease outside the attempt directory")
+	}
+}

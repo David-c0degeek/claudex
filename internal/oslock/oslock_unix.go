@@ -16,6 +16,14 @@ func acquire(path string) (*os.File, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	return lockOpenFile(f)
+}
+
+// lockOpenFile takes the lock on an ALREADY-OPEN file, so a caller that opened it through a confined
+// root gets the same primitive as one that opened it by path. Using one primitive for both is the
+// point: flock and OFD locks do not contend with each other, so a probe written against one would
+// report a lease held by the other as unheld.
+func lockOpenFile(f *os.File) (*os.File, bool, error) {
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
 		// EWOULDBLOCK and EAGAIN both signal "already locked" portably.
