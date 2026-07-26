@@ -105,7 +105,13 @@ var ErrTerminalSequence = errors.New("proctree: terminal sequence failed")
 // runs, and the accumulated failure withholds the successful terminal.
 func RunToTerminal(s Supervision) (Terminal, error) {
 	if err := s.validate(); err != nil {
-		return Terminal{}, err
+		// A MALFORMED supervision must not leave a live group behind either.
+		//
+		// Accumulating close and await failures fixed the same hole one step further in, and this gate
+		// still returned early — so a nil status channel, a missing lease or a bad clock left the
+		// command running while the supervisor exited. The reason to clean up is the state of the
+		// world, not the validity of the request, and the two are independent.
+		return Terminal{}, errors.Join(err, s.emergencyTeardown())
 	}
 
 	var problems []error
@@ -158,6 +164,30 @@ func RunToTerminal(s Supervision) (Terminal, error) {
 		return term, errors.Join(fmt.Errorf("%w: releasing the lease", ErrTerminalSequence), err)
 	}
 	return term, nil
+}
+
+// emergencyTeardown reaps the owned group when the sequence cannot proceed at all.
+//
+// It deliberately does NOT trust the caller-supplied policy: containment cleanup is exactly the thing
+// that must still work when the request is malformed, so an invalid policy falls back to the shipped
+// default rather than becoming a second reason to skip the teardown. The stream copies are dropped
+// too, because the coordinator is waiting for their EOF regardless of why this failed.
+func (s Supervision) emergencyTeardown() error {
+	var problems []error
+	if err := CloseStreamCopies(s.Spawn); err != nil {
+		problems = append(problems, err)
+	}
+	if s.Outcome != LaunchStarted || s.Reaper == nil || s.PGID <= 0 {
+		return errors.Join(problems...)
+	}
+	policy := s.Policy
+	if policy.Validate() != nil {
+		policy = DefaultReapPolicy
+	}
+	if _, err := s.Reaper.Teardown(policy); err != nil {
+		problems = append(problems, fmt.Errorf("%w: emergency teardown", ErrTerminalSequence), err)
+	}
+	return errors.Join(problems...)
 }
 
 // facts derives the terminal and the receipt INDEPENDENTLY for the outcome.

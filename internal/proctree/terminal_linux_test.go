@@ -406,3 +406,40 @@ func TestTerminalSequencePublishesNothingWhenTeardownFails(t *testing.T) {
 		t.Fatal("the lease was released before cleanup completed")
 	}
 }
+
+// TestTerminalSequenceTearsDownOnValidationFailure is CX's adversarial case, kept.
+//
+// It is the third appearance of one asymmetry: close and await failures were made non-short-circuiting
+// so a live group could not be abandoned, and the VALIDATION gate still returned early — so a nil
+// status channel, a missing lease or a bad clock left the command running while the supervisor exited.
+// The reason to clean up is the state of the world, not the validity of the request.
+func TestTerminalSequenceTearsDownOnValidationFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mutet func(*Supervision)
+	}{
+		{"no status channel", func(s *Supervision) { s.Stat = nil }},
+		{"no lease", func(s *Supervision) { s.Lease = nil }},
+		{"no clock", func(s *Supervision) { s.Now = nil }},
+		// An invalid policy must not become a second reason to skip the cleanup.
+		{"invalid reap policy", func(s *Supervision) { s.Policy = ReapPolicy{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := superviseStarted(t, "sleep 30", nil)
+			pgid := s.PGID
+			t.Cleanup(func() { _, _ = ReapGroup(pgid, fastPolicy) })
+			tc.mutet(&s)
+
+			if _, err := RunToTerminal(s); err == nil {
+				t.Fatal("RunToTerminal accepted a malformed supervision")
+			}
+			empty, eerr := groupIsEmpty(pgid)
+			if eerr != nil {
+				t.Fatalf("groupIsEmpty: %v", eerr)
+			}
+			if !empty {
+				t.Fatal("the started command group survived a validation failure; the supervisor would exit leaving it alive")
+			}
+		})
+	}
+}
