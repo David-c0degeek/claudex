@@ -151,7 +151,7 @@ Before considering a box done:
 | [x] | 01 | `tasks/interactive-pairing/01-durable-state-core.md` | DONE | agent: 10 | n/a |
 | [x] | 02 | `tasks/interactive-pairing/02-transport-protocol.md` | DONE | agent: 6 | n/a |
 | [x] | 03 | `tasks/interactive-pairing/03-attach-and-phase-engine.md` | DONE | agent: 9 | n/a |
-| [ ] | 04 | `tasks/interactive-pairing/04-git-transaction-and-review-evidence.md` | TODO | agent: 6 | n/a |
+| [ ] | 04 | `tasks/interactive-pairing/04-git-transaction-and-review-evidence.md` | IN PROGRESS — 04.0/04.1a/04.1b/04.2/04.3/04.4 ticked; 04.5 (mechanical test gate) in design, 04.6 (merge gating) open | agent: 6 | n/a |
 | [ ] | 05 | `tasks/interactive-pairing/05-human-gates-and-caps.md` | TODO | agent: 7 | n/a |
 | [ ] | 06 | `tasks/interactive-pairing/06-agent-skills-and-byo-integration.md` | TODO | agent: 7 | n/a |
 | [ ] | 07 | `tasks/interactive-pairing/07-managed-launcher-and-release.md` | TODO | agent: 7; release-engineer: 3 | yes |
