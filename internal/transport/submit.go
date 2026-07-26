@@ -61,6 +61,19 @@ var (
 	// state effect, and is distinct from ErrRepoMutationInReadOnlyPhase — an unobservable
 	// worktree is never reported as an observed mutation.
 	ErrWorktreeUnobserved = errors.New("transport: could not observe the read-only worktree")
+	// ErrPostSnapshotEdit means a PHASE BOUNDARY that is about to issue an editable turn was
+	// reached with the run worktree already dirty. Nothing may legitimately have edited the
+	// repository since the last implementation was accepted, so the dirt predates the boundary:
+	// it raced the snapshot that produced the accepted commit and would otherwise be folded
+	// silently into the NEXT commit, attributed to work it was never part of.
+	//
+	// It is deliberately distinct from ErrRepoMutationInReadOnlyPhase. That one says "you edited
+	// during someone else's turn"; this one says "an editable turn cannot start over dirt that is
+	// not yours". Merging them would make the operator message wrong in one of the two cases.
+	//
+	// The refusal is RECOVERABLE, not terminal: no state, ledger, or identity is bound. An
+	// operator resolves the worktree and the transition is retried.
+	ErrPostSnapshotEdit = errors.New("transport: the worktree was already modified before this turn was issued")
 )
 
 const (
@@ -191,8 +204,18 @@ func (p PreparedTransition) IssuedGateID() string { return p.issuedGateID }
 // the snapshot is a copy), perform I/O, or mint identities under the guard.
 type Prepare func(snapshot state.RunState, prepared PreparedSubmit) (PreparedTransition, error)
 
-// WorktreeClean observes whether the run worktree is clean (no tracked, staged, or
-// untracked changes). It is the OPTIONAL, guard-time read-only-phase gate: transport
+// WorktreeClean observes whether the run worktree is clean — no tracked, staged, or untracked
+// changes — RELATIVE TO ITS CURRENT HEAD. That is the whole of what it proves, and the limit
+// matters: a pristine checkout of the wrong commit, or a detached HEAD, is "clean" to this
+// observer. It is NOT authority for "the worktree matches the last accepted commit".
+//
+// That stronger identity is proven where it is actually needed, by the snapshot path
+// (validateRunWorktree/ConfirmPreState re-prove the registered linked worktree, a symbolic HEAD on
+// the run branch at the frozen parent, and the frozen tree), so a wrong-HEAD worktree fails closed
+// there rather than being waved through by a second, weaker check here. Duplicating that proof at
+// this seam would create a rival authority for a fact one place already owns.
+//
+// It is the guard-time gate transport
 // calls it only after the exact locked turn is authorized, only for a genuine new
 // acceptance in a read-only turn (`!EditableTurn`), and only before any sink/state
 // effect. The coordinator supplies the git I/O. A (false, nil) result is an observed

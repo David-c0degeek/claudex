@@ -309,6 +309,9 @@ func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest 
 		Registry: rn.registry,
 		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Prepare:  prepare,
+		// Required, not optional: the TESTS boundary is the one place an editable turn can be
+		// issued without an agent submit having already proven the worktree.
+		WorktreeClean: func() (bool, error) { return rn.git.WorktreeClean(ctx, rn.runWorktree()) },
 	}, expectedRevision, evidenceDigest)
 }
 

@@ -49,10 +49,15 @@ type TestOutcomeDeps struct {
 	Registry *state.RegistryStore
 	Journal  JournalReader
 	Prepare  TestPrepare
+	// WorktreeClean observes the run worktree at the TESTS boundary. It is REQUIRED, not
+	// optional: this outcome is coordinator-authored, so there is no caller for whom the
+	// observation could legitimately be absent, and the boundary it guards is the one place an
+	// editable turn can be issued without an agent submit having already proven the worktree.
+	WorktreeClean WorktreeClean
 }
 
 func (d TestOutcomeDeps) validate() error {
-	if d.Store == nil || d.Registry == nil || d.Journal == nil || d.Prepare == nil {
+	if d.Store == nil || d.Registry == nil || d.Journal == nil || d.Prepare == nil || d.WorktreeClean == nil {
 		return ErrMissingSeam
 	}
 	lp := d.Store.LockPath()
@@ -150,6 +155,20 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 	}
 	if expectedRevision != rs.Revision {
 		return reject(staleErr(rs, expectedRevision))
+	}
+
+	// The TESTS boundary. Nothing has edited the repository legitimately since the last
+	// implementation was accepted — TESTS is ownerless and every phase between carries a
+	// read-only turn — so dirt observed here PREDATES this boundary and raced the snapshot.
+	//
+	// It is checked for EVERY genuine new authorized outcome, not only the branch that issues
+	// FIX: a PASS advances into VERIFY, which is equally a phase no one may have edited in, and
+	// gating only the FIX branch would let a dirty worktree through on exactly the path where
+	// nobody looks at the repository again before the verifier reviews it. The check sits after
+	// the stale/phase/journal/registry authorization and before Prepare, so a refusal binds no
+	// identity and moves no state.
+	if werr := boundaryWorktreeGate(deps.WorktreeClean); werr != nil {
+		return reject(werr)
 	}
 
 	curPairGen, pgErr := currentPairGeneration(reg)
@@ -299,4 +318,27 @@ func cloneAcceptedTurns(m map[string]state.AcceptedTurn) map[string]state.Accept
 		c[k] = v
 	}
 	return c
+}
+
+// boundaryWorktreeGate refuses a phase boundary whose worktree is already dirty.
+//
+// The successful observation is the LINEARIZATION POINT of the boundary, exactly as the read-only
+// submit gate defines it: dirt present at this instant predates the boundary and refuses it, and
+// dirt appearing after belongs to the editable interval this transition opens. The run guard does
+// not lock external filesystem writers, so an edit landing between this observation and the state
+// CAS is attributed to the new interval. That residue is inherent — recording the worktree at
+// issuance and checking it at the next submit would move the race, not remove it — so the contract
+// is stated rather than papered over.
+//
+// Observed dirt and an unobservable worktree stay separately typed: an observation that could not
+// run is never reported as an observed edit, and its cause is preserved for errors.Is.
+func boundaryWorktreeGate(observe WorktreeClean) error {
+	clean, err := observe()
+	if err != nil {
+		return errors.Join(ErrWorktreeUnobserved, err)
+	}
+	if !clean {
+		return ErrPostSnapshotEdit
+	}
+	return nil
 }

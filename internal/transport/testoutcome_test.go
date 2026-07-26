@@ -28,8 +28,17 @@ func runAtTests(t *testing.T, pairGen uint64) (*state.Store, uint64) {
 }
 
 func testOutcomeDeps(store *state.Store, prep TestPrepare) TestOutcomeDeps {
-	return TestOutcomeDeps{Store: store, Registry: openRunRegistry(store), Journal: terminalJournal(store), Prepare: prep}
+	return TestOutcomeDeps{
+		Store: store, Registry: openRunRegistry(store), Journal: terminalJournal(store), Prepare: prep,
+		WorktreeClean: cleanWorktree,
+	}
 }
+
+// cleanWorktree is the default boundary observation for fixtures that are not about the worktree.
+func cleanWorktree() (bool, error) { return true, nil }
+
+// dirtyWorktree models a worktree carrying an edit that predates the boundary.
+func dirtyWorktree() (bool, error) { return false, nil }
 
 // prepFn wraps an apply into a TestPrepare that returns the given issued ids.
 func prepFn(turn, gate string, apply func(gen uint64, next *state.RunState, p PreparedTestOutcome) error) TestPrepare {
@@ -481,5 +490,103 @@ func TestTestOutcomeGuardedRejections(t *testing.T) {
 				t.Fatalf("a rejected outcome advanced the run: %d -> %d", before.Revision, after.Revision)
 			}
 		})
+	}
+}
+
+// The TESTS boundary refuses a worktree that is ALREADY dirty when it is reached. Nothing may
+// legitimately have edited the repository since the last implementation was accepted — TESTS is
+// ownerless and every phase between carries a read-only turn — so the dirt predates the boundary and
+// raced the snapshot that produced the accepted commit. Left alone it would be folded into the NEXT
+// commit and attributed to work it was never part of.
+//
+// The refusal binds nothing: same revision, no assignment issued, and the run still at TESTS, so an
+// operator can resolve the worktree and retry.
+func TestTestOutcomeBoundaryRefusesPreexistingDirt(t *testing.T) {
+	for name, prep := range map[string]TestPrepare{
+		"fail (would issue FIX)":         failToFix(),
+		"pass (would advance to VERIFY)": passToVerify(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, rev := runAtTests(t, 2)
+			deps := testOutcomeDeps(store, prep)
+			deps.WorktreeClean = dirtyWorktree
+
+			_, err := SubmitTestOutcome(context.Background(), deps, rev, evDigest)
+			if !errors.Is(err, ErrPostSnapshotEdit) {
+				t.Fatalf("dirty boundary err = %v, want ErrPostSnapshotEdit", err)
+			}
+			// Distinct from the read-only-submit violation: the two diagnoses are different.
+			if errors.Is(err, ErrRepoMutationInReadOnlyPhase) {
+				t.Fatal("the boundary refusal must not be reported as a read-only-phase mutation")
+			}
+			// Recoverable, not terminal: nothing was bound.
+			after, ok, lerr := store.Load()
+			if lerr != nil || !ok {
+				t.Fatalf("load: ok=%v err=%v", ok, lerr)
+			}
+			if after.Revision != rev {
+				t.Fatalf("revision moved to %d, want the unchanged %d", after.Revision, rev)
+			}
+			if after.Phase != state.PhaseTests {
+				t.Fatalf("phase = %s, want the run still at TESTS", after.Phase)
+			}
+			if after.Assignment != nil {
+				t.Fatalf("an editable turn was issued over pre-existing dirt: %+v", after.Assignment)
+			}
+			if after.Lifecycle != state.LifecycleRunning {
+				t.Fatalf("lifecycle = %s, want a recoverable running run", after.Lifecycle)
+			}
+		})
+	}
+}
+
+// A clean boundary issues normally — the gate must not block the ordinary path.
+func TestTestOutcomeBoundaryAllowsCleanWorktree(t *testing.T) {
+	store, rev := runAtTests(t, 2)
+	res, err := SubmitTestOutcome(context.Background(), testOutcomeDeps(store, failToFix()), rev, evDigest)
+	if err != nil {
+		t.Fatalf("clean boundary: %v", err)
+	}
+	if res.Revision <= rev {
+		t.Fatalf("revision %d did not advance past %d", res.Revision, rev)
+	}
+	after, _, _ := store.Load()
+	if after.Phase != state.PhaseFix || after.Assignment == nil {
+		t.Fatalf("clean FAIL should issue FIX: phase=%s assignment=%+v", after.Phase, after.Assignment)
+	}
+}
+
+// An unobservable worktree is never reported as an observed edit, and its cause survives for
+// errors.Is — the same two-outcome distinction the read-only submit gate keeps.
+func TestTestOutcomeBoundaryUnobservableIsDistinct(t *testing.T) {
+	store, rev := runAtTests(t, 2)
+	deps := testOutcomeDeps(store, failToFix())
+	boom := errors.New("git status exploded")
+	deps.WorktreeClean = func() (bool, error) { return false, boom }
+
+	_, err := SubmitTestOutcome(context.Background(), deps, rev, evDigest)
+	if !errors.Is(err, ErrWorktreeUnobserved) {
+		t.Fatalf("err = %v, want ErrWorktreeUnobserved", err)
+	}
+	if errors.Is(err, ErrPostSnapshotEdit) {
+		t.Fatal("an unobservable worktree must never be reported as an observed edit")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatal("the underlying cause must survive for errors.Is")
+	}
+	after, _, _ := store.Load()
+	if after.Revision != rev || after.Phase != state.PhaseTests {
+		t.Fatalf("an unobservable boundary moved the run: rev=%d phase=%s", after.Revision, after.Phase)
+	}
+}
+
+// The observer is REQUIRED, not optional: this outcome is coordinator-authored, so an absent
+// observation is a wiring bug rather than a caller choice.
+func TestTestOutcomeRequiresTheWorktreeObserver(t *testing.T) {
+	store, rev := runAtTests(t, 2)
+	deps := testOutcomeDeps(store, failToFix())
+	deps.WorktreeClean = nil
+	if _, err := SubmitTestOutcome(context.Background(), deps, rev, evDigest); !errors.Is(err, ErrMissingSeam) {
+		t.Fatalf("missing observer err = %v, want ErrMissingSeam", err)
 	}
 }
