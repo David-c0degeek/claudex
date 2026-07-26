@@ -1,6 +1,7 @@
 package proctree
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -44,6 +46,12 @@ func TestMain(m *testing.M) {
 		// into no-ops that pass.
 		time.Sleep(10 * time.Minute)
 		os.Exit(3)
+	case "dump":
+		// Reports the exact descriptor set, argv and environment the contained command received, so
+		// the containment can be asserted from the CHILD's point of view rather than from the
+		// parent's intentions.
+		dumpChildState()
+		os.Exit(0)
 	case "":
 		os.Exit(m.Run())
 	default:
@@ -557,4 +565,37 @@ func TestReapPolicyValidation(t *testing.T) {
 	if err := DefaultReapPolicy.Validate(); err != nil {
 		t.Fatalf("the shipped policy must be valid: %v", err)
 	}
+}
+
+// dumpChildState prints what this process actually holds. The fd listing excludes the descriptor
+// opened to read /proc/self/fd itself, which would otherwise always appear as a phantom extra.
+func dumpChildState() {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		fmt.Println("FDERR", err)
+		return
+	}
+	var fds []string
+	for _, e := range entries {
+		target, lerr := os.Readlink("/proc/self/fd/" + e.Name())
+		if lerr != nil {
+			// The reading descriptor is gone by the time we resolve it, or is the directory itself.
+			continue
+		}
+		if strings.HasPrefix(target, "/proc/") && strings.HasSuffix(target, "/fd") {
+			continue
+		}
+		fds = append(fds, e.Name()+"="+target)
+	}
+	sort.Strings(fds)
+	fmt.Println("FDS", strings.Join(fds, ","))
+	for i, a := range os.Args {
+		fmt.Printf("ARG %d %s\n", i, base64.StdEncoding.EncodeToString([]byte(a)))
+	}
+	env := os.Environ()
+	sort.Strings(env)
+	for _, kv := range env {
+		fmt.Println("ENV", base64.StdEncoding.EncodeToString([]byte(kv)))
+	}
+	fmt.Println("PGID", syscall.Getpgrp())
 }
