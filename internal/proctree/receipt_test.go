@@ -2,10 +2,12 @@ package proctree
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/canonjson"
 )
 
@@ -219,5 +221,51 @@ func TestReceiptIsRootConfined(t *testing.T) {
 	// An escape attempt through the root is refused by the root itself.
 	if _, err := root.OpenFile("../"+ReceiptFileName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400); err == nil {
 		t.Fatal("root permitted a write outside the attempt directory")
+	}
+}
+
+// TestPublishErrorClassification. A committed-but-unsynced publish is NOT a success: the entry exists
+// while its durability was never established, so treating it as published would license a retry over
+// a fact that may not survive a crash. The branch is tested directly because the condition cannot be
+// provoked through the filesystem on demand.
+func TestPublishErrorClassification(t *testing.T) {
+	if err := classifyPublishErr(nil); err != nil {
+		t.Fatalf("nil must classify as success, got %v", err)
+	}
+	if err := classifyPublishErr(fs.ErrExist); !errors.Is(err, ErrReceiptExists) {
+		t.Fatalf("exists: err = %v, want ErrReceiptExists", err)
+	}
+	pce := &atomicfile.PostCommitSyncError{Err: errors.New("fsync failed")}
+	err := classifyPublishErr(pce)
+	if !errors.Is(err, ErrReceiptDurabilityAmbiguous) {
+		t.Fatalf("post-commit sync: err = %v, want ErrReceiptDurabilityAmbiguous", err)
+	}
+	// It must NOT be mistaken for either of the other two, since each licenses different behaviour.
+	if errors.Is(err, ErrReceiptExists) {
+		t.Fatal("durability ambiguity classified as a conflict")
+	}
+	other := errors.New("disk on fire")
+	if e := classifyPublishErr(other); errors.Is(e, ErrReceiptExists) || errors.Is(e, ErrReceiptDurabilityAmbiguous) {
+		t.Fatalf("an unrelated error was classified as a known case: %v", e)
+	}
+}
+
+// TestReadReceiptLeavesTheEntryDurable states only what it can prove.
+//
+// ReadReceipt calls ConfirmParentInRoot so that a receipt committed by a publish that then failed to
+// sync is made durable before recovery trusts it. That branch is NOT independently mutation-detectable
+// here: an unsynced parent cannot be constructed through the public API, so removing the re-confirm
+// leaves this test green. It is recorded as an unverified guard rather than dressed up as a verified
+// one — the assertion below is a postcondition, not proof that the call happened.
+func TestReadReceiptLeavesTheEntryDurable(t *testing.T) {
+	root := testRoot(t)
+	if err := PublishReceipt(root, startedReceipt()); err != nil {
+		t.Fatalf("PublishReceipt: %v", err)
+	}
+	if _, err := ReadReceipt(root, "att-1"); err != nil {
+		t.Fatalf("ReadReceipt: %v", err)
+	}
+	if err := atomicfile.ConfirmParentInRoot(root, ReceiptFileName); err != nil {
+		t.Fatalf("entry is not durable after a read: %v", err)
 	}
 }

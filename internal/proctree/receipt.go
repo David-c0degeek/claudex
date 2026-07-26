@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 
+	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/canonjson"
 )
 
@@ -32,8 +32,13 @@ var (
 	ErrReceiptExists = errors.New("proctree: cleanup receipt already exists")
 	// ErrReceiptMissing means no completion fact exists. Recovery BLOCKS on this.
 	ErrReceiptMissing = errors.New("proctree: cleanup receipt missing")
-	// ErrReceiptInvalid covers malformed, non-canonical, oversized, or self-inconsistent receipts.
+	// ErrReceiptInvalid covers malformed, non-canonical, oversized, non-regular, or self-inconsistent
+	// receipts.
 	ErrReceiptInvalid = errors.New("proctree: cleanup receipt invalid")
+	// ErrReceiptDurabilityAmbiguous means the entry exists but its durability was never established.
+	// It is NOT a success: the design requires post-commit durability ambiguity to block, because a
+	// receipt that may not survive a crash cannot license a retry.
+	ErrReceiptDurabilityAmbiguous = errors.New("proctree: cleanup receipt durability unconfirmed")
 )
 
 // CleanupReceipt is what the supervisor durably publishes once the owned group is proven empty.
@@ -179,58 +184,70 @@ func decodeReceipt(raw []byte) (CleanupReceipt, error) {
 
 // PublishReceipt writes the completion fact through a rooted directory handle.
 //
-// Rooted, not path-resolved: the supervisor holds a handle to exactly one attempt directory, so the
-// destination cannot be chosen by a caller and cannot be redirected by anything that renames a
-// component afterwards. No-clobber, because a second publisher for one attempt means the ownership
-// model was violated. Durability-confirmed before returning, because the whole point is that this
-// survives the death of the process that wrote it — a receipt still in a page cache when the machine
-// dies proves nothing, and returning success then would make recovery trust a fact that no longer
-// exists.
+// It delegates to atomicfile.InstallInRoot rather than creating the authoritative name directly. The
+// earlier version opened `cleanup.receipt.v1.json` itself with O_EXCL and then wrote, synced and
+// closed it — so EVERY failure after the open left the authoritative name behind, often holding
+// complete readable bytes. Recovery would then find a receipt that publication had reported as
+// failed, which is the exact "post-commit durability ambiguity" the design says must BLOCK. Bytes are
+// now synced under a non-authoritative staging name and committed by a rooted no-clobber link, so the
+// final name appears only once the content is durable.
+//
+// Two failure classes are distinguished because they demand different things of the caller:
+// ErrReceiptExists means someone else published for this attempt, which is an ownership violation;
+// ErrReceiptDurabilityAmbiguous means the entry exists but its durability is unconfirmed, which is
+// NOT a success and must not produce a successful terminal.
 func PublishReceipt(root *os.Root, r CleanupReceipt) error {
 	data, err := r.encode()
 	if err != nil {
 		return err
 	}
-	f, err := root.OpenFile(ReceiptFileName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
-	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("%w: %s", ErrReceiptExists, ReceiptFileName)
-		}
-		return fmt.Errorf("proctree: create receipt: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("proctree: write receipt: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("proctree: sync receipt: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("proctree: close receipt: %w", err)
-	}
-	// The entry has to be durable too, not just the bytes: a synced file in an unsynced directory can
-	// vanish entirely on a crash.
-	if err := syncRootDir(root); err != nil {
-		return fmt.Errorf("proctree: confirm receipt durability: %w", err)
-	}
-	return nil
+	return classifyPublishErr(atomicfile.InstallInRoot(root, ReceiptFileName, data, 0o400))
 }
 
-// ReadReceipt is what recovery calls. A missing receipt is reported distinctly, because "no
-// completion fact" is the case that must BLOCK rather than be treated as an ordinary read error.
-func ReadReceipt(root *os.Root, attemptID string) (CleanupReceipt, error) {
-	f, err := root.Open(ReceiptFileName)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return CleanupReceipt{}, fmt.Errorf("%w: %s", ErrReceiptMissing, ReceiptFileName)
-		}
-		return CleanupReceipt{}, fmt.Errorf("proctree: open receipt: %w", err)
+// classifyPublishErr maps a publication failure onto the three outcomes the caller must tell apart.
+// It is separated so the branch is testable: a PostCommitSyncError cannot be provoked through the
+// filesystem on demand, but misclassifying one would silently turn "durability unknown" into
+// "published", which is the difference between blocking and licensing a retry.
+func classifyPublishErr(err error) error {
+	if err == nil {
+		return nil
 	}
-	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, MaxReceiptBytes+1))
+	if errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("%w: %s", ErrReceiptExists, ReceiptFileName)
+	}
+	var pce *atomicfile.PostCommitSyncError
+	if errors.As(err, &pce) {
+		return fmt.Errorf("%w: %v", ErrReceiptDurabilityAmbiguous, err)
+	}
+	return fmt.Errorf("proctree: publish receipt: %w", err)
+}
+
+// ReadReceipt is what recovery calls.
+//
+// It reads through atomicfile.ReadInRoot, which proves the entry is a REGULAR file, refuses symlinks,
+// and opens non-blocking. Each of those matters here rather than being defensive habit: a FIFO at the
+// receipt name would otherwise block the open forever — before any byte ceiling could help, and in
+// recovery, which is precisely where an unbounded filesystem read cannot be tolerated — and a
+// followed symlink could bless a different in-root file after the real no-clobber publish had
+// conflicted.
+//
+// It then RE-CONFIRMS the directory entry before returning. A prior publish may have committed and
+// then failed to sync, so the entry can exist while its durability was never established; recovery is
+// the party that must not trust such a receipt, and confirming it here is what converts an ambiguous
+// commit into a fact.
+func ReadReceipt(root *os.Root, attemptID string) (CleanupReceipt, error) {
+	raw, err := atomicfile.ReadInRoot(root, ReceiptFileName, MaxReceiptBytes+1)
 	if err != nil {
-		return CleanupReceipt{}, fmt.Errorf("proctree: read receipt: %w", err)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return CleanupReceipt{}, fmt.Errorf("%w: %s", ErrReceiptMissing, ReceiptFileName)
+		case errors.Is(err, atomicfile.ErrNotRegular):
+			// A non-regular entry at the authoritative name is corruption, not an absent receipt:
+			// reporting it as missing would let a hostile or damaged directory look merely empty.
+			return CleanupReceipt{}, fmt.Errorf("%w: %s is not a regular file: %v", ErrReceiptInvalid, ReceiptFileName, err)
+		default:
+			return CleanupReceipt{}, fmt.Errorf("proctree: read receipt: %w", err)
+		}
 	}
 	r, err := decodeReceipt(raw)
 	if err != nil {
@@ -240,6 +257,9 @@ func ReadReceipt(root *os.Root, attemptID string) (CleanupReceipt, error) {
 	// accepting it would let a stale directory entry unblock a run it says nothing about.
 	if r.AttemptID != attemptID {
 		return CleanupReceipt{}, fmt.Errorf("%w: receipt is for attempt %q, want %q", ErrReceiptInvalid, r.AttemptID, attemptID)
+	}
+	if err := atomicfile.ConfirmParentInRoot(root, ReceiptFileName); err != nil {
+		return CleanupReceipt{}, fmt.Errorf("%w: %v", ErrReceiptDurabilityAmbiguous, err)
 	}
 	return r, nil
 }
