@@ -3,6 +3,7 @@ package proctree
 import (
 	"bufio"
 	"encoding/base64"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,6 +20,34 @@ type childState struct {
 	args [][]byte
 	env  [][]byte
 	pgid int
+}
+
+// openInheritable opens a path and CLEARS close-on-exec, then proves it is clear.
+//
+// Go's os.Open sets FD_CLOEXEC on Linux, so a descriptor merely opened here can never cross exec —
+// a "leak marker" created that way is pre-arranged to pass. That silently invalidated the mutation
+// evidence for the descriptor sweep: removing the sweep still could not leak this marker, so whatever
+// the mutation detected was an incidental ambient descriptor and would vanish in a clean environment.
+// The flag is therefore cleared explicitly and ASSERTED clear, so the fixture is hostile by
+// construction rather than by assumption.
+func openInheritable(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_SETFD, 0); errno != 0 {
+		t.Fatalf("clear FD_CLOEXEC: %v", errno)
+	}
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_GETFD, 0)
+	if errno != 0 {
+		t.Fatalf("read FD_CLOEXEC: %v", errno)
+	}
+	if flags&syscall.FD_CLOEXEC != 0 {
+		t.Fatal("the marker still has FD_CLOEXEC set; it cannot test the descriptor sweep")
+	}
+	return f
 }
 
 // runContained spawns the dumper under SpawnContained and reads back what the CHILD actually holds.
@@ -46,11 +75,7 @@ func runContained(t *testing.T, extraEnv []EnvVar, extraArgs [][]byte, capabilit
 	// the point is that the spawn closes the descriptor set itself rather than relying on every fd
 	// having been created correctly somewhere else.
 	if capabilityPath != "" {
-		capability, oerr := os.Open(capabilityPath)
-		if oerr != nil {
-			t.Fatalf("open capability stand-in: %v", oerr)
-		}
-		defer capability.Close()
+		_ = openInheritable(t, capabilityPath)
 	}
 
 	argv := append([][]byte{[]byte(exe)}, extraArgs...)
@@ -276,12 +301,9 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
-	// Held WITHOUT close-on-exec, so the spawn's own sweep is what must stop it.
-	capability, err := os.Open(marker)
-	if err != nil {
-		t.Fatalf("open marker: %v", err)
-	}
-	defer capability.Close()
+	// Held with close-on-exec explicitly CLEARED, so the spawn's own sweep is the only thing that can
+	// stop it from reaching the child.
+	_ = openInheritable(t, marker)
 
 	outR, outW, err := os.Pipe()
 	if err != nil {
@@ -419,5 +441,92 @@ func TestSpawnRefusesNonAbsoluteOrUnclean(t *testing.T) {
 	}
 	if err := validateExecutionBoundary(base); err != nil {
 		t.Fatalf("a valid spec was refused: %v", err)
+	}
+}
+
+// TestSpawnClosesTheProvidedHalfWhenTheOtherIsMissing. Ownership begins when the handles arrive, not
+// when they are found acceptable: rejecting a malformed call while keeping one write end open is the
+// same no-EOF-forever deadlock, reached through the check meant to prevent bad input.
+func TestSpawnClosesTheProvidedHalfWhenTheOtherIsMissing(t *testing.T) {
+	spec := ExecSpec{
+		Executable: []byte("/bin/true"),
+		Argv:       [][]byte{[]byte("true")},
+		Cwd:        []byte("/"),
+		Identity:   NameByteExact,
+	}
+	for _, tc := range []struct {
+		name    string
+		useOut  bool
+		useErrS bool
+	}{
+		{"stdout provided, stderr missing", true, false},
+		{"stderr provided, stdout missing", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("pipe: %v", err)
+			}
+			defer r.Close()
+			s := CommandSpawn{Spec: spec}
+			if tc.useOut {
+				s.Stdout = w
+			}
+			if tc.useErrS {
+				s.Stderr = w
+			}
+			if _, err := SpawnContained(s); err == nil {
+				t.Fatal("SpawnContained accepted a half-supplied stream pair")
+			}
+			if derr := r.SetReadDeadline(time.Now().Add(2 * time.Second)); derr != nil {
+				t.Fatalf("SetReadDeadline: %v", derr)
+			}
+			buf := make([]byte, 1)
+			if _, rerr := r.Read(buf); rerr != io.EOF {
+				t.Fatalf("read err = %v, want io.EOF — the provided write end was left open", rerr)
+			}
+		})
+	}
+}
+
+// TestSpawnCallsTheExecutionBoundary proves the CALL SITE, not just the predicate.
+//
+// TestSpawnRefusesNonAbsoluteOrUnclean invokes validateExecutionBoundary directly, so deleting the
+// call from SpawnContained left it green — a sound mutation harness caught that. The gap matters
+// because a relative executable does not merely fail: exec resolves it against Dir, so `true` with a
+// cwd of /bin starts /bin/true successfully. That is the ambient resolution the resolved absolute
+// path exists to eliminate, and without the call site it would silently work.
+func TestSpawnCallsTheExecutionBoundary(t *testing.T) {
+	if _, err := os.Stat("/bin/true"); err != nil {
+		t.Skipf("/bin/true unavailable: %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer outR.Close()
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer errR.Close()
+
+	// Relative executable that WOULD resolve and run against this cwd.
+	spec := ExecSpec{
+		Executable: []byte("true"),
+		Argv:       [][]byte{[]byte("true")},
+		Cwd:        []byte("/bin"),
+		Env:        []EnvVar{{Name: []byte("PATH"), Value: []byte("/bin")}},
+		Identity:   NameByteExact,
+	}
+	cmd, err := SpawnContained(CommandSpawn{Spec: spec, Stdout: outW, Stderr: errW})
+	if err == nil {
+		if cmd != nil && cmd.Process != nil {
+			_, _ = ReapGroup(cmd.Process.Pid, fastPolicy)
+		}
+		t.Fatal("SpawnContained ran a relative executable resolved against its cwd")
+	}
+	if !errors.Is(err, ErrSpecInvalid) {
+		t.Fatalf("err = %v, want ErrSpecInvalid", err)
 	}
 }

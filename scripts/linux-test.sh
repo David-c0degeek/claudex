@@ -18,10 +18,26 @@ pkg="${1:?usage: linux-test.sh <package> [test flags...]}"
 shift || true
 
 distro="${CLAUDEX_WSL_DISTRO:-Ubuntu}"
-# Forward slashes throughout: a Windows path with backslashes does not survive the shell hops below.
-stage="${CLAUDEX_LINUX_TEST_STAGE:-C:/Users/$USERNAME/AppData/Local/Temp/claudex-linux-test}"
+
+# The staging directory is derived from the REPOSITORY, not from environment variables.
+#
+# This is not a style preference. A bash launched from a non-interactive parent — a mutation harness
+# calling subprocess, for instance — receives none of USERNAME, TEMP or LOCALAPPDATA, so a stage path
+# built from them made `set -u` abort before anything ran. A harness that judges by exit code then
+# reads EVERY mutation as "detected", because the runner failed rather than the test. Silent false
+# positives in a verification tool are worse than having no tool.
+if [ -n "${CLAUDEX_LINUX_TEST_STAGE:-}" ]; then
+  stage="$CLAUDEX_LINUX_TEST_STAGE"
+else
+  # Git prints a forward-slash Windows path here, and .git is never committed.
+  stage="$(git rev-parse --show-toplevel)/.git/claudex-linux-test"
+fi
 # C:/x -> /mnt/c/x
 stage_wsl="$(printf '%s' "$stage" | sed -E 's#^([A-Za-z]):#/mnt/\l\1#')"
+case "$stage_wsl" in
+  /mnt/*) ;;
+  *) echo "linux-test: cannot map staging path '$stage' into WSL" >&2; exit 2 ;;
+esac
 
 # Invocation-unique, so concurrent runs cannot overwrite or execute each other's binary.
 id="$$-${RANDOM}"

@@ -168,10 +168,13 @@ func TestReapSurvivingGrandchild(t *testing.T) {
 // TestReapDoesNotWaitOnASetsidEscape is the out-of-model case.
 //
 // A descendant that setsid()s out of the group cannot be contained by an unprivileged supervisor —
-// that is a stated limit, not a hole. But because this process is a subreaper, the escapee still
-// REPARENTS here, so an unqualified wait would block on it forever. Scoping waitpid to -pgid excludes
-// it by construction. The test proves both halves: the teardown completes promptly, and the escapee
-// is neither waited on nor killed.
+// that is a stated limit, not a hole. This proves the teardown completes promptly and does not KILL
+// the escapee, since killing it would overstate a guarantee the design explicitly disclaims.
+//
+// It does NOT prove that scoping waitpid to -pgid matters: the drain uses WNOHANG and never blocks,
+// so an unqualified wait would not hang here. That justification was wrong, and a sound mutation
+// harness caught it. What scoping really prevents is counting out-of-model children into the reap
+// total — see TestReapCountsOnlyTheOwnedGroup.
 func TestReapDoesNotWaitOnASetsidEscape(t *testing.T) {
 	if _, err := exec.LookPath("setsid"); err != nil {
 		t.Skipf("setsid unavailable: %v", err)
@@ -598,4 +601,52 @@ func dumpChildState() {
 		fmt.Println("ENV", base64.StdEncoding.EncodeToString([]byte(kv)))
 	}
 	fmt.Println("PGID", syscall.Getpgrp())
+}
+
+// TestReapCountsOnlyTheOwnedGroup pins what scoping waitpid to -pgid actually buys.
+//
+// The original justification — that an unqualified wait would block forever on a setsid escapee — is
+// FALSE for this implementation, because the drain uses WNOHANG and never blocks. A sound mutation
+// harness proved it: swapping -pgid for -1 changed nothing the existing tests could see. What scoping
+// really prevents is REAPING OUT-OF-MODEL CHILDREN: with -1 the supervisor waits on descendants that
+// left the group, stealing their exit status and inflating the reap count that the receipt and the
+// terminal both bind. So the escapee here exits during the teardown, and the count must not move.
+func TestReapCountsOnlyTheOwnedGroup(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skipf("setsid unavailable: %v", err)
+	}
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	done := filepath.Join(t.TempDir(), "escapee.done")
+	// The escapee leaves the group and then exits, becoming reapable by this process as a subreaper.
+	cmd := startGroupLeader(t, "setsid /bin/sh -c 'sleep 0.2; echo done > "+done+"' & exit 0")
+	pgid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("leader wait: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(done); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(done); err != nil {
+		t.Skipf("escapee never completed: %v", err)
+	}
+	// Give the exited escapee time to reparent here before the teardown runs.
+	time.Sleep(100 * time.Millisecond)
+
+	res, err := ReapGroup(pgid, fastPolicy)
+	if err != nil {
+		t.Fatalf("ReapGroup: %v", err)
+	}
+	if !res.GroupEmpty {
+		t.Fatal("teardown did not prove the owned group empty")
+	}
+	if res.Reaped != 0 {
+		t.Fatalf("reaped %d; the owned group was already empty, so a nonzero count means an "+
+			"out-of-model child was waited on and counted into the receipt", res.Reaped)
+	}
 }

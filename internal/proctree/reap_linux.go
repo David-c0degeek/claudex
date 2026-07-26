@@ -118,10 +118,14 @@ func signalGroup(pgid int, sig unix.Signal) error {
 
 // drainGroup reaps everything currently waitable in the owned group, without blocking.
 //
-// waitpid is scoped to -pgid rather than -1 on purpose. A process that deliberately setsid()s out of
-// the group is outside the containment model but, because this supervisor is a subreaper, it can
-// still REPARENT here — and an unqualified wait would then block on an out-of-model child forever.
-// Group scoping excludes it by construction rather than by hoping it exits.
+// waitpid is scoped to -pgid rather than -1 on purpose, though not for the reason first written here.
+// The original claim was that an unqualified wait would BLOCK on an out-of-model child; that is false
+// for this implementation, because WNOHANG never blocks, and a sound mutation harness disproved it.
+//
+// The real reason: a descendant that setsid()s out of the group still REPARENTS to this supervisor,
+// since it is a subreaper. An unqualified wait would therefore reap processes that are not ours —
+// consuming their exit status and inflating the reap count that both the cleanup receipt and the
+// TERMINAL bind. Group scoping keeps the count a statement about the owned group.
 func drainGroup(pgid int) (int, LeaderOutcome, error) {
 	reaped := 0
 	var leader LeaderOutcome

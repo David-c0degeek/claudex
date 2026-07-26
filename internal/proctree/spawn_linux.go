@@ -51,14 +51,25 @@ type CommandSpawn struct {
 // ordering depends on would wait forever. The comment claiming "every failure path" was true of the
 // intent and false of the code.
 func SpawnContained(s CommandSpawn) (cmd *exec.Cmd, err error) {
+	// Installed FIRST, before any validation, because ownership begins when the handles arrive rather
+	// than when they are found acceptable. With the pair check above this defer, passing a real stdout
+	// end and a nil stderr returned an error while leaving the supplied end open — the same
+	// no-EOF-forever deadlock, reachable through the very check meant to reject a malformed call.
+	// CloseStreamCopies tolerates nil, so a half-supplied pair is closed correctly.
+	defer func() {
+		if err == nil {
+			return
+		}
+		// A failed ownership release is NOT an ordinary pre-spawn refusal: the caller would treat the
+		// error as "nothing started, streams are yours again" while a write end stayed open. Joined so
+		// both facts reach the supervisor.
+		if cerr := CloseStreamCopies(s); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
 	if s.Stdout == nil || s.Stderr == nil {
 		return nil, fmt.Errorf("proctree: stream write ends are required")
 	}
-	defer func() {
-		if err != nil {
-			_ = CloseStreamCopies(s)
-		}
-	}()
 	if err = s.Spec.Validate(); err != nil {
 		return nil, err
 	}
