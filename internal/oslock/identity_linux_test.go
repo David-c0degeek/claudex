@@ -179,3 +179,51 @@ func TestProbeReconfirmsAfterLocking(t *testing.T) {
 		t.Fatal("a lease displaced after locking was reported unheld")
 	}
 }
+
+// TestAcquireReconfirmsAfterLocking is the acquire half of the post-lock window.
+//
+// The previous revision added the re-confirmation to the probe only, so arming could end up HOLDING
+// inode A while the lease name referred to inode B: it would report success, proceed to READY and the
+// active CAS, and a later probe of B would answer `unheld` while the supervisor was still live. The
+// same seam that pins the probe window pins this one, because the two now share one implementation.
+func TestAcquireReconfirmsAfterLocking(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer root.Close()
+	if err := os.WriteFile(filepath.Join(dir, "replacement"), nil, 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+
+	swapped := false
+	afterLockHook = func(name string) {
+		if swapped {
+			return
+		}
+		swapped = true
+		// The lock is already held on the original object here; the NAME is what moves.
+		if rerr := os.Rename(filepath.Join(dir, "replacement"), filepath.Join(dir, name)); rerr != nil {
+			t.Errorf("swap: %v", rerr)
+		}
+	}
+	t.Cleanup(func() { afterLockHook = nil })
+
+	l, ok, err := TryAcquireInRoot(root, "lease")
+	if !swapped {
+		t.Fatal("the post-lock seam never fired; the test proved nothing")
+	}
+	if err == nil {
+		if ok {
+			_ = l.Release()
+		}
+		t.Fatal("arming reported success while holding a lock on a displaced object")
+	}
+	if !errors.Is(err, ErrLeaseDisplaced) {
+		t.Fatalf("err = %v, want ErrLeaseDisplaced", err)
+	}
+	if ok {
+		t.Fatal("arming reported acquired on a displacement")
+	}
+}

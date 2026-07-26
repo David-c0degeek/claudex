@@ -159,11 +159,34 @@ func TryAcquireInRoot(root *os.Root, name string) (*Lock, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	return lockAndConfirm(root, name, f)
+}
+
+// lockAndConfirm takes the lock and RE-CONFIRMS identity while still holding it.
+//
+// Both entry points go through this, which is the point rather than a tidiness: the previous revision
+// added the post-lock re-confirmation to the probe alone, leaving acquisition able to end up holding
+// inode A while the name referred to inode B — arming would report success, proceed to READY and the
+// active CAS, and a later probe of B would answer `unheld` while the supervisor was still live. One
+// function for the rule means the two sides cannot drift apart again.
+//
+// Confirming while the lock is held is what makes it meaningful. Releasing first would leave a window
+// in which the answer is decided by an object nobody holds, and confirming before locking proves only
+// that the object was right BEFORE the lock existed.
+func lockAndConfirm(root *os.Root, name string, f *os.File) (*Lock, bool, error) {
 	lf, ok, lerr := lockOpenFile(f)
 	if lerr != nil || !ok {
 		return nil, ok, lerr
 	}
-	return &Lock{f: lf}, true, nil
+	l := &Lock{f: lf}
+	if afterLockHook != nil {
+		afterLockHook(name)
+	}
+	if cerr := confirmLeaseIdentity(root, name, lf); cerr != nil {
+		_ = l.Release()
+		return nil, false, cerr
+	}
+	return l, true, nil
 }
 
 var (
@@ -204,22 +227,12 @@ func ProbeInRoot(root *os.Root, name string) (held bool, err error) {
 	if oerr != nil {
 		return true, oerr
 	}
-	lf, ok, lerr := lockOpenFile(f)
+	l, ok, lerr := lockAndConfirm(root, name, f)
 	if lerr != nil {
 		return true, lerr
 	}
 	if !ok {
 		return true, nil
-	}
-	l := &Lock{f: lf}
-	if afterLockHook != nil {
-		afterLockHook(name)
-	}
-	// Re-confirmed while still HOLDING the lock: releasing first would leave a window in which the
-	// answer is decided by an object nobody holds.
-	if cerr := confirmLeaseIdentity(root, name, lf); cerr != nil {
-		_ = l.Release()
-		return true, cerr
 	}
 	if rerr := l.Release(); rerr != nil {
 		return true, rerr
