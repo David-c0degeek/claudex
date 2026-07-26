@@ -126,7 +126,7 @@ func TestCancelAfterGoIsIdempotent(t *testing.T) {
 
 func TestDuplicateTerminalIsRefused(t *testing.T) {
 	sup, coord, _, stat := handshake(t)
-	term := Terminal{CommandStarted: true, Exited: true, CommandPGID: 7}
+	term := Terminal{CommandStarted: true, Exited: true, CommandPGID: 7, Reaped: 1}
 	if err := sup.SendTerminal(stat, term); err != nil {
 		t.Fatalf("SendTerminal: %v", err)
 	}
@@ -287,5 +287,163 @@ func TestTerminalAlwaysFitsAFrame(t *testing.T) {
 	oversize := Terminal{SpawnErrorClass: string(bytes.Repeat([]byte("x"), MaxSpawnErrorClassBytes+1))}
 	if _, err := oversize.encode(); err == nil {
 		t.Fatal("encode accepted an over-length spawn error class")
+	}
+}
+
+// TestTrailingBytesAfterTerminalRefused: json.Decoder.Decode stops after one value and leaves the
+// rest unread, so "<valid> {}" parsed happily. For a frame payload that is a malformed frame being
+// accepted as a good one, and TERMINAL is the authoritative runner fact.
+func TestTrailingBytesAfterTerminalRefused(t *testing.T) {
+	payload, err := Terminal{CommandStarted: true, Exited: true, CommandPGID: 5, Reaped: 1}.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := decodeTerminal(append(append([]byte(nil), payload...), []byte(" {}")...)); err == nil {
+		t.Fatal("decodeTerminal accepted trailing JSON")
+	}
+	if _, err := decodeTerminal(append(append([]byte(nil), payload...), 'x')); err == nil {
+		t.Fatal("decodeTerminal accepted trailing garbage")
+	}
+}
+
+// TestNonCanonicalTerminalRefused: the payload is canonical by contract, so a semantically identical
+// but differently spelled encoding is still a malformed frame.
+func TestNonCanonicalTerminalRefused(t *testing.T) {
+	payload, err := Terminal{CommandStarted: true, Exited: true, CommandPGID: 5, Reaped: 1}.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	spaced := append([]byte("{ "), payload[1:]...)
+	if _, err := decodeTerminal(spaced); err == nil {
+		t.Fatal("decodeTerminal accepted a non-canonical encoding")
+	}
+}
+
+// TestCancelBeforeGoClosesTheLaunch is the sequence CX ran: READY, CANCEL, GO. A coordinator that
+// stayed "armed" after aborting could still launch the command it had just cancelled, and the
+// supervisor — already done — would have refused a GO that the coordinator believed it had sent.
+func TestCancelBeforeGoClosesTheLaunch(t *testing.T) {
+	var ctrl countingWriter
+	var stat bytes.Buffer
+	sup := &SupervisorProtocol{}
+	coord := &CoordinatorProtocol{}
+	if err := sup.SendReady(&stat); err != nil {
+		t.Fatalf("SendReady: %v", err)
+	}
+	if err := coord.RecvReady(mustRead(t, &stat)); err != nil {
+		t.Fatalf("RecvReady: %v", err)
+	}
+	if err := coord.SendCancel(&ctrl); err != nil {
+		t.Fatalf("SendCancel: %v", err)
+	}
+	if err := coord.SendGo(&ctrl); !errors.Is(err, ErrOutOfState) {
+		t.Fatalf("SendGo after a pre-GO CANCEL: err = %v, want ErrOutOfState", err)
+	}
+
+	// A repeat must not put a second CANCEL on the wire: the supervisor is in its terminal state and
+	// classifies a second one as fatal, so re-emitting would turn an idempotent-looking call into a
+	// protocol kill.
+	writesBefore := ctrl.writes
+	if err := coord.SendCancel(&ctrl); err != nil {
+		t.Fatalf("repeat SendCancel: %v", err)
+	}
+	if ctrl.writes != writesBefore {
+		t.Fatalf("repeat pre-GO CANCEL emitted %d extra frames", ctrl.writes-writesBefore)
+	}
+
+	// The supervisor's view: exactly one CANCEL, classified as an abort.
+	act, err := sup.Recv(mustRead(t, &ctrl.buf))
+	if err != nil {
+		t.Fatalf("Recv CANCEL: %v", err)
+	}
+	if act != ActionAbort {
+		t.Fatalf("action = %v, want ActionAbort", act)
+	}
+	if ctrl.buf.Len() != 0 {
+		t.Fatalf("%d bytes left on ctrl; a second CANCEL was emitted", ctrl.buf.Len())
+	}
+
+	// An aborted launch still owes a terminal, and the coordinator must accept it.
+	if err := sup.SendTerminal(&stat, Terminal{CommandStarted: false}); err != nil {
+		t.Fatalf("SendTerminal after abort: %v", err)
+	}
+	got, err := coord.RecvTerminal(mustRead(t, &stat))
+	if err != nil {
+		t.Fatalf("RecvTerminal after abort: %v", err)
+	}
+	if got.CommandStarted {
+		t.Fatal("aborted launch reported a started command")
+	}
+}
+
+// TestTerminalSumType walks every branch of the invariant. These are the ONLY facts anyone gets about
+// how the command ended, so an incomplete terminal is not a cosmetic problem: the accepted-before case
+// (started, no exit, no signal) describes no outcome at all.
+func TestTerminalSumType(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		term Terminal
+		ok   bool
+	}{
+		{"started, exited", Terminal{CommandStarted: true, Exited: true, ExitCode: 3, CommandPGID: 9, Reaped: 1}, true},
+		{"started, signalled", Terminal{CommandStarted: true, Signal: 9, CommandPGID: 9, Reaped: 2}, true},
+		{"started, exit 0", Terminal{CommandStarted: true, Exited: true, CommandPGID: 9, Reaped: 1}, true},
+		{"started, exit 255", Terminal{CommandStarted: true, Exited: true, ExitCode: 255, CommandPGID: 9, Reaped: 1}, true},
+		{"aborted", Terminal{CommandStarted: false}, true},
+		{"spawn failed", Terminal{CommandStarted: false, SpawnErrorClass: "not_found"}, true},
+
+		{"started, neither exit nor signal", Terminal{CommandStarted: true, CommandPGID: 9, Reaped: 1}, false},
+		{"started, no PGID", Terminal{CommandStarted: true, Exited: true, Reaped: 1}, false},
+		{"started, nothing reaped", Terminal{CommandStarted: true, Exited: true, CommandPGID: 9}, false},
+		{"started, both exit and signal", Terminal{CommandStarted: true, Exited: true, Signal: 9, CommandPGID: 9, Reaped: 1}, false},
+		{"started, negative exit", Terminal{CommandStarted: true, Exited: true, ExitCode: -5, CommandPGID: 9, Reaped: 1}, false},
+		{"started, exit above 255", Terminal{CommandStarted: true, Exited: true, ExitCode: 256, CommandPGID: 9, Reaped: 1}, false},
+		{"started, signal out of range", Terminal{CommandStarted: true, Signal: 65, CommandPGID: 9, Reaped: 1}, false},
+		{"signalled with an exit code", Terminal{CommandStarted: true, Signal: 9, ExitCode: 1, CommandPGID: 9, Reaped: 1}, false},
+		{"started with a spawn error", Terminal{CommandStarted: true, Exited: true, SpawnErrorClass: "x", CommandPGID: 9, Reaped: 1}, false},
+		{"negative reap count", Terminal{CommandStarted: true, Exited: true, CommandPGID: 9, Reaped: -1}, false},
+		{"negative PGID", Terminal{CommandStarted: true, Exited: true, CommandPGID: -1, Reaped: 1}, false},
+		{"no command, exit code", Terminal{CommandStarted: false, ExitCode: 127}, false},
+		{"no command, exited", Terminal{CommandStarted: false, Exited: true}, false},
+		{"no command, signal", Terminal{CommandStarted: false, Signal: 9}, false},
+		{"no command, PGID", Terminal{CommandStarted: false, CommandPGID: 4}, false},
+		{"no command, reaped", Terminal{CommandStarted: false, Reaped: 1}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := tc.term.encode()
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("encode rejected a valid terminal: %v", err)
+				}
+				got, derr := decodeTerminal(payload)
+				if derr != nil {
+					t.Fatalf("decode rejected its own encoding: %v", derr)
+				}
+				if got != tc.term {
+					t.Fatalf("round trip = %+v, want %+v", got, tc.term)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("encode accepted an invalid terminal")
+			}
+			// The decode side must refuse it independently: a peer is not trusted to have validated.
+			raw, cerr := canonjson.CanonicalizeValue(wireTerminal{
+				SchemaVersion:   terminalSchemaVersion,
+				CommandStarted:  tc.term.CommandStarted,
+				Exited:          tc.term.Exited,
+				ExitCode:        tc.term.ExitCode,
+				Signal:          tc.term.Signal,
+				SpawnErrorClass: tc.term.SpawnErrorClass,
+				CommandPGID:     tc.term.CommandPGID,
+				Reaped:          tc.term.Reaped,
+			})
+			if cerr != nil {
+				t.Fatalf("canonicalize: %v", cerr)
+			}
+			if _, derr := decodeTerminal(raw); derr == nil {
+				t.Fatal("decode accepted an invalid terminal")
+			}
+		})
 	}
 }

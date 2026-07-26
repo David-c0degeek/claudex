@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -160,6 +159,11 @@ const (
 	coordInit coordState = iota
 	coordArmed
 	coordRunning
+	// coordAborted is reached by a CANCEL sent BEFORE GO. It is a distinct state rather than a flag
+	// because the supervisor's matching state is terminal: it has already classified that CANCEL as an
+	// abort and moved to done, so a later GO would be refused and a repeated CANCEL would be fatal. A
+	// coordinator that stayed "armed" could still launch a command it had just aborted.
+	coordAborted
 	coordDone
 )
 
@@ -171,6 +175,8 @@ func (s coordState) String() string {
 		return "armed"
 	case coordRunning:
 		return "running"
+	case coordAborted:
+		return "aborted"
 	case coordDone:
 		return "done"
 	}
@@ -208,12 +214,28 @@ func (p *CoordinatorProtocol) SendGo(w io.Writer) error {
 	return nil
 }
 
-// SendCancel is valid once the supervisor is armed, and is idempotent thereafter.
+// SendCancel stops the attempt. Its effect differs either side of GO, mirroring the supervisor:
+//
+//   - BEFORE GO it is a no-command abort and is terminal for the launch. The supervisor moves to done
+//     on that frame, so no GO may follow and a repeat must NOT be emitted — the peer classifies a
+//     second CANCEL as fatal.
+//   - AFTER GO it is a stop request and is idempotent, so a coordinator retry loop is safe.
 func (p *CoordinatorProtocol) SendCancel(w io.Writer) error {
-	if p.state != coordArmed && p.state != coordRunning {
+	switch p.state {
+	case coordArmed:
+		if err := WriteFrame(w, Frame{Type: TypeCancel, Payload: nil}); err != nil {
+			return err
+		}
+		p.state = coordAborted
+		return nil
+	case coordRunning:
+		return WriteFrame(w, Frame{Type: TypeCancel, Payload: nil})
+	case coordAborted:
+		// Idempotent by doing nothing: the abort is already in flight and the peer is done.
+		return nil
+	default:
 		return fmt.Errorf("%w: CANCEL in state %v", ErrOutOfState, p.state)
 	}
-	return WriteFrame(w, Frame{Type: TypeCancel, Payload: nil})
 }
 
 // RecvTerminal consumes the one TERMINAL frame.
@@ -224,7 +246,8 @@ func (p *CoordinatorProtocol) RecvTerminal(f Frame) (Terminal, error) {
 	if p.state == coordDone {
 		return Terminal{}, ErrDuplicateTerminal
 	}
-	if p.state != coordRunning && p.state != coordArmed {
+	// An aborted launch still owes a terminal, so coordAborted is admissible here.
+	if p.state != coordRunning && p.state != coordArmed && p.state != coordAborted {
 		return Terminal{}, fmt.Errorf("%w: TERMINAL in state %v", ErrOutOfState, p.state)
 	}
 	t, err := decodeTerminal(f.Payload)
@@ -275,24 +298,74 @@ type wireTerminal struct {
 
 const terminalSchemaVersion = 1
 
+// MaxExitCode is the widest exit status a POSIX wait status can carry.
+const MaxExitCode = 255
+
+// MaxSignal is the highest signal number Linux defines, including the real-time range.
+const MaxSignal = 64
+
+// validate enforces the COMPLETE sum type, not a sample of contradictions.
+//
+// These are the authoritative runner facts — the only statement anyone ever gets about how the command
+// ended — so "not obviously self-contradictory" is the wrong bar. A terminal claiming a command
+// started while carrying neither an exit code nor a signal describes no outcome at all, and would be
+// consumed downstream as though it did.
 func (t Terminal) validate() error {
 	if len(t.SpawnErrorClass) > MaxSpawnErrorClassBytes {
 		return fmt.Errorf("proctree: spawn error class %d bytes exceeds %d", len(t.SpawnErrorClass), MaxSpawnErrorClassBytes)
 	}
+	if t.Reaped < 0 {
+		return errors.New("proctree: negative reap count")
+	}
+	if t.CommandPGID < 0 {
+		return errors.New("proctree: negative command PGID")
+	}
+
 	if !t.CommandStarted {
+		// Nothing ran, so every field describing a run must be at its zero. This covers the abort
+		// (CANCEL before GO) and the spawn failure alike; the two differ only by SpawnErrorClass.
 		if t.CommandPGID != 0 {
 			return errors.New("proctree: terminal reports no command but carries a command PGID")
 		}
-		if t.Exited || t.Signal != 0 {
+		if t.Exited || t.Signal != 0 || t.ExitCode != 0 {
 			return errors.New("proctree: terminal reports no command but carries exit facts")
+		}
+		if t.Reaped != 0 {
+			return errors.New("proctree: terminal reports no command but claims reaped descendants")
 		}
 		return nil
 	}
+
 	if t.SpawnErrorClass != "" {
 		return errors.New("proctree: terminal reports a started command and a spawn error")
 	}
-	if t.Exited && t.Signal != 0 {
+	// A started command has a real group: setpgid runs in the child before any user code.
+	if t.CommandPGID <= 0 {
+		return errors.New("proctree: terminal reports a started command without a command PGID")
+	}
+	// The leader is a member of the group the supervisor reaps, so a started command always accounts
+	// for at least one reaped process. Zero means the reap loop did not run.
+	if t.Reaped < 1 {
+		return errors.New("proctree: terminal reports a started command with no reaped descendants")
+	}
+	// Exactly one of exited/signalled. "Neither" is the case that was accepted before: it describes no
+	// outcome whatsoever while looking well formed.
+	switch {
+	case t.Exited && t.Signal != 0:
 		return errors.New("proctree: terminal reports both a normal exit and a signal")
+	case !t.Exited && t.Signal == 0:
+		return errors.New("proctree: terminal reports a started command with neither an exit code nor a signal")
+	case t.Exited:
+		if t.ExitCode < 0 || t.ExitCode > MaxExitCode {
+			return fmt.Errorf("proctree: exit code %d outside 0..%d", t.ExitCode, MaxExitCode)
+		}
+	default:
+		if t.Signal < 1 || t.Signal > MaxSignal {
+			return fmt.Errorf("proctree: signal %d outside 1..%d", t.Signal, MaxSignal)
+		}
+		if t.ExitCode != 0 {
+			return errors.New("proctree: terminal reports a signalled command carrying an exit code")
+		}
 	}
 	return nil
 }
@@ -322,9 +395,7 @@ func (t Terminal) encode() ([]byte, error) {
 
 func decodeTerminal(payload []byte) (Terminal, error) {
 	var w wireTerminal
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&w); err != nil {
+	if err := decodeExactlyOne(payload, &w); err != nil {
 		return Terminal{}, fmt.Errorf("proctree: decode terminal: %w", err)
 	}
 	if w.SchemaVersion != terminalSchemaVersion {
@@ -343,6 +414,13 @@ func decodeTerminal(payload []byte) (Terminal, error) {
 	// terminal just because it is well-formed JSON.
 	if err := t.validate(); err != nil {
 		return Terminal{}, err
+	}
+	canonical, err := t.encode()
+	if err != nil {
+		return Terminal{}, err
+	}
+	if !bytes.Equal(canonical, payload) {
+		return Terminal{}, errors.New("proctree: terminal bytes are not their own canonical encoding")
 	}
 	return t, nil
 }

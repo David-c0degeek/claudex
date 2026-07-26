@@ -3,7 +3,9 @@ package proctree
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -307,4 +309,99 @@ func TestSpecCeiling(t *testing.T) {
 	if _, err := DecodeSpec(make([]byte, MaxSpecBytes+1)); !errors.Is(err, ErrSpecInvalid) {
 		t.Fatalf("decode err = %v, want ErrSpecInvalid", err)
 	}
+}
+
+// TestSpecRefusesTrailingAndNonCanonicalBytes. The spec claims a CANONICAL grammar and its digest is
+// bound in the attempt intent, so a reader that accepts non-canonical spellings makes that digest an
+// authority over only one of the byte strings it admits.
+func TestSpecRefusesTrailingAndNonCanonicalBytes(t *testing.T) {
+	raw, err := baseSpec().Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if _, err := DecodeSpec(raw); err != nil {
+		t.Fatalf("the canonical encoding must decode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"trailing value", append(append([]byte(nil), raw...), []byte(" {}")...)},
+		{"trailing garbage", append(append([]byte(nil), raw...), 'x')},
+		{"leading whitespace", append([]byte(" "), raw...)},
+		{"reordered members", reorderFirstTwoMembers(raw)},
+		{"duplicate member", duplicateFirstMember(raw)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.in == nil {
+				t.Skip("variant not constructible for this encoding")
+			}
+			if _, err := DecodeSpec(tc.in); err == nil {
+				t.Fatal("DecodeSpec accepted non-canonical bytes")
+			}
+		})
+	}
+}
+
+// reorderFirstTwoMembers swaps two top-level members, producing bytes that decode to the same value
+// but are not the canonical encoding of it.
+func reorderFirstTwoMembers(raw []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) < 2 {
+		return nil
+	}
+	keys[0], keys[1] = keys[1], keys[0]
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, err := json.Marshal(k)
+		if err != nil {
+			return nil
+		}
+		b.Write(kb)
+		b.WriteByte(':')
+		b.Write(m[k])
+	}
+	b.WriteByte('}')
+	return b.Bytes()
+}
+
+// duplicateFirstMember repeats a member. Go's decoder keeps the last occurrence, so the value still
+// parses — which is exactly why the canonical re-encoding check has to exist.
+func duplicateFirstMember(raw []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return nil
+	}
+	first := keys[0]
+	kb, err := json.Marshal(first)
+	if err != nil {
+		return nil
+	}
+	dup := append([]byte(nil), kb...)
+	dup = append(dup, ':')
+	dup = append(dup, m[first]...)
+	dup = append(dup, ',')
+	out := append([]byte("{"), dup...)
+	return append(out, raw[1:]...)
 }

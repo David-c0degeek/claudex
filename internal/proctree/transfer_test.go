@@ -185,3 +185,83 @@ func TestWriteSpecRefusesOverLength(t *testing.T) {
 		t.Fatalf("read after refused write: %v", err)
 	}
 }
+
+// shortStreamWriter transfers only part of what it is given and reports success, which io.Writer
+// permits implementations to get wrong and which a pipe under a deadline does for real.
+type shortStreamWriter struct {
+	got    []byte
+	closed bool
+}
+
+func (w *shortStreamWriter) Write(p []byte) (int, error) {
+	n := len(p) / 2
+	if n == 0 {
+		n = len(p)
+	}
+	w.got = append(w.got, p[:n]...)
+	return n, nil
+}
+func (w *shortStreamWriter) Close() error                     { w.closed = true; return nil }
+func (w *shortStreamWriter) SetWriteDeadline(time.Time) error { return nil }
+
+// TestWriteSpecTransfersEverything. A control frame is one atomic PIPE_BUF write, so a single call
+// settles it — but the spec may exceed PIPE_BUF by design, so one Write proves nothing. Discarding n
+// left the supervisor holding a truncated spec while the coordinator reported success.
+func TestWriteSpecTransfersEverything(t *testing.T) {
+	canonical, err := baseSpec().Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	w := &shortStreamWriter{}
+	if err := WriteSpec(w, canonical, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("WriteSpec: %v", err)
+	}
+	if !bytes.Equal(w.got, canonical) {
+		t.Fatalf("transferred %d of %d bytes", len(w.got), len(canonical))
+	}
+	if !w.closed {
+		t.Fatal("write end left open")
+	}
+}
+
+// stalledWriter accepts nothing and reports no error, the shape that would spin forever.
+type stalledWriter struct{}
+
+func (stalledWriter) Write([]byte) (int, error)        { return 0, nil }
+func (stalledWriter) Close() error                     { return nil }
+func (stalledWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func TestWriteSpecRefusesAStalledWriter(t *testing.T) {
+	canonical, err := baseSpec().Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := WriteSpec(stalledWriter{}, canonical, time.Now().Add(time.Minute)); err == nil {
+		t.Fatal("WriteSpec reported success against a writer that accepted nothing")
+	}
+}
+
+// partialThenDeadlineWriter is the real pipe case: some bytes go through, then the deadline fires.
+// The partial transfer must be an error, never a success.
+type partialThenDeadlineWriter struct{ wrote int }
+
+func (w *partialThenDeadlineWriter) Write(p []byte) (int, error) {
+	if w.wrote == 0 && len(p) > 4 {
+		w.wrote = 4
+		return 4, nil
+	}
+	return 0, os.ErrDeadlineExceeded
+}
+func (w *partialThenDeadlineWriter) Close() error                     { return nil }
+func (w *partialThenDeadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func TestWriteSpecPartialThenDeadline(t *testing.T) {
+	canonical, err := baseSpec().Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	err = WriteSpec(&partialThenDeadlineWriter{}, canonical, time.Now().Add(time.Minute))
+	if !errors.Is(err, ErrArmingDeadline) {
+		t.Fatalf("err = %v, want ErrArmingDeadline", err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/David-c0degeek/claudex/internal/canonjson"
@@ -271,9 +272,7 @@ func DecodeSpec(raw []byte) (ExecSpec, error) {
 		return ExecSpec{}, fmt.Errorf("%w: spec %d bytes exceeds %d", ErrSpecInvalid, len(raw), MaxSpecBytes)
 	}
 	var w wireSpec
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&w); err != nil {
+	if err := decodeExactlyOne(raw, &w); err != nil {
 		return ExecSpec{}, fmt.Errorf("proctree: decode spec: %w", err)
 	}
 	if w.SchemaVersion != specSchemaVersion {
@@ -308,7 +307,36 @@ func DecodeSpec(raw []byte) (ExecSpec, error) {
 	if err := s.Validate(); err != nil {
 		return ExecSpec{}, err
 	}
+	// The grammar is CANONICAL, so canonicality is enforced on input rather than merely produced on
+	// output. Decoding normalises one way: duplicate keys collapse, member order is discarded, and two
+	// different byte strings can decode to the same value. Accepting those would make the digest bound
+	// in the attempt intent an authority over only one of the byte strings this reader admits, which
+	// is the opposite of what a content digest is for.
+	canonical, err := s.Encode()
+	if err != nil {
+		return ExecSpec{}, err
+	}
+	if !bytes.Equal(canonical, raw) {
+		return ExecSpec{}, fmt.Errorf("%w: bytes are not the canonical encoding of their own content", ErrSpecInvalid)
+	}
 	return s, nil
+}
+
+// decodeExactlyOne decodes one JSON value and PROVES nothing follows it.
+//
+// json.Decoder.Decode stops after a single value and leaves the rest of the stream unread, so a
+// payload of "<valid> {}" decodes without complaint. For a frame payload that is a malformed frame
+// accepted as a good one; for the spec it breaks the canonical-bytes claim outright.
+func decodeExactlyOne(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing bytes after the value")
+	}
+	return nil
 }
 
 // Environ renders the child environment as os/exec expects it.

@@ -43,11 +43,23 @@ func WriteSpec(w deadlineWriter, canonical []byte, deadline time.Time) (err erro
 	if err := w.SetWriteDeadline(deadline); err != nil {
 		return fmt.Errorf("proctree: set spec write deadline: %w", err)
 	}
-	if _, err := w.Write(canonical); err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return fmt.Errorf("%w: writing execution spec", ErrArmingDeadline)
+	// Written in a LOOP, unlike a control frame. A frame is one atomic PIPE_BUF write, so a single
+	// call settles it; the spec deliberately may exceed PIPE_BUF, so one Write is not a completion
+	// guarantee. Discarding n left a supervisor holding a truncated spec while the coordinator
+	// believed the transfer had succeeded — and a partial write followed by the deadline firing is a
+	// real case on a pipe, not a hypothetical.
+	for off := 0; off < len(canonical); {
+		n, werr := w.Write(canonical[off:])
+		off += n
+		if werr != nil {
+			if errors.Is(werr, os.ErrDeadlineExceeded) {
+				return fmt.Errorf("%w: wrote %d of %d spec bytes", ErrArmingDeadline, off, len(canonical))
+			}
+			return fmt.Errorf("proctree: write execution spec: %w", werr)
 		}
-		return fmt.Errorf("proctree: write execution spec: %w", err)
+		if n <= 0 {
+			return fmt.Errorf("proctree: spec write stalled after %d of %d bytes", off, len(canonical))
+		}
 	}
 	return nil
 }
