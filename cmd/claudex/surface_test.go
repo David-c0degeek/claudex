@@ -35,17 +35,42 @@ func TestExactCommandSurface(t *testing.T) {
 		t.Fatalf("dispatchable surface = %v, want exactly %v", got, want)
 	}
 
-	// The pre-pivot entrypoints are named explicitly as well. The set comparison above already
-	// excludes them; this states the intent, so a future reader sees WHY the set is closed.
+	// ALIASES ARE A SECOND ROUTE NAMESPACE and must be closed too: run() resolves an alias BEFORE
+	// looking in commands, so every alias key is also an accepted first-argument spelling. Comparing
+	// only the canonical table would leave `aliases["run"] = "help"` routing the forbidden verb while
+	// every other assertion here still passed.
+	wantAliases := []string{"--help", "--version", "-h", "-v"}
+	var gotAliases []string
+	for name := range aliases {
+		gotAliases = append(gotAliases, name)
+	}
+	sort.Strings(gotAliases)
+	if strings.Join(gotAliases, ",") != strings.Join(wantAliases, ",") {
+		t.Fatalf("alias spellings = %v, want exactly %v", gotAliases, wantAliases)
+	}
+	for alias, target := range aliases {
+		// The dash prefix is WHY the alias namespace is safe: a flag spelling can never collide with
+		// a verb, so no bare word can become a hidden entrypoint through this map.
+		if !strings.HasPrefix(alias, "-") {
+			t.Errorf("alias %q is not a flag spelling; a bare word alias is a hidden command", alias)
+		}
+		if target != "version" && target != "help" {
+			t.Errorf("alias %q routes to %q; aliases are for informational commands only", alias, target)
+		}
+		if _, exists := commands[target]; !exists {
+			t.Errorf("alias %q routes to %q, which is not a command", alias, target)
+		}
+	}
+
+	// The pre-pivot entrypoints are named explicitly against BOTH namespaces. The two exact-set
+	// comparisons above already exclude them; this states the intent, so a future reader sees WHY the
+	// union of canonical verbs and accepted aliases is closed.
 	for _, cmd := range []string{"run", "pair", "gates", "operator", "resume", "exec", "start", "drive"} {
 		if _, exists := commands[cmd]; exists {
 			t.Errorf("command %q must not exist: attach is the sole run bootstrap", cmd)
 		}
-	}
-	// Aliases route to informational commands only; none of them may reach a run-affecting verb.
-	for alias, target := range aliases {
-		if target != "version" && target != "help" {
-			t.Errorf("alias %q routes to %q; aliases are for informational commands only", alias, target)
+		if _, exists := aliases[cmd]; exists {
+			t.Errorf("alias %q must not exist: it would route a forbidden entrypoint", cmd)
 		}
 	}
 
