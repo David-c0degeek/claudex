@@ -1,0 +1,118 @@
+name: CI
+
+# The Linux job is the point of this workflow, not a formality.
+#
+# claudex's process containment — the supervisor, the child-subreaper reap loop, the process-group
+# teardown, the descriptor discipline, the advisory-lock identity checks — is Linux-only and cannot be
+# exercised by a cross-compile, which proves only that such code builds. Developed on Windows, that
+# whole layer would otherwise ship on a promise. Here it runs natively on every push.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux/amd64 (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The containment tests spawn real process groups and rely on setsid being present, so its
+      # absence must fail loudly rather than turn those tests into skips.
+      - name: Verify test prerequisites
+        run: |
+          set -euo pipefail
+          for tool in setsid sleep sh; do
+            command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
+          done
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # Skips are not failures, but an unnoticed skip is how a platform-specific guard quietly stops
+      # being tested. Surface them so a reviewer sees what did not run.
+      - name: Report skipped tests
+        if: always()
+        run: go test -count=1 ./... -run . -v 2>&1 | grep -E "^\s*--- SKIP" || echo "no skipped tests"
+
+  windows:
+    name: windows/amd64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -count=1 ./...
+
+  macos:
+    name: darwin/arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      # Best-effort tier: the containment layer has no supervisor here, so this proves the portable
+      # half builds and passes rather than claiming the gate is supported.
+      - name: go test
+        run: go test -count=1 ./...
+
+  cross-compile:
+    name: cross-compile release targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build every release target
+        run: |
+          set -euo pipefail
+          for target in windows/amd64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%%/*}"
+            goarch="${target##*/}"
+            echo "==> $goos/$goarch"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build ./...
+          done

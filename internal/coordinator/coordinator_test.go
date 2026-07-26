@@ -1518,8 +1518,8 @@ func TestActivationIdempotentRetry(t *testing.T) {
 // A persisted activation whose run-state append lands across a genstore GAP still binds and
 // recovers: a torn file occupies the next state slot, so the verifier assignment binds at a
 // revision past expected+1, and classifyActivation must recognize that as Applied (the exact
-// case the slice-ad fix and the iii-b apply fix cover — proven here end-to-end against a real
-// VERIFY, not a hand-built one).
+// case the activation-classifier fix and the apply-ordering fix cover — proven here end-to-end
+// against a real VERIFY, not a hand-built one).
 func TestActivationBindsAcrossStateGap(t *testing.T) {
 	repo := t.TempDir()
 	runID, lead, pair := newPairedRun(t, repo)

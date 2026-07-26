@@ -136,7 +136,7 @@ func TestPullUsageErrors(t *testing.T) {
 }
 
 // pull RE-VERIFIES the state-bound packet; it does not merely project the locator run state carries.
-// Without this, deleting the VerifyRef call would leave every other test in this slice green — the
+// Without this, deleting the VerifyRef call would leave every other test in this file green — the
 // standalone verifier tests prove the verifier, not that pull calls it.
 func TestPullRefusesATamperedPacket(t *testing.T) {
 	for name, damage := range map[string]func(t *testing.T, packetDir string){

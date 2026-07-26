@@ -369,3 +369,31 @@ attach → join → pull → submit → wait → status, asserting the session-i
 the mailbox projection, and schema-valid receipt JSON — not only stdout; race
 tests force a replacement, a pair join, an active-run switch, and a pending commit
 journal between the reader's bracket reads.
+
+## D022 — Plan-agnostic gate: triage rule + accepted violations
+
+**Date:** 2026-07-26
+
+**Decision.** The plan-agnostic gate items are rules with a defined triage, not a raw grep.
+
+- **Shipped code, tests, comments, identifiers.** The gate's grep matches Go's own vocabulary — the
+  `slices` standard-library package and the `slice` type — and version strings such as
+  `git version 2.54.0`. Those are named false-positive classes and are triaged out. What counts is a
+  reference that is only meaningful with the plan in hand: a box id, a decision id, a plan file path,
+  or "this slice" used to mean a plan slice. Two such references existed in tests and were removed.
+- **Commit messages.** Subjects must be plan-agnostic from this decision onward. Bodies may cite
+  decisions and boxes: traceability from code to rationale is worth more than purity, and the body is
+  not what a reader of `git log --oneline` sees. Subjects already pushed are an accepted violation,
+  since the plan forbids rewriting pushed history and the peer reviewer has reviewed those exact
+  commits.
+- **Branch name.** `interactive-pairing` is an accepted violation for the life of the branch. Renaming
+  mid-flight would break the peer-review mailbox protocol and every recorded resume pointer, for no
+  correctness gain. The PR title and merge commit must be plan-agnostic.
+
+**Rationale.** A gate item that cannot be satisfied as literally written gets waved through at gate
+time, which is worse than having no gate — the finding that raised this (M10) said explicitly to
+decide it now rather than at the gate. Writing the triage down makes the items checkable and records
+what was knowingly accepted instead of letting it pass silently.
+
+**Refs.** §7 gate items; `findings.md` M10; `cmd/claudex/pull_test.go`,
+`internal/coordinator/coordinator_test.go`.
