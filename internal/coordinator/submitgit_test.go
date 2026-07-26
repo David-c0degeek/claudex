@@ -12,7 +12,7 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// TestGitSubmitTransactionEvidence proves the 04.2 acceptance contract on a REAL
+// TestGitSubmitTransactionEvidence proves the git-transaction acceptance contract on a REAL
 // linked worktree, for both an IMPLEMENT_STEP and a FIX transaction:
 //   - the accepted turn carries the git-commit evidence tuple, chained
 //     (first parent == BaseCommit, next parent == the previous accepted commit);

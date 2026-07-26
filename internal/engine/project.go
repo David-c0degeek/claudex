@@ -46,7 +46,7 @@ func Project(cur state.RunState, canonical []byte, facts ProjectionFacts) (Event
 // its criteria must cover the acceptance criteria exactly once in canonical order, and
 // (unless a human decision is requested) the verdict must be consistent with its
 // findings. Blockers are any unmet criterion, non-meaningful tests, unsupported
-// claims, or any scope expansion (D020).
+// claims, or any scope expansion.
 func projectVerified(cur state.RunState, canonical []byte, src state.EventRef, rhd bool, facts ProjectionFacts) (Event, error) {
 	var a struct {
 		Verdict  string `json:"verdict"`

@@ -40,7 +40,8 @@ func Ledger(rs RunState) []LedgerEntry {
 
 // LatestGitCommit returns the git-commit evidence of the most recent IMPLEMENT_STEP/FIX acceptance
 // (the highest receipt revision), or (nil, false) if the run has no git acceptance yet. It is the
-// single projection 04.3/04.5 use to select the head commit, so selection is never reinvented.
+// single projection the review-evidence packet and the test gate use to select the head
+// commit, so selection is never reinvented.
 func LatestGitCommit(rs RunState) (*GitCommitEvidence, bool) {
 	var latest *GitCommitEvidence
 	for _, e := range Ledger(rs) { // receipt-revision order; the last with evidence is the newest

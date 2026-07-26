@@ -362,7 +362,7 @@ func validateHonesty(l HonestyLabels) error {
 			freshCount++
 			// On a BYO run the generation enforcement must be reported exactly: enforced,
 			// backed by fresh-session-declared. Managed-tier exactness is deferred to the
-			// managed launch record (subject 07) and is constrained here only by the
+			// managed launch record, which is not built yet, and is constrained here only by the
 			// fresh-process reservation and the anti-laundering rule above.
 			if l.Tier == TierProtocolOnly && (c.Status != "enforced" || c.Mechanism != capMechFreshSessionDeclared) {
 				return fmt.Errorf("%w: a protocol-only verify-fresh-session must be enforced via fresh-session-declared", ErrHonestySource)

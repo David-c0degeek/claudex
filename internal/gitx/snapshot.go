@@ -64,7 +64,7 @@ func runWorktreeAbs(repo, runID string) string {
 // SnapshotCommit is AUTHORITY-NEUTRAL: `git commit-tree` writes into the object database, but this
 // moves no ref, no durable state, and never the real checked-out index. It captures the exact
 // worktree snapshot in a throwaway index and creates a commit from it, returning the commit and
-// tree OIDs (which 04.2 freezes; recovery observes those and never recomputes). It fails closed on
+// tree OIDs (which the commit transaction freezes; recovery observes those and never recomputes). It fails closed on
 // a wrong run worktree/branch/HEAD, a staged-only index divergence, a dirty/unexpected submodule, a
 // racing edit, or a no-op tree — re-validating the durable-state invariants at the post-capture
 // barrier so an edit interposed at the seam cannot slip a divergent index/submodule past.

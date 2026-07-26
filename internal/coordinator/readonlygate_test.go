@@ -26,7 +26,7 @@ func cleanWorktree(t *testing.T, rn *Run) {
 	_ = os.Remove(filepath.Join(rn.runWorktree(), "stray.txt"))
 }
 
-// The read-only-phase edit policy (03.7/04.1b) refused end-to-end on a REAL linked worktree:
+// The read-only-phase edit policy refused end-to-end on a REAL linked worktree:
 // a dirty worktree refuses a CHECKPOINT (pair) and the plan phases; a clean worktree accepts;
 // IMPLEMENT/FIX still route through the git transaction; a replay of an already-accepted
 // read-only turn returns its receipt even when the worktree is now dirty.

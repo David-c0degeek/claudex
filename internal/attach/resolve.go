@@ -105,7 +105,7 @@ func runLocationFor(lay layout, runID string) RunLocation {
 		CommitTxnDir: lay.commitTxnJournalDir(runDir),
 		ArtifactsDir: filepath.Join(runDir, "artifacts"),
 		EvidenceDir:  filepath.Join(runDir, "evidence"),
-		// The session inbox and the human-readable mailbox mirror are repo-level per D018
+		// The session inbox and the human-readable mailbox mirror are repo-level
 		// (`.claudex/mailbox.md`), attach-derived so no consumer re-joins the private layout.
 		SessionDir: filepath.Join(base, "session"),
 		MailboxDir: base,

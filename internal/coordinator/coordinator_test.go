@@ -134,7 +134,7 @@ func editWorktree(t *testing.T, rn *Run) {
 
 // newPairedRun bootstraps a lead-claude run over a REAL git repository (created in
 // the empty repo dir) and fills the codex pair, leaving the run at PLAN_DRAFT with
-// the lead's first turn issued. The real seams matter since 04.2: an IMPLEMENT/FIX
+// the lead's first turn issued. The real seams matter: an IMPLEMENT/FIX
 // submit routes through the git commit transaction against the real linked worktree.
 func newPairedRun(t *testing.T, repo string) (runID, lead, pair string) {
 	return newPairedRunWithPolicy(t, repo, policyBytes())

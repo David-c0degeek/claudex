@@ -12,8 +12,9 @@
 // already-decided ownerless TESTS pass/fail into VERIFY or FIX). The ownerless VERIFY is
 // activated by attach.ReplaceAttach (which stands alone). It does NOT run the mechanical test
 // gate itself — the attempt/executor/evidence authority (deciding the outcome by exit code
-// and the unchanged exact tree over a durable attempt record) is subject 04.5, which binds the
-// git commit/tree identities from 04.1–04.4 and then composes onto SubmitTestOutcome. It also
+// and the unchanged exact tree over a durable attempt record) is the mechanical test-gate
+// authority, which binds the git commit/tree identities and then composes onto
+// SubmitTestOutcome. It also
 // does not resolve human gates or expose a CLI; an unsupported edge fails closed before any
 // effect is published. Every mutating entrypoint gates on the aggregate journal reader (a
 // complete pairing, no pending replacement) before Registry authority.
@@ -80,7 +81,7 @@ type Run struct {
 // production. afterFacts fires inside precompute once fact preparation is done (or
 // skipped) and before minting; afterPrecompute fires after precompute and before
 // transport acquires the run lock. Both run while the submit holds its read lock.
-// The three git-transaction seams inject crash CUTS for the 04.2 crash matrix: a
+// The three git-transaction seams inject crash CUTS for the commit-transaction crash matrix: a
 // non-nil returned error halts the submit at exactly that point, leaving the
 // durable state a real power cut would (beforeGitJournal: artifact published and
 // commit/target-index objects built, but no journal record; stepApply: the journal
@@ -265,7 +266,7 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 		Journal:  runJournalReader{loc: rn.loc, state: rn.state},
 		Sink:     rn.store,
 		Prepare:  prepare,
-		// The read-only-phase edit-policy gate (03.7/04.1b): transport invokes it under the
+		// The read-only-phase edit-policy gate: transport invokes it under the
 		// run guard only for a genuinely authorized new acceptance in a non-editable turn.
 		WorktreeClean: func() (bool, error) { return rn.git.WorktreeClean(ctx, rn.runWorktree()) },
 	}, sessionID, raw)
@@ -273,7 +274,7 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 
 // SubmitTestOutcome authors the coordinator-owned TESTS pass/fail through the locked
 // transport primitive. It is ownerless — no agent turn, no artifact, no accepted turn: the
-// mechanical-gate attempt authority (subject 04.5) supplies the outcome, the evidence digest,
+// mechanical-gate attempt authority supplies the outcome, the evidence digest,
 // and the expectedRevision the outcome was derived against. The candidate identities are
 // pre-minted OFF the guard (the FIX/gate id, selected under the guard by the pure engine
 // adapter — never minted under the guard), and transport enforces the run identity bind
@@ -281,7 +282,7 @@ func (rn *Run) Submit(ctx context.Context, sessionID string, raw []byte) (transp
 // cancellation, and the exact TESTS-outcome shape. A pass enters ownerless VERIFY one
 // generation past the pair; a fail routes to the lead's FIX or the test-budget gate.
 //
-// evidenceDigest is the sha256 the outcome's ownerless source hashes; subject 04.5 binds it
+// evidenceDigest is the sha256 the outcome's ownerless source hashes; the mechanical test gate binds it
 // to a durable attempt record. transport validates it as the ownerless empty-turn source shape.
 func (rn *Run) SubmitTestOutcome(ctx context.Context, pass bool, evidenceDigest string, expectedRevision uint64) (transport.TestOutcomeResult, error) {
 	rn.mu.RLock()
@@ -371,7 +372,7 @@ func (rn *Run) precomputeTestOutcome(pass bool, expectedRevision uint64) (transp
 }
 
 // MirrorMailbox rebuilds the human-readable .claudex/mailbox.md transcript from the run's
-// durable ledger and immutable artifacts (D018: a rebuildable, re-validated projection,
+// durable ledger and immutable artifacts (a rebuildable, re-validated projection,
 // atomically replaced). It is idempotent — every submit rebuilds it, so a mirror a crash left
 // stale or missing is repaired by the next successful or replayed submit. It serializes on the
 // REPOSITORY lock and binds to the current active-run pointer inside that boundary (see

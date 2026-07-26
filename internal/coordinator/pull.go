@@ -102,7 +102,7 @@ func pullFrom(repoDir string, loc attach.RunLocation, sessionID string) (transpo
 		SessionID: sessionID,
 		Role:      role,
 		// Binding guidance is the set of human decisions that stay binding for the rest of the run.
-		// Human gates are subject 05, so there are none yet — an empty set is the honest projection,
+		// Human gates are not built yet, so there are none — an empty set is the honest projection,
 		// not a placeholder to be filled from something else.
 		BindingGuidance:       nil,
 		CurrentPairGeneration: view.PairGeneration,
@@ -161,7 +161,7 @@ func verifiedEvidence(repoDir string, loc attach.RunLocation, rs state.RunState)
 // expectedSource re-derives the {commit, tree} the live turn's packet must be cut from, through the
 // SAME function the producer used. The tree is read from the object store because run state stores
 // only the base COMMIT — deriving it here rather than persisting it is the ruling recorded in the
-// 04.3 log: the source is a pure function of state, and a second stored copy would add a coherence
+// review-evidence design: the source is a pure function of state, and a second stored copy would add a coherence
 // invariant every issuance and recovery writer would have to keep synchronized.
 func expectedSource(repoDir string, rs state.RunState, loc attach.RunLocation) (evidence.SourceObject, error) {
 	g, err := gitx.New()

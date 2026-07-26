@@ -25,7 +25,7 @@ const snapshotPerm = 0o600
 // recorded" crash cut at a named step. It is nil in production.
 var stepFailpoint func(step string) error
 
-// seams bundles the git-touching participants subject 04 fills.
+// seams bundles the git-touching participants the git-transaction layer fills.
 type seams struct {
 	base     BaseResolver
 	worktree WorktreeProvisioner
@@ -79,7 +79,7 @@ func planFor(ctx context.Context, lay layout, sm seams, g *genstore.Guard, raw t
 			Name:   "worktree",
 			Status: func() (txn.StepStatus, error) { return sm.worktree.ObserveWorktree(ctx, lay.repoDir, in) },
 			Apply:  func() error { return sm.worktree.ApplyWorktree(ctx, lay.repoDir, in) },
-			// The worktree is an EXTERNAL git participant (subject 04). ConfirmWorktree
+			// The worktree is an EXTERNAL git participant. ConfirmWorktree
 			// reconfirms the provisioned branch/registration/HEAD/clean-tree identity AND
 			// forces the git/OS durability barrier under the held guard — Observe==Applied
 			// proves identity, not that the directory entries survive a crash — so the journal

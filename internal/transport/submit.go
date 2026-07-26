@@ -199,7 +199,8 @@ type Prepare func(snapshot state.RunState, prepared PreparedSubmit) (PreparedTra
 // mutation (ErrRepoMutationInReadOnlyPhase); a non-nil error is an unobservable
 // worktree (ErrWorktreeUnobserved) — the two are never conflated. The successful clean
 // observation is the policy linearization point; the run guard does not lock external
-// filesystem writers, so dirt appearing afterward is future dirt (04.4's concern).
+// filesystem writers, so dirt appearing afterward is future dirt (post-snapshot edit
+// detection's concern).
 type WorktreeClean func() (clean bool, err error)
 
 // SubmitDeps are the injected, lock-sharing dependencies of a submit.
@@ -539,7 +540,7 @@ func preparePublish(ctx context.Context, deps SubmitDeps, auth submitAuthorized,
 	return pt, nil
 }
 
-// readOnlyWorktreeGate enforces the 03.7 edit policy for a single authorized new
+// readOnlyWorktreeGate enforces the read-only-phase edit policy for a single authorized new
 // acceptance: if the turn is not an editable one (per the role+phase EditableTurn
 // predicate) and a clean gate is wired, the run worktree must be observed clean. An
 // unobservable worktree fails closed as ErrWorktreeUnobserved (never mislabeled a
@@ -602,7 +603,7 @@ func lockedSubmit(ctx context.Context, deps SubmitDeps, g *genstore.Guard, sessi
 		return reject(ErrGitParticipantRequired)
 	}
 
-	// Read-only-phase edit policy (03.7/04.1b): a genuinely authorized NEW acceptance in
+	// Read-only-phase edit policy: a genuinely authorized NEW acceptance in
 	// a turn that is not an editable lead IMPLEMENT_STEP/FIX must be made against a CLEAN
 	// worktree — the authority is the role+phase predicate, not the phase alone. Bound to
 	// the exact locked turn, resolved AFTER authorization and the replay return, BEFORE any

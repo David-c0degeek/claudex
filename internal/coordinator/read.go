@@ -182,7 +182,7 @@ func readCoherent[T any](repoDir, runID string, read func(loc attach.RunLocation
 		// The stores moved during the read; retry with a fresh bracket.
 	}
 	// Persistent churn: a run mutating faster than the bracket can read is itself recovery-
-	// required (D021 pins "retry, else recovery-required"), so callers keep the typed
+	// required (the rule is "retry, else recovery-required"), so callers keep the typed
 	// classification rather than a generic error.
 	return zero, fmt.Errorf("%w: no coherent snapshot after %d bracket attempts (persistent churn)", ErrReadRecoveryRequired, readCoherenceMaxAttempts)
 }

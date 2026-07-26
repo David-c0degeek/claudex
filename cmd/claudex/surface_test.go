@@ -11,15 +11,15 @@ import (
 	"testing"
 )
 
-// TestExactCommandSurface is the 03.9 invariant: attach is the SOLE run bootstrap, and the shipped
+// TestExactCommandSurface is the command-surface invariant: attach is the SOLE run bootstrap, and the shipped
 // executable surface is exactly the attach protocol plus the read-only legacy inspector.
 //
 // It is written as an exact set rather than a "these exist" check on purpose. The subject's whole
 // point is that nothing else can create or drive a run — a test that only asserted presence would
 // pass just as happily if a stray `run` or `pair` entrypoint were added beside them.
 func TestExactCommandSurface(t *testing.T) {
-	// Per the D021 amendment, gates/operator are a subject-05 closure dependency and are NOT part of
-	// this surface until 05 lands them.
+	// gates/operator are not built yet — they have no library API — and are NOT part of this
+	// surface until they land.
 	want := []string{"attach", "help", "inspect-legacy", "pull", "status", "submit", "version", "wait"}
 
 	// Compare against the ACTUAL routed set, enumerated from the dispatch table. Iterating the

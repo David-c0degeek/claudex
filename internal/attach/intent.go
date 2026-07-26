@@ -9,7 +9,7 @@
 // repaired forward: recovery reconstructs the identical plan from the intent and
 // re-drives. The task and effective-policy snapshots are ordinary atomic input
 // persistence (done here); only base-commit resolution and worktree creation are
-// git seams that subject 04 fills behind a frozen interface.
+// git seams the git-transaction layer fills behind a frozen interface.
 package attach
 
 import (
@@ -28,7 +28,7 @@ const intentKind = "bootstrap"
 
 // bootstrapIntentVersion is the bootstrap PAYLOAD schema version, independent of the txn
 // envelope version. It is bumped whenever the persisted BootstrapIntent shape changes in a way
-// an older reader cannot honor (per D017: a durable required-field change is a version change).
+// an older reader cannot honor (a durable required-field change is a version change).
 // Version 1 is the first explicitly-versioned shape and carries PairJoinOperationID; a payload
 // with any other version (including a pre-versioning payload that decodes to 0) is refused.
 const bootstrapIntentVersion = 1

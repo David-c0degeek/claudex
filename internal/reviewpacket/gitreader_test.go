@@ -16,7 +16,7 @@ import (
 )
 
 // The packet materializes bytes from the COMMITTED object and is byte-stable regardless of later
-// worktree edits — the core 04.3 invariant.
+// worktree edits — the core review-evidence invariant.
 var testBounds = evidence.Bounds{MaxTotalBytes: 262144, MaxFileBytes: 98304, MaxRequests: 8}
 
 func TestReadsFromCommitNotWorktree(t *testing.T) {

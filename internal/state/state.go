@@ -254,7 +254,7 @@ type VerifyRequirement struct {
 }
 
 // PauseKind discriminates the two durable human-gated pauses. Both use
-// AWAIT_GUIDANCE + LifecyclePaused + Gate; neither is the D019 usage-window pause
+// AWAIT_GUIDANCE + LifecyclePaused + Gate; neither is the usage-window pause
 // (LifecyclePausedBudget), which carries no gate.
 type PauseKind string
 

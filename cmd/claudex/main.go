@@ -5,7 +5,7 @@
 // This is the greenfield Go implementation. The attach protocol —
 // attach/pull/submit/wait/status — is wired over the coordinator, alongside the
 // read-only inspector for pre-pivot Python runs. Human gates and the operator
-// surface arrive with subject 05.
+// surface are not built yet.
 package main
 
 import (
@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 type handler func(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 // commands is the COMPLETE dispatch table — the single source of what this binary can do. It is a
-// table rather than a switch so the shipped command surface is enumerable: the 03.9 invariant is
+// table rather than a switch so the shipped command surface is enumerable: the invariant is
 // that attach is the sole run bootstrap and nothing else exists, and that can only be asserted
 // against the actual routed set. A switch can be extended without any test noticing.
 var commands = map[string]handler{
@@ -163,4 +163,4 @@ Commands:
   inspect-legacy   Print a redacted, read-only view of a pre-pivot Python run
                    (state.json); it is never resumed as an attach run
 
-Human gates and the operator surface arrive with subject 05.`
+Human gates and the operator surface are not built yet.`

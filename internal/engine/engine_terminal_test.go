@@ -289,7 +289,7 @@ func TestVerifyBudgetGate(t *testing.T) {
 }
 
 // The verification's criteria must cover the frozen acceptance criteria exactly; the
-// verdict must be consistent with its findings; a scope expansion is a blocker (D020).
+// verdict must be consistent with its findings; a scope expansion is a blocker.
 func TestVerifyProjectionRejects(t *testing.T) {
 	reach := func(t *testing.T) *state.Store {
 		store := newStore(t)

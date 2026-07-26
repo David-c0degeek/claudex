@@ -2,7 +2,7 @@
 // executable via exec.CommandContext with EXPLICIT ARGV (never a shell), so the coordinator
 // owns git as a concrete participant in the prepared-transaction machine.
 //
-// Hardening (subject 04.0): every invocation disables hooks by pointing core.hooksPath at a
+// Hardening: every invocation disables hooks by pointing core.hooksPath at a
 // FRESH EMPTY directory (an empty core.hooksPath value is ambiguous), neutralizes personal and
 // system git configuration, strips ambient authority-changing GIT_* variables from the child
 // environment, forces the C locale and non-interactive behavior, and bounds + redacts the
@@ -120,7 +120,7 @@ var (
 
 // maxNulRecord bounds a SINGLE NUL-separated record (a path or a diff header). maxInventoryBytes is
 // the TOTAL output ceiling for RunNulRecords — a documented, realistic bound (a very large tree's
-// `ls-tree -r` inventory is tens of MiB) that keeps memory bounded per 04.0's hardened-leaf
+// `ls-tree -r` inventory is tens of MiB) that keeps memory bounded per the hardened-leaf
 // requirement while comfortably covering legitimate >1 MiB inventories. Both are package vars so a
 // test can shrink them to exercise the fail-closed overflow paths cheaply.
 var (

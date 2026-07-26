@@ -1,5 +1,5 @@
-// Package evidence is the sole producer and verifier of the immutable review-evidence packet
-// (subject 04.3). A read-only review turn is actionable only through a hash-bound packet
+// Package evidence is the sole producer and verifier of the immutable review-evidence packet.
+// A read-only review turn is actionable only through a hash-bound packet
 // materialized from a COMMITTED Git object — never the live worktree. This package never mints run
 // identity and never mutates run state; its callers (the issuance authorities) bind the resulting
 // EvidenceRef into the state transition, and pull re-verifies + projects it.

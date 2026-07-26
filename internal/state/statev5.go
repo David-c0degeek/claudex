@@ -119,7 +119,7 @@ func effAtPlanEnd(eff, effFix Phase) bool {
 func validateV5Shape(rs *RunState) error {
 	// Gate coherence: pause, gate, AWAIT_GUIDANCE, and LifecyclePaused are all
 	// present/true together or all absent/false together — the same exact shape the
-	// wait/status contract assumes. D019 LifecyclePausedBudget is distinct and
+	// wait/status contract assumes. LifecyclePausedBudget is distinct and
 	// carries none of them.
 	hasPause := rs.Pause != nil
 	hasGate := rs.Gate != nil
