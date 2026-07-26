@@ -29,8 +29,12 @@ distro="${CLAUDEX_WSL_DISTRO:-Ubuntu}"
 if [ -n "${CLAUDEX_LINUX_TEST_STAGE:-}" ]; then
   stage="$CLAUDEX_LINUX_TEST_STAGE"
 else
-  # Git prints a forward-slash Windows path here, and .git is never committed.
-  stage="$(git rev-parse --show-toplevel)/.git/claudex-linux-test"
+  # --absolute-git-dir, NOT "<toplevel>/.git". In a LINKED worktree, <toplevel>/.git is a regular file
+  # holding a gitdir pointer, so mkdir -p on it fails with "Not a directory" — and linked worktrees are
+  # exactly where this runner is needed, since the run worktree the gate tests commands in is one.
+  # --absolute-git-dir resolves to a real directory in both the main and linked cases, and nothing
+  # under it is ever committed.
+  stage="$(git rev-parse --absolute-git-dir)/claudex-linux-test"
 fi
 # C:/x -> /mnt/c/x
 stage_wsl="$(printf '%s' "$stage" | sed -E 's#^([A-Za-z]):#/mnt/\l\1#')"
@@ -44,7 +48,16 @@ id="$$-${RANDOM}"
 name="$(basename "$pkg").${id}.test"
 run_dir="/tmp/claudex-linux-test/${id}"
 
-mkdir -p "$stage"
+# Fail loudly rather than half-working: a staging directory that cannot be created is the failure mode
+# that previously turned every mutation result into a false "detected".
+if ! mkdir -p "$stage"; then
+  echo "linux-test: cannot create staging directory '$stage'" >&2
+  exit 2
+fi
+if [ ! -d "$stage" ]; then
+  echo "linux-test: staging path '$stage' is not a directory" >&2
+  exit 2
+fi
 cleanup() {
   rm -f "$stage/$name" 2>/dev/null || true
   wsl.exe -d "$distro" -- bash -lc "rm -rf '$run_dir'" >/dev/null 2>&1 || true

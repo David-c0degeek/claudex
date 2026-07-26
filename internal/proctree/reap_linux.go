@@ -169,7 +169,8 @@ func drainGroup(pgid int) (int, LeaderOutcome, error) {
 // The sequence is exact, and each step exists because a shorter one is wrong:
 //
 //  1. signal the whole GROUP, since the leader may already be gone;
-//  2. drain with waitpid(-pgid), scoped so a setsid escapee cannot block us forever;
+//  2. drain with waitpid(-pgid), scoped to the OWNED group so an out-of-model escapee cannot be
+//     reaped here and counted into a total the receipt and the TERMINAL both bind;
 //  3. probe with kill(-pgid, 0) — ECHILD and group-empty are DIFFERENT facts, and ECHILD can be true
 //     before an in-group grandchild has reparented, so draining until ECHILD and stopping there would
 //     declare victory over a group that still has members;
