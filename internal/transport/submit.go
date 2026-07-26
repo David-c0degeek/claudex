@@ -227,10 +227,9 @@ type Prepare func(snapshot state.RunState, prepared PreparedSubmit) (PreparedTra
 //     is owned by the mechanical test gate and the merge gate, which are not built yet; both carry
 //     that obligation explicitly in their boxes.
 //
-// It is the guard-time gate transport
-// calls it only after the exact locked turn is authorized, only for a genuine new
-// acceptance in a read-only turn (`!EditableTurn`), and only before any sink/state
-// effect. The coordinator supplies the git I/O. A (false, nil) result is an observed
+// It is the guard-time read-only-phase gate: transport calls it only after the exact locked turn is
+// authorized, only for a genuine new acceptance in a read-only turn (`!EditableTurn`), and only
+// before any sink/state effect. The coordinator supplies the git I/O. A (false, nil) result is an observed
 // mutation (ErrRepoMutationInReadOnlyPhase); a non-nil error is an unobservable
 // worktree (ErrWorktreeUnobserved) — the two are never conflated. The successful clean
 // observation is the policy linearization point; the run guard does not lock external
