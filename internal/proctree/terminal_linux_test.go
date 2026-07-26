@@ -5,23 +5,67 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-type recordingLease struct{ released int }
+// The ordering instruments below are the point of this file.
+//
+// A test that runs the sequence and afterwards checks a receipt, one frame and one release all exist
+// would stay green if the terminal were sent before the receipt, or the lease released before either.
+// That is presence, not order — and order is the entire reason this object exists. So each step
+// asserts, AT THE INSTANT IT RUNS, what must already be true and what must not yet have happened.
 
-func (l *recordingLease) Release() error { l.released++; return nil }
+// orderingLease asserts at release time that the receipt is durable and the terminal already sent.
+type orderingLease struct {
+	t        *testing.T
+	root     *os.Root
+	stat     *bytes.Buffer
+	released int
+	err      error
+}
 
-type failingLease struct{}
+func (l *orderingLease) Release() error {
+	l.t.Helper()
+	l.released++
+	if _, err := ReadReceipt(l.root, "att-1"); err != nil {
+		l.t.Errorf("lease released before the receipt was durable: %v", err)
+	}
+	if l.stat.Len() == 0 {
+		l.t.Error("lease released before the terminal was sent")
+	}
+	return l.err
+}
 
-func (failingLease) Release() error { return errors.New("lease stuck") }
+// orderingStat asserts at write time that the receipt is already durable and the lease still held.
+type orderingStat struct {
+	t     *testing.T
+	root  *os.Root
+	buf   *bytes.Buffer
+	lease *orderingLease
+	err   error
+}
 
-// supervise wires a real contained command to a real reaper, real receipt publication and the real
-// protocol, so the ordering is exercised end to end rather than against stubs.
-func supervise(t *testing.T, script string, tweak func(*Supervision)) (Supervision, *bytes.Buffer, *os.Root) {
+func (w *orderingStat) Write(p []byte) (int, error) {
+	w.t.Helper()
+	if _, err := ReadReceipt(w.root, "att-1"); err != nil {
+		w.t.Errorf("terminal sent before the receipt was durable: %v", err)
+	}
+	if w.lease != nil && w.lease.released != 0 {
+		w.t.Error("terminal sent after the lease was already released")
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	return w.buf.Write(p)
+}
+
+// superviseStarted wires a real contained command to a real reaper, real receipt publication and the
+// real protocol, with the ordering instruments in place.
+func superviseStarted(t *testing.T, script string, tweak func(*Supervision)) (Supervision, *bytes.Buffer, *os.Root, *orderingLease) {
 	t.Helper()
 	if err := BecomeSubreaper(); err != nil {
 		t.Fatalf("BecomeSubreaper: %v", err)
@@ -55,46 +99,62 @@ func supervise(t *testing.T, script string, tweak func(*Supervision)) (Supervisi
 	}
 	t.Cleanup(func() { _ = r.Close() })
 
+	s, buf, root, lease := baseSupervision(t, LaunchStarted)
+	s.Spawn = sp
+	s.Reaper = r
+	s.PGID = pgid
+	if tweak != nil {
+		tweak(&s)
+	}
+	return s, buf, root, lease
+}
+
+func baseSupervision(t *testing.T, outcome LaunchOutcome) (Supervision, *bytes.Buffer, *os.Root, *orderingLease) {
+	t.Helper()
 	root, err := os.OpenRoot(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenRoot: %v", err)
 	}
 	t.Cleanup(func() { root.Close() })
 
-	stat := &bytes.Buffer{}
+	buf := &bytes.Buffer{}
+	lease := &orderingLease{t: t, root: root, stat: buf}
+	stat := &orderingStat{t: t, root: root, buf: buf, lease: lease}
+
 	proto := &SupervisorProtocol{}
-	if err := proto.SendReady(stat); err != nil {
+	ready := &bytes.Buffer{}
+	if err := proto.SendReady(ready); err != nil {
 		t.Fatalf("SendReady: %v", err)
 	}
-	stat.Reset()
-	if _, err := proto.Recv(Frame{Type: TypeGo, Payload: proto.challenge}); err != nil {
-		t.Fatalf("Recv GO: %v", err)
+	// The protocol phase must MATCH the outcome, and the fact this is necessary is itself the
+	// launch-phase coupling working: an abort-shape terminal is refused in the authorized phase,
+	// because after GO "nothing happened" is not among the things that can be true.
+	drive := Frame{Type: TypeGo, Payload: proto.challenge}
+	if outcome == LaunchAborted {
+		drive = Frame{Type: TypeCancel}
 	}
-
-	s := Supervision{
+	if _, err := proto.Recv(drive); err != nil {
+		t.Fatalf("drive protocol to %v: %v", outcome, err)
+	}
+	return Supervision{
+		Outcome:       outcome,
 		AttemptID:     "att-1",
-		Spawn:         sp,
-		Reaper:        r,
-		PGID:          pgid,
 		Root:          root,
+		Lease:         lease,
 		Stat:          stat,
 		Protocol:      proto,
 		Policy:        fastPolicy,
 		AwaitDeadline: time.Now().Add(10 * time.Second),
 		AwaitPoll:     20 * time.Millisecond,
 		Now:           func() time.Time { return time.Unix(1753500000, 0) },
-	}
-	if tweak != nil {
-		tweak(&s)
-	}
-	return s, stat, root
+	}, buf, root, lease
 }
 
-// TestTerminalSequenceHappyPath: the receipt is durable BEFORE the terminal is announced, and the
-// lease is released last.
-func TestTerminalSequenceHappyPath(t *testing.T) {
-	lease := &recordingLease{}
-	s, stat, root := supervise(t, "exit 3", func(s *Supervision) { s.Lease = lease })
+// TestTerminalSequenceOrderIsEnforced is the ordering proof: the instruments fail the test at the
+// instant a step happens out of order, so a reordering is caught even though the end state looks the
+// same.
+func TestTerminalSequenceOrderIsEnforced(t *testing.T) {
+	s, buf, root, lease := superviseStarted(t, "exit 3", nil)
 
 	term, err := RunToTerminal(s)
 	if err != nil {
@@ -105,7 +165,7 @@ func TestTerminalSequenceHappyPath(t *testing.T) {
 	}
 	got, err := ReadReceipt(root, "att-1")
 	if err != nil {
-		t.Fatalf("the receipt must be durable before the terminal is announced: %v", err)
+		t.Fatalf("ReadReceipt: %v", err)
 	}
 	if err := got.AgreesWith(term); err != nil {
 		t.Fatalf("receipt and terminal disagree: %v", err)
@@ -113,26 +173,25 @@ func TestTerminalSequenceHappyPath(t *testing.T) {
 	if lease.released != 1 {
 		t.Fatalf("lease released %d times, want exactly 1", lease.released)
 	}
-	f, err := ReadFrame(stat)
+	f, err := ReadFrame(buf)
 	if err != nil {
 		t.Fatalf("ReadFrame: %v", err)
 	}
 	if f.Type != TypeTerminal {
 		t.Fatalf("frame = %v, want TERMINAL", f.Type)
 	}
-	if stat.Len() != 0 {
-		t.Fatalf("%d bytes left on stat; more than one frame was sent", stat.Len())
+	if buf.Len() != 0 {
+		t.Fatalf("%d bytes left on stat; more than one frame was sent", buf.Len())
 	}
 }
 
-// TestTerminalSequenceClosesStreamsFirst is the reason that is step one: the coordinator's drain
-// cannot see EOF while the supervisor still holds a write end, so the ordering would deadlock.
+// TestTerminalSequenceClosesStreamsFirst: the coordinator's drain cannot see EOF while the supervisor
+// still holds a write end, so the ordering would deadlock.
 func TestTerminalSequenceClosesStreamsFirst(t *testing.T) {
-	s, _, _ := supervise(t, "echo hello; exit 0", nil)
+	s, _, _, _ := superviseStarted(t, "echo hello; exit 0", nil)
 	if _, err := RunToTerminal(s); err != nil {
 		t.Fatalf("RunToTerminal: %v", err)
 	}
-	// Closing an already-closed handle is the observable proof the sequence dropped them.
 	if err := s.Spawn.Stdout.Close(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("stdout write copy was not closed by the sequence: %v", err)
 	}
@@ -141,27 +200,189 @@ func TestTerminalSequenceClosesStreamsFirst(t *testing.T) {
 	}
 }
 
+// TestTerminalSequenceTearsDownDespiteEarlierFailure. Returning early on a pre-teardown error would
+// leave the command group ALIVE while the supervisor exits — lease released by process death, domain
+// uncontained, worktree still mutable. Recovery blocking on an absent receipt does not clean that up,
+// so teardown must be attempted regardless.
+func TestTerminalSequenceTearsDownDespiteEarlierFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*Supervision)
+	}{
+		{"await fails", func(s *Supervision) {
+			// Closing the reaper makes Await fail while leaving the group perfectly alive.
+			if err := s.Reaper.Close(); err != nil {
+				t.Fatalf("close reaper: %v", err)
+			}
+		}},
+		{"stream close fails", func(s *Supervision) {
+			// Closing the underlying descriptor out from under the *os.File makes Close return EBADF,
+			// which is a genuine failure rather than the ErrClosed the sequence tolerates. Passing a
+			// bogus fd to os.NewFile does not work: it returns nil, which CloseStreamCopies skips.
+			if err := syscall.Close(int(s.Spawn.Stdout.Fd())); err != nil {
+				t.Fatalf("close underlying fd: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf, root, lease := superviseStarted(t, "sleep 30", nil)
+			pgid := s.PGID
+			tc.break_(&s)
+
+			if _, err := RunToTerminal(s); err == nil {
+				t.Fatal("RunToTerminal reported success despite a pre-teardown failure")
+			}
+			// The whole point: the group must be GONE even though the sequence failed.
+			empty, eerr := groupIsEmpty(pgid)
+			if eerr != nil {
+				t.Fatalf("groupIsEmpty: %v", eerr)
+			}
+			if !empty {
+				t.Fatal("the owned group survived a failed sequence; containment cleanup was skipped")
+			}
+			if _, rerr := ReadReceipt(root, "att-1"); !errors.Is(rerr, ErrReceiptMissing) {
+				t.Fatalf("a receipt was published for a failed sequence: %v", rerr)
+			}
+			if buf.Len() != 0 {
+				t.Fatal("a terminal was announced for a failed sequence")
+			}
+			if lease.released != 0 {
+				t.Fatal("the lease was released for a failed sequence")
+			}
+		})
+	}
+}
+
+// TestTerminalSequenceNoCommandOutcomes: both no-command paths run the same ordered authority.
+func TestTerminalSequenceNoCommandOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		outcome   LaunchOutcome
+		errClass  string
+		wantShape terminalShape
+	}{
+		{"aborted before GO", LaunchAborted, "", shapeAbort},
+		{"spawn failed after GO", LaunchSpawnFailed, "not_found", shapeSpawnFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf, root, lease := baseSupervision(t, tc.outcome)
+			s.SpawnErrorClass = tc.errClass
+
+			term, err := RunToTerminal(s)
+			if err != nil {
+				t.Fatalf("RunToTerminal: %v", err)
+			}
+			if term.shape() != tc.wantShape {
+				t.Fatalf("shape = %v, want %v", term.shape(), tc.wantShape)
+			}
+			if term.CommandStarted || term.CommandPGID != 0 || term.Reaped != 0 {
+				t.Fatalf("a no-command terminal carries run facts: %+v", term)
+			}
+			got, rerr := ReadReceipt(root, "att-1")
+			if rerr != nil {
+				t.Fatalf("the receipt must be published for a no-command outcome too: %v", rerr)
+			}
+			if !got.GroupEmpty {
+				t.Fatal("a no-command receipt must state the group is empty; nothing was ever started")
+			}
+			if err := got.AgreesWith(term); err != nil {
+				t.Fatalf("receipt and terminal disagree: %v", err)
+			}
+			if lease.released != 1 {
+				t.Fatalf("lease released %d times, want exactly 1", lease.released)
+			}
+			if f, ferr := ReadFrame(buf); ferr != nil || f.Type != TypeTerminal {
+				t.Fatalf("frame = %v (err %v), want TERMINAL", f.Type, ferr)
+			}
+		})
+	}
+}
+
+// TestTerminalSequenceKeepsTheLeaseWhenTheTerminalCannotBeSent: the lease goes last, so a failure to
+// announce must not leave it free while this supervisor is unfinished.
+func TestTerminalSequenceKeepsTheLeaseWhenTheTerminalCannotBeSent(t *testing.T) {
+	s, _, root, lease := baseSupervision(t, LaunchAborted)
+	s.Stat.(*orderingStat).err = errors.New("stat pipe gone")
+
+	if _, err := RunToTerminal(s); !errors.Is(err, ErrTerminalSequence) {
+		t.Fatalf("err = %v, want ErrTerminalSequence", err)
+	}
+	if lease.released != 0 {
+		t.Fatal("the lease was released even though the terminal was never announced")
+	}
+	// The receipt is already durable at that point, which is correct: it precedes the announcement.
+	if _, err := ReadReceipt(root, "att-1"); err != nil {
+		t.Fatalf("the receipt should already be durable: %v", err)
+	}
+}
+
+// TestTerminalSequenceReportsALeaseReleaseFailure: releasing last does not mean failing quietly.
+func TestTerminalSequenceReportsALeaseReleaseFailure(t *testing.T) {
+	s, _, root, lease := baseSupervision(t, LaunchAborted)
+	lease.err = errors.New("lease stuck")
+
+	term, err := RunToTerminal(s)
+	if !errors.Is(err, ErrTerminalSequence) {
+		t.Fatalf("err = %v, want ErrTerminalSequence", err)
+	}
+	// The terminal is still returned: it WAS announced and the receipt IS durable. Only the release
+	// failed, and a caller that discarded the terminal would lose facts that really happened.
+	if term.shape() != shapeAbort {
+		t.Fatalf("the terminal that was actually sent should still be returned, got %+v", term)
+	}
+	if _, rerr := ReadReceipt(root, "att-1"); rerr != nil {
+		t.Fatalf("the receipt should be durable: %v", rerr)
+	}
+}
+
+func TestTerminalSequenceValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mutet func(*Supervision)
+	}{
+		{"no outcome", func(s *Supervision) { s.Outcome = 0 }},
+		{"no attempt id", func(s *Supervision) { s.AttemptID = "" }},
+		{"no root", func(s *Supervision) { s.Root = nil }},
+		{"no stat", func(s *Supervision) { s.Stat = nil }},
+		{"no protocol", func(s *Supervision) { s.Protocol = nil }},
+		{"no clock", func(s *Supervision) { s.Now = nil }},
+		{"no lease", func(s *Supervision) { s.Lease = nil }},
+		{"abort carrying a spawn error", func(s *Supervision) { s.SpawnErrorClass = "x" }},
+		{"spawn failure without a class", func(s *Supervision) {
+			s.Outcome = LaunchSpawnFailed
+			s.SpawnErrorClass = ""
+		}},
+		{"no-command owning a group", func(s *Supervision) { s.PGID = 42 }},
+		{"started without a reaper", func(s *Supervision) { s.Outcome = LaunchStarted; s.PGID = 42 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := baseSupervision(t, LaunchAborted)
+			tc.mutet(&s)
+			_, err := RunToTerminal(s)
+			if err == nil {
+				t.Fatal("RunToTerminal accepted an inconsistent supervision")
+			}
+			if !strings.Contains(err.Error(), "proctree:") {
+				t.Fatalf("unexpected error shape: %v", err)
+			}
+		})
+	}
+}
+
 // TestTerminalSequencePublishesNothingWhenTeardownFails. A teardown that cannot prove the group empty
-// must leave NO receipt and send NO terminal, so recovery finds the proof absent and blocks rather
-// than trusting an unfinished cleanup.
+// must leave NO receipt and send NO terminal.
 func TestTerminalSequencePublishesNothingWhenTeardownFails(t *testing.T) {
-	lease := &recordingLease{}
 	// A plain `sleep 30` is NOT a hostile fixture: sleep dies on SIGTERM, the group drains inside the
-	// deadline, and the test passes while proving nothing — the same trap that cost three wrong
-	// guesses in the reap slice. An ignoring shell that keeps regenerating work survives SIGTERM and
-	// still cannot ignore SIGKILL.
+	// deadline, and the test passes while proving nothing. An ignoring shell that regenerates work
+	// survives SIGTERM and still cannot ignore SIGKILL.
 	const survivesTerm = "trap '' TERM; while :; do sleep 0.05; done"
-	s, stat, root := supervise(t, survivesTerm, func(s *Supervision) {
-		s.Lease = lease
-		// Grace beyond the deadline: SIGKILL never arrives, so the group cannot drain in time.
+	s, buf, root, lease := superviseStarted(t, survivesTerm, func(s *Supervision) {
 		s.Policy = ReapPolicy{Grace: time.Hour, Deadline: 200 * time.Millisecond, Poll: 5 * time.Millisecond}
 		s.AwaitDeadline = time.Now().Add(150 * time.Millisecond)
 	})
 	t.Cleanup(func() { _, _ = ReapGroup(s.PGID, fastPolicy) })
 
-	// Prove the fixture is hostile before relying on it: give the shell time to install its trap,
-	// signal the group, and require it to still be populated. Without this the test could go green
-	// because the group died on its own.
+	// Prove the fixture is hostile before relying on it.
 	time.Sleep(150 * time.Millisecond)
 	if err := signalGroup(s.PGID, unix.SIGTERM); err != nil {
 		t.Fatalf("probe signal: %v", err)
@@ -172,83 +393,16 @@ func TestTerminalSequencePublishesNothingWhenTeardownFails(t *testing.T) {
 	}
 
 	_, err := RunToTerminal(s)
-	if !errors.Is(err, ErrTerminalSequence) {
-		t.Fatalf("err = %v, want ErrTerminalSequence", err)
-	}
 	if !errors.Is(err, ErrReapDeadline) {
 		t.Fatalf("err = %v, want the reap deadline preserved as the cause", err)
 	}
 	if _, rerr := ReadReceipt(root, "att-1"); !errors.Is(rerr, ErrReceiptMissing) {
 		t.Fatalf("a receipt was published for a teardown that never proved the group empty: %v", rerr)
 	}
-	if stat.Len() != 0 {
+	if buf.Len() != 0 {
 		t.Fatal("a terminal was announced for an unfinished cleanup")
 	}
 	if lease.released != 0 {
-		t.Fatal("the lease was released before cleanup completed; a recovering coordinator would see it free")
-	}
-}
-
-// TestTerminalSequenceKeepsTheLeaseWhenTheTerminalCannotBeSent: the lease goes last, so a failure to
-// announce must not leave it free while this supervisor is unfinished.
-func TestTerminalSequenceKeepsTheLeaseWhenTheTerminalCannotBeSent(t *testing.T) {
-	lease := &recordingLease{}
-	s, _, _ := supervise(t, "exit 0", func(s *Supervision) {
-		s.Lease = lease
-		s.Stat = failWriter{err: errors.New("stat pipe gone")}
-	})
-	if _, err := RunToTerminal(s); !errors.Is(err, ErrTerminalSequence) {
-		t.Fatalf("err = %v, want ErrTerminalSequence", err)
-	}
-	if lease.released != 0 {
-		t.Fatal("the lease was released even though the terminal was never announced")
-	}
-}
-
-// TestTerminalSequenceReportsALeaseReleaseFailure: releasing last does not mean failing quietly.
-func TestTerminalSequenceReportsALeaseReleaseFailure(t *testing.T) {
-	s, _, root := supervise(t, "exit 0", func(s *Supervision) { s.Lease = failingLease{} })
-	term, err := RunToTerminal(s)
-	if !errors.Is(err, ErrTerminalSequence) {
-		t.Fatalf("err = %v, want ErrTerminalSequence", err)
-	}
-	// The terminal is still returned: it WAS announced and the receipt IS durable. Only the release
-	// failed, and a caller that discarded the terminal would lose facts that really happened.
-	if !term.CommandStarted {
-		t.Fatal("the terminal that was actually sent should still be returned")
-	}
-	if _, rerr := ReadReceipt(root, "att-1"); rerr != nil {
-		t.Fatalf("the receipt should be durable: %v", rerr)
-	}
-}
-
-func TestTerminalSequenceValidation(t *testing.T) {
-	base, _, _ := supervise(t, "exit 0", nil)
-	t.Cleanup(func() { _, _ = ReapGroup(base.PGID, fastPolicy) })
-	for _, tc := range []struct {
-		name  string
-		mutet func(*Supervision)
-	}{
-		{"no attempt id", func(s *Supervision) { s.AttemptID = "" }},
-		{"no reaper", func(s *Supervision) { s.Reaper = nil }},
-		{"bad pgid", func(s *Supervision) { s.PGID = 0 }},
-		{"no root", func(s *Supervision) { s.Root = nil }},
-		{"no stat", func(s *Supervision) { s.Stat = nil }},
-		{"no protocol", func(s *Supervision) { s.Protocol = nil }},
-		{"no clock", func(s *Supervision) { s.Now = nil }},
-		{"bad await poll", func(s *Supervision) { s.AwaitPoll = 0 }},
-		{"bad policy", func(s *Supervision) { s.Policy = ReapPolicy{} }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := base
-			tc.mutet(&s)
-			_, err := RunToTerminal(s)
-			if err == nil {
-				t.Fatal("RunToTerminal accepted an incomplete supervision")
-			}
-			if !strings.Contains(err.Error(), "proctree:") {
-				t.Fatalf("unexpected error shape: %v", err)
-			}
-		})
+		t.Fatal("the lease was released before cleanup completed")
 	}
 }
