@@ -157,23 +157,28 @@ func lockedTestOutcome(ctx context.Context, deps TestOutcomeDeps, g *genstore.Gu
 		return reject(staleErr(rs, expectedRevision))
 	}
 
-	// The TESTS boundary. Nothing has edited the repository legitimately since the last
-	// implementation was accepted — TESTS is ownerless and every phase between carries a
-	// read-only turn — so dirt observed here PREDATES this boundary and raced the snapshot.
-	//
-	// It is checked for EVERY genuine new authorized outcome, not only the branch that issues
-	// FIX: a PASS advances into VERIFY, which is equally a phase no one may have edited in, and
-	// gating only the FIX branch would let a dirty worktree through on exactly the path where
-	// nobody looks at the repository again before the verifier reviews it. The check sits after
-	// the stale/phase/journal/registry authorization and before Prepare, so a refusal binds no
-	// identity and moves no state.
-	if werr := boundaryWorktreeGate(deps.WorktreeClean); werr != nil {
-		return reject(werr)
-	}
-
 	curPairGen, pgErr := currentPairGeneration(reg)
 	if pgErr != nil {
 		return reject(pgErr)
+	}
+
+	// The TESTS boundary, observed only once authorization is COMPLETE. Nothing has edited the
+	// repository legitimately since the last implementation was accepted — TESTS is ownerless and
+	// every phase between carries a read-only turn — so dirt observed here predates this boundary
+	// and raced the snapshot.
+	//
+	// Ordering matters in both directions. It runs AFTER the cross-store pair-generation check
+	// (and the stale/phase/journal/registry checks before it) so ambient filesystem state can never
+	// mask an authoritative run/registry mismatch: a run whose registry is wrong is wrong whatever
+	// the worktree looks like, and the agent path already establishes that precedence. It runs
+	// BEFORE Prepare and every state or identity effect, so a refusal binds nothing.
+	//
+	// It is checked for EVERY genuine new authorized outcome, not only the branch that issues FIX:
+	// PASS advances into VERIFY and a budget-exhausted FAIL opens a human gate, and both are
+	// boundaries no one may have edited across. Gating only the FIX branch would let a dirty
+	// worktree through on exactly the path where nobody looks at the repository again.
+	if werr := boundaryWorktreeGate(deps.WorktreeClean); werr != nil {
+		return reject(werr)
 	}
 
 	snapshot, cerr := cloneRunState(rs)
@@ -324,11 +329,15 @@ func cloneAcceptedTurns(m map[string]state.AcceptedTurn) map[string]state.Accept
 //
 // The successful observation is the LINEARIZATION POINT of the boundary, exactly as the read-only
 // submit gate defines it: dirt present at this instant predates the boundary and refuses it, and
-// dirt appearing after belongs to the editable interval this transition opens. The run guard does
-// not lock external filesystem writers, so an edit landing between this observation and the state
-// CAS is attributed to the new interval. That residue is inherent — recording the worktree at
-// issuance and checking it at the next submit would move the race, not remove it — so the contract
-// is stated rather than papered over.
+// dirt appearing after belongs to the interval the transition opens. The run guard does not lock
+// external filesystem writers, so an edit landing between this observation and the state CAS is
+// attributed to the new interval. That residue is inherent — recording the worktree at issuance and
+// checking it at the next submit would move the race, not remove it — so the contract is stated
+// rather than papered over.
+//
+// The refusal says nothing about what the boundary was going to do: some boundaries issue an
+// editable turn, others advance into an ownerless phase or open a human gate. All it establishes is
+// that post-snapshot dirt exists, so the transition must not proceed.
 //
 // Observed dirt and an unobservable worktree stay separately typed: an observation that could not
 // run is never reported as an observed edit, and its cause is preserved for errors.Is.

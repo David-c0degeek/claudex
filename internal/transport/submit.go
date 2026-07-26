@@ -61,19 +61,22 @@ var (
 	// state effect, and is distinct from ErrRepoMutationInReadOnlyPhase — an unobservable
 	// worktree is never reported as an observed mutation.
 	ErrWorktreeUnobserved = errors.New("transport: could not observe the read-only worktree")
-	// ErrPostSnapshotEdit means a PHASE BOUNDARY that is about to issue an editable turn was
-	// reached with the run worktree already dirty. Nothing may legitimately have edited the
-	// repository since the last implementation was accepted, so the dirt predates the boundary:
-	// it raced the snapshot that produced the accepted commit and would otherwise be folded
-	// silently into the NEXT commit, attributed to work it was never part of.
+	// ErrPostSnapshotEdit means a PHASE BOUNDARY was reached with the run worktree already dirty.
+	// Nothing may legitimately have edited the repository since the last implementation was
+	// accepted, so the dirt predates the boundary: it raced the snapshot that produced the accepted
+	// commit and would otherwise be carried silently past a transition that never accounted for it.
 	//
-	// It is deliberately distinct from ErrRepoMutationInReadOnlyPhase. That one says "you edited
-	// during someone else's turn"; this one says "an editable turn cannot start over dirt that is
-	// not yours". Merging them would make the operator message wrong in one of the two cases.
+	// It is deliberately BOUNDARY-NEUTRAL. A boundary need not issue a turn — a passing test
+	// advances into ownerless VERIFY and a budget-exhausted failure opens a human gate — so this
+	// says only what is actually known: post-snapshot dirt was detected and the boundary cannot
+	// advance. Claiming an editable turn was about to be issued would be false on those routes.
+	//
+	// It is distinct from ErrRepoMutationInReadOnlyPhase, which says "you edited during someone
+	// else's turn". Merging them would make the operator message wrong in one of the two cases.
 	//
 	// The refusal is RECOVERABLE, not terminal: no state, ledger, or identity is bound. An
 	// operator resolves the worktree and the transition is retried.
-	ErrPostSnapshotEdit = errors.New("transport: the worktree was already modified before this turn was issued")
+	ErrPostSnapshotEdit = errors.New("transport: post-snapshot changes in the run worktree; this phase boundary cannot advance")
 )
 
 const (
@@ -209,11 +212,20 @@ type Prepare func(snapshot state.RunState, prepared PreparedSubmit) (PreparedTra
 // matters: a pristine checkout of the wrong commit, or a detached HEAD, is "clean" to this
 // observer. It is NOT authority for "the worktree matches the last accepted commit".
 //
-// That stronger identity is proven where it is actually needed, by the snapshot path
-// (validateRunWorktree/ConfirmPreState re-prove the registered linked worktree, a symbolic HEAD on
-// the run branch at the frozen parent, and the frozen tree), so a wrong-HEAD worktree fails closed
-// there rather than being waved through by a second, weaker check here. Duplicating that proof at
-// this seam would create a rival authority for a fact one place already owns.
+// The stronger identity is owned PER ROUTE, and not by this seam:
+//
+//   - Any route that reaches a snapshot proves it there. validateRunWorktree/ConfirmPreState
+//     re-prove the registered linked worktree, a symbolic HEAD on the run branch at the frozen
+//     parent, and the frozen tree, so a wrong-HEAD worktree fails closed on every implementation
+//     acceptance. Duplicating that proof here would create a rival authority for a fact one place
+//     already owns.
+//   - A route that reaches DONE WITHOUT a further snapshot is NOT covered by the above, and this
+//     comment must not pretend otherwise: a passing test outcome can advance TESTS -> VERIFY -> DONE
+//     with no intervening snapshot, and the only worktree check on that path is this
+//     clean-relative-to-current-HEAD observer. A clean `reset --hard` to a wrong commit therefore
+//     traverses it today. Re-proving the TESTED accepted commit/tree before DONE and before a merge
+//     is owned by the mechanical test gate and the merge gate, which are not built yet; both carry
+//     that obligation explicitly in their boxes.
 //
 // It is the guard-time gate transport
 // calls it only after the exact locked turn is authorized, only for a genuine new

@@ -590,3 +590,36 @@ func TestTestOutcomeRequiresTheWorktreeObserver(t *testing.T) {
 		t.Fatalf("missing observer err = %v, want ErrMissingSeam", err)
 	}
 }
+
+// Authoritative run/registry state outranks ambient filesystem state. A run whose registry cannot
+// yield a live pair is wrong whatever the worktree looks like, so a dirty worktree must NOT mask the
+// mismatch — otherwise an operator chasing "post-snapshot changes" would clean the worktree and hit
+// the real fault only on the retry. The agent submit path already establishes this precedence
+// (authorizeLockedSubmit completes the pair-generation check before its clean gate).
+func TestTestOutcomeRegistryMismatchOutranksDirtyWorktree(t *testing.T) {
+	store, rev := newStoreAt(t, func(gen uint64, n *state.RunState) {
+		*n.StepIndex = n.AgreedPlan.Plan.StepCount
+		n.Phase = state.PhaseTests
+		n.Assignment = nil
+		n.Evidence = nil // the binding is consumed with the turn it authorized
+	})
+	// A lead-only registry: the pair generation cannot be derived.
+	if _, err := openRunRegistry(store).Mutate(0, func(gen uint64, n *state.Registry) error {
+		n.RunID = "run-a"
+		n.Lead = &state.RoleSlot{Agent: state.AgentClaude, CurrentSessionID: leadSess, Sessions: []state.SessionRecord{{SessionID: leadSess, Generation: 1, IssuedRegistryRevision: gen}}}
+		return nil
+	}); err != nil {
+		t.Fatalf("lead-only registry: %v", err)
+	}
+
+	deps := testOutcomeDeps(store, passToVerify())
+	deps.WorktreeClean = dirtyWorktree // both faults present at once
+
+	_, err := SubmitTestOutcome(context.Background(), deps, rev, evDigest)
+	if !errors.Is(err, ErrRunMismatch) {
+		t.Fatalf("err = %v, want ErrRunMismatch to outrank the dirty worktree", err)
+	}
+	if errors.Is(err, ErrPostSnapshotEdit) {
+		t.Fatal("ambient worktree state masked an authoritative registry mismatch")
+	}
+}
