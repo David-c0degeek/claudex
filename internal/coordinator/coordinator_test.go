@@ -18,6 +18,7 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/atomicfile"
 	"github.com/David-c0degeek/claudex/internal/attach"
+	"github.com/David-c0degeek/claudex/internal/canonjson"
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/engine"
 	"github.com/David-c0degeek/claudex/internal/evidence"
@@ -189,6 +190,75 @@ func testIssuer(t *testing.T, repo, runID string) attach.EvidenceIssuer {
 	}
 	t.Cleanup(func() { store.Close() })
 	return reviewpacket.NewIssuer(context.Background(), g, repo, loc.RunDir, loc.EvidenceDir, store)
+}
+
+// packetEntryBytes returns the payload a packet records under a logical path. The manifest maps the
+// lossless base64 path to the blob's sha256, which is also the blob's name in the packet root.
+func packetEntryBytes(t *testing.T, rn *Run, ev *state.AssignmentEvidence, logicalPath string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(rn.loc.EvidenceDir, ev.ManifestRelPath))
+	if err != nil {
+		t.Fatalf("read packet manifest: %v", err)
+	}
+	var m struct {
+		Entries []struct {
+			PathB64 string `json:"path_b64"`
+			SHA256  string `json:"sha256"`
+		} `json:"entries"`
+	}
+	if uerr := json.Unmarshal(raw, &m); uerr != nil {
+		t.Fatalf("decode packet manifest: %v", uerr)
+	}
+	want := base64.StdEncoding.EncodeToString([]byte(logicalPath))
+	for _, e := range m.Entries {
+		if e.PathB64 == want {
+			body, rerr := os.ReadFile(filepath.Join(rn.loc.EvidenceDir, filepath.Dir(ev.ManifestRelPath), e.SHA256))
+			if rerr != nil {
+				t.Fatalf("read packet blob for %s: %v", logicalPath, rerr)
+			}
+			return body
+		}
+	}
+	t.Fatalf("packet has no entry for %s", logicalPath)
+	return nil
+}
+
+// A plan_revision is a PATCH: the fixture leaves every section null and inherits them from the base.
+// So the packet must carry the MATERIALIZED resulting plan, not the revision artifact — otherwise a
+// reviewer sees only the responses and never the plan those responses produced.
+func assertPlanIsMaterialized(t *testing.T, rn *Run, rs state.RunState, logicalPath string) {
+	t.Helper()
+	if rs.Evidence == nil {
+		t.Fatalf("%s assignment must carry an evidence binding", rs.Phase)
+	}
+	body := packetEntryBytes(t, rn, rs.Evidence, logicalPath)
+	// The base draft's content, which the null revision inherited rather than restated.
+	for _, want := range []string{"architecture prose", "a risk", "step one"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("%s in the %s packet is missing inherited content %q; got %s", logicalPath, rs.Phase, want, body)
+		}
+	}
+	// It is the plan DOCUMENT, not the submit envelope: a revision artifact would carry responses and
+	// a message type, and the materialized document carries neither.
+	for _, unwanted := range []string{"responses", "message_type", "plan_revision"} {
+		if bytes.Contains(body, []byte(unwanted)) {
+			t.Fatalf("%s in the %s packet looks like a submit artifact (contains %q): %s", logicalPath, rs.Phase, unwanted, body)
+		}
+	}
+	// The bytes must be the exact document state froze the digest of.
+	if d, derr := canonjson.Digest(body); derr != nil {
+		t.Fatalf("digest the materialized plan: %v", derr)
+	} else if want := frozenPlanDigest(rs, logicalPath); d != want {
+		t.Fatalf("%s digest = %s, want the frozen %s", logicalPath, d, want)
+	}
+}
+
+// frozenPlanDigest is the materialized plan digest run state carries for this packet entry.
+func frozenPlanDigest(rs state.RunState, logicalPath string) string {
+	if logicalPath == evidence.ReservedContextPrefix+"agreed-plan.json" {
+		return rs.AgreedPlan.Plan.Digest
+	}
+	return rs.CandidatePlan.Digest
 }
 
 // assertCheckpointPacket verifies the packet bound to a live CHECKPOINT turn and checks it contains
@@ -414,6 +484,9 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 	if rs.Phase != state.PhasePlanCritique || rs.PendingFindings != nil {
 		t.Fatalf("not back at PLAN_CRITIQUE: %+v", rs)
 	}
+	// The critique that follows a REVISION must see the resulting plan, not the null-laden patch:
+	// revisionArtifact leaves every section nil, so the base content is inherited, not restated.
+	assertPlanIsMaterialized(t, rn, rs, evidence.ReservedContextPrefix+"candidate-plan.json")
 	submitOK(t, rn, pair, critiqueArtifact(t, rs.Assignment.ID, rs.Revision, "AGREE", false, nil, nil))
 	rs = cur(t, rn)
 	if rs.Phase != state.PhaseImplementStep || rs.AgreedPlan == nil || rs.StepIndex == nil || *rs.StepIndex != 0 {
@@ -431,6 +504,7 @@ func driveToTests(t *testing.T, rn *Run, lead, pair string) state.RunState {
 	// implementation report, and the CHANGED file's committed bytes — not the whole tree, and not
 	// the worktree.
 	assertCheckpointPacket(t, rn, rs)
+	assertPlanIsMaterialized(t, rn, rs, evidence.ReservedContextPrefix+"agreed-plan.json")
 
 	// CHECKPOINT reviewer retry: REVISE, only a nit, tests adequate -> stays CHECKPOINT.
 	submitOK(t, rn, pair, checkpointArtifact(t, rs.Assignment.ID, rs.Revision, "REVISE", true, []string{"nit"}))

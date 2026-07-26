@@ -7,8 +7,10 @@ import (
 	"github.com/David-c0degeek/claudex/internal/evidence"
 )
 
+const nul = "\x00"
+
 func rawRec(srcMode, dstMode, srcOID, dstOID, status, path string) []byte {
-	return []byte(":" + srcMode + " " + dstMode + " " + srcOID + " " + dstOID + " " + status + "\x00" + path + "\x00")
+	return []byte(":" + srcMode + " " + dstMode + " " + srcOID + " " + dstOID + " " + status + nul + path + nul)
 }
 
 func TestParseRawDiff(t *testing.T) {
@@ -57,6 +59,7 @@ func TestParseRawDiffPathsAreLossless(t *testing.T) {
 
 func TestParseRawDiffFailsClosed(t *testing.T) {
 	zero, a := strings.Repeat("0", 40), strings.Repeat("a", 40)
+	good := rawRec("000000", "100644", zero, a, "A", "x.go")
 	cases := map[string][]byte{
 		// A submodule has no blob to materialize; omitting it would silently drop a change the
 		// reviewer was told to review.
@@ -65,9 +68,14 @@ func TestParseRawDiffFailsClosed(t *testing.T) {
 		"rename status":            rawRec("100644", "100644", a, a, "R100", "moved.go"),
 		"unmerged status":          rawRec("100644", "100644", a, a, "U", "conflict.go"),
 		"malformed destination id": rawRec("000000", "100644", zero, "nope", "A", "x.go"),
-		"missing leading colon":    []byte("100644 100644 " + a + " " + a + " M\x00x.go\x00"),
-		"truncated metadata":       []byte(":100644 100644 M\x00x.go\x00"),
+		"missing leading colon":    []byte("100644 100644 " + a + " " + a + " M" + nul + "x.go" + nul),
+		"truncated metadata":       []byte(":100644 100644 M" + nul + "x.go" + nul),
 		"empty path":               rawRec("000000", "100644", zero, a, "A", ""),
+		// The stream must be accounted for EXHAUSTIVELY: a dropped fragment could hide a real change.
+		"missing final NUL":     good[:len(good)-1],
+		"trailing garbage":      append(append([]byte{}, good...), []byte("garbage")...),
+		"premature empty field": append([]byte(nul), good...),
+		"odd field count":       []byte(":000000 100644 " + zero + " " + a + " A" + nul),
 	}
 	for name, out := range cases {
 		t.Run(name, func(t *testing.T) {

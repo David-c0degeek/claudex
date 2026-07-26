@@ -34,15 +34,26 @@ func changedEntries(ctx context.Context, d Deps, parent, commit string) ([]evide
 // NUL, then the path terminated by NUL:
 //
 //	:<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0
+//
+// The stream is parsed EXHAUSTIVELY rather than best-effort: every byte must be accounted for. A
+// change list that silently ignored a trailing fragment, or stopped at the first empty field, could
+// drop a real change from the packet — and a packet missing a change is exactly the failure this
+// whole subject exists to prevent. Anything that is not "empty output, or complete metadata/path
+// pairs followed by exactly one terminator" fails closed.
 func parseRawDiff(out []byte) ([]evidence.RecipeEntry, error) {
+	if len(out) == 0 {
+		return nil, nil // an empty range is legal: nothing changed
+	}
 	fields := bytes.Split(out, []byte{0})
-	var entries []evidence.RecipeEntry
-	for i := 0; i+1 < len(fields); i += 2 {
-		meta, path := fields[i], fields[i+1]
-		if len(meta) == 0 {
-			break // the trailing terminator
-		}
-		e, err := rawDiffEntry(meta, path)
+	// A well-formed stream ends with a NUL, so Split leaves exactly one empty final field, and the
+	// records before it come in pairs.
+	if n := len(fields); n < 3 || len(fields[n-1]) != 0 || (n-1)%2 != 0 {
+		return nil, fmt.Errorf("%w: the change stream is truncated or malformed", ErrResolve)
+	}
+	records := fields[:len(fields)-1]
+	entries := make([]evidence.RecipeEntry, 0, len(records)/2)
+	for i := 0; i < len(records); i += 2 {
+		e, err := rawDiffEntry(records[i], records[i+1])
 		if err != nil {
 			return nil, err
 		}

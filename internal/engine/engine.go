@@ -1266,6 +1266,23 @@ func materializeChecks(checks []MaterializedCheck) (state.CheckSetRef, error) {
 // planDocDigest is the materialized plan-document digest: the canonical digest of
 // the plan's content sections, distinct from the submit artifact digest.
 func planDocDigest(markdown string, steps []PlanStep, risks, openQuestions []string) (string, error) {
+	return canonjson.DigestValue(planDocValue(markdown, steps, risks, openQuestions))
+}
+
+// MarshalPlanDocument returns the canonical bytes of a MATERIALIZED plan document — the resulting
+// plan itself, not the submit artifact that produced it. Those differ whenever a plan_revision is
+// involved: a revision is a PATCH that may leave sections null and inherit them from the base, so
+// its artifact shows only the delta.
+//
+// It is built from the SAME value planDocDigest hashes, so the digest of these bytes is by
+// construction the plan digest run state carries (PlanRef.Digest). A reader can therefore check the
+// bytes it was handed against the digest state froze.
+func MarshalPlanDocument(p CanonicalPlan) ([]byte, error) {
+	return canonjson.CanonicalizeValue(planDocValue(p.Markdown, p.Steps, p.Risks, p.OpenQuestions))
+}
+
+// planDocValue is the one canonical shape of a materialized plan document.
+func planDocValue(markdown string, steps []PlanStep, risks, openQuestions []string) map[string]any {
 	stepVals := make([]any, 0, len(steps))
 	for _, s := range steps {
 		stepVals = append(stepVals, map[string]any{
@@ -1275,13 +1292,12 @@ func planDocDigest(markdown string, steps []PlanStep, risks, openQuestions []str
 			"tests":       strsToVals(s.Tests),
 		})
 	}
-	doc := map[string]any{
+	return map[string]any{
 		"plan_markdown":  markdown,
 		"steps":          stepVals,
 		"risks":          strsToVals(risks),
 		"open_questions": strsToVals(openQuestions),
 	}
-	return canonjson.DigestValue(doc)
 }
 
 func strsToVals(ss []string) []any {

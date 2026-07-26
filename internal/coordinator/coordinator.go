@@ -652,7 +652,7 @@ func (rn *Run) precompute(ctx context.Context, raw []byte) (transport.Prepare, e
 				// The next turn is usually a RESPONSE to the turn being accepted right now, which is not
 				// in the accepted history yet (the packet is published before the state CAS). Passing the
 				// acceptance in flight is what lets a critique see the plan this submit establishes.
-				pending := &reviewpacket.Pending{Phase: snapshot.Phase, Plan: dec.Plan, Body: []byte(prepared.CanonicalJSON)}
+				pending := &reviewpacket.Pending{Phase: snapshot.Phase, Plan: dec.Plan, Ref: ev.Source, Body: []byte(prepared.CanonicalJSON)}
 				manifestRel, rootDigest, eerr := rn.issueEvidence(ctx, turnCand, dec.Next, snapshot, pending)
 				if eerr != nil {
 					return transport.PreparedTransition{}, eerr

@@ -50,16 +50,21 @@ func (p *Pending) artifact(d Deps, what string) ([]byte, error) {
 	return readArtifact(d, p.Ref, what)
 }
 
-// candidatePlan materializes the plan a planning turn must review: the one this acceptance
+// candidatePlan materializes the plan a planning turn must review. It is the RESULTING plan
+// document, replayed from the accepted history plus the acceptance in flight — never the submit
+// artifact, which for a revision is only a patch. The expected digest is the one the acceptance
 // establishes when the decision sets a new candidate, otherwise the one already named by state.
 func candidatePlan(d Deps, rs state.RunState, pending *Pending) ([]byte, error) {
-	if pending != nil && pending.Plan != nil {
-		return pending.artifact(d, "candidate plan")
+	var expect string
+	switch {
+	case pending != nil && pending.Plan != nil:
+		expect = pending.Plan.Digest
+	case rs.CandidatePlan != nil:
+		expect = rs.CandidatePlan.Digest
+	default:
+		return nil, fmt.Errorf("%w: there is no candidate plan to review", ErrResolve)
 	}
-	if rs.CandidatePlan != nil {
-		return readArtifact(d, rs.CandidatePlan.Source, "candidate plan")
-	}
-	return nil, fmt.Errorf("%w: there is no candidate plan to review", ErrResolve)
+	return materializedPlan(d, rs, pending, expect, "", "candidate plan")
 }
 
 // latestArtifactFor materializes the most recent artifact submitted in any of these phases,
@@ -180,7 +185,10 @@ func checkpointEntries(ctx context.Context, d Deps, rs state.RunState, src evide
 	if rs.AgreedPlan == nil {
 		return nil, fmt.Errorf("%w: CHECKPOINT has no agreed plan", ErrResolve)
 	}
-	plan, err := readArtifact(d, rs.AgreedPlan.Plan.Source, "agreed plan")
+	// The agreed plan is materialized too: when agreement came from a PLAN_REVISE, its source is a
+	// patch, and the frozen digest is of the resulting document — which is what the replay must
+	// reproduce.
+	plan, err := materializedPlan(d, rs, pending, rs.AgreedPlan.Plan.Digest, rs.AgreedPlan.Critique.TurnID, "agreed plan")
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +223,7 @@ func verifyEntries(ctx context.Context, d Deps, rs state.RunState, src evidence.
 	if rs.AgreedPlan == nil {
 		return nil, fmt.Errorf("%w: VERIFY has no agreed plan", ErrResolve)
 	}
-	plan, err := readArtifact(d, rs.AgreedPlan.Plan.Source, "agreed plan")
+	plan, err := materializedPlan(d, rs, nil, rs.AgreedPlan.Plan.Digest, rs.AgreedPlan.Critique.TurnID, "agreed plan")
 	if err != nil {
 		return nil, err
 	}
