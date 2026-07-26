@@ -99,15 +99,24 @@ func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, ph
 	}, nil
 }
 
-// ExpectedSource is the complete {commit, tree} a packet for this run state must be cut from. Before
-// the first accepted implementation it is the run's BaseCommit; afterwards it is the latest ACCEPTED
-// commit, so a reviewer always sees the state the run actually agreed to, never an unaccepted one.
+// ExpectedSource is the complete, PROVEN {commit, tree} a packet for this run state must be cut
+// from. Before the first accepted implementation it is the run's BaseCommit; afterwards it is the
+// latest ACCEPTED commit, so a reviewer always sees the state the run actually agreed to.
 //
-// It is exported because pull re-derives the SAME expectation when it re-verifies a bound packet.
-// Sharing this one function is what makes producer and verifier agree by construction rather than by
-// two derivations that could drift.
+// It is exported because pull re-derives the same expectation when it re-verifies a bound packet.
+// The proof is part of what is shared: the accepted tuple is persisted state, and persisted state is
+// not evidence that the objects still exist and still form a pair. Without proving here, pull would
+// accept a packet whose asserted source has since gone missing or become inconsistent in the object
+// store, and Expectation only checks object-id grammar.
 func ExpectedSource(ctx context.Context, d Deps, rs state.RunState) (evidence.SourceObject, error) {
-	return resolveSource(ctx, d, rs)
+	src, err := resolveSource(ctx, d, rs)
+	if err != nil {
+		return evidence.SourceObject{}, err
+	}
+	if err := proveSourcePair(ctx, d, src); err != nil {
+		return evidence.SourceObject{}, err
+	}
+	return src, nil
 }
 
 func resolveSource(ctx context.Context, d Deps, rs state.RunState) (evidence.SourceObject, error) {

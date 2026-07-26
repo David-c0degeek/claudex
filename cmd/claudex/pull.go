@@ -34,7 +34,7 @@ func pullCmd(_ context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if !state.IsSessionID(*session) {
-		fmt.Fprintln(stderr, "claudex: pull requires --session ses-<32 lower-hex>")
+		fmt.Fprintln(stderr, "claudex: pull requires --session sess-<32 lower-hex>")
 		return 2
 	}
 	runID, code := resolveRunID(*repo, *run, stderr)

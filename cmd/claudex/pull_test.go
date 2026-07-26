@@ -135,6 +135,95 @@ func TestPullUsageErrors(t *testing.T) {
 	}
 }
 
+// pull RE-VERIFIES the state-bound packet; it does not merely project the locator run state carries.
+// Without this, deleting the VerifyRef call would leave every other test in this slice green — the
+// standalone verifier tests prove the verifier, not that pull calls it.
+func TestPullRefusesATamperedPacket(t *testing.T) {
+	for name, damage := range map[string]func(t *testing.T, packetDir string){
+		"a listed blob removed": func(t *testing.T, packetDir string) {
+			removeOnePacketBlob(t, packetDir)
+		},
+		"a listed blob tampered": func(t *testing.T, packetDir string) {
+			blob := onePacketBlob(t, packetDir)
+			if err := os.Remove(blob); err != nil { // committed blobs are read-only
+				t.Fatalf("remove blob: %v", err)
+			}
+			writeF(t, blob, "tampered content that does not hash to its name")
+		},
+		"an unlisted entry planted": func(t *testing.T, packetDir string) {
+			writeF(t, filepath.Join(packetDir, "unlisted-extra"), "not in the manifest")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo, runID, lead := bootstrapPair(t)
+			loc, err := attach.ResolveRun(repo, runID)
+			if err != nil {
+				t.Fatalf("resolve run: %v", err)
+			}
+			// A first pull establishes the inbox, so the refusal can be shown to leave it untouched
+			// rather than merely never having written one.
+			var seed, seedErr bytes.Buffer
+			if code := run(context.Background(),
+				[]string{"pull", "--repo", repo, "--run", runID, "--session", lead}, &seed, &seedErr); code != 0 {
+				t.Fatalf("seed pull: exit %d, %s", code, seedErr.String())
+			}
+			inbox := filepath.Join(loc.SessionDir, lead, "assignment.json")
+			before, err := os.ReadFile(inbox)
+			if err != nil {
+				t.Fatalf("read seeded inbox: %v", err)
+			}
+
+			rs, ok, err := state.Open(loc.StateDir, loc.RunLock).Load()
+			if err != nil || !ok || rs.Evidence == nil {
+				t.Fatalf("load state: ok=%v err=%v evidence=%+v", ok, err, rs.Evidence)
+			}
+			damage(t, filepath.Join(loc.EvidenceDir, filepath.Dir(rs.Evidence.ManifestRelPath)))
+
+			var out, errb bytes.Buffer
+			if code := run(context.Background(),
+				[]string{"pull", "--repo", repo, "--run", runID, "--session", lead}, &out, &errb); code != 1 {
+				t.Fatalf("pull over a damaged packet = exit %d, want 1; stderr=%s", code, errb.String())
+			}
+			if out.Len() != 0 {
+				t.Fatalf("a refused pull must emit no assignment, got %s", out.String())
+			}
+			if !strings.Contains(errb.String(), "evidence") {
+				t.Fatalf("stderr = %q, want an evidence refusal", errb.String())
+			}
+			after, err := os.ReadFile(inbox)
+			if err != nil {
+				t.Fatalf("read inbox after the refusal: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("a refused pull replaced the inbox")
+			}
+		})
+	}
+}
+
+// onePacketBlob returns the path of one content-addressed blob in a packet root.
+func onePacketBlob(t *testing.T, packetDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(packetDir)
+	if err != nil {
+		t.Fatalf("read packet dir: %v", err)
+	}
+	for _, e := range entries {
+		if len(e.Name()) == 64 { // a sha256 name; the manifest is manifest.v1.json
+			return filepath.Join(packetDir, e.Name())
+		}
+	}
+	t.Fatalf("packet %s has no blob to damage", packetDir)
+	return ""
+}
+
+func removeOnePacketBlob(t *testing.T, packetDir string) {
+	t.Helper()
+	if err := os.Remove(onePacketBlob(t, packetDir)); err != nil {
+		t.Fatalf("remove packet blob: %v", err)
+	}
+}
+
 // A well-formed run id that does not bind to an active run is an operational failure, not a usage
 // error: the caller spelled it correctly, the repository just has no such run.
 func TestPullUnknownRun(t *testing.T) {

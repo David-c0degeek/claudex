@@ -12,6 +12,7 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/gitx"
+	"github.com/David-c0degeek/claudex/internal/state"
 )
 
 // The packet materializes bytes from the COMMITTED object and is byte-stable regardless of later
@@ -155,4 +156,56 @@ func commitFile(t *testing.T, g *gitx.Git, repo, name, body string) (commit, tre
 		t.Fatalf("rev-parse tree: %v", err)
 	}
 	return string(c), string(tr)
+}
+
+// acceptedRun is a run state whose latest ACCEPTED turn carries the given git tuple.
+func acceptedRun(commit, tree string) state.RunState {
+	return state.RunState{
+		RunID: "run-1",
+		AcceptedTurns: map[string]state.AcceptedTurn{
+			"turn-1": {
+				ArtifactDigest: strings.Repeat("d", 64),
+				Receipt:        state.Receipt{TurnID: "turn-1", Revision: 2, ArtifactDigest: strings.Repeat("d", 64)},
+				Phase:          state.PhaseImplementStep,
+				GitCommit:      &state.GitCommitEvidence{Parent: strings.Repeat("0", 40), Tree: tree, Commit: commit},
+			},
+		},
+	}
+}
+
+// The accepted tuple is PERSISTED STATE, and persisted state is not evidence that the objects still
+// exist and still form a pair. pull re-derives its expectation through ExpectedSource before
+// verifying a bound packet, so ExpectedSource must PROVE the pair — otherwise a packet could be
+// accepted while the source it asserts has gone missing or become inconsistent in the object store,
+// which evidence.Expectation cannot catch (it checks only object-id grammar).
+func TestExpectedSourceProvesTheAcceptedPair(t *testing.T) {
+	repo := t.TempDir()
+	g := gitEnv(t, repo)
+	commitA, treeA := commitFile(t, g, repo, "a.txt", "first\n")
+	_, treeB := commitFile(t, g, repo, "b.txt", "second\n")
+	d := Deps{RunDir: t.TempDir(), RepoDir: repo, Git: g}
+	ctx := context.Background()
+
+	// The real accepted tuple proves.
+	got, err := ExpectedSource(ctx, d, acceptedRun(commitA, treeA))
+	if err != nil {
+		t.Fatalf("a consistent accepted tuple was rejected: %v", err)
+	}
+	if got.Commit != commitA || got.Tree != treeA {
+		t.Fatalf("source = %+v, want {%s, %s}", got, commitA, treeA)
+	}
+
+	// A tuple whose tree belongs to a DIFFERENT commit: both ids exist and are well-formed, so only
+	// an object-store proof can reject it.
+	if _, err := ExpectedSource(ctx, d, acceptedRun(commitA, treeB)); err == nil {
+		t.Fatal("an inconsistent accepted {commit, tree} must fail closed")
+	}
+	// A tuple naming an object that is not in the store at all.
+	if _, err := ExpectedSource(ctx, d, acceptedRun(strings.Repeat("1", 40), treeA)); err == nil {
+		t.Fatal("an accepted commit missing from the object store must fail closed")
+	}
+	// The pre-implementation path is proven too: a base commit the store does not have fails closed.
+	if _, err := ExpectedSource(ctx, d, state.RunState{RunID: "run-1", BaseCommit: strings.Repeat("2", 40)}); err == nil {
+		t.Fatal("an unknown base commit must fail closed")
+	}
 }

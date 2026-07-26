@@ -2,10 +2,10 @@
 // and Codex) pair-programming on one plan and one implementation, converging by
 // agreement over a durable file protocol.
 //
-// This is the greenfield Go implementation. The attach protocol
-// (attach/pull/submit/wait/status) and its coordinator arrive with later
-// milestones; today the binary exposes only version and help so the module has
-// a real, wired entry point rather than a hollow command surface.
+// This is the greenfield Go implementation. The attach protocol —
+// attach/pull/submit/wait/status — is wired over the coordinator, alongside the
+// read-only inspector for pre-pivot Python runs. Human gates and the operator
+// surface arrive with subject 05.
 package main
 
 import (
@@ -39,41 +39,64 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	cmd, rest := args[0], args[1:]
-	switch cmd {
-	case "version", "--version", "-v":
-		if len(rest) > 0 {
-			return usageError(stderr, cmd, rest)
-		}
-		if _, err := fmt.Fprintln(stdout, buildinfo.Version()); err != nil {
-			fmt.Fprintf(stderr, "claudex: write failed: %v\n", err)
-			return 1
-		}
-		return 0
-	case "help", "-h", "--help":
-		if len(rest) > 0 {
-			return usageError(stderr, cmd, rest)
-		}
-		if _, err := fmt.Fprintln(stdout, usage); err != nil {
-			fmt.Fprintf(stderr, "claudex: write failed: %v\n", err)
-			return 1
-		}
-		return 0
-	case "attach":
-		return attachCmd(ctx, rest, stdout, stderr)
-	case "pull":
-		return pullCmd(ctx, rest, stdout, stderr)
-	case "submit":
-		return submitCmd(ctx, rest, stdout, stderr)
-	case "status":
-		return statusCmd(ctx, rest, stdout, stderr)
-	case "wait":
-		return waitCmd(ctx, rest, stdout, stderr)
-	case "inspect-legacy":
-		return inspectLegacy(rest, stdout, stderr)
-	default:
+	if canonical, ok := aliases[cmd]; ok {
+		cmd = canonical
+	}
+	h, ok := commands[cmd]
+	if !ok {
 		fmt.Fprintf(stderr, "claudex: unknown command %q\n\n%s\n", cmd, usage)
 		return 2
 	}
+	return h(ctx, rest, stdout, stderr)
+}
+
+// handler is one dispatchable command.
+type handler func(ctx context.Context, args []string, stdout, stderr io.Writer) int
+
+// commands is the COMPLETE dispatch table — the single source of what this binary can do. It is a
+// table rather than a switch so the shipped command surface is enumerable: the 03.9 invariant is
+// that attach is the sole run bootstrap and nothing else exists, and that can only be asserted
+// against the actual routed set. A switch can be extended without any test noticing.
+var commands = map[string]handler{
+	"version": versionCmd,
+	"help":    helpCmd,
+	"attach":  attachCmd,
+	"pull":    pullCmd,
+	"submit":  submitCmd,
+	"status":  statusCmd,
+	"wait":    waitCmd,
+	"inspect-legacy": func(_ context.Context, args []string, stdout, stderr io.Writer) int {
+		return inspectLegacy(args, stdout, stderr)
+	},
+}
+
+// aliases are the conventional flag spellings of the two informational commands. They route to the
+// same handlers and are deliberately NOT part of the command surface.
+var aliases = map[string]string{
+	"--version": "version", "-v": "version",
+	"-h": "help", "--help": "help",
+}
+
+func versionCmd(_ context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		return usageError(stderr, "version", args)
+	}
+	if _, err := fmt.Fprintln(stdout, buildinfo.Version()); err != nil {
+		fmt.Fprintf(stderr, "claudex: write failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func helpCmd(_ context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		return usageError(stderr, "help", args)
+	}
+	if _, err := fmt.Fprintln(stdout, usage); err != nil {
+		fmt.Fprintf(stderr, "claudex: write failed: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // usageError reports a command invoked with unexpected arguments.

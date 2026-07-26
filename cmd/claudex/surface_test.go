@@ -22,24 +22,30 @@ func TestExactCommandSurface(t *testing.T) {
 	// this surface until 05 lands them.
 	want := []string{"attach", "help", "inspect-legacy", "pull", "status", "submit", "version", "wait"}
 
-	var got []string
-	for _, cmd := range want {
-		if !commandExists(t, cmd) {
-			t.Errorf("command %q is missing from the shipped surface", cmd)
-			continue
-		}
-		got = append(got, cmd)
+	// Compare against the ACTUAL routed set, enumerated from the dispatch table. Iterating the
+	// expected list instead would only ever detect a MISSING command — an extra, unadvertised verb
+	// (a stray `run`, a leftover `debug`) would pass unnoticed, and ruling exactly that out is the
+	// whole point of this invariant.
+	got := make([]string, 0, len(commands))
+	for name := range commands {
+		got = append(got, name)
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("surface = %v, want %v", got, want)
+		t.Fatalf("dispatchable surface = %v, want exactly %v", got, want)
 	}
 
-	// Nothing else is dispatchable. `run` and `pair` are named explicitly: they are the pre-pivot
-	// entrypoints this invariant exists to keep from coming back.
+	// The pre-pivot entrypoints are named explicitly as well. The set comparison above already
+	// excludes them; this states the intent, so a future reader sees WHY the set is closed.
 	for _, cmd := range []string{"run", "pair", "gates", "operator", "resume", "exec", "start", "drive"} {
-		if commandExists(t, cmd) {
+		if _, exists := commands[cmd]; exists {
 			t.Errorf("command %q must not exist: attach is the sole run bootstrap", cmd)
+		}
+	}
+	// Aliases route to informational commands only; none of them may reach a run-affecting verb.
+	for alias, target := range aliases {
+		if target != "version" && target != "help" {
+			t.Errorf("alias %q routes to %q; aliases are for informational commands only", alias, target)
 		}
 	}
 
@@ -47,8 +53,8 @@ func TestExactCommandSurface(t *testing.T) {
 	// pointed at a verb that does not exist, nor miss one that does. The advertised list is parsed
 	// from the Commands block rather than substring-matched, so prose mentioning a future subject
 	// cannot be mistaken for a shipped verb.
-	if advertised := helpCommands(t); strings.Join(advertised, ",") != strings.Join(want, ",") {
-		t.Fatalf("help advertises %v, want exactly %v", advertised, want)
+	if advertised := helpCommands(t); strings.Join(advertised, ",") != strings.Join(got, ",") {
+		t.Fatalf("help advertises %v, want exactly the dispatchable %v", advertised, got)
 	}
 }
 
@@ -81,17 +87,6 @@ func helpCommands(t *testing.T) []string {
 	}
 	sort.Strings(cmds)
 	return cmds
-}
-
-// commandExists reports whether the dispatcher routes cmd. An unknown command is the ONLY thing that
-// prints "unknown command"; every real verb either succeeds or fails on its own arguments.
-func commandExists(t *testing.T, cmd string) bool {
-	t.Helper()
-	var out, errb bytes.Buffer
-	// --claudex-surface-probe is not a flag any verb defines, so a routed command rejects it as a
-	// usage error rather than doing any work. That keeps this probe side-effect free.
-	run(context.Background(), []string{cmd, "--claudex-surface-probe"}, &out, &errb)
-	return !strings.Contains(errb.String(), "unknown command")
 }
 
 // The legacy inspector is READ-ONLY: it renders a redacted view of a pre-pivot state.json and can
