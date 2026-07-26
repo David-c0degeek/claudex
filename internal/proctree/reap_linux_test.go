@@ -113,7 +113,9 @@ func TestReapSurvivingGrandchild(t *testing.T) {
 	cmd := startGroupLeader(t, "sleep 30 & exit 0")
 	pgid := cmd.Process.Pid
 
-	// Reap the leader the way its parent would, leaving only the background descendant.
+	// The leader is reaped here deliberately: this test is about the DESCENDANT that outlives it, so
+	// the leader is removed from the picture the way a parent would. Tests that need the leader's exit
+	// status let ReapGroup reap it instead — there cannot be two reapers.
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("leader wait: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestReapSurvivingGrandchild(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	var sawEchildWhilePopulated bool
 	for time.Now().Before(deadline) {
-		n, err := drainGroup(pgid)
+		n, _, err := drainGroup(pgid)
 		if err != nil {
 			t.Fatalf("drainGroup: %v", err)
 		}
@@ -240,7 +242,7 @@ func TestReapEscalatesToSIGKILL(t *testing.T) {
 	pgid := cmd.Process.Pid
 	t.Cleanup(func() {
 		_ = unix.Kill(-pgid, unix.SIGKILL)
-		_, _ = drainGroup(pgid)
+		_, _, _ = drainGroup(pgid)
 	})
 	start := time.Now()
 	res, err := ReapGroup(pgid, fastPolicy)
@@ -266,7 +268,7 @@ func TestReapDeadlineDoesNotClaimSuccess(t *testing.T) {
 	pgid := cmd.Process.Pid
 	t.Cleanup(func() {
 		_ = unix.Kill(-pgid, unix.SIGKILL)
-		_, _ = drainGroup(pgid)
+		_, _, _ = drainGroup(pgid)
 	})
 
 	// Grace beyond the deadline, so SIGKILL never arrives and the group cannot drain.
@@ -284,5 +286,181 @@ func TestReapRefusesInvalidGroup(t *testing.T) {
 		if _, err := ReapGroup(pgid, fastPolicy); err == nil {
 			t.Fatalf("ReapGroup(%d) was accepted; signalling group 0 would hit the caller's own group", pgid)
 		}
+	}
+}
+
+// --- the teardown must supply the authoritative TERMINAL it exists to support ---
+
+// reapLeaderOnly runs a leader to completion and lets ReapGroup be the SOLE reaper, which is the only
+// arrangement in which the leader's exit status survives: a concurrent cmd.Wait would race the group
+// wait, and whichever call lost would also lose the only copy of that status.
+func reapLeaderOnly(t *testing.T, cmd *exec.Cmd) (ReapResult, int) {
+	t.Helper()
+	pgid := cmd.Process.Pid
+	r, err := NewReaper(pgid)
+	if err != nil {
+		t.Fatalf("NewReaper: %v", err)
+	}
+	// Await first, so a command that finishes normally reports what it DID. Signalling straight away
+	// would report every command as terminated by SIGTERM regardless of its actual outcome — which is
+	// exactly what happened before these two phases were separated.
+	if _, err := r.Await(time.Now().Add(5*time.Second), 5*time.Millisecond); err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	res, err := r.Teardown(fastPolicy)
+	if err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if !res.GroupEmpty {
+		t.Fatal("teardown did not prove the group empty")
+	}
+	return res, pgid
+}
+
+func TestTeardownCarriesTheLeaderExitStatus(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		code int
+	}{
+		{"exit 0", 0},
+		{"exit 7", 7},
+		{"exit 127", 127},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := startGroupLeader(t, fmt.Sprintf("exit %d", tc.code))
+			res, pgid := reapLeaderOnly(t, cmd)
+			if !res.Leader.Observed {
+				t.Fatal("teardown did not observe the leader")
+			}
+			term, err := TerminalFrom(res, pgid)
+			if err != nil {
+				t.Fatalf("TerminalFrom: %v", err)
+			}
+			if !term.Exited || term.ExitCode != tc.code {
+				t.Fatalf("terminal = %+v, want a normal exit with code %d", term, tc.code)
+			}
+			if term.Reaped < 1 {
+				t.Fatalf("reaped %d; the leader must be counted by the reaper that waited on it", term.Reaped)
+			}
+			// Exit 127 is the case the whole design turns on: it must be a statement about the
+			// command, distinguishable from any supervisor failure.
+			if tc.code == 127 && (!term.CommandStarted || term.Signal != 0) {
+				t.Fatalf("exit 127 did not survive as a command fact: %+v", term)
+			}
+		})
+	}
+}
+
+// TestTeardownCarriesSignalTermination: a command killed by the escalation must report the signal, not
+// a fabricated exit code.
+func TestTeardownCarriesSignalTermination(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	cmd := startTermImmuneLeader(t)
+	pgid := cmd.Process.Pid
+	r, err := NewReaper(pgid)
+	if err != nil {
+		t.Fatalf("NewReaper: %v", err)
+	}
+	// This leader never finishes, so Await must give up rather than hang; the teardown then kills it.
+	observed, err := r.Await(time.Now().Add(100*time.Millisecond), 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	if observed {
+		t.Fatal("a command that never exits was reported as observed")
+	}
+	res, err := r.Teardown(fastPolicy)
+	if err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	term, err := TerminalFrom(res, pgid)
+	if err != nil {
+		t.Fatalf("TerminalFrom: %v", err)
+	}
+	if term.Exited || term.Signal != int(unix.SIGKILL) {
+		t.Fatalf("terminal = %+v, want termination by SIGKILL", term)
+	}
+}
+
+// TestTeardownOfAnAlreadyExitedLeader is the cancel race in its simplest form: CANCEL is a REQUEST,
+// not the outcome fact, so a command that had already finished must still report what it did.
+func TestTeardownOfAnAlreadyExitedLeader(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	cmd := startGroupLeader(t, "exit 3")
+	// Let it finish and become a zombie before the teardown begins.
+	time.Sleep(200 * time.Millisecond)
+	res, pgid := reapLeaderOnly(t, cmd)
+	term, err := TerminalFrom(res, pgid)
+	if err != nil {
+		t.Fatalf("TerminalFrom: %v", err)
+	}
+	if !term.Exited || term.ExitCode != 3 {
+		t.Fatalf("terminal = %+v, want the exit that already happened", term)
+	}
+}
+
+// TestTerminalFromRefusesAnUnobservedLeader: "the command ran but we do not know how it ended" is not
+// an outcome TERMINAL may express.
+func TestTerminalFromRefusesAnUnobservedLeader(t *testing.T) {
+	if _, err := TerminalFrom(ReapResult{Reaped: 2, GroupEmpty: true}, 42); err == nil {
+		t.Fatal("TerminalFrom produced a terminal without having observed the leader")
+	}
+}
+
+// TestReapDeadlineIsNotOvershotByThePoll. The deadline is the function's stated bound, so it must not
+// depend on the production constants happening to be ordered: a poll longer than the deadline used to
+// sleep in full after the check and overshoot by an entire interval.
+func TestReapDeadlineIsNotOvershotByThePoll(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	cmd := startTermImmuneLeader(t)
+	pgid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = unix.Kill(-pgid, unix.SIGKILL)
+		_, _, _ = drainGroup(pgid)
+	})
+	start := time.Now()
+	res, err := ReapGroup(pgid, ReapPolicy{Grace: time.Hour, Deadline: 20 * time.Millisecond, Poll: 500 * time.Millisecond})
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrReapDeadline) {
+		t.Fatalf("err = %v, want ErrReapDeadline", err)
+	}
+	if res.GroupEmpty {
+		t.Fatal("a timed-out teardown claimed the group was empty")
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("20ms deadline returned after %v; the poll is not capped to the remaining time", elapsed)
+	}
+}
+
+func TestReapPolicyValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    ReapPolicy
+	}{
+		{"zero poll", ReapPolicy{Grace: time.Second, Deadline: time.Second, Poll: 0}},
+		{"negative poll", ReapPolicy{Grace: time.Second, Deadline: time.Second, Poll: -1}},
+		{"zero deadline", ReapPolicy{Grace: time.Second, Deadline: 0, Poll: time.Millisecond}},
+		{"negative grace", ReapPolicy{Grace: -1, Deadline: time.Second, Poll: time.Millisecond}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.p.Validate(); err == nil {
+				t.Fatal("Validate accepted a policy whose bound would not hold")
+			}
+			if _, err := ReapGroup(1234567, tc.p); err == nil {
+				t.Fatal("ReapGroup accepted an invalid policy")
+			}
+		})
+	}
+	if err := DefaultReapPolicy.Validate(); err != nil {
+		t.Fatalf("the shipped policy must be valid: %v", err)
 	}
 }

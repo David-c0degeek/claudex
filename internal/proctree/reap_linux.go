@@ -21,11 +21,43 @@ type ReapPolicy struct {
 	Poll time.Duration
 }
 
+// Validate rejects a policy whose stated bound would not hold.
+//
+// The production constants happen to be ordered sensibly, but a function that claims to bound its own
+// runtime must not depend on that accident: a Poll larger than the Deadline, or a nonpositive Poll,
+// turns the bound into a suggestion or a hot loop.
+func (p ReapPolicy) Validate() error {
+	switch {
+	case p.Poll <= 0:
+		return fmt.Errorf("proctree: reap poll must be positive, got %v", p.Poll)
+	case p.Deadline <= 0:
+		return fmt.Errorf("proctree: reap deadline must be positive, got %v", p.Deadline)
+	case p.Grace < 0:
+		return fmt.Errorf("proctree: reap grace must not be negative, got %v", p.Grace)
+	}
+	return nil
+}
+
 // DefaultReapPolicy is what the supervisor uses in production.
 var DefaultReapPolicy = ReapPolicy{
 	Grace:    2 * time.Second,
 	Deadline: 30 * time.Second,
 	Poll:     10 * time.Millisecond,
+}
+
+// LeaderOutcome is the command leader's exact exit status, captured by the ONE process that reaps it.
+//
+// It lives here rather than being read separately by the caller because there cannot be two reapers.
+// A caller that ran cmd.Wait() alongside this loop would race it, and whichever call lost would also
+// lose the only copy of the leader's status — the fact TERMINAL exists to carry. Reaping it here and
+// counting it in the same pass removes the race instead of coordinating it.
+type LeaderOutcome struct {
+	// Observed is false when the leader was never seen, which means no outcome may be claimed.
+	Observed bool
+	// Exited and ExitCode describe a normal exit; Signal describes a termination. Exactly one applies.
+	Exited   bool
+	ExitCode int
+	Signal   int
 }
 
 // ReapResult is what the teardown proved.
@@ -37,6 +69,8 @@ type ReapResult struct {
 	// GroupEmpty is the ESRCH proof. False means the deadline expired with processes still in the
 	// group, and no success receipt may be published.
 	GroupEmpty bool
+	// Leader is the command leader's exit status, captured during the drain.
+	Leader LeaderOutcome
 }
 
 // ErrReapDeadline means the owned group did not drain in time.
@@ -88,27 +122,40 @@ func signalGroup(pgid int, sig unix.Signal) error {
 // the group is outside the containment model but, because this supervisor is a subreaper, it can
 // still REPARENT here — and an unqualified wait would then block on an out-of-model child forever.
 // Group scoping excludes it by construction rather than by hoping it exits.
-func drainGroup(pgid int) (int, error) {
+func drainGroup(pgid int) (int, LeaderOutcome, error) {
 	reaped := 0
+	var leader LeaderOutcome
 	for {
 		var ws unix.WaitStatus
 		pid, err := unix.Wait4(-pgid, &ws, unix.WNOHANG, nil)
 		switch {
 		case err == nil && pid > 0:
 			reaped++
+			// The leader is the process whose pid IS the group id, since it created the group. This is
+			// the only place its status exists, so it is captured here rather than left to a second
+			// reaper that would race this one.
+			if pid == pgid {
+				leader = LeaderOutcome{Observed: true}
+				if ws.Signaled() {
+					leader.Signal = int(ws.Signal())
+				} else {
+					leader.Exited = true
+					leader.ExitCode = ws.ExitStatus()
+				}
+			}
 			continue
 		case err == nil && pid == 0:
 			// Children exist but none has exited yet.
-			return reaped, nil
+			return reaped, leader, nil
 		case errors.Is(err, unix.ECHILD):
 			// No children in this group are ours right now. That is NOT the same as the group being
 			// empty: an in-group grandchild may not have reparented yet, which is why the caller
 			// probes separately instead of stopping here.
-			return reaped, nil
+			return reaped, leader, nil
 		case errors.Is(err, unix.EINTR):
 			continue
 		default:
-			return reaped, fmt.Errorf("proctree: wait on group %d: %w", pgid, err)
+			return reaped, leader, fmt.Errorf("proctree: wait on group %d: %w", pgid, err)
 		}
 	}
 }
@@ -126,20 +173,34 @@ func drainGroup(pgid int) (int, error) {
 //  5. give up at the deadline WITHOUT claiming success, so recovery blocks rather than retrying over
 //     a group that will not drain.
 func ReapGroup(pgid int, p ReapPolicy) (ReapResult, error) {
+	var acc ReapResult
+	return reapGroup(pgid, p, &acc)
+}
+
+func reapGroup(pgid int, p ReapPolicy, acc *ReapResult) (ReapResult, error) {
 	if pgid <= 0 {
 		return ReapResult{}, fmt.Errorf("proctree: refusing to signal group %d", pgid)
 	}
-	var res ReapResult
+	if err := p.Validate(); err != nil {
+		return ReapResult{}, err
+	}
+	res := *acc
 
 	if err := signalGroup(pgid, unix.SIGTERM); err != nil {
 		return res, err
 	}
 	start := time.Now()
+	// Absolute, so the bound is a property of this call rather than of how the increments happen to
+	// add up.
+	hardDeadline := start.Add(p.Deadline)
 	escalated := false
 
 	for {
-		n, err := drainGroup(pgid)
+		n, leader, err := drainGroup(pgid)
 		res.Reaped += n
+		if leader.Observed {
+			res.Leader = leader
+		}
 		if err != nil {
 			return res, err
 		}
@@ -158,9 +219,117 @@ func ReapGroup(pgid int, p ReapPolicy) (ReapResult, error) {
 			}
 			escalated = true
 		}
-		if elapsed >= p.Deadline {
+		if !time.Now().Before(hardDeadline) {
 			return res, fmt.Errorf("%w: group %d after %v, %d reaped", ErrReapDeadline, pgid, elapsed, res.Reaped)
 		}
-		time.Sleep(p.Poll)
+		// Capped: sleeping the full poll interval after checking the deadline would overshoot it by up
+		// to one interval, so a 20ms deadline with a 500ms poll returned after 500ms. The stated bound
+		// must not depend on the production constants happening to be ordered.
+		nap := p.Poll
+		if remaining := time.Until(hardDeadline); remaining < nap {
+			nap = remaining
+		}
+		if nap > 0 {
+			time.Sleep(nap)
+		}
 	}
+}
+
+// TerminalFrom builds the authoritative TERMINAL from a completed teardown.
+//
+// It exists so the composition is pinned rather than left to each caller: the leader's status, the
+// reap count and the group id all come from the ONE teardown that observed them, which is what keeps
+// the terminal and the cleanup receipt describing the same attempt.
+//
+// A teardown that never observed the leader cannot produce a terminal at all — "the command ran but
+// we do not know how it ended" is not one of the outcomes TERMINAL is allowed to express.
+func TerminalFrom(res ReapResult, pgid int) (Terminal, error) {
+	if !res.Leader.Observed {
+		return Terminal{}, fmt.Errorf("proctree: teardown never observed the command leader; no outcome can be claimed")
+	}
+	t := Terminal{
+		CommandStarted: true,
+		CommandPGID:    pgid,
+		Reaped:         res.Reaped,
+		Exited:         res.Leader.Exited,
+		ExitCode:       res.Leader.ExitCode,
+		Signal:         res.Leader.Signal,
+	}
+	if err := t.validate(); err != nil {
+		return Terminal{}, err
+	}
+	return t, nil
+}
+
+// Reaper is the SINGLE wait authority for one owned command group.
+//
+// Awaiting normal completion and tearing the group down are different operations, but they cannot be
+// different reapers: a cmd.Wait() running alongside a waitpid(-pgid) loop races it, and whichever call
+// loses also loses the only copy of the leader's exit status — the fact TERMINAL exists to carry.
+// Splitting them into two methods of one accumulator gives the lifecycle its two phases without ever
+// creating a second reaper.
+//
+// The supervisor uses it as: NewReaper before the command is spawned, Await while it runs, Teardown to
+// clear whatever remains, then TerminalFrom over the accumulated result.
+type Reaper struct {
+	pgid int
+	res  ReapResult
+}
+
+// NewReaper binds a reaper to an owned group.
+func NewReaper(pgid int) (*Reaper, error) {
+	if pgid <= 0 {
+		return nil, fmt.Errorf("proctree: refusing to reap group %d", pgid)
+	}
+	return &Reaper{pgid: pgid}, nil
+}
+
+// Result is everything observed so far.
+func (r *Reaper) Result() ReapResult { return r.res }
+
+// Await drains without signalling, until the leader is observed or the deadline passes.
+//
+// It signals nothing: this is the command running normally, and a teardown that starts by killing
+// would report every command as terminated by SIGTERM regardless of what it was doing. Draining
+// meanwhile is not optional either — descendants that exit while the leader still runs would otherwise
+// accumulate as zombies in the group and keep the ESRCH proof from ever succeeding.
+//
+// Returns true when the leader's status has been captured.
+func (r *Reaper) Await(deadline time.Time, poll time.Duration) (bool, error) {
+	if poll <= 0 {
+		return false, fmt.Errorf("proctree: await poll must be positive, got %v", poll)
+	}
+	for {
+		n, leader, err := drainGroup(r.pgid)
+		r.res.Reaped += n
+		if leader.Observed {
+			r.res.Leader = leader
+		}
+		if err != nil {
+			return r.res.Leader.Observed, err
+		}
+		if r.res.Leader.Observed {
+			return true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		nap := poll
+		if remaining := time.Until(deadline); remaining < nap {
+			nap = remaining
+		}
+		if nap > 0 {
+			time.Sleep(nap)
+		}
+	}
+}
+
+// Teardown signals the group and proves it empty, accumulating into the same result.
+func (r *Reaper) Teardown(p ReapPolicy) (ReapResult, error) {
+	out, err := reapGroup(r.pgid, p, &r.res)
+	if err != nil {
+		return r.res, err
+	}
+	r.res = out
+	return r.res, nil
 }
