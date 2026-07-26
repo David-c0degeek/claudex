@@ -33,6 +33,31 @@ idempotent receipts, and a protocol/schema version on every message.
 - [x] Captain Hindsight review recorded
 - [x] Verdict is `CLOSE`
 
+### Amendment — the 2026-07-16 close under-disclosed the surface (recorded 2026-07-26)
+
+The review below was recorded, and this subject closed `CLOSE`, while the verbs its boxes name
+(`submit --file`, `wait --timeout N`, `status`) did **not exist as commands**: the CLI dispatched only
+`version`/`help`/`inspect-legacy`, and `transport.Wait`, `transport.Status`,
+`transport.BuildAssignment`, `transport.SubmitTestOutcome`, the mailbox mirror, and the session inbox
+had zero non-test callers. `.claudex/mailbox.md` was never written on any shipped path. That is
+`findings.md` M9.
+
+The defect was **not the ticks** — the boxes describe transport behaviour that was genuinely built and
+tested, and they are now true end-to-end as well. The defect was that this Hindsight did not
+**disclose** the library-only surface, while subject 03's slice-h Hindsight disclosed exactly that
+class for its own leaves. The plan's §7 gate item "new public surface wired to a non-test caller, **or
+disclosed** library-only/unwired" was therefore recorded as satisfied when it was not, and the gap
+stayed invisible until subject 03's close-out found it from the other side.
+
+Resolved by D021: the CLI was built over the existing library (`attach`/`pull`/`submit`/`wait`/
+`status` + `inspect-legacy`), finishing in subject 04.3 when `pull` — which needed the review-evidence
+packet to exist — was wired. Every surface M9 lists now has a non-test caller, and the mailbox mirror
+and session inbox are written on shipped paths.
+
+The lesson is recorded in `lessons.md`: a close-out must state what is NOT wired as explicitly as what
+is, because "built and tested" and "reachable by a user" are different claims and only the second is
+what the box's wording promised.
+
 ### Captain Hindsight — subject 02 (recorded 2026-07-16)
 
 **Keep**

@@ -35,7 +35,54 @@ is `AGREE` + zero blocking/major, evaluated by the coordinator.
 
 ## Hindsight checkpoint
 - [x] Captain Hindsight review recorded
-- [ ] Verdict is `CLOSE`  ← **DO NOT CLOSE** pending 03.9 (see the review below)
+- [x] Verdict is `CLOSE` (re-run 2026-07-26 after 03.9 landed — see the close-out below)
+
+### Captain Hindsight close-out — 2026-07-26 (03.9 satisfied; verdict set)
+
+Re-run of the 2026-07-22 review, whose verdict was **DO NOT CLOSE** solely because 03.9's named
+deliverable — the `attach`/`pull`/`submit`/`wait`/`status` command surface — did not exist. It does
+now, and 03.9 is ticked.
+
+**Keep.** Everything the 2026-07-22 review kept, plus: the CLI was wired **over** the existing
+library rather than beside it — `coordinator.Pull` mirrors `coordinator.Status`'s coherent-read
+bracket, `submit` reuses the locked transport path, and no verb introduced a second authority for
+anything. `pull` is a genuine read-only no-mint projection that RE-VERIFIES the state-bound evidence
+packet rather than synthesizing one, which was the specific risk the 03.9 amendment (D021) called out.
+
+**Fix before closing.** One, now fixed: `README.md:26-28` still said *"Today the binary builds and
+exposes `version`/`help`; the attach protocol … land over the subsequent milestones."* That is 03.9's
+exact subject matter and §7's documentation-impact item, so it belonged to this close, not a later
+gate. Corrected to describe the shipped surface.
+
+**Record.**
+1. `lessons.md` — the recurring assertion failure across 04.3 (five instances; presence-vs-correctness
+   and "the boundary you asserted is not the whole boundary"), with mutation-testing the guard as the
+   practical rule that worked.
+2. `lessons.md` + `02-transport-protocol.md` — a close-out must disclose what is NOT wired as loudly
+   as what is. Subject 02 closed while its named verbs were library-only; the amendment records that
+   the defect was the missing **disclosure**, not the ticks, since the boxes are now true end-to-end.
+3. Plan-agnostic debt, for the §7 gate (NOT a subject-03 blocker — §7 runs last, and this is
+   plan-wide): a grep of shipped `.go` outside `tasks/` for box ids finds **29 hits** (e.g.
+   `internal/evidence/evidence.go:2`, `internal/coordinator/pull.go:164`, `internal/gitx/gitx.go:5`).
+   The working branch name `interactive-pairing` is itself a plan reference (§7:213). This is the same
+   class as `findings.md` M10 (plan references in ~12 pushed commit subjects) and needs the same
+   resolution: a triage rule or an accepted-violation §4 row. Deciding it at gate time is what M10
+   already warns against.
+
+**Risk.**
+- Behaviour verification for this subject is **per-verb** end-to-end through the real CLI over real
+  git (`TestAttachFirstThenJoin`, `TestPullE2E`, `TestSubmitE2E`, `TestStatusE2E`, `TestWaitE2E`), not
+  the canonical *"two attached sessions complete a real turn"* loop, which §7:198/200 assigns to
+  subject 06. 03 therefore closes on verb-level evidence; the full two-terminal loop remains unproven
+  until 06.
+- `manual-actions.md` has no open human-owned items for this subject (0 unchecked boxes).
+
+**Verification (re-run at HEAD `41ba59f`).** `gofmt -l .` empty; `go vet ./...` clean;
+`go build ./...` clean; `go test -count=1 ./...` green (20 packages); `go test -race -count=1 ./...`
+green; 4-target cross-compile (windows/linux/darwin amd64 + darwin/arm64) green;
+`go test ./cmd/...` green in 22.9s, which is the 03.9 exact-surface test plus every CLI e2e.
+
+**Verdict: CLOSE.**
 
 ### Captain Hindsight review — 2026-07-22 (after 04.0 landed 03.1's provisioner + 04.1b/03.7 landed the edit policy)
 

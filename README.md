@@ -23,9 +23,10 @@ implementation is retired and lives only in git history; its test suite and
 schemas are being harvested as executable requirements for the new build (see
 [`docs/evidence-harvest.md`](docs/evidence-harvest.md)).
 
-Today the binary builds and exposes `version`/`help`; the attach protocol
-(`attach`/`pull`/`submit`/`wait`/`status`) and coordinator land over the
-subsequent milestones.
+Today the binary ships the attach protocol — `attach`, `pull`, `submit`, `wait`,
+and `status` — over the durable coordinator, alongside `inspect-legacy`, a
+read-only view of a pre-pivot Python run. Human gates and the operator surface
+land over the subsequent milestones.
 
 ## Build
 
