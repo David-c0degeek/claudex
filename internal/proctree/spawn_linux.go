@@ -1,9 +1,11 @@
 package proctree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"syscall"
 )
@@ -42,20 +44,35 @@ type CommandSpawn struct {
 //
 // The caller is responsible for having set FD_CLOEXEC on every capability descriptor before this
 // runs; ExtraFiles is deliberately left nil, so the child receives only fds 0, 1 and 2.
-func SpawnContained(s CommandSpawn) (*exec.Cmd, error) {
-	if err := s.Spec.Validate(); err != nil {
-		return nil, err
-	}
+// It TAKES OWNERSHIP of the stream write ends. On every error it closes both itself; on success the
+// caller closes them immediately, via CloseStreamCopies. Ownership has to be mechanical rather than a
+// documented convention: an earlier version returned directly from each error and left the copies
+// open, so a failed spawn meant the coordinator never saw stream EOF and the drain the terminal
+// ordering depends on would wait forever. The comment claiming "every failure path" was true of the
+// intent and false of the code.
+func SpawnContained(s CommandSpawn) (cmd *exec.Cmd, err error) {
 	if s.Stdout == nil || s.Stderr == nil {
 		return nil, fmt.Errorf("proctree: stream write ends are required")
 	}
-	devNull, err := os.OpenFile(NullDevice, os.O_RDONLY, 0)
+	defer func() {
+		if err != nil {
+			_ = CloseStreamCopies(s)
+		}
+	}()
+	if err = s.Spec.Validate(); err != nil {
+		return nil, err
+	}
+	if err = validateExecutionBoundary(s.Spec); err != nil {
+		return nil, err
+	}
+	var devNull *os.File
+	devNull, err = os.OpenFile(NullDevice, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("proctree: open %s: %w", NullDevice, err)
 	}
 	defer devNull.Close()
 
-	cmd := &exec.Cmd{
+	cmd = &exec.Cmd{
 		Path:   string(s.Spec.Executable),
 		Args:   s.Spec.ArgvStrings(),
 		Env:    s.Spec.Environ(),
@@ -63,7 +80,8 @@ func SpawnContained(s CommandSpawn) (*exec.Cmd, error) {
 		Stdin:  devNull,
 		Stdout: s.Stdout,
 		Stderr: s.Stderr,
-		// nil on purpose: ExtraFiles is the only way a child could inherit a capability descriptor.
+		// nil on purpose: ExtraFiles is the only way a child could inherit a capability descriptor
+		// that Go itself passes.
 		ExtraFiles: nil,
 		SysProcAttr: &syscall.SysProcAttr{
 			Setpgid: true,
@@ -73,16 +91,46 @@ func SpawnContained(s CommandSpawn) (*exec.Cmd, error) {
 	// ExtraFiles: nil is NOT sufficient on its own. It controls only what Go explicitly PASSES; any
 	// descriptor the parent happens to hold without FD_CLOEXEC crosses exec regardless of intent.
 	// This is not hypothetical — the child was observed inheriting the Go runtime's cgroup cpu.max
-	// handle and a /dev/ptmx handle, neither of which anything here passed. A containment guarantee
-	// that depends on every descriptor the process ever opened having been created correctly is not a
-	// guarantee, so the set is closed explicitly instead.
-	if err := markInheritedCloexec(); err != nil {
+	// handle and a /dev/ptmx handle, neither of which anything here passed.
+	if err = markInheritedCloexec(); err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		return nil, fmt.Errorf("proctree: start command: %w", err)
 	}
 	return cmd, nil
+}
+
+// validateExecutionBoundary refuses anything that would reintroduce resolution at execution time.
+//
+// ExecSpec.Validate proves the spec is well formed; it does not prove it is EXECUTABLE as written. A
+// relative executable or cwd reaching exec.Cmd would be resolved against whatever directory this
+// process happens to be in — exactly the ambient-resolution defect the resolved absolute path exists
+// to eliminate. The supervisor will separately compare these against the rooted intent, but this is
+// the last boundary before the kernel and it refuses independently rather than trusting that an
+// earlier check ran.
+func validateExecutionBoundary(spec ExecSpec) error {
+	for _, f := range []struct {
+		what string
+		path string
+	}{
+		{"executable", string(spec.Executable)},
+		{"cwd", string(spec.Cwd)},
+	} {
+		if !filepath.IsAbs(f.path) {
+			return fmt.Errorf("%w: %s %q is not absolute", ErrSpecInvalid, f.what, f.path)
+		}
+		if filepath.Clean(f.path) != f.path {
+			return fmt.Errorf("%w: %s %q is not clean", ErrSpecInvalid, f.what, f.path)
+		}
+	}
+	// The fold identity belongs to Windows. Executing under it on Linux would mean the digest bound
+	// one comparison rule while the kernel applied another, so names differing only in case would be
+	// one variable to the record and two to the process.
+	if spec.Identity != NameByteExact {
+		return fmt.Errorf("%w: environment identity %v is not Linux semantics", ErrSpecInvalid, spec.Identity)
+	}
+	return nil
 }
 
 // markInheritedCloexec sets FD_CLOEXEC on every descriptor above stderr.
@@ -122,7 +170,10 @@ func CloseStreamCopies(s CommandSpawn) error {
 		if f == nil {
 			continue
 		}
-		if err := f.Close(); err != nil && first == nil {
+		// Idempotent: SpawnContained closes these on its own error paths, and the caller closes them
+		// after a successful start, so an already-closed handle is an expected state rather than a
+		// fault. Anything else is reported.
+		if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) && first == nil {
 			first = fmt.Errorf("proctree: close stream copy: %w", err)
 		}
 	}

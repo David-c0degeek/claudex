@@ -3,8 +3,10 @@ package proctree
 import (
 	"bufio"
 	"encoding/base64"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -118,18 +120,14 @@ func runContained(t *testing.T, extraEnv []EnvVar, extraArgs [][]byte, capabilit
 	return st
 }
 
-// TestContainedChildInheritsNoCapabilityDescriptor is the assertion CX pinned: four pipe EOFs say
-// nothing about descriptors that have no EOF. A leaked lease descriptor would keep an OFD lock alive
-// past supervisor death, and a leaked attempt-directory descriptor would let the task interfere with
-// the receipt it is judged by.
+// TestContainedChildInheritsNoCapabilityDescriptor is the CAPABILITY-specific half, and it does not
+// replace the exact-set assertion above.
 //
-// It asserts the CAPABILITY property rather than a descriptor count, and the difference is not
-// convenience. The Go runtime opens a cgroup cpu.max handle for its GOMAXPROCS tracking and reopens it
-// asynchronously, so a descriptor can appear between the close-on-exec sweep and the fork. That file
-// is read-only, is not ours, and confers nothing — but it means "the child holds exactly three
-// descriptors" is a claim this process cannot honestly make. What it CAN guarantee is that nothing
-// carrying authority crosses: no pipe beyond the two stream ends, and no handle on the marker file
-// standing in for the lease and attempt directory.
+// It runs against the Go dumper, whose own runtime opens descriptors after exec, so no count is
+// meaningful here — that is what TestContainedChildInheritsExactlyStdioFDs uses a non-Go fixture for.
+// What this adds is the class-specific check over a process that really is the supervisor's own
+// binary re-executed: no pipe beyond the two stream ends (ctrl, stat, spec and the streams are all
+// pipes), and no handle on the marker standing in for the lease and attempt directory.
 func TestContainedChildInheritsNoCapabilityDescriptor(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "capability-marker")
 	if err := os.WriteFile(marker, []byte("x"), 0o600); err != nil {
@@ -233,5 +231,193 @@ func TestSpawnRequiresStreamEnds(t *testing.T) {
 	}
 	if _, err := SpawnContained(CommandSpawn{Spec: spec}); err == nil {
 		t.Fatal("SpawnContained accepted a spawn with no stream write ends")
+	}
+}
+
+// childFDs reads a live child's descriptor table from the PARENT, so the listing is not perturbed by
+// the act of listing it.
+func childFDs(t *testing.T, pid int) []string {
+	t.Helper()
+	dir := "/proc/" + strconv.Itoa(pid) + "/fd"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var out []string
+	for _, e := range entries {
+		target, lerr := os.Readlink(dir + "/" + e.Name())
+		if lerr != nil {
+			continue
+		}
+		out = append(out, e.Name()+"="+target)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestContainedChildInheritsExactlyStdioFDs is the exact-set assertion the design pins.
+//
+// The Go dumper cannot support it: its own runtime opens descriptors after exec, and one of them
+// (a cgroup cpu.max handle) is reopened asynchronously, so any count would be measuring the runtime
+// rather than the containment. A non-Go fixture has no such behaviour, so /bin/sleep is spawned and
+// its table is read FROM THE PARENT while it blocks. That distinguishes inherited descriptors from
+// child-created ones, which is the property actually under test.
+//
+// An earlier version of this test rejected only extras containing "pipe:" or a marker path — which
+// would have accepted a leaked socket, git directory handle, secret file or memfd. Narrowing an
+// assertion because the fixture could not support it produced a predicate that no longer said what
+// the design requires.
+func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
+	const sleepBin = "/bin/sleep"
+	if _, err := os.Stat(sleepBin); err != nil {
+		t.Skipf("%s unavailable: %v", sleepBin, err)
+	}
+	marker := filepath.Join(t.TempDir(), "capability-marker")
+	if err := os.WriteFile(marker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	// Held WITHOUT close-on-exec, so the spawn's own sweep is what must stop it.
+	capability, err := os.Open(marker)
+	if err != nil {
+		t.Fatalf("open marker: %v", err)
+	}
+	defer capability.Close()
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	defer outR.Close()
+	defer errR.Close()
+
+	spec := ExecSpec{
+		Executable: []byte(sleepBin),
+		Argv:       [][]byte{[]byte("sleep"), []byte("30")},
+		Cwd:        []byte(t.TempDir()),
+		Env:        []EnvVar{{Name: []byte("PATH"), Value: []byte("/usr/bin:/bin")}},
+		Identity:   NameByteExact,
+	}
+	sp := CommandSpawn{Spec: spec, Stdout: outW, Stderr: errW}
+	cmd, err := SpawnContained(sp)
+	if err != nil {
+		t.Fatalf("SpawnContained: %v", err)
+	}
+	if err := CloseStreamCopies(sp); err != nil {
+		t.Fatalf("CloseStreamCopies: %v", err)
+	}
+	pgid := cmd.Process.Pid
+	r, err := NewReaper(pgid)
+	if err != nil {
+		t.Fatalf("NewReaper: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = r.Close()
+		_, _ = ReapGroup(pgid, fastPolicy)
+	})
+
+	fds := childFDs(t, cmd.Process.Pid)
+	if len(fds) != 3 {
+		t.Fatalf("child holds %d descriptors (%v), want exactly stdin/stdout/stderr", len(fds), fds)
+	}
+	if !strings.HasSuffix(fds[0], NullDevice) {
+		t.Fatalf("stdin is %q, want %s", fds[0], NullDevice)
+	}
+	for _, fd := range fds[1:] {
+		if !strings.Contains(fd, "pipe:") {
+			t.Fatalf("stream descriptor %q is not a pipe", fd)
+		}
+	}
+}
+
+// TestSpawnClosesStreamCopiesOnFailure. Once SpawnContained accepts the handles it owns them, so a
+// failed spawn must still let the coordinator see EOF. Leaving them open is the terminal-ordering
+// deadlock the descriptor table forbids: the drain would wait forever for a command that never ran.
+func TestSpawnClosesStreamCopiesOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec ExecSpec
+	}{
+		{"validation failure", ExecSpec{
+			Executable: []byte("/bin/true"),
+			Cwd:        []byte("/"),
+			Identity:   NameByteExact,
+			// no argv
+		}},
+		{"start failure", ExecSpec{
+			Executable: []byte("/nonexistent/definitely-not-here"),
+			Argv:       [][]byte{[]byte("x")},
+			Cwd:        []byte("/"),
+			Identity:   NameByteExact,
+		}},
+		{"execution boundary failure", ExecSpec{
+			Executable: []byte("relative/path"),
+			Argv:       [][]byte{[]byte("x")},
+			Cwd:        []byte("/"),
+			Identity:   NameByteExact,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outR, outW, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("stdout pipe: %v", err)
+			}
+			defer outR.Close()
+			errR, errW, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("stderr pipe: %v", err)
+			}
+			defer errR.Close()
+
+			if _, err := SpawnContained(CommandSpawn{Spec: tc.spec, Stdout: outW, Stderr: errW}); err == nil {
+				t.Fatal("SpawnContained accepted a spawn it should have refused")
+			}
+			// Both reads must reach EOF promptly. If the write copy survived, they block forever.
+			for name, r := range map[string]*os.File{"stdout": outR, "stderr": errR} {
+				if derr := r.SetReadDeadline(time.Now().Add(2 * time.Second)); derr != nil {
+					t.Fatalf("SetReadDeadline: %v", derr)
+				}
+				buf := make([]byte, 1)
+				if _, rerr := r.Read(buf); rerr != io.EOF {
+					t.Fatalf("%s: read err = %v, want io.EOF — SpawnContained returned with the write copy still open", name, rerr)
+				}
+			}
+		})
+	}
+}
+
+// TestSpawnRefusesNonAbsoluteOrUnclean: a relative or unclean path would be resolved against whatever
+// directory this process happens to be in, which is the ambient resolution the resolved absolute path
+// exists to eliminate.
+func TestSpawnRefusesNonAbsoluteOrUnclean(t *testing.T) {
+	base := ExecSpec{
+		Executable: []byte("/bin/true"),
+		Argv:       [][]byte{[]byte("true")},
+		Cwd:        []byte("/"),
+		Identity:   NameByteExact,
+	}
+	for _, tc := range []struct {
+		name  string
+		mutet func(*ExecSpec)
+	}{
+		{"relative executable", func(s *ExecSpec) { s.Executable = []byte("bin/true") }},
+		{"unclean executable", func(s *ExecSpec) { s.Executable = []byte("/bin/../bin/true") }},
+		{"relative cwd", func(s *ExecSpec) { s.Cwd = []byte("work") }},
+		{"unclean cwd", func(s *ExecSpec) { s.Cwd = []byte("/tmp/../tmp") }},
+		{"windows identity on linux", func(s *ExecSpec) { s.Identity = NameASCIIFold }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := base
+			tc.mutet(&spec)
+			if err := validateExecutionBoundary(spec); err == nil {
+				t.Fatal("the execution boundary accepted a spec that reintroduces ambient resolution")
+			}
+		})
+	}
+	if err := validateExecutionBoundary(base); err != nil {
+		t.Fatalf("a valid spec was refused: %v", err)
 	}
 }
