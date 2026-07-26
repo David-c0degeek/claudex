@@ -61,6 +61,10 @@ const (
 	supInit supState = iota
 	supArmed
 	supRunning
+	// supAborted is CANCEL before GO. It is distinct from supDone because the two permit different
+	// terminals: an aborted launch may only report the no-command shape, while supDone means a
+	// terminal has already been sent.
+	supAborted
 	supDone
 )
 
@@ -72,6 +76,8 @@ func (s supState) String() string {
 		return "armed"
 	case supRunning:
 		return "running"
+	case supAborted:
+		return "aborted"
 	case supDone:
 		return "done"
 	}
@@ -112,7 +118,7 @@ func (p *SupervisorProtocol) Recv(f Frame) (Action, error) {
 	case TypeCancel:
 		switch p.state {
 		case supArmed:
-			p.state = supDone
+			p.state = supAborted
 			return ActionAbort, nil
 		case supRunning:
 			// Deliberately not a state change: cancel after GO is idempotent, so a coordinator that
@@ -126,14 +132,120 @@ func (p *SupervisorProtocol) Recv(f Frame) (Action, error) {
 	}
 }
 
-// SendTerminal writes the one TERMINAL frame. Valid once, and only after the supervisor has reached a
-// state where a terminal statement is meaningful.
+// launchPhase is how far the launch got, as both halves see it. TERMINAL is validated against it
+// because a terminal that is internally consistent can still be false IN CONTEXT.
+type launchPhase int
+
+const (
+	// launchUnauthorized: READY has been exchanged but neither GO nor CANCEL has. Nothing can have
+	// happened yet, so no terminal is truthful.
+	launchUnauthorized launchPhase = iota + 1
+	// launchAborted: CANCEL arrived before GO. No command was ever attempted.
+	launchAborted
+	// launchAuthorized: GO was sent and received. Either the command ran or the spawn failed.
+	launchAuthorized
+)
+
+// terminalShape is the outcome a terminal reports, independent of who is asking.
+type terminalShape int
+
+const (
+	shapeAbort terminalShape = iota + 1
+	shapeSpawnFailed
+	shapeStarted
+)
+
+func (s terminalShape) String() string {
+	switch s {
+	case shapeAbort:
+		return "no-command abort"
+	case shapeSpawnFailed:
+		return "spawn failure"
+	case shapeStarted:
+		return "started command"
+	}
+	return "unknown"
+}
+
+func (t Terminal) shape() terminalShape {
+	switch {
+	case t.CommandStarted:
+		return shapeStarted
+	case t.SpawnErrorClass != "":
+		return shapeSpawnFailed
+	default:
+		return shapeAbort
+	}
+}
+
+// validateTerminalInPhase couples the payload to the protocol state.
+//
+// Terminal.validate proves a terminal is consistent WITH ITSELF; that is not the same as being true.
+// A perfectly well-formed "command started, exited 0" is a lie before GO, because GO is the sole
+// launch authorization — and the value validator has no way to know that. This check lives at
+// send/receive rather than in encode/decode because it needs a phase, which those layers do not have;
+// one function serves both halves so the rule cannot drift into two versions.
+func validateTerminalInPhase(phase launchPhase, t Terminal) error {
+	switch phase {
+	case launchUnauthorized:
+		return fmt.Errorf("%w: TERMINAL before either GO or CANCEL", ErrOutOfState)
+	case launchAborted:
+		if sh := t.shape(); sh != shapeAbort {
+			return fmt.Errorf("%w: aborted launch reported a %s", ErrOutOfState, sh)
+		}
+	case launchAuthorized:
+		// After GO exactly two things can be true: the command ran, or the spawn failed. "Nothing
+		// happened" is not among them, so the empty abort shape is a false statement here.
+		if sh := t.shape(); sh == shapeAbort {
+			return fmt.Errorf("%w: authorized launch reported a %s", ErrOutOfState, sh)
+		}
+	default:
+		return fmt.Errorf("%w: TERMINAL in an unknown launch phase", ErrOutOfState)
+	}
+	return nil
+}
+
+func (p *SupervisorProtocol) launchPhase() (launchPhase, error) {
+	switch p.state {
+	case supArmed:
+		return launchUnauthorized, nil
+	case supAborted:
+		return launchAborted, nil
+	case supRunning:
+		return launchAuthorized, nil
+	default:
+		return 0, fmt.Errorf("%w: TERMINAL in state %v", ErrOutOfState, p.state)
+	}
+}
+
+func (p *CoordinatorProtocol) launchPhase() (launchPhase, error) {
+	switch p.state {
+	case coordArmed:
+		return launchUnauthorized, nil
+	case coordAborted:
+		return launchAborted, nil
+	case coordRunning:
+		return launchAuthorized, nil
+	default:
+		return 0, fmt.Errorf("%w: TERMINAL in state %v", ErrOutOfState, p.state)
+	}
+}
+
+// SendTerminal writes the one TERMINAL frame. Valid once, and only where the terminal it carries can
+// actually be true.
 func (p *SupervisorProtocol) SendTerminal(w io.Writer, t Terminal) error {
 	if p.state == supInit {
 		return fmt.Errorf("%w: TERMINAL before READY", ErrOutOfState)
 	}
 	if p.terminalSent {
 		return fmt.Errorf("%w: TERMINAL already sent", ErrOutOfState)
+	}
+	phase, err := p.launchPhase()
+	if err != nil {
+		return err
+	}
+	if err := validateTerminalInPhase(phase, t); err != nil {
+		return err
 	}
 	payload, err := t.encode()
 	if err != nil {
@@ -246,12 +358,18 @@ func (p *CoordinatorProtocol) RecvTerminal(f Frame) (Terminal, error) {
 	if p.state == coordDone {
 		return Terminal{}, ErrDuplicateTerminal
 	}
-	// An aborted launch still owes a terminal, so coordAborted is admissible here.
-	if p.state != coordRunning && p.state != coordArmed && p.state != coordAborted {
-		return Terminal{}, fmt.Errorf("%w: TERMINAL in state %v", ErrOutOfState, p.state)
+	// An aborted launch still owes a terminal, so coordAborted is admissible — but coordArmed is NOT:
+	// the coordinator has neither authorized a launch nor cancelled one, so an unsolicited terminal
+	// there reports something that cannot have happened.
+	phase, err := p.launchPhase()
+	if err != nil {
+		return Terminal{}, err
 	}
 	t, err := decodeTerminal(f.Payload)
 	if err != nil {
+		return Terminal{}, err
+	}
+	if err := validateTerminalInPhase(phase, t); err != nil {
 		return Terminal{}, err
 	}
 	p.state = coordDone

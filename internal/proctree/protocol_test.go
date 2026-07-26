@@ -447,3 +447,139 @@ func TestTerminalSumType(t *testing.T) {
 		})
 	}
 }
+
+// --- TERMINAL is validated against the LAUNCH PHASE, not only against itself ---
+
+var (
+	termAbort       = Terminal{CommandStarted: false}
+	termSpawnFailed = Terminal{CommandStarted: false, SpawnErrorClass: "not_found"}
+	termStarted     = Terminal{CommandStarted: true, Exited: true, CommandPGID: 7, Reaped: 1}
+)
+
+// supervisorAt drives the real protocol to a launch phase, so the test starts from the shipped
+// sequence rather than from hand-set states.
+func supervisorAt(t *testing.T, phase launchPhase) (*SupervisorProtocol, *bytes.Buffer) {
+	t.Helper()
+	var ctrl, stat bytes.Buffer
+	sup := &SupervisorProtocol{}
+	if err := sup.SendReady(&stat); err != nil {
+		t.Fatalf("SendReady: %v", err)
+	}
+	mustRead(t, &stat)
+	switch phase {
+	case launchUnauthorized:
+	case launchAborted:
+		if err := WriteFrame(&ctrl, Frame{Type: TypeCancel}); err != nil {
+			t.Fatalf("WriteFrame CANCEL: %v", err)
+		}
+		if _, err := sup.Recv(mustRead(t, &ctrl)); err != nil {
+			t.Fatalf("Recv CANCEL: %v", err)
+		}
+	case launchAuthorized:
+		if err := WriteFrame(&ctrl, Frame{Type: TypeGo, Payload: sup.challenge}); err != nil {
+			t.Fatalf("WriteFrame GO: %v", err)
+		}
+		if _, err := sup.Recv(mustRead(t, &ctrl)); err != nil {
+			t.Fatalf("Recv GO: %v", err)
+		}
+	}
+	return sup, &stat
+}
+
+func coordinatorAt(t *testing.T, phase launchPhase) (*CoordinatorProtocol, *bytes.Buffer) {
+	t.Helper()
+	var ctrl, stat bytes.Buffer
+	sup := &SupervisorProtocol{}
+	coord := &CoordinatorProtocol{}
+	if err := sup.SendReady(&stat); err != nil {
+		t.Fatalf("SendReady: %v", err)
+	}
+	if err := coord.RecvReady(mustRead(t, &stat)); err != nil {
+		t.Fatalf("RecvReady: %v", err)
+	}
+	switch phase {
+	case launchUnauthorized:
+	case launchAborted:
+		if err := coord.SendCancel(&ctrl); err != nil {
+			t.Fatalf("SendCancel: %v", err)
+		}
+	case launchAuthorized:
+		if err := coord.SendGo(&ctrl); err != nil {
+			t.Fatalf("SendGo: %v", err)
+		}
+	}
+	return coord, &stat
+}
+
+// TestTerminalMustMatchTheLaunchPhase walks the whole cross-product.
+//
+// Terminal.validate proves a terminal is consistent with ITSELF. That is not the same as being true:
+// a well-formed "started, exited 0" is a lie before GO, because GO is the sole launch authorization,
+// and the value validator has no way to know it. Both directions are checked, because a coordinator
+// must not believe a frame merely because a peer was willing to send it.
+func TestTerminalMustMatchTheLaunchPhase(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase launchPhase
+		term  Terminal
+		ok    bool
+	}{
+		// Before GO or CANCEL nothing can have happened, so no terminal is truthful.
+		{"unauthorized/abort", launchUnauthorized, termAbort, false},
+		{"unauthorized/spawn-failed", launchUnauthorized, termSpawnFailed, false},
+		{"unauthorized/started", launchUnauthorized, termStarted, false},
+
+		// A cancelled launch never attempted a spawn, so only the empty shape can be true.
+		{"aborted/abort", launchAborted, termAbort, true},
+		{"aborted/spawn-failed", launchAborted, termSpawnFailed, false},
+		{"aborted/started", launchAborted, termStarted, false},
+
+		// After GO exactly two things can be true: the command ran, or the spawn failed.
+		{"authorized/abort", launchAuthorized, termAbort, false},
+		{"authorized/spawn-failed", launchAuthorized, termSpawnFailed, true},
+		{"authorized/started", launchAuthorized, termStarted, true},
+	} {
+		t.Run("send/"+tc.name, func(t *testing.T) {
+			sup, stat := supervisorAt(t, tc.phase)
+			err := sup.SendTerminal(stat, tc.term)
+			if tc.ok && err != nil {
+				t.Fatalf("SendTerminal refused a truthful terminal: %v", err)
+			}
+			if !tc.ok && !errors.Is(err, ErrOutOfState) {
+				t.Fatalf("SendTerminal: err = %v, want ErrOutOfState", err)
+			}
+		})
+		t.Run("recv/"+tc.name, func(t *testing.T) {
+			coord, stat := coordinatorAt(t, tc.phase)
+			payload, err := tc.term.encode()
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			// Injected directly, exactly as a buggy or hostile peer would: the coordinator must
+			// decide for itself whether the frame can be true.
+			if err := WriteFrame(stat, Frame{Type: TypeTerminal, Payload: payload}); err != nil {
+				t.Fatalf("WriteFrame: %v", err)
+			}
+			_, err = coord.RecvTerminal(mustRead(t, stat))
+			if tc.ok && err != nil {
+				t.Fatalf("RecvTerminal refused a truthful terminal: %v", err)
+			}
+			if !tc.ok && !errors.Is(err, ErrOutOfState) {
+				t.Fatalf("RecvTerminal: err = %v, want ErrOutOfState", err)
+			}
+		})
+	}
+}
+
+// TestAbortedSupervisorIsNotDone: the supervisor's aborted state is distinct from done, because the
+// two admit different terminals. Collapsing them would let a terminal-already-sent supervisor abort,
+// or an aborted one report a started command.
+func TestAbortedSupervisorStillOwesExactlyOneTerminal(t *testing.T) {
+	sup, stat := supervisorAt(t, launchAborted)
+	if err := sup.SendTerminal(stat, termAbort); err != nil {
+		t.Fatalf("SendTerminal: %v", err)
+	}
+	if err := sup.SendTerminal(stat, termAbort); !errors.Is(err, ErrOutOfState) {
+		t.Fatalf("second SendTerminal: err = %v, want ErrOutOfState", err)
+	}
+}
