@@ -677,12 +677,44 @@ func samePath(a, b string) bool {
 	if normPath(a) == normPath(b) {
 		return true
 	}
-	ra, ea := filepath.EvalSymlinks(a)
-	rb, eb := filepath.EvalSymlinks(b)
+	ra, ea := resolveThroughMissingLeaf(a)
+	rb, eb := resolveThroughMissingLeaf(b)
 	if ea == nil && eb == nil {
 		return normPath(ra) == normPath(rb)
 	}
 	return false
+}
+
+// resolveThroughMissingLeaf resolves symlinks in a path whose leaf may not exist.
+//
+// EvalSymlinks fails outright on a missing path, which broke exactly the case worktree recovery
+// exists for: when our worktree directory has been DELETED, macOS reports the registration under
+// /private/var while the constructed path says /var, the fast string compare misses, and the
+// resolution that would reconcile them cannot run because the leaf is gone. The registration was
+// therefore unmatchable and a recoverable own-partial worktree was classified foreign — on macOS
+// only, which is why it survived local testing on Linux and Windows.
+//
+// Resolving the deepest ancestor that DOES exist and re-appending the missing tail gives the same
+// answer without requiring the leaf to be present.
+func resolveThroughMissingLeaf(p string) (string, error) {
+	p = filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r, nil
+	}
+	var tail []string
+	cur := p
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the volume root without finding anything that exists.
+			return "", fs.ErrNotExist
+		}
+		tail = append([]string{filepath.Base(cur)}, tail...)
+		if r, err := filepath.EvalSymlinks(parent); err == nil {
+			return filepath.Join(append([]string{r}, tail...)...), nil
+		}
+		cur = parent
+	}
 }
 
 func normPath(p string) string {

@@ -134,10 +134,40 @@ func (g *Git) openAdminRoot(ctx context.Context, repoDir, worktree string) (*adm
 		return nil, errors.Join(cerr, gitRoot.Close())
 	}
 
-	common := filepath.Join(repoDir, ".git")
-	admin, err := g.revParse(ctx, worktree, "--absolute-git-dir")
+	// BOTH paths come from git, in git's own normalisation, and are then proven to be the directory
+	// this function already opened and verified.
+	//
+	// Constructing `common` as filepath.Join(repoDir, ".git") and comparing it to git's answer was a
+	// string comparison between two different spellings of the same place. On macOS git resolves
+	// /var to /private/var, and on Windows the caller's path and git's can differ in case or short-name
+	// form; filepath.Rel is case-sensitive even there. A perfectly legitimate linked worktree then
+	// looked like an escape, and the whole coordinator failed on both platforms while passing on the
+	// developer's machine. Asking git for both removes the mismatch at its source rather than
+	// normalising after the fact.
+	// A failure to RESOLVE either git dir is itself a CAS refusal, not an incidental git error.
+	//
+	// Callers key on ErrIndexCAS to distinguish "the CAS refused" from "something else broke", and
+	// containment that cannot be established must fail closed with that classification — the same
+	// posture the rest of this package takes for facts it cannot observe. Concretely: when the admin
+	// dir is redirected through a symlink, git on Linux answers "not a git repository" while git on
+	// Windows answers with a path, so without this the identical attack produced a typed refusal on
+	// one platform and a raw error on the other.
+	common, err := g.revParse(ctx, repoDir, "--absolute-git-dir")
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: cannot resolve the repository git dir", ErrIndexCAS), err, gitRoot.Close())
+	}
+	// Git's answer must BE the object already verified and opened above, not merely a path that looks
+	// like it — otherwise a redirected repository could hand back a different directory entirely.
+	commonFi, err := os.Lstat(common)
 	if err != nil {
 		return nil, errors.Join(err, gitRoot.Close())
+	}
+	if !os.SameFile(commonFi, gitStat) {
+		return nil, errors.Join(fmt.Errorf("%w: %s reports a git dir that is not the verified %s/.git", ErrIndexCAS, repoDir, repoDir), gitRoot.Close())
+	}
+	admin, err := g.revParse(ctx, worktree, "--absolute-git-dir")
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: cannot resolve the worktree admin dir", ErrIndexCAS), err, gitRoot.Close())
 	}
 	rel, err := filepath.Rel(common, admin)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
