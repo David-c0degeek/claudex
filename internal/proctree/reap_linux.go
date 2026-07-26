@@ -247,6 +247,13 @@ func TerminalFrom(res ReapResult, pgid int) (Terminal, error) {
 	if !res.Leader.Observed {
 		return Terminal{}, fmt.Errorf("proctree: teardown never observed the command leader; no outcome can be claimed")
 	}
+	// The ESRCH proof is part of what makes the terminal TRUE, not a separate concern. A terminal can
+	// be internally consistent and still false in context: reporting "exited 0" while descendants are
+	// still running in the owned group would let the gate finalize over live processes, which is the
+	// same phase/value gap found at the launch boundary, recreated at the cleanup boundary.
+	if !res.GroupEmpty {
+		return Terminal{}, fmt.Errorf("proctree: teardown did not prove the group empty; no outcome can be claimed")
+	}
 	t := Terminal{
 		CommandStarted: true,
 		CommandPGID:    pgid,
@@ -272,54 +279,82 @@ func TerminalFrom(res ReapResult, pgid int) (Terminal, error) {
 // The supervisor uses it as: NewReaper before the command is spawned, Await while it runs, Teardown to
 // clear whatever remains, then TerminalFrom over the accumulated result.
 type Reaper struct {
-	pgid int
-	res  ReapResult
+	pgid     int
+	leaderFd int
+	res      ReapResult
 }
 
-// NewReaper binds a reaper to an owned group.
+// NewReaper binds a reaper to an owned group and takes an identity-bound handle on its leader.
+//
+// The pidfd is what keeps the group id from being recycled underneath the teardown. Detecting the
+// leader's exit by REAPING it would free its PID the moment the group had no other members — and
+// because the leader's pid IS the group id, a recycled number in the gap before teardown signals
+// would send that signal to an unrelated group. A pidfd reports the exit without reaping, so the
+// leader stays a zombie, its pid stays reserved, and the group identity remains ours until teardown
+// finishes with it. Keeping the number in a Go struct gives no such affinity, which is exactly why
+// the design already refuses a bare PGID for a later process.
 func NewReaper(pgid int) (*Reaper, error) {
 	if pgid <= 0 {
 		return nil, fmt.Errorf("proctree: refusing to reap group %d", pgid)
 	}
-	return &Reaper{pgid: pgid}, nil
+	fd, err := unix.PidfdOpen(pgid, 0)
+	if err != nil {
+		return nil, fmt.Errorf("proctree: pidfd_open on leader %d: %w", pgid, err)
+	}
+	return &Reaper{pgid: pgid, leaderFd: fd}, nil
+}
+
+// Close releases the leader handle. It is safe to call more than once.
+func (r *Reaper) Close() error {
+	if r.leaderFd < 0 {
+		return nil
+	}
+	err := unix.Close(r.leaderFd)
+	r.leaderFd = -1
+	return err
 }
 
 // Result is everything observed so far.
 func (r *Reaper) Result() ReapResult { return r.res }
 
-// Await drains without signalling, until the leader is observed or the deadline passes.
+// Await waits for the command leader to EXIT, without reaping it and without signalling anything.
 //
-// It signals nothing: this is the command running normally, and a teardown that starts by killing
-// would report every command as terminated by SIGTERM regardless of what it was doing. Draining
-// meanwhile is not optional either — descendants that exit while the leader still runs would otherwise
-// accumulate as zombies in the group and keep the ESRCH proof from ever succeeding.
+// Two properties matter and neither is incidental. It does not signal, because a teardown that starts
+// by killing would report every normally-finishing command as terminated by SIGTERM — that is not a
+// hypothetical, it is what the first version of this code did. And it does not reap, because reaping
+// is what frees the identity: the leader remains a zombie, so the group id stays ours until teardown
+// has finished signalling it.
 //
-// Returns true when the leader's status has been captured.
+// The leader's exit STATUS is therefore not captured here; it is captured when teardown reaps it.
+// Returns true when the leader has exited.
 func (r *Reaper) Await(deadline time.Time, poll time.Duration) (bool, error) {
 	if poll <= 0 {
 		return false, fmt.Errorf("proctree: await poll must be positive, got %v", poll)
 	}
+	if r.leaderFd < 0 {
+		return false, errors.New("proctree: reaper is closed")
+	}
 	for {
-		n, leader, err := drainGroup(r.pgid)
-		r.res.Reaped += n
-		if leader.Observed {
-			r.res.Leader = leader
-		}
-		if err != nil {
-			return r.res.Leader.Observed, err
-		}
-		if r.res.Leader.Observed {
-			return true, nil
-		}
-		if !time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return false, nil
 		}
-		nap := poll
-		if remaining := time.Until(deadline); remaining < nap {
-			nap = remaining
+		wait := remaining
+		if poll < wait {
+			wait = poll
 		}
-		if nap > 0 {
-			time.Sleep(nap)
+		fds := []unix.PollFd{{Fd: int32(r.leaderFd), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, int(wait.Milliseconds())+1)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return false, fmt.Errorf("proctree: poll leader pidfd: %w", err)
+		}
+		// A pidfd becomes readable exactly when its process terminates, so this is the exit signal
+		// without the reap that would release the identity.
+		if n > 0 && fds[0].Revents&unix.POLLIN != 0 {
+			return true, nil
 		}
 	}
 }

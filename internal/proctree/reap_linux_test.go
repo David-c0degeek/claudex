@@ -301,11 +301,16 @@ func reapLeaderOnly(t *testing.T, cmd *exec.Cmd) (ReapResult, int) {
 	if err != nil {
 		t.Fatalf("NewReaper: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	// Await first, so a command that finishes normally reports what it DID. Signalling straight away
 	// would report every command as terminated by SIGTERM regardless of its actual outcome — which is
 	// exactly what happened before these two phases were separated.
-	if _, err := r.Await(time.Now().Add(5*time.Second), 5*time.Millisecond); err != nil {
+	exited, err := r.Await(time.Now().Add(5*time.Second), 50*time.Millisecond)
+	if err != nil {
 		t.Fatalf("Await: %v", err)
+	}
+	if !exited {
+		t.Fatal("leader did not exit within the await window")
 	}
 	res, err := r.Teardown(fastPolicy)
 	if err != nil {
@@ -366,8 +371,9 @@ func TestTeardownCarriesSignalTermination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReaper: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	// This leader never finishes, so Await must give up rather than hang; the teardown then kills it.
-	observed, err := r.Await(time.Now().Add(100*time.Millisecond), 5*time.Millisecond)
+	observed, err := r.Await(time.Now().Add(100*time.Millisecond), 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Await: %v", err)
 	}
@@ -411,6 +417,94 @@ func TestTeardownOfAnAlreadyExitedLeader(t *testing.T) {
 func TestTerminalFromRefusesAnUnobservedLeader(t *testing.T) {
 	if _, err := TerminalFrom(ReapResult{Reaped: 2, GroupEmpty: true}, 42); err == nil {
 		t.Fatal("TerminalFrom produced a terminal without having observed the leader")
+	}
+}
+
+// TestTerminalFromRequiresTheGroupEmptyProof. A terminal can be internally consistent and still false
+// in context: reporting a clean exit while descendants are still running in the owned group would let
+// the gate finalize over live processes.
+func TestTerminalFromRequiresTheGroupEmptyProof(t *testing.T) {
+	unfinished := ReapResult{
+		Reaped:     1,
+		GroupEmpty: false,
+		Leader:     LeaderOutcome{Observed: true, Exited: true},
+	}
+	if _, err := TerminalFrom(unfinished, 42); err == nil {
+		t.Fatal("TerminalFrom accepted a teardown that never proved the group empty")
+	}
+}
+
+// TestNoTerminalAfterADeadlinedTeardown is the same rule end to end on a real group: the leader is
+// observed, the teardown times out, and no outcome may be claimed.
+func TestNoTerminalAfterADeadlinedTeardown(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	cmd := startTermImmuneLeader(t)
+	pgid := cmd.Process.Pid
+	r, err := NewReaper(pgid)
+	if err != nil {
+		t.Fatalf("NewReaper: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = r.Close()
+		_ = unix.Kill(-pgid, unix.SIGKILL)
+		_, _, _ = drainGroup(pgid)
+	})
+	res, terr := r.Teardown(ReapPolicy{Grace: time.Hour, Deadline: 100 * time.Millisecond, Poll: 5 * time.Millisecond})
+	if !errors.Is(terr, ErrReapDeadline) {
+		t.Fatalf("Teardown: err = %v, want ErrReapDeadline", terr)
+	}
+	if _, err := TerminalFrom(res, pgid); err == nil {
+		t.Fatal("a timed-out teardown produced an authoritative terminal")
+	}
+}
+
+// TestAwaitDoesNotReleaseTheLeaderIdentity is the window an end-state test cannot see.
+//
+// If Await reaped the leader, its pid — which IS the group id — would be free the moment the group
+// had no other members, and the teardown's kill(-pgid, ...) could then land on an unrelated recycled
+// group. Keeping the leader unreaped holds the identity, and the proof is that the group still
+// answers a probe after Await reports the exit.
+func TestAwaitDoesNotReleaseTheLeaderIdentity(t *testing.T) {
+	if err := BecomeSubreaper(); err != nil {
+		t.Fatalf("BecomeSubreaper: %v", err)
+	}
+	cmd := startGroupLeader(t, "exit 5")
+	pgid := cmd.Process.Pid
+	r, err := NewReaper(pgid)
+	if err != nil {
+		t.Fatalf("NewReaper: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	exited, err := r.Await(time.Now().Add(5*time.Second), 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	if !exited {
+		t.Fatal("leader did not exit")
+	}
+	// The leader is a zombie here, not gone: the group must still exist, or its id was released
+	// before the teardown ever signalled it.
+	empty, err := groupIsEmpty(pgid)
+	if err != nil {
+		t.Fatalf("groupIsEmpty: %v", err)
+	}
+	if empty {
+		t.Fatal("the group id was released before teardown; a recycled id could be signalled instead")
+	}
+
+	res, err := r.Teardown(fastPolicy)
+	if err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	term, err := TerminalFrom(res, pgid)
+	if err != nil {
+		t.Fatalf("TerminalFrom: %v", err)
+	}
+	if !term.Exited || term.ExitCode != 5 {
+		t.Fatalf("terminal = %+v, want the exit captured by the teardown that reaped it", term)
 	}
 }
 
