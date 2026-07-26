@@ -60,6 +60,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "attach":
 		return attachCmd(ctx, rest, stdout, stderr)
+	case "pull":
+		return pullCmd(ctx, rest, stdout, stderr)
 	case "submit":
 		return submitCmd(ctx, rest, stdout, stderr)
 	case "status":
@@ -131,10 +133,11 @@ Commands:
   version          Print version information
   help             Show this help
   attach           Bootstrap or join a run, or reattach/replace a session
+  pull             Print the caller's assignment and mirror it to their inbox
   submit           Submit an artifact for the caller's turn
   status           Print the run's status projection
   wait             Long-poll for the next event relevant to a session
   inspect-legacy   Print a redacted, read-only view of a pre-pivot Python run
                    (state.json); it is never resumed as an attach run
 
-pull is wired incrementally; gates/operator arrive with subject 05.`
+Human gates and the operator surface arrive with subject 05.`

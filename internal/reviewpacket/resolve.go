@@ -99,9 +99,17 @@ func ResolveAt(ctx context.Context, d Deps, rs state.RunState, turnID string, ph
 	}, nil
 }
 
-// resolveSource proves the complete {commit, tree} the packet is cut from. Before the first accepted
-// implementation the source is the run's BaseCommit; afterwards it is the latest ACCEPTED commit, so
-// a reviewer always sees the state the run actually agreed to, never an unaccepted one.
+// ExpectedSource is the complete {commit, tree} a packet for this run state must be cut from. Before
+// the first accepted implementation it is the run's BaseCommit; afterwards it is the latest ACCEPTED
+// commit, so a reviewer always sees the state the run actually agreed to, never an unaccepted one.
+//
+// It is exported because pull re-derives the SAME expectation when it re-verifies a bound packet.
+// Sharing this one function is what makes producer and verifier agree by construction rather than by
+// two derivations that could drift.
+func ExpectedSource(ctx context.Context, d Deps, rs state.RunState) (evidence.SourceObject, error) {
+	return resolveSource(ctx, d, rs)
+}
+
 func resolveSource(ctx context.Context, d Deps, rs state.RunState) (evidence.SourceObject, error) {
 	if latest, ok := state.LatestGitCommit(rs); ok {
 		// Returned as-is; ResolveAt proves the pair against the object store, so the accepted tuple
