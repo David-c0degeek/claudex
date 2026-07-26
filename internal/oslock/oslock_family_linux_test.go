@@ -1,6 +1,7 @@
 package oslock
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -45,7 +46,19 @@ func TestLockFamiliesDoNotContend(t *testing.T) {
 	defer other.Close()
 	fl := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 1}
 	if err := unix.FcntlFlock(other.Fd(), unix.F_OFD_SETLK, &fl); err != nil {
-		t.Skipf("OFD locks unavailable here: %v", err)
+		// Only a genuinely unsupported kernel or filesystem is a skip. CONTENTION is the opposite of
+		// a reason to skip: it means the shipped family has become OFD, which is exactly the silent
+		// substitution this guard exists to catch — and converting every error into a skip would have
+		// turned this test green-by-omission at the moment it mattered.
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EACCES) {
+			t.Fatal("an OFD probe CONTENDED with the shipped lease lock: the shipped family appears to " +
+				"have been changed to OFD, so acquire and probe are no longer the single family the " +
+				"design requires")
+		}
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skipf("OFD locks unsupported here: %v", err)
+		}
+		t.Fatalf("unexpected error from the cross-family probe: %v", err)
 	}
 	// It SUCCEEDED against a lease that is genuinely held. That is the whole point: mixing families
 	// silently reports a running attempt as free.

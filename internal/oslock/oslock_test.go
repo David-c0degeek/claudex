@@ -2,6 +2,7 @@ package oslock
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +193,14 @@ func TestRootedAcquireAndRelease(t *testing.T) {
 // would start over a running one. Acquire and probe must therefore share one implementation.
 func TestProbeSeesAHeldRootedLease(t *testing.T) {
 	root := testRoot(t)
+	// Arming creates the entry, exactly as the supervisor does before any probe can be meaningful.
+	arm, _, err := TryAcquireInRoot(root, "lease")
+	if err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	if err := arm.Release(); err != nil {
+		t.Fatalf("release arm: %v", err)
+	}
 	held, err := ProbeInRoot(root, "lease")
 	if err != nil {
 		t.Fatalf("probe on a free lease: %v", err)
@@ -228,39 +237,23 @@ func TestProbeSeesAHeldRootedLease(t *testing.T) {
 // like a live owner.
 func TestProbeDoesNotRetainTheLock(t *testing.T) {
 	root := testRoot(t)
+	arm, _, err := TryAcquireInRoot(root, "lease")
+	if err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	if err := arm.Release(); err != nil {
+		t.Fatalf("release arm: %v", err)
+	}
 	for i := 0; i < 3; i++ {
 		if held, err := ProbeInRoot(root, "lease"); err != nil || held {
 			t.Fatalf("probe %d: held=%v err=%v", i, held, err)
 		}
 	}
-	l, ok, err := TryAcquireInRoot(root, "lease")
-	if err != nil || !ok {
-		t.Fatalf("acquire after probes: ok=%v err=%v", ok, err)
+	l, ok, aerr := TryAcquireInRoot(root, "lease")
+	if aerr != nil || !ok {
+		t.Fatalf("acquire after probes: ok=%v err=%v", ok, aerr)
 	}
 	_ = l.Release()
-}
-
-// TestProbeFailsClosed: on any error the probe reports HELD, so a caller that ignores the error treats
-// "we could not tell" as "someone is running" rather than starting a second attempt over a live one.
-func TestProbeFailsClosed(t *testing.T) {
-	root := testRoot(t)
-	// A directory at the lease name cannot be opened for writing, so the probe errors.
-	if err := os.Mkdir(filepath.Join(rootDir(t, root), "lease"), 0o700); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
-	held, err := ProbeInRoot(root, "lease")
-	if err == nil {
-		t.Fatal("probe succeeded against an unopenable lease")
-	}
-	if !held {
-		t.Fatal("probe reported unheld on error; a caller ignoring the error would start a second attempt")
-	}
-}
-
-// rootDir recovers the directory a root was opened on, for fixtures that must act outside it.
-func rootDir(t *testing.T, root *os.Root) string {
-	t.Helper()
-	return root.Name()
 }
 
 // TestRootedLeaseIsConfined: the lease cannot be steered out of the attempt directory.
@@ -268,5 +261,67 @@ func TestRootedLeaseIsConfined(t *testing.T) {
 	root := testRoot(t)
 	if _, _, err := TryAcquireInRoot(root, "../escaped"); err == nil {
 		t.Fatal("the root permitted a lease outside the attempt directory")
+	}
+}
+
+// TestProbeDoesNotCreateTheLease is the defect the acquire/probe split exists for.
+//
+// Sharing the acquiring open meant a probe of a lease that had been RENAMED AWAY created a fresh empty
+// file at the original name and locked that instead — reporting "unheld" while the original lock was
+// still live under its new name. The probe was answering a question about a file it had just made.
+func TestProbeDoesNotCreateTheLease(t *testing.T) {
+	root := testRoot(t)
+
+	// Absent entry: after arming, absence is not a free lease, and probing must not manufacture one.
+	held, err := ProbeInRoot(root, "lease")
+	if !errors.Is(err, ErrLeaseMissing) {
+		t.Fatalf("err = %v, want ErrLeaseMissing", err)
+	}
+	if !held {
+		t.Fatal("an absent lease was reported unheld; the probe must fail closed")
+	}
+	if _, serr := os.Lstat(filepath.Join(root.Name(), "lease")); serr == nil {
+		t.Fatal("the probe created the lease entry it was asked about")
+	}
+
+	// The displaced-lease vector: acquire, rename WITHOUT releasing, then probe the original name.
+	l, ok, err := TryAcquireInRoot(root, "lease")
+	if err != nil || !ok {
+		t.Fatalf("TryAcquireInRoot: ok=%v err=%v", ok, err)
+	}
+	defer l.Release()
+	if rerr := root.Rename("lease", "displaced"); rerr != nil {
+		t.Skipf("cannot rename a locked lease here: %v", rerr)
+	}
+	held, err = ProbeInRoot(root, "lease")
+	if !errors.Is(err, ErrLeaseMissing) {
+		t.Fatalf("displaced lease: err = %v, want ErrLeaseMissing", err)
+	}
+	if !held {
+		t.Fatal("a displaced lease was reported unheld while its lock was still live")
+	}
+	// The lock really is still held, under the new name.
+	stillHeld, err := ProbeInRoot(root, "displaced")
+	if err != nil {
+		t.Fatalf("probe displaced: %v", err)
+	}
+	if !stillHeld {
+		t.Fatal("the renamed entry should still carry the live lock")
+	}
+}
+
+// TestProbeRejectsANonRegularLease: following a substitute would let something other than the lease
+// answer for it.
+func TestProbeRejectsANonRegularLease(t *testing.T) {
+	root := testRoot(t)
+	if err := os.Mkdir(filepath.Join(root.Name(), "lease"), 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	held, err := ProbeInRoot(root, "lease")
+	if !errors.Is(err, ErrLeaseNotRegular) {
+		t.Fatalf("err = %v, want ErrLeaseNotRegular", err)
+	}
+	if !held {
+		t.Fatal("a non-regular lease entry was reported unheld")
 	}
 }
