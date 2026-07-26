@@ -700,18 +700,41 @@ func resolveThroughMissingLeaf(p string) (string, error) {
 	p = filepath.Clean(p)
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return r, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// Only genuine ABSENCE justifies the fallback. A symlink loop, a permission denial or any
+		// other resolution failure is not a missing worktree, and this helper feeds a registration
+		// ownership proof — reinterpreting "cannot resolve" as "not there yet" would let an
+		// unresolvable existing path be treated as a recoverable one.
+		//
+		// Defence in depth rather than an independent guard: the walk below proves each stripped
+		// component genuinely absent by Lstat, which catches the same cases. Recorded as such rather
+		// than counted, since a mutation that removes this check alone is not detectable.
+		return "", err
 	}
+
 	var tail []string
 	cur := p
 	for {
+		// The component about to be stripped must be genuinely absent. Lstat, not Stat: a dangling or
+		// looping symlink EXISTS as a directory entry while EvalSymlinks reports not-exist, and
+		// accepting that as absence is exactly the reinterpretation this guard refuses.
+		if _, lerr := os.Lstat(cur); lerr == nil {
+			return "", fmt.Errorf("%w: %s exists but cannot be resolved", fs.ErrInvalid, cur)
+		} else if !errors.Is(lerr, fs.ErrNotExist) {
+			return "", lerr
+		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
 			// Reached the volume root without finding anything that exists.
 			return "", fs.ErrNotExist
 		}
 		tail = append([]string{filepath.Base(cur)}, tail...)
-		if r, err := filepath.EvalSymlinks(parent); err == nil {
+		r, perr := filepath.EvalSymlinks(parent)
+		if perr == nil {
 			return filepath.Join(append([]string{r}, tail...)...), nil
+		}
+		if !errors.Is(perr, fs.ErrNotExist) {
+			return "", perr
 		}
 		cur = parent
 	}

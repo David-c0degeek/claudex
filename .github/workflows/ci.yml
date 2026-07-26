@@ -53,9 +53,12 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Skips are not failures, but an unnoticed skip is how a platform-specific guard quietly stops
-      # being tested. Surface them so a reviewer sees what did not run.
+      # being tested — which already happened once in this repository. Surfaced on every native job,
+      # not just this one: a guard that silently stops running on a release-gate platform is exactly
+      # the failure this workflow exists to prevent.
       - name: Report skipped tests
         if: always()
+        shell: bash
         run: go test -count=1 ./... -run . -v 2>&1 | grep -E "^\s*--- SKIP" || echo "no skipped tests"
 
   windows:
@@ -81,6 +84,13 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test -count=1 ./...
+      # Skips are not failures, but an unnoticed skip is how a platform-specific guard quietly stops
+      # being tested. This matters most on Windows, which is a first-class release gate and where the
+      # symlink-based containment guards can skip: a green job would otherwise omit them silently.
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: go test -count=1 ./... -run . -v 2>&1 | grep -E "^\s*--- SKIP" || echo "no skipped tests"
 
   macos:
     name: darwin/arm64
@@ -97,6 +107,13 @@ jobs:
       # half builds and passes rather than claiming the gate is supported.
       - name: go test
         run: go test -count=1 ./...
+      # Skips are not failures, but an unnoticed skip is how a platform-specific guard quietly stops
+      # being tested. This matters most on Windows, which is a first-class release gate and where the
+      # symlink-based containment guards can skip: a green job would otherwise omit them silently.
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: go test -count=1 ./... -run . -v 2>&1 | grep -E "^\s*--- SKIP" || echo "no skipped tests"
 
   cross-compile:
     name: cross-compile release targets
