@@ -222,17 +222,20 @@ func TestSpawnFailureReleasesTheStreamEnds(t *testing.T) {
 	}
 }
 
-// TestSpawnRestoresHandleInheritance.
+// TestSpawnNeverExposesTheCallersOwnHandles.
 //
-// The standard handles have to be made inheritable for the duration of the call, and must be put back
-// afterwards so they cannot cross into an unrelated CreateProcess elsewhere in the program.
+// An earlier version flipped the caller's real stream handles inheritable for the duration of
+// CreateProcess and restored them afterwards. A handle list constrains only the CreateProcess that
+// carries it, so during that window any unrelated concurrent spawn in this program with inheritance
+// enabled could have received the coordinator's real stdout and stderr — and a failed restore would
+// have made the window permanent. Spawn now passes inheritable DUPLICATES and never touches the
+// originals, so the assertion is that the flag is unchanged rather than restored.
 //
-// The inheritance flag is cleared FIRST, and that is not tidiness. Measured on this platform,
-// os.Pipe returns handles that are ALREADY inheritable — Go's syscall.Pipe creates them with
-// InheritHandle set — so a version of this test that trusted the default read 1 before and 1 after and
-// could not fail whatever the code did. Starting from a known-off state is what gives the assertion
-// something to detect.
-func TestSpawnRestoresHandleInheritance(t *testing.T) {
+// The flag is cleared FIRST, and that is not tidiness. Measured on this platform, os.Pipe returns
+// handles that are ALREADY inheritable — Go's syscall.Pipe creates them with InheritHandle set — so a
+// version of this test that trusted the default read 1 before and 1 after and could not fail whatever
+// the code did.
+func TestSpawnNeverExposesTheCallersOwnHandles(t *testing.T) {
 	job := armForTest(t)
 	outR, outW, err := os.Pipe()
 	if err != nil {
@@ -270,6 +273,75 @@ func TestSpawnRestoresHandleInheritance(t *testing.T) {
 		t.Fatalf("Spawn left the stream handle inheritable (flags 0x%x); it can now cross into an unrelated CreateProcess", after)
 	}
 	_ = CloseStreamCopies(CommandSpawn{Stdout: outW, Stderr: errW})
+}
+
+// TestACommandThatStartedIsNeverReportedAsASpawnFailure.
+//
+// `spawn_failed` is reserved for a configured command that COULD NOT START — it is a statement about
+// the operator's command, and the whole point of separating it from a code failure is that the two mean
+// different things to whoever reads the record. A cleanup fault in the coordinator's own process is
+// neither.
+//
+// The earlier code failed Spawn on a thread-handle close error, which sent it through the terminate
+// path and killed a command that may already have executed. Resuming is now the irreversible boundary:
+// the started process is returned ALONGSIDE the error, and it is still running.
+func TestACommandThatStartedIsNeverReportedAsASpawnFailure(t *testing.T) {
+	job := armForTest(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer outR.Close()
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer errR.Close()
+
+	boom := errors.New("injected thread-handle close failure")
+	real := closeThreadHandle
+	closeThreadHandle = func(h windows.Handle) error {
+		_ = real(h)
+		return boom
+	}
+	t.Cleanup(func() { closeThreadHandle = real })
+
+	cp, err := job.Spawn(CommandSpawn{Spec: treeSpec(t, exe), Stdout: outW, Stderr: errW})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the injected cleanup failure surfaced", err)
+	}
+	if cp == nil {
+		t.Fatal("a command that started was returned as nothing; the caller cannot distinguish it from a spawn failure")
+	}
+	t.Cleanup(func() { _ = cp.Close() })
+	if err := CloseStreamCopies(CommandSpawn{Stdout: outW, Stderr: errW}); err != nil {
+		t.Fatalf("CloseStreamCopies: %v", err)
+	}
+
+	// Still running, and still contained: the cleanup fault must not have killed it.
+	if exited, werr := cp.Wait(time.Now().Add(300 * time.Millisecond)); werr != nil {
+		t.Fatalf("Wait: %v", werr)
+	} else if exited {
+		code, _ := cp.ExitCode()
+		t.Fatalf("the started command was terminated by a cleanup failure (exit %d)", code)
+	}
+	pids, perr := job.MemberPIDs()
+	if perr != nil {
+		t.Fatalf("MemberPIDs: %v", perr)
+	}
+	found := false
+	for _, p := range pids {
+		if p == cp.PID() {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the started command %d is not in the containment domain %v", cp.PID(), pids)
+	}
 }
 
 // TestSpawnedCommandInheritsNothingBeyondItsStreams is the handle-list proof, and it matters more here

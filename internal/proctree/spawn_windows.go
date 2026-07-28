@@ -128,20 +128,27 @@ func (j *ArmedJob) Spawn(s CommandSpawn) (cp *ContainedProcess, err error) {
 	}
 	defer devNull.Close()
 
-	// Inheritability is granted for the duration of this call and then put back. Leaving it on would
-	// let these handles cross into an UNRELATED CreateProcess elsewhere in the program that inherits
-	// handles without a list — the leak the handle list prevents for our own child, reintroduced
-	// through somebody else's.
-	stdHandles := []windows.Handle{
+	// The caller's real handles are NEVER made inheritable. Inheritable DUPLICATES are created for this
+	// call and closed immediately after it.
+	//
+	// The earlier version flipped the originals inheritable for the duration of CreateProcess and put
+	// them back afterwards, which left a window in which they were inheritable PROCESS-WIDE. A handle
+	// list constrains only the CreateProcess that carries it, so any unrelated concurrent spawn in this
+	// program with inheritance enabled could have received the coordinator's real stdout and stderr —
+	// and the restore step could fail silently, making the window permanent. Duplicates remove the
+	// window entirely rather than shortening it: the originals' inheritance is never touched, so there
+	// is nothing to restore and nothing to get wrong.
+	originals := []windows.Handle{
 		windows.Handle(devNull.Fd()),
 		windows.Handle(s.Stdout.Fd()),
 		windows.Handle(s.Stderr.Fd()),
 	}
-	var restore func()
-	if restore, err = makeInheritable(stdHandles); err != nil {
+	var stdHandles []windows.Handle
+	var closeDups func()
+	if stdHandles, closeDups, err = inheritableDuplicates(originals); err != nil {
 		return nil, err
 	}
-	defer restore()
+	defer closeDups()
 
 	var attrs *windows.ProcThreadAttributeListContainer
 	if attrs, err = windows.NewProcThreadAttributeList(2); err != nil {
@@ -199,7 +206,16 @@ func (j *ArmedJob) Spawn(s CommandSpawn) (cp *ContainedProcess, err error) {
 	// exit is what makes the failure mean the containment is as it was — and it is cheap, because this
 	// process was created suspended and never ran a single instruction. A wait that does not complete
 	// is joined into the error rather than swallowed, because then the domain really is not clear.
+	//
+	// It keys on `resumed`, NOT on err. Keying on err was the defect: once the command has started,
+	// Spawn can still return an error for a cleanup fault, and the terminate path would then kill a
+	// running command and close the very handle the caller was just handed — which is also a
+	// double-close, since the caller closes it too.
+	resumed := false
 	defer func() {
+		if resumed {
+			return
+		}
 		if err == nil {
 			return
 		}
@@ -215,44 +231,55 @@ func (j *ArmedJob) Spawn(s CommandSpawn) (cp *ContainedProcess, err error) {
 	if err = j.confirmProcessContained(pi.Process); err != nil {
 		return nil, err
 	}
+
+	// RESUMING IS THE IRREVERSIBLE BOUNDARY. Once this returns successfully the configured command has
+	// started, and no later failure may unsay that.
+	//
+	// The earlier version treated a failure to close the thread handle as a Spawn failure, which sent
+	// the error defer above through TerminateProcess on a command that might already have executed —
+	// reporting `spawn_failed`, a class reserved for a command that could not start, about a command
+	// that did. A leaked thread handle is an infrastructure fault in the caller's process; it is
+	// returned ALONGSIDE the started command rather than converted into a claim about the command.
 	if _, err = windows.ResumeThread(pi.Thread); err != nil {
 		err = fmt.Errorf("proctree: resume contained process: %w", err)
 		return nil, err
 	}
-	if err = windows.CloseHandle(pi.Thread); err != nil {
-		err = fmt.Errorf("proctree: close contained thread handle: %w", err)
-		return nil, err
+	resumed = true
+	started := &ContainedProcess{handle: pi.Process, pid: pi.ProcessId}
+	if cerr := closeThreadHandle(pi.Thread); cerr != nil {
+		return started, fmt.Errorf("proctree: the command started; closing its thread handle failed: %w", cerr)
 	}
-	return &ContainedProcess{handle: pi.Process, pid: pi.ProcessId}, nil
+	return started, nil
 }
 
-// makeInheritable turns inheritance on for exactly these handles and returns the undo.
+// closeThreadHandle is a seam. The boundary it guards — that a started command is never reported as a
+// spawn failure — cannot be exercised otherwise, because a CloseHandle on a valid handle does not fail
+// on demand, and a boundary that is only asserted in a comment is one nothing prevents from moving.
+var closeThreadHandle = windows.CloseHandle
+
+// inheritableDuplicates makes inheritable copies of handles whose originals must stay private.
 //
-// The previous flags are read rather than assumed to be zero. Go creates pipes and opens files
-// non-inheritable today, but restoring a value that was never observed is how a handle quietly stays
-// inheritable for the rest of the process's life.
-func makeInheritable(hs []windows.Handle) (func(), error) {
-	prev := make([]uint32, len(hs))
-	done := 0
-	undo := func() {
-		for i := 0; i < done; i++ {
-			_ = windows.SetHandleInformation(hs[i], windows.HANDLE_FLAG_INHERIT, prev[i])
+// DuplicateHandle with bInheritHandle set produces a NEW handle in this process that CreateProcess can
+// pass on, while the source handle's own flags are untouched. That is the difference that matters: the
+// originals are the coordinator's real streams, and any interval in which they are inheritable is an
+// interval in which an unrelated spawn elsewhere in the program can receive them.
+func inheritableDuplicates(src []windows.Handle) ([]windows.Handle, func(), error) {
+	dups := make([]windows.Handle, 0, len(src))
+	closeAll := func() {
+		for _, h := range dups {
+			_ = windows.CloseHandle(h)
 		}
 	}
-	for i, h := range hs {
-		var flags uint32
-		if err := getHandleInformation(h, &flags); err != nil {
-			undo()
-			return nil, fmt.Errorf("proctree: read handle inheritance: %w", err)
+	self := windows.CurrentProcess()
+	for _, h := range src {
+		var dup windows.Handle
+		if err := windows.DuplicateHandle(self, h, self, &dup, 0, true, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("proctree: duplicate a stream handle for inheritance: %w", err)
 		}
-		prev[i] = flags & windows.HANDLE_FLAG_INHERIT
-		if err := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
-			undo()
-			return nil, fmt.Errorf("proctree: grant handle inheritance: %w", err)
-		}
-		done = i + 1
+		dups = append(dups, dup)
 	}
-	return undo, nil
+	return dups, closeAll, nil
 }
 
 // envBlockUTF16 renders the frozen environment as the double-NUL-terminated block CreateProcessW wants.

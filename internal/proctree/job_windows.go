@@ -29,11 +29,10 @@ import (
 // be given that would reach this object. The handle is never made inheritable and never duplicated, so
 // "the coordinator holds the only handle" is structural.
 //
-// What that costs, stated plainly: the completion fact can no longer be a name lookup. It does not need
-// to be. Kill-on-close is enforced by the KERNEL when the last handle closes, and process exit closes
-// every handle a process held — so on Windows the owner's death IS the teardown, with no intermediary
-// that could fail. Recovery therefore reads owner death (an unheld lease) rather than a published
-// receipt. See RecoveryGuarantee for exactly what that does and does not claim.
+// What that costs, stated plainly: the completion fact can no longer be a name lookup, and nothing
+// replaces it. Kill-on-close is enforced by the KERNEL when the last handle closes, and process exit
+// closes every handle a process held, so the tree really is terminated when the coordinator dies — but
+// that is not something a LATER process can read. See RecoveryGuarantee.
 
 // procThreadAttributeJobList is PROC_THREAD_ATTRIBUTE_JOB_LIST, which x/sys/windows does not define.
 //
@@ -81,11 +80,21 @@ var (
 //     job handle out of it, injecting code, or terminating it in a way that matters. Nothing
 //     unprivileged can defend that, and it is the same class as the Linux setsid escape the design
 //     already places outside the authority model.
-//   - After owner death, recovery knows every member was TERMINATED, not that every member was
-//     REAPED. There is no handle left to enumerate the domain with, so "no member can still execute"
-//     is the claim, and the reap accounting a live coordinator produces is simply absent. Identity
-//     observation, not this, is what covers a write that was already in flight.
-const RecoveryGuarantee = "windows: kernel-enforced kill-on-close on an unnamed job; owner death terminates the domain"
+//   - **Owner death is not a fact RECOVERY can read.** An earlier version of this comment said it was,
+//     reasoning that the kernel tears the domain down when the coordinator dies. The teardown does
+//     happen; the inference does not follow. The run lease and the job are DIFFERENT handles — the
+//     lease is a file lock released when its own handle closes — and Windows specifies no order in
+//     which a terminating process's handles are closed. A recovering coordinator can therefore see the
+//     lease unheld while job termination is still in flight, and would retry over a domain that is
+//     dying rather than dead. So there is no post-crash completion fact on Windows and recovery must
+//     BLOCK, exactly as it does on a POSIX platform with no supervisor.
+//   - Consequently there is no reap accounting after a crash either: nothing holds a handle with which
+//     to enumerate the domain.
+//
+// The clean-shutdown path is unaffected. A LIVE coordinator terminates the job, observes the domain
+// empty through the handle it still holds, and only then releases the lease — that ordering belongs to
+// the coordinator and is provable.
+const RecoveryGuarantee = "windows: kernel-enforced kill-on-close on an unnamed job while the owner lives; NO readable post-crash fact, so recovery blocks"
 
 // ArmedJob is containment with no command in it yet.
 //

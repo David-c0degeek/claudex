@@ -163,10 +163,15 @@ func kernelObjectName(h windows.Handle) (string, error) {
 	const objectNameInformation = 1
 	ntQueryObject := windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryObject")
 
-	buf := make([]byte, 2048)
+	// Allocated as []uintptr, not []byte, so the buffer is pointer-aligned by construction. A byte
+	// slice leaves alignment to the allocator, and under the race allocator it is NOT aligned — the
+	// call then fails with STATUS_DATATYPE_MISALIGNMENT, deterministically, which is exactly the kind
+	// of defect that hides when only one build configuration is ever run. Production MemberPIDs
+	// allocates this way for the same reason.
+	buf := make([]uintptr, 256)
 	var retlen uint32
 	r0, _, _ := syscall.SyscallN(ntQueryObject.Addr(), uintptr(h), objectNameInformation,
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&retlen)))
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)*int(unsafe.Sizeof(uintptr(0)))), uintptr(unsafe.Pointer(&retlen)))
 	if r0 != 0 {
 		return "", fmt.Errorf("NtQueryObject: NTSTATUS 0x%x", r0)
 	}
