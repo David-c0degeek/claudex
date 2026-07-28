@@ -259,6 +259,25 @@ func TestSpawnRequiresStreamEnds(t *testing.T) {
 	}
 }
 
+// awaitChildAnnouncement blocks until the child has written its first byte.
+//
+// That byte is the only available proof that the process is past execve AND past the dynamic loader,
+// which is what makes the descriptor listing that follows a statement about INHERITANCE rather than a
+// snapshot of whatever the loader happened to be holding.
+func awaitChildAnnouncement(t *testing.T, r *os.File) {
+	t.Helper()
+	if err := r.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var one [1]byte
+	if _, err := io.ReadFull(r, one[:]); err != nil {
+		t.Fatalf("the child never announced itself: %v", err)
+	}
+	if err := r.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear read deadline: %v", err)
+	}
+}
+
 // childFDs reads a live child's descriptor table from the PARENT, so the listing is not perturbed by
 // the act of listing it.
 func childFDs(t *testing.T, pid int) []string {
@@ -293,9 +312,27 @@ func childFDs(t *testing.T, pid int) []string {
 // assertion because the fixture could not support it produced a predicate that no longer said what
 // the design requires.
 func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
-	const sleepBin = "/bin/sleep"
-	if _, err := os.Stat(sleepBin); err != nil {
-		t.Skipf("%s unavailable: %v", sleepBin, err)
+	// The child ANNOUNCES that it is running, and the listing below waits for that announcement.
+	//
+	// Enumerating straight after the spawn raced the dynamic loader: between execve and main, ld.so has
+	// the process's shared objects OPEN, so a listing taken in that window sees libc as a fourth
+	// descriptor and the test fails claiming a leak that does not exist. It passed in isolation and
+	// failed under a loaded full-suite run, which is the worst possible failure mode - a gate nobody can
+	// trust and a defect nobody can reproduce on demand.
+	//
+	// The fix is a FACT rather than a delay: the child writes a byte, the test reads it, and only a
+	// process that has finished loading and reached its own code can have written it. The shell then
+	// FORKS for its sleep rather than exec-ing, so the observed process does no further loading at all
+	// and the window is closed by construction rather than merely made narrower. Deliberately NOT
+	// `exec sleep` after the announcement: a second execve reopens the same window.
+	//
+	// HONESTY ABOUT THE EVIDENCE: the original failure was observed once, under a loaded full-suite run,
+	// and 200 repeats of the old shape on a warm cache did not reproduce it. This fix is therefore
+	// justified by the argument above rather than by a demonstrated red-to-green flip, and removing the
+	// wait does not reliably turn the test red.
+	const shellBin = "/bin/sh"
+	if _, err := os.Stat(shellBin); err != nil {
+		t.Skipf("%s unavailable: %v", shellBin, err)
 	}
 	marker := filepath.Join(t.TempDir(), "capability-marker")
 	if err := os.WriteFile(marker, []byte("x"), 0o600); err != nil {
@@ -317,8 +354,8 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 	defer errR.Close()
 
 	spec := ExecSpec{
-		Executable: []byte(sleepBin),
-		Argv:       [][]byte{[]byte("sleep"), []byte("30")},
+		Executable: []byte(shellBin),
+		Argv:       [][]byte{[]byte("sh"), []byte("-c"), []byte("echo r; sleep 30")},
 		Cwd:        []byte(t.TempDir()),
 		Env:        []EnvVar{{Name: []byte("PATH"), Value: []byte("/usr/bin:/bin")}},
 		Identity:   NameByteExact,
@@ -340,6 +377,8 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 		_ = r.Close()
 		_, _ = ReapGroup(pgid, fastPolicy)
 	})
+
+	awaitChildAnnouncement(t, outR)
 
 	fds := childFDs(t, cmd.Process.Pid)
 	if len(fds) != 3 {
