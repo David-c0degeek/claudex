@@ -413,17 +413,10 @@ const (
 	TestExecutionInterrupted TestExecution = "interrupted"
 )
 
-// KnownTestExecution reports whether e is one of the enumerated observations.
-func KnownTestExecution(e TestExecution) bool {
-	switch e {
-	case TestExecutionOK, TestExecutionNonzero, TestExecutionTimeout,
-		TestExecutionCancelled, TestExecutionSpawnFailed, TestExecutionInterrupted:
-		return true
-	}
-	return false
-}
-
 // TestIdentity is whether the repository was the same at the end as at the start.
+//
+// Independent of TestExecution by construction: the verdict is a total function of the PAIR, so no case
+// is left implicit the way an ordered precedence list would leave it.
 type TestIdentity string
 
 const (
@@ -435,11 +428,39 @@ const (
 	TestIdentityUnobserved TestIdentity = "unobserved"
 )
 
+// AllTestExecutions and AllTestIdentities are THE vocabularies, in production.
+//
+// They were briefly duplicated as test-only slices, which made the "closed vocabulary" claim depend on
+// somebody remembering to edit a copy: adding a production constant did not enlarge the tested cross
+// product, so the new combinations were never decided and never noticed. One authority, iterated by the
+// tests, is what makes growing either vocabulary fail until its combinations exist.
+func AllTestExecutions() []TestExecution {
+	return []TestExecution{
+		TestExecutionOK, TestExecutionNonzero, TestExecutionTimeout,
+		TestExecutionCancelled, TestExecutionSpawnFailed, TestExecutionInterrupted,
+	}
+}
+
+func AllTestIdentities() []TestIdentity {
+	return []TestIdentity{TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved}
+}
+
+// KnownTestExecution reports whether e is one of the enumerated observations.
+func KnownTestExecution(e TestExecution) bool {
+	for _, k := range AllTestExecutions() {
+		if k == e {
+			return true
+		}
+	}
+	return false
+}
+
 // KnownTestIdentity reports whether i is one of the enumerated observations.
 func KnownTestIdentity(i TestIdentity) bool {
-	switch i {
-	case TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved:
-		return true
+	for _, k := range AllTestIdentities() {
+		if k == i {
+			return true
+		}
 	}
 	return false
 }
@@ -459,25 +480,59 @@ const (
 	OutcomeCancelled TestOutcome = "cancelled"
 )
 
-// Outcome is a TOTAL function of the two observations.
+type observation struct {
+	Execution TestExecution
+	Identity  TestIdentity
+}
+
+// outcomeTable is an EXPLICIT row per combination, with no fallthrough.
 //
-// Total is the property, not a convenience. The predecessor was a precedence list, which has to be read
-// in order to be understood and leaves every unlisted combination undefined — so a pair nobody had
-// thought about would fall through to whatever the last branch happened to be. Here every one of the
-// eighteen combinations has an answer, and an unknown value on either axis is refused rather than
-// guessed, because a verdict the gate cannot justify is worse than no verdict.
+// It replaced an ordered set of cases ending in a default, and the default was the defect: a newly
+// accepted execution omitted from the cases was silently classified as `fail`, and a newly accepted
+// identity was guessed as pass or fail. Both are verdicts the gate would have acted on, decided by
+// nobody. With a table, an undecided pair has no row and Outcome refuses — so adding a value to either
+// vocabulary fails closed until somebody decides what it means.
 //
-// The order of the rules is itself a set of decisions:
+// Several rows are DECISIONS rather than deductions:
 //
-//   - CANCELLED outranks everything, including a timeout. Operator intent supersedes a bound, and
-//     calling a cancelled attempt a failure would blame the code for a human's decision.
-//   - SPAWN_FAILED and INTERRUPTED are indeterminate whatever identity says. Neither is a statement
-//     about the code, so neither may spend the fix budget.
-//   - UNOBSERVED identity is indeterminate even for a clean exit 0. The gate cannot certify a tree it
-//     did not observe; passing there would be the strongest possible claim made on the weakest
-//     evidence.
-//   - CHANGED identity FAILS even for a clean exit 0, because the result describes a tree that no
-//     longer exists — the run was edited underneath the gate.
+//   - cancelled outranks everything, including a timeout: operator intent supersedes a bound, and
+//     calling a cancelled attempt a failure blames the code for a human's decision;
+//   - spawn_failed and interrupted are indeterminate whatever identity says, because neither is a
+//     statement about the code and neither may spend the fix budget;
+//   - an unobserved tree cannot pass even on a clean exit — that would be the strongest available claim
+//     made on the weakest evidence;
+//   - a changed tree fails even on a clean exit, because the result describes a tree that no longer
+//     exists.
+var outcomeTable = map[observation]TestOutcome{
+	{TestExecutionOK, TestIdentityUnchanged}:  OutcomePass,
+	{TestExecutionOK, TestIdentityChanged}:    OutcomeFail,
+	{TestExecutionOK, TestIdentityUnobserved}: OutcomeIndeterminate,
+
+	{TestExecutionNonzero, TestIdentityUnchanged}:  OutcomeFail,
+	{TestExecutionNonzero, TestIdentityChanged}:    OutcomeFail,
+	{TestExecutionNonzero, TestIdentityUnobserved}: OutcomeIndeterminate,
+
+	{TestExecutionTimeout, TestIdentityUnchanged}:  OutcomeFail,
+	{TestExecutionTimeout, TestIdentityChanged}:    OutcomeFail,
+	{TestExecutionTimeout, TestIdentityUnobserved}: OutcomeIndeterminate,
+
+	{TestExecutionCancelled, TestIdentityUnchanged}:  OutcomeCancelled,
+	{TestExecutionCancelled, TestIdentityChanged}:    OutcomeCancelled,
+	{TestExecutionCancelled, TestIdentityUnobserved}: OutcomeCancelled,
+
+	{TestExecutionSpawnFailed, TestIdentityUnchanged}:  OutcomeIndeterminate,
+	{TestExecutionSpawnFailed, TestIdentityChanged}:    OutcomeIndeterminate,
+	{TestExecutionSpawnFailed, TestIdentityUnobserved}: OutcomeIndeterminate,
+
+	{TestExecutionInterrupted, TestIdentityUnchanged}:  OutcomeIndeterminate,
+	{TestExecutionInterrupted, TestIdentityChanged}:    OutcomeIndeterminate,
+	{TestExecutionInterrupted, TestIdentityUnobserved}: OutcomeIndeterminate,
+}
+
+// Outcome is a TOTAL function of the two observations, by table lookup.
+//
+// An unknown value on either axis is refused, and so is a KNOWN pair with no decided row: a verdict the
+// gate cannot justify is worse than no verdict, because it would be acted on.
 func Outcome(e TestExecution, i TestIdentity) (TestOutcome, error) {
 	if !KnownTestExecution(e) {
 		return "", fmt.Errorf("state: %q is not a known execution observation", e)
@@ -485,20 +540,11 @@ func Outcome(e TestExecution, i TestIdentity) (TestOutcome, error) {
 	if !KnownTestIdentity(i) {
 		return "", fmt.Errorf("state: %q is not a known identity observation", i)
 	}
-	switch {
-	case e == TestExecutionCancelled:
-		return OutcomeCancelled, nil
-	case e == TestExecutionSpawnFailed, e == TestExecutionInterrupted:
-		return OutcomeIndeterminate, nil
-	case i == TestIdentityUnobserved:
-		return OutcomeIndeterminate, nil
-	case i == TestIdentityChanged:
-		return OutcomeFail, nil
-	case e == TestExecutionOK:
-		return OutcomePass, nil
-	default: // nonzero, timeout — both with unchanged identity
-		return OutcomeFail, nil
+	o, ok := outcomeTable[observation{e, i}]
+	if !ok {
+		return "", fmt.Errorf("state: no decided outcome for the known pair (%q, %q); the vocabulary grew without the combination being decided", e, i)
 	}
+	return o, nil
 }
 
 // FinalizedAttempt is one immutable ledger entry.

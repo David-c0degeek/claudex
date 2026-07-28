@@ -11,15 +11,53 @@ import "testing"
 // here, and a separate test proves the enumeration IS the whole cross product, so a value added to
 // either axis without a decision cannot slip through.
 
-// allExecutions and allIdentities are the closed vocabularies. If either grows, the completeness test
-// below fails until the new combinations are decided.
-var allExecutions = []TestExecution{
-	TestExecutionOK, TestExecutionNonzero, TestExecutionTimeout,
-	TestExecutionCancelled, TestExecutionSpawnFailed, TestExecutionInterrupted,
+// The vocabularies come from PRODUCTION. They were briefly duplicated here, which made the
+// closed-vocabulary claim depend on somebody remembering to edit a copy — so adding a constant did not
+// enlarge the tested cross product and its combinations were never decided.
+var allExecutions = AllTestExecutions()
+
+var allIdentities = AllTestIdentities()
+
+// TestTheOutcomeTableIsExactlyTheCrossProduct is what makes growth fail closed.
+//
+// Every combination must have an explicit row, and every row must be a combination — so adding a value
+// to either vocabulary without deciding its outcomes fails here, and a row for a value that no longer
+// exists cannot linger unnoticed.
+func TestTheOutcomeTableIsExactlyTheCrossProduct(t *testing.T) {
+	want := len(allExecutions) * len(allIdentities)
+	if len(outcomeTable) != want {
+		t.Fatalf("the outcome table has %d rows, want %d (%d executions x %d identities)",
+			len(outcomeTable), want, len(allExecutions), len(allIdentities))
+	}
+	for k := range outcomeTable {
+		if !KnownTestExecution(k.Execution) || !KnownTestIdentity(k.Identity) {
+			t.Fatalf("the table has a row for (%q, %q), which is not a known pair", k.Execution, k.Identity)
+		}
+	}
 }
 
-var allIdentities = []TestIdentity{
-	TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved,
+// TestAKnownPairWithNoDecidedRowIsRefused exercises the branch that catches vocabulary growth.
+//
+// It is reachable only by removing a row, which is exactly the state the guard exists for: a value
+// accepted by the known-ness check but never given a meaning. The previous implementation ended in a
+// default, so that state produced a verdict — `fail` for an unchanged tree, a guess for a new identity
+// — decided by nobody and acted on by the gate.
+func TestAKnownPairWithNoDecidedRowIsRefused(t *testing.T) {
+	k := observation{TestExecutionOK, TestIdentityUnchanged}
+	saved, ok := outcomeTable[k]
+	if !ok {
+		t.Fatal("the fixture row is missing; this test cannot prove anything")
+	}
+	delete(outcomeTable, k)
+	t.Cleanup(func() { outcomeTable[k] = saved })
+
+	got, err := Outcome(k.Execution, k.Identity)
+	if err == nil {
+		t.Fatalf("an undecided known pair produced the verdict %q instead of a refusal", got)
+	}
+	if got != "" {
+		t.Fatalf("a refused pair still produced the verdict %q", got)
+	}
 }
 
 // TestOutcomeTableIsExactlyTheDesign enumerates all eighteen combinations.

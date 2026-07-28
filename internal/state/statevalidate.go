@@ -197,6 +197,20 @@ func validateAttemptTransition(old, next *RunState) error {
 			e.TestedCommit != a.TestedCommit || e.TestedTree != a.TestedTree {
 			return fmt.Errorf("finalized attempt %q does not match the active attempt %q it claims to finalize", e.AttemptID, a.AttemptID)
 		}
+		// The `cancelled` observation is bound to a cancel that ACTUALLY BOUND, in both directions.
+		//
+		// The design's race has one winner either way: if the cancel binds first, the runner's
+		// subsequent finalization is a ledger-only `cancelled`; if the result binds first, the cancel is
+		// a no-op against a finalized attempt. Without this, both halves were expressible as lies — a
+		// perfectly ordinary attempt could be recorded as cancelled when no operator ever asked, and a
+		// cancel-pending attempt could be finalized as `ok` or `nonzero` and take an ordinary verdict,
+		// spending the fix budget for a run the operator had already stopped.
+		if cancelled := e.Execution == TestExecutionCancelled; cancelled != a.CancelPending {
+			if cancelled {
+				return fmt.Errorf("attempt %q was finalized as cancelled, but no cancel had bound to it", e.AttemptID)
+			}
+			return fmt.Errorf("attempt %q had a cancel bound, so it can only be finalized as cancelled, not %q", e.AttemptID, e.Execution)
+		}
 		// Finalization CONSUMES the ref, and that is enforced STRUCTURALLY rather than here: an entry
 		// whose attempt is also the active one is not a representable state at all (see
 		// validateTestAttempts), so a duplicate check at this level could never fire. It is left out
@@ -778,6 +792,23 @@ func validateProjection(field string, p *Projection, rev uint64) error {
 // executable/control field (never silently rewriting identity/control values).
 func redactAndGuard(rs *RunState) error {
 	rs.FS.Reason = redact.Text(rs.FS.Reason)
+	// The ledger's terminal detail is FREE TEXT from the runner — a spawn error, a signal description —
+	// so it is redacted here like every other free-text field, rather than left as the one exception.
+	//
+	// Redacted, not rejected, and the difference from the ENVIRONMENT rule is the point. An environment
+	// value must be refused because a digest over redacted values would bind something the command never
+	// received; this field is DESCRIPTIVE — nothing consumes it as an execution input — so a redacted
+	// form is a faithful record of a description. Rejecting instead would let hostile command output
+	// strand the gate.
+	//
+	// The canonical representation is therefore the REDACTED text, and the runner must redact at
+	// construction so the result digest binds exactly these bytes. That is safe because redaction is
+	// idempotent: the marker matches no token pattern, so redacting twice is redacting once (pinned by
+	// test). This pass is the persistence-boundary backstop for anything that reached state by another
+	// path.
+	for i := range rs.TestAttempts {
+		rs.TestAttempts[i].TerminalReason = redact.Text(rs.TestAttempts[i].TerminalReason)
+	}
 	if rs.Recovery != nil {
 		rs.Recovery.Reason = redact.Text(rs.Recovery.Reason)
 	}

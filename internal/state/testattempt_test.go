@@ -2,6 +2,7 @@ package state
 
 import (
 	"github.com/David-c0degeek/claudex/internal/config"
+	"github.com/David-c0degeek/claudex/internal/redact"
 	"strings"
 	"testing"
 )
@@ -549,5 +550,102 @@ func TestActiveAttemptMalformations(t *testing.T) {
 				t.Fatalf("err = %v, want one containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestTheCancelledObservationIsBoundToARealCancel, in BOTH directions.
+//
+// The design's race has one winner either way: a cancel that binds first makes the runner's subsequent
+// finalization a ledger-only `cancelled`; a result that binds first makes the cancel a no-op against a
+// finalized attempt. Neither half was enforced, so both were expressible as lies — an ordinary attempt
+// could be recorded as cancelled when no operator ever asked, and a cancel-pending attempt could take an
+// ordinary verdict, spending the fix budget for a run the operator had already stopped.
+func TestTheCancelledObservationIsBoundToARealCancel(t *testing.T) {
+	t.Run("cancelled without a cancel having bound", func(t *testing.T) {
+		s := newStore(t)
+		started := start(t, s, atTests(t, s), "attempt-0001")
+		_, err := finalize(t, s, started, sha256Hex(20), func(e *FinalizedAttempt) {
+			e.Execution = TestExecutionCancelled
+			e.TerminalReason = "cancelled"
+		})
+		if err == nil || !strings.Contains(err.Error(), "no cancel had bound") {
+			t.Fatalf("err = %v, want a fabricated-cancel refusal", err)
+		}
+	})
+	t.Run("a cancelled attempt taking an ordinary verdict", func(t *testing.T) {
+		s := newStore(t)
+		started := start(t, s, atTests(t, s), "attempt-0001")
+		cancelled, err := s.Mutate(started.Revision, func(_ uint64, n *RunState) error {
+			n.Lifecycle = LifecycleCancelled
+			n.ActiveTestAttempt.CancelPending = true
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		if _, err := finalize(t, s, cancelled, sha256Hex(21), nil); err == nil ||
+			!strings.Contains(err.Error(), "can only be finalized as cancelled") {
+			t.Fatalf("err = %v, want a refusal to take an ordinary verdict after a cancel", err)
+		}
+		// And the legitimate finalization of that same attempt IS accepted.
+		done, err := finalize(t, s, cancelled, sha256Hex(22), func(e *FinalizedAttempt) {
+			e.Execution = TestExecutionCancelled
+			e.TerminalReason = "cancelled by operator"
+		})
+		if err != nil {
+			t.Fatalf("a cancelled attempt could not be finalized as cancelled: %v", err)
+		}
+		got, oerr := Outcome(done.TestAttempts[0].Execution, done.TestAttempts[0].Identity)
+		if oerr != nil || got != OutcomeCancelled {
+			t.Fatalf("verdict = %q (err %v), want cancelled", got, oerr)
+		}
+	})
+}
+
+// TestTerminalDetailIsRedactedAtThePersistenceBoundary.
+//
+// The ledger's terminal detail is free text from the runner — a spawn error, a signal description — and
+// it was the one free-text field the redaction pass never visited, so a token-shaped detail persisted
+// raw despite the package contract.
+//
+// Redacted rather than rejected, unlike an environment value: this field is DESCRIPTIVE, nothing
+// consumes it as an execution input, and rejecting would let hostile command output strand the gate.
+// The canonical representation is therefore the redacted text, which the runner must also produce at
+// construction so a result digest binds exactly these bytes — safe because redaction is idempotent.
+func TestTerminalDetailIsRedactedAtThePersistenceBoundary(t *testing.T) {
+	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
+	s := newStore(t)
+	started := start(t, s, atTests(t, s), "attempt-0001")
+	done, err := finalize(t, s, started, sha256Hex(23), func(e *FinalizedAttempt) {
+		e.Execution = TestExecutionSpawnFailed
+		e.TerminalReason = "exec failed: token=" + secret
+	})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	got := done.TestAttempts[0].TerminalReason
+	if strings.Contains(got, secret) {
+		t.Fatalf("the credential persisted raw in the ledger: %q", got)
+	}
+	if !strings.Contains(got, "REDACTED") {
+		t.Fatalf("terminal detail = %q, want a redaction marker", got)
+	}
+	// Length-changing, as it must be — and the persisted value is what a later read sees, so the
+	// immutability comparison compares redacted against redacted.
+	if len(got) == len("exec failed: token="+secret) {
+		t.Fatal("redaction did not change the text; the vector proves nothing")
+	}
+	// Idempotent, which is what lets the runner redact at construction and still have the digest bind
+	// the persisted bytes.
+	if again := redact.Text(got); again != got {
+		t.Fatalf("redaction is not idempotent: %q -> %q", got, again)
+	}
+	// A further mutation that leaves the entry alone must still be accepted, proving the redacted form
+	// is stable rather than re-redacted into something new each time.
+	if _, err := s.Mutate(done.Revision, func(_ uint64, n *RunState) error {
+		n.Phase = PhaseTests
+		return nil
+	}); err != nil {
+		t.Fatalf("a later mutation was refused after redaction: %v", err)
 	}
 }
