@@ -2,7 +2,6 @@ package state
 
 import (
 	"github.com/David-c0degeek/claudex/internal/config"
-	"github.com/David-c0degeek/claudex/internal/redact"
 	"strings"
 	"testing"
 )
@@ -116,7 +115,7 @@ func TestWhereAnAttemptMayBeActive(t *testing.T) {
 			n.ActiveTestAttempt = attemptRef("attempt-0001", rev)
 			return nil
 		})
-		if err == nil || !strings.Contains(err.Error(), "requires ownerless TESTS") {
+		if err == nil || !strings.Contains(err.Error(), "an active test attempt requires") {
 			t.Fatalf("err = %v, want a placement refusal", err)
 		}
 	})
@@ -129,7 +128,7 @@ func TestWhereAnAttemptMayBeActive(t *testing.T) {
 			n.ActiveTestAttempt = attemptRef("attempt-0001", rev)
 			return nil
 		})
-		if err == nil || !strings.Contains(err.Error(), "requires ownerless TESTS") {
+		if err == nil || !strings.Contains(err.Error(), "an active test attempt requires") {
 			t.Fatalf("err = %v, want a placement refusal", err)
 		}
 	})
@@ -602,50 +601,106 @@ func TestTheCancelledObservationIsBoundToARealCancel(t *testing.T) {
 	})
 }
 
-// TestTerminalDetailIsRedactedAtThePersistenceBoundary.
+// TestTerminalDetailMustArriveCanonical.
 //
-// The ledger's terminal detail is free text from the runner — a spawn error, a signal description — and
-// it was the one free-text field the redaction pass never visited, so a token-shaped detail persisted
-// raw despite the package contract.
-//
-// Redacted rather than rejected, unlike an environment value: this field is DESCRIPTIVE, nothing
-// consumes it as an execution input, and rejecting would let hostile command output strand the gate.
-// The canonical representation is therefore the redacted text, which the runner must also produce at
-// construction so a result digest binds exactly these bytes — safe because redaction is idempotent.
-func TestTerminalDetailIsRedactedAtThePersistenceBoundary(t *testing.T) {
+// The persistence boundary used to REDACT this field. That silently severed the entry's ResultDigest —
+// which binds the canonical result published before this CAS — from the text it identifies: the digest
+// stayed while the text it covered changed underneath it. So the boundary now refuses a non-canonical
+// reason instead of fixing one, and CanonicalTerminalReason is the single constructor applied before
+// both hashing and binding.
+func TestTerminalDetailMustArriveCanonical(t *testing.T) {
 	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
-	s := newStore(t)
-	started := start(t, s, atTests(t, s), "attempt-0001")
-	done, err := finalize(t, s, started, sha256Hex(23), func(e *FinalizedAttempt) {
-		e.Execution = TestExecutionSpawnFailed
-		e.TerminalReason = "exec failed: token=" + secret
+	raw := "exec failed: token=" + secret
+
+	t.Run("a raw reason is refused, not rewritten", func(t *testing.T) {
+		s := newStore(t)
+		started := start(t, s, atTests(t, s), "attempt-0001")
+		_, err := finalize(t, s, started, sha256Hex(23), func(e *FinalizedAttempt) {
+			e.Execution = TestExecutionSpawnFailed
+			e.TerminalReason = raw
+		})
+		if err == nil || !strings.Contains(err.Error(), "not canonical") {
+			t.Fatalf("err = %v, want a refusal naming the canonical constructor", err)
+		}
 	})
-	if err != nil {
-		t.Fatalf("finalize: %v", err)
+
+	t.Run("the canonical form is accepted and stored unchanged", func(t *testing.T) {
+		s := newStore(t)
+		started := start(t, s, atTests(t, s), "attempt-0001")
+		canonical := CanonicalTerminalReason(raw)
+		if strings.Contains(canonical, secret) {
+			t.Fatalf("the canonical form still carries the credential: %q", canonical)
+		}
+		if len(canonical) == len(raw) {
+			t.Fatal("redaction did not change the text; the vector proves nothing")
+		}
+		done, err := finalize(t, s, started, sha256Hex(24), func(e *FinalizedAttempt) {
+			e.Execution = TestExecutionSpawnFailed
+			e.TerminalReason = canonical
+		})
+		if err != nil {
+			t.Fatalf("a canonical reason was refused: %v", err)
+		}
+		// Stored EXACTLY as supplied — which is what keeps the result digest, computed over these same
+		// bytes before the CAS, an identifier of what is actually in the ledger.
+		if got := done.TestAttempts[0].TerminalReason; got != canonical {
+			t.Fatalf("the persistence boundary altered a digest-bound field: %q -> %q", canonical, got)
+		}
+		if got := done.TestAttempts[0].ResultDigest; got != sha256Hex(24) {
+			t.Fatalf("the result digest changed: %q", got)
+		}
+	})
+
+	// Idempotence is what lets the caller apply this before hashing and the boundary check it
+	// afterwards without the two disagreeing.
+	t.Run("canonicalization is idempotent", func(t *testing.T) {
+		once := CanonicalTerminalReason(raw)
+		if twice := CanonicalTerminalReason(once); twice != once {
+			t.Fatalf("not idempotent: %q -> %q", once, twice)
+		}
+	})
+}
+
+// TestTheCancelFactIsWholeOrAbsent.
+//
+// The cancel is ONE durable transition: the CAS that cancels marks the lifecycle cancelled and the
+// attempt cancel-pending together. As two independent placement arms, either half could stand alone —
+// and a fabricated half-state then satisfied the finalization rule, letting a cancel be recorded that
+// never happened, or an ordinary verdict be taken on a run the operator had stopped.
+func TestTheCancelFactIsWholeOrAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mutet func(*RunState)
+	}{
+		{"cancel pending on a running run", func(n *RunState) {
+			n.ActiveTestAttempt.CancelPending = true
+		}},
+		{"a cancelled run whose attempt is not cancel-pending", func(n *RunState) {
+			n.Lifecycle = LifecycleCancelled
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			started := start(t, s, atTests(t, s), "attempt-0001")
+			_, err := s.Mutate(started.Revision, func(_ uint64, n *RunState) error {
+				tc.mutet(n)
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "an active test attempt requires") {
+				t.Fatalf("err = %v, want a half-state refusal", err)
+			}
+		})
 	}
-	got := done.TestAttempts[0].TerminalReason
-	if strings.Contains(got, secret) {
-		t.Fatalf("the credential persisted raw in the ledger: %q", got)
-	}
-	if !strings.Contains(got, "REDACTED") {
-		t.Fatalf("terminal detail = %q, want a redaction marker", got)
-	}
-	// Length-changing, as it must be — and the persisted value is what a later read sees, so the
-	// immutability comparison compares redacted against redacted.
-	if len(got) == len("exec failed: token="+secret) {
-		t.Fatal("redaction did not change the text; the vector proves nothing")
-	}
-	// Idempotent, which is what lets the runner redact at construction and still have the digest bind
-	// the persisted bytes.
-	if again := redact.Text(got); again != got {
-		t.Fatalf("redaction is not idempotent: %q -> %q", got, again)
-	}
-	// A further mutation that leaves the entry alone must still be accepted, proving the redacted form
-	// is stable rather than re-redacted into something new each time.
-	if _, err := s.Mutate(done.Revision, func(_ uint64, n *RunState) error {
-		n.Phase = PhaseTests
-		return nil
-	}); err != nil {
-		t.Fatalf("a later mutation was refused after redaction: %v", err)
-	}
+	// Both halves together are accepted, so the rule is a binding rather than a prohibition on cancelling.
+	t.Run("both halves together", func(t *testing.T) {
+		s := newStore(t)
+		started := start(t, s, atTests(t, s), "attempt-0001")
+		if _, err := s.Mutate(started.Revision, func(_ uint64, n *RunState) error {
+			n.Lifecycle = LifecycleCancelled
+			n.ActiveTestAttempt.CancelPending = true
+			return nil
+		}); err != nil {
+			t.Fatalf("the whole cancel fact was refused: %v", err)
+		}
+	})
 }

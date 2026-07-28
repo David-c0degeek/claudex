@@ -258,17 +258,23 @@ func validateAttemptTransition(old, next *RunState) error {
 		}
 	}
 
-	// 9. Where an attempt may be active at all. It belongs to an ownerless TESTS phase — no agent holds
-	// the turn, the coordinator is running the gate — or to a run already marked cancelled whose
-	// in-flight attempt still has to be bound. The second arm is what lets a cancel take effect
-	// immediately, so status and wait wake, without discarding the only identity the runner can
-	// finalize.
+	// 9. Where an attempt may be active at all, stated as two EXACT shapes rather than two loose arms.
+	//
+	// The cancel fact is a single durable transition: the CAS that cancels marks the LIFECYCLE cancelled
+	// and the attempt CancelPending together. Two independent OR arms let either half stand alone —
+	// `CancelPending` with a running lifecycle passed on the ownerless-TESTS arm, and a cancelled
+	// lifecycle with `CancelPending` false passed on the same arm — so a fabricated half-state could then
+	// satisfy the finalization rule and record a cancel that never happened, or take an ordinary verdict
+	// on a run the operator had stopped. Requiring the whole shape is what makes the boolean and the
+	// lifecycle one fact instead of two that merely usually agree.
 	if a := next.ActiveTestAttempt; a != nil {
+		normal := next.Phase == PhaseTests && next.Assignment == nil &&
+			next.Lifecycle != LifecycleCancelled && !a.CancelPending
 		cancelled := next.Lifecycle == LifecycleCancelled && a.CancelPending
-		ownerlessTests := next.Phase == PhaseTests && next.Assignment == nil
-		if !cancelled && !ownerlessTests {
-			return fmt.Errorf("an active test attempt requires ownerless TESTS or a cancelled run awaiting its terminal binding, got phase %s lifecycle %s assigned=%v",
-				next.Phase, next.Lifecycle, next.Assignment != nil)
+		if !normal && !cancelled {
+			return fmt.Errorf("an active test attempt requires either ownerless TESTS on a non-cancelled run with no cancel pending, "+
+				"or a cancelled run with the cancel bound to the attempt; got phase %s lifecycle %s assigned=%v cancel_pending=%v",
+				next.Phase, next.Lifecycle, next.Assignment != nil, a.CancelPending)
 		}
 	}
 	return nil
@@ -344,6 +350,13 @@ func validateTestAttempts(rs *RunState) error {
 		}
 		if strings.TrimSpace(e.TerminalReason) == "" || len(e.TerminalReason) > 256 {
 			return fmt.Errorf("test_attempts[%d].terminal_reason is required and bounded", i)
+		}
+		// Already canonical, not made canonical here. This field is covered by the result digest, which
+		// was computed before this CAS, so rewriting it at the persistence boundary would leave the
+		// digest identifying text that no longer exists. Refusing instead keeps one representation:
+		// whatever was hashed is what is stored.
+		if e.TerminalReason != CanonicalTerminalReason(e.TerminalReason) {
+			return fmt.Errorf("test_attempts[%d].terminal_reason is not canonical; redact it with CanonicalTerminalReason before hashing the result and binding the entry", i)
 		}
 		// An attempt cannot be both active and finalized: the ref is MOVED into the ledger, not copied.
 		if rs.ActiveTestAttempt != nil && rs.ActiveTestAttempt.AttemptID == e.AttemptID {
@@ -792,29 +805,18 @@ func validateProjection(field string, p *Projection, rev uint64) error {
 // executable/control field (never silently rewriting identity/control values).
 func redactAndGuard(rs *RunState) error {
 	rs.FS.Reason = redact.Text(rs.FS.Reason)
-	// The ledger's terminal detail is FREE TEXT from the runner — a spawn error, a signal description —
-	// so it is redacted here like every other free-text field, rather than left as the one exception.
-	//
-	// Redacted, not rejected, and the difference from the ENVIRONMENT rule is the point. An environment
-	// value must be refused because a digest over redacted values would bind something the command never
-	// received; this field is DESCRIPTIVE — nothing consumes it as an execution input — so a redacted
-	// form is a faithful record of a description. Rejecting instead would let hostile command output
-	// strand the gate.
-	//
-	// The canonical representation is therefore the REDACTED text, and the runner must redact at
-	// construction so the result digest binds exactly these bytes. That is safe because redaction is
-	// idempotent: the marker matches no token pattern, so redacting twice is redacting once (pinned by
-	// test). This pass is the persistence-boundary backstop for anything that reached state by another
-	// path.
-	for i := range rs.TestAttempts {
-		rs.TestAttempts[i].TerminalReason = redact.Text(rs.TestAttempts[i].TerminalReason)
-	}
 	if rs.Recovery != nil {
 		rs.Recovery.Reason = redact.Text(rs.Recovery.Reason)
 	}
 	if rs.Failure != nil {
 		rs.Failure.Reason = redact.Text(rs.Failure.Reason)
 	}
+	// The ledger's terminal detail is NOT rewritten here, and that is a correction rather than an
+	// omission. Rewriting it silently severed the entry's ResultDigest — which binds the canonical
+	// result published BEFORE this CAS — from the field it identifies: the digest stayed while the text
+	// it covered changed underneath it. The state boundary therefore REQUIRES the text to arrive
+	// canonical (see validateTestAttempts) rather than making it so, and CanonicalTerminalReason is the
+	// one constructor callers use before both hashing and binding.
 
 	control := map[string]string{
 		"run_id":                       rs.RunID,

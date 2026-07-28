@@ -23,6 +23,7 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/genstore"
+	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
 // RunStateVersion is the on-disk schema version; an unknown version fails closed.
@@ -546,6 +547,21 @@ func Outcome(e TestExecution, i TestIdentity) (TestOutcome, error) {
 	}
 	return o, nil
 }
+
+// CanonicalTerminalReason is the ONE representation of a runner's terminal detail.
+//
+// It exists so the same bytes are hashed into the published result and bound into the ledger. The
+// persistence boundary used to redact this field itself, which silently severed the entry's
+// ResultDigest from the text it identifies — the digest covered what was published, and what was stored
+// was something else. Callers apply this before hashing; the state boundary then REFUSES anything that
+// is not already canonical rather than quietly fixing it.
+//
+// Redaction rather than rejection is deliberate, and asymmetric with the environment rule on purpose:
+// an environment value must be refused because a digest over redacted values would bind something the
+// command never received, whereas this field is DESCRIPTIVE — nothing consumes it as an execution input
+// — and refusing would let hostile command output strand the gate. It is idempotent, which is what
+// makes applying it before hashing and checking it afterwards agree.
+func CanonicalTerminalReason(s string) string { return redact.Text(s) }
 
 // FinalizedAttempt is one immutable ledger entry.
 type FinalizedAttempt struct {
