@@ -3,29 +3,23 @@ package testgate
 import (
 	"bytes"
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// bs makes the byte-slice lists the execution view uses. Argv and environment names are bytes because
-// they may not be valid UTF-8, and a string would normalize them.
-func bs(vals ...string) [][]byte {
-	out := make([][]byte, len(vals))
-	for i, v := range vals {
-		out[i] = []byte(v)
-	}
-	return out
-}
-
 func validRecord() ResultRecord {
 	return ResultRecord{
 		AttemptID: theAttemptID, TestedCommit: theCommit, TestedTree: theTree,
-		SchemaVersion: ResultRecordVersion, SpecDigest: strings.Repeat("7a", 32), Cwd: "/work",
-		ResolvedExecutable: "/usr/bin/go", ResolvedArgv: bs("go", "test", "./..."),
-		EnvNames: bs("PATH"), EnvDigest: strings.Repeat("5e", 32),
+		SchemaVersion: ResultRecordVersion,
+		View: ExecutionView{
+			Executable: Bytes("/usr/bin/go"),
+			Argv:       ByteList{Bytes("go"), Bytes("test"), Bytes("./...")},
+			Cwd:        Bytes("/work"),
+			EnvNames:   ByteList{Bytes("PATH")},
+			EnvDigest:  strings.Repeat("5e", 32),
+		},
 		Execution: state.TestExecutionOK, Identity: state.TestIdentityUnchanged,
 		TerminalReason: "exited 0", TerminalAuthor: state.TerminalByRunner,
 		HasExitCode: true, ExitCode: 0,
@@ -48,14 +42,12 @@ func TestAResultRecordIsRefusedWhenItContradictsItself(t *testing.T) {
 		{"a tree that is not an oid", func(r *ResultRecord) { r.TestedTree = "x" }, "not git object ids"},
 		// A verifier is expected to be able to see WHICH argv ran; a record without it cannot answer
 		// the question it exists to answer.
-		{"no executable", func(r *ResultRecord) { r.ResolvedExecutable = "" }, "records no command"},
-		{"no argv", func(r *ResultRecord) { r.ResolvedArgv = nil }, "records no command"},
-		{"no working directory", func(r *ResultRecord) { r.Cwd = "" }, "records no working directory"},
-		// Without it the record can describe the same command in a different directory and still look
-		// consistent with everything else.
-		{"no execution spec digest", func(r *ResultRecord) { r.SpecDigest = "" }, "execution spec digest"},
+		{"no executable", func(r *ResultRecord) { r.View.Executable = nil }, "names no executable"},
+		{"no argv", func(r *ResultRecord) { r.View.Argv = nil }, "has no argv"},
+		{"no working directory", func(r *ResultRecord) { r.View.Cwd = nil }, "names no working directory"},
+		{"an environment digest that is not a digest", func(r *ResultRecord) { r.View.EnvDigest = "nope" }, "is not a sha256"},
 		{"no schema version", func(r *ResultRecord) { r.SchemaVersion = 0 }, "schema version"},
-		{"an environment digest that is not a digest", func(r *ResultRecord) { r.EnvDigest = "nope" }, "is not a sha256"},
+
 		{"an unknown execution", func(r *ResultRecord) { r.Execution = "probably-fine" }, "unknown execution"},
 		{"an unknown identity", func(r *ResultRecord) { r.Identity = "probably-fine" }, "unknown identity"},
 		{"no terminal authority", func(r *ResultRecord) { r.TerminalAuthor = "" }, "no known authority"},
@@ -189,15 +181,15 @@ func TestTheRecordCarriesItsOwnBytesRatherThanTheCallersBackingArray(t *testing.
 	}
 
 	rec := validRecord()
-	rec.ResolvedArgv = bs("go", "test")
-	rec.EnvNames = bs("PATH")
+	rec.View.Argv = ByteList{Bytes("go"), Bytes("test")}
+	rec.View.EnvNames = ByteList{Bytes("PATH")}
 	rec.Stdout = StreamRecord{Present: true, SourceBytes: 4, RedactedBytes: 3,
 		SHA256: sha256Hex([]byte("abc")), Head: []byte("abc")}
 	c := cloneRecord(&rec)
-	rec.ResolvedArgv[0][0] = 'X'
-	rec.EnvNames[0][0] = 'X'
+	rec.View.Argv[0][0] = 'X'
+	rec.View.EnvNames[0][0] = 'X'
 	rec.Stdout.Head[0] = 'X'
-	if string(c.ResolvedArgv[0]) != "go" || string(c.EnvNames[0]) != "PATH" || string(c.Stdout.Head) != "abc" {
+	if string(c.View.Argv[0]) != "go" || string(c.View.EnvNames[0]) != "PATH" || string(c.Stdout.Head) != "abc" {
 		t.Fatalf("the record clone shares backing arrays with its source: %+v", c)
 	}
 }
@@ -213,7 +205,7 @@ func TestARecordRoundTripsThroughItsCanonicalBoundary(t *testing.T) {
 		SHA256: sha256Hex([]byte{0xff, 0xfe, 0x00}), Head: []byte{0xff, 0xfe, 0x00}}
 	// An argv element that is not valid UTF-8, which is the case a JSON string field would silently
 	// normalize - binding bytes the child never received.
-	rec.ResolvedArgv = [][]byte{[]byte("go"), {0xff, 0xfe, 'x'}}
+	rec.View.Argv = ByteList{Bytes("go"), Bytes{0xff, 0xfe, 'x'}}
 
 	raw, digest, err := rec.Encode()
 	if err != nil {
@@ -231,17 +223,24 @@ func TestARecordRoundTripsThroughItsCanonicalBoundary(t *testing.T) {
 	if !bytes.Equal(back.Stdout.Head, []byte{0xff, 0xfe, 0x00}) {
 		t.Fatalf("non-UTF-8 stream bytes did not survive the round trip: %v", back.Stdout.Head)
 	}
-	if !bytes.Equal(back.ResolvedArgv[1], []byte{0xff, 0xfe, 'x'}) {
-		t.Fatalf("a non-UTF-8 argv element did not survive the round trip: %v", back.ResolvedArgv[1])
+	if !bytes.Equal(back.View.Argv[1], []byte{0xff, 0xfe, 'x'}) {
+		t.Fatalf("a non-UTF-8 argv element did not survive the round trip: %v", back.View.Argv[1])
 	}
-	if !reflect.DeepEqual(back, rec) {
-		t.Fatalf("round trip changed the record:\n got %+v\nwant %+v", back, rec)
+	// The claim is BYTE identity, not struct-shape identity. Comparing structs would fuss over nil
+	// against empty, which the wire deliberately no longer distinguishes - and byte identity is the only
+	// form of "unchanged" a digest-identified record actually needs.
+	againRaw, _, err := back.Encode()
+	if err != nil {
+		t.Fatalf("re-encoding what was decoded: %v", err)
 	}
-	again, digest2, err := back.Encode()
+	if !bytes.Equal(againRaw, raw) {
+		t.Fatal("a decoded record does not re-encode to the bytes it came from")
+	}
+	_, digest2, err := back.Encode()
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
 	}
-	if !bytes.Equal(again, raw) || digest2 != digest {
+	if digest2 != digest {
 		t.Fatal("encoding is not deterministic, so the digest does not identify the record")
 	}
 }
@@ -419,5 +418,78 @@ func TestTheDecoderRefusesNonCanonicalDocuments(t *testing.T) {
 				t.Fatal("a non-canonical document was accepted, so one record has several durable digests")
 			}
 		})
+	}
+}
+
+// TestTheSplitRuleIsEnforcedNotJustDefined.
+//
+// SplitExcerpt on its own was a helper nothing consulted: for the same retained length, an all-head
+// excerpt and the documented split both validated, so "head+tail" was a shape rather than a rule and two
+// producers could keep different bytes while each called itself correct. And a single combined budget
+// does not say how much of it each stream gets, so 100/0 and 50/50 both fit the ceiling.
+func TestTheSplitRuleIsEnforcedNotJustDefined(t *testing.T) {
+	head, tail, _ := SplitExcerpt([]byte("0123456789"), 8)
+	good := StreamRecord{Present: true, SourceBytes: 10, RedactedBytes: 10,
+		SHA256: strings.Repeat("3c", 32), Head: head, Tail: tail, Truncated: true}
+	if err := good.CheckSplit("stdout", 8); err != nil {
+		t.Fatalf("the documented split was refused: %v", err)
+	}
+	skewed := good
+	skewed.Head, skewed.Tail = Bytes("01234567"), nil
+	if err := skewed.CheckSplit("stdout", 8); err == nil {
+		t.Fatal("an all-head excerpt of the right length passed the split rule")
+	}
+	// An untruncated stream has nothing to allocate, so the rule does not apply to it.
+	whole := StreamRecord{Present: true, RedactedBytes: 3, SHA256: sha256Hex([]byte("abc")), Head: Bytes("abc")}
+	if err := whole.CheckSplit("stdout", 8); err != nil {
+		t.Fatalf("an untruncated stream was held to the split rule: %v", err)
+	}
+
+	// The combined budget is DIVIDED, so both allocations are named rather than left to a producer.
+	out, errB := AllocateOutputBudget(true, true, 9)
+	if out != 5 || errB != 4 {
+		t.Fatalf("two present streams got %d/%d of nine bytes", out, errB)
+	}
+	if out, errB = AllocateOutputBudget(true, false, 9); out != 9 || errB != 0 {
+		t.Fatalf("a lone stdout got %d/%d", out, errB)
+	}
+	if out, errB = AllocateOutputBudget(false, true, 9); out != 0 || errB != 9 {
+		t.Fatalf("a lone stderr got %d/%d", out, errB)
+	}
+	if out, errB = AllocateOutputBudget(false, false, 9); out != 0 || errB != 0 {
+		t.Fatalf("two absent streams were allocated %d/%d", out, errB)
+	}
+}
+
+// TestEncodingSettlesNilAgainstEmptyBeforeHashing.
+//
+// A record built with a nil half and the same record read back from disk describe the same thing, and
+// they must hash the same or one fact has two durable identities.
+//
+// It is the WIRE TYPES that settle this, not a normalization pass: an earlier version normalized the
+// struct before encoding, and the mutation sweep showed removing that step changed nothing, because the
+// marshaller already emits the empty form. Unprovable code removed rather than kept for comfort.
+func TestEncodingSettlesNilAgainstEmptyBeforeHashing(t *testing.T) {
+	withNil := validRecord()
+	withNil.Stdout = StreamRecord{Present: true, SourceBytes: 3, RedactedBytes: 3,
+		SHA256: sha256Hex([]byte("abc")), Head: Bytes("abc"), Tail: nil}
+
+	withEmpty := validRecord()
+	withEmpty.Stdout = StreamRecord{Present: true, SourceBytes: 3, RedactedBytes: 3,
+		SHA256: sha256Hex([]byte("abc")), Head: Bytes("abc"), Tail: Bytes{}}
+
+	rawA, digestA, err := withNil.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	rawB, digestB, err := withEmpty.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if digestA != digestB || !bytes.Equal(rawA, rawB) {
+		t.Fatalf("nil and empty produced two identities for one record:\n %s\n %s", rawA, rawB)
+	}
+	if bytes.Contains(rawA, []byte("null")) {
+		t.Fatalf("an empty value was written as null: %s", rawA)
 	}
 }

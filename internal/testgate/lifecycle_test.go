@@ -1689,8 +1689,9 @@ func TestARecordThatCannotBePublishedIsRefusedBeforeItIsHandedOver(t *testing.T)
 		spoil func(*PreparedAttempt)
 		want  string
 	}{
-		{"no argv to say which command ran", func(p *PreparedAttempt) { p.Spec.Argv = nil }, "records no command"},
-		{"no executable", func(p *PreparedAttempt) { p.Spec.Executable = "" }, "records no command"},
+		{"no argv to say which command ran", func(p *PreparedAttempt) { p.Spec.Argv = nil }, "has no argv"},
+		{"no executable", func(p *PreparedAttempt) { p.Spec.Executable = "" }, "names no executable"},
+		{"no working directory", func(p *PreparedAttempt) { p.Spec.Cwd = "" }, "names no working directory"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -1851,10 +1852,50 @@ func TestTheRecordBindsTheWorkingDirectoryTheAttemptRanIn(t *testing.T) {
 	if _, err := Run(h.deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if h.sawResultRecord.Cwd != theSpec.Cwd {
-		t.Fatalf("the record says cwd %q, the attempt ran in %q", h.sawResultRecord.Cwd, theSpec.Cwd)
+	if string(h.sawResultRecord.View.Cwd) != theSpec.Cwd {
+		t.Fatalf("the record says cwd %q, the attempt ran in %q", h.sawResultRecord.View.Cwd, theSpec.Cwd)
 	}
-	if h.sawResultRecord.SpecDigest != theSpec.Digest {
-		t.Fatalf("the record binds spec %q, the attempt armed %q", h.sawResultRecord.SpecDigest, theSpec.Digest)
+	// ONE digest comparison, which is the point of the shared view: a field added to the execution
+	// description is bound everywhere at once, rather than in the places somebody remembered.
+	wantView, err := theSpec.View()
+	if err != nil {
+		t.Fatalf("View: %v", err)
+	}
+	got, gerr := h.sawResultRecord.View.Digest()
+	want, werr := wantView.Digest()
+	if gerr != nil || werr != nil {
+		t.Fatalf("digesting: %v / %v", gerr, werr)
+	}
+	if got != want {
+		t.Fatalf("the record describes execution %s, the attempt armed %s", got, want)
+	}
+}
+
+// TestASkewedExcerptIsRefusedAtTheCollaboratorBoundary.
+//
+// The allocation is only a rule if something applies it, and the frozen budget lives with the attempt
+// rather than in the record - so this is the boundary where it can be applied at all.
+func TestASkewedExcerptIsRefusedAtTheCollaboratorBoundary(t *testing.T) {
+	h := newHarness(t)
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.MaxOutputBytes = 8
+		return p, err
+	}
+	// The right total, divided the wrong way: all head, no tail.
+	h.cont.term = Terminal{
+		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
+		HasExitCode: true,
+		Stdout: StreamRecord{Present: true, SourceBytes: 100, RedactedBytes: 100,
+			SHA256: strings.Repeat("3c", 32), Head: Bytes("01234567"), Truncated: true},
+	}
+
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "allocates") {
+		t.Fatalf("err = %v, want a split-rule refusal", err)
+	}
+	if h.r.did("publish-result") {
+		t.Fatalf("a skewed excerpt reached the durable seam: %v", h.r.steps)
 	}
 }

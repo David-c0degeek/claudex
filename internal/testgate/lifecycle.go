@@ -99,8 +99,37 @@ type ExecutionSpec struct {
 	// Env is the frozen environment, ordered, as raw name/value BYTES — an inherited Unix value need not
 	// be valid UTF-8, and the child must receive it byte for byte.
 	Env config.ResolvedExecution
-	// Digest is the identity of everything above, bound in the intent and the result.
+	// Digest is the identity of everything above, bound in the intent and the result. It is the digest of
+	// the ExecutionView below, so the spec and the record cannot describe different things while claiming
+	// the same identity.
 	Digest string
+}
+
+// View renders the spec as the ONE execution description the intent and the result both bind.
+//
+// Building it here rather than at each carrier is what makes "the result describes the execution that
+// was armed" a single digest comparison instead of six hand-written field checks - the kind that
+// silently omits whichever field was added last.
+func (s ExecutionSpec) View() (ExecutionView, error) {
+	envDigest, err := s.Env.EnvIdentityDigest()
+	if err != nil {
+		return ExecutionView{}, fmt.Errorf("%w: digesting the environment identity: %v", ErrLifecycle, err)
+	}
+	argv := make(ByteList, 0, len(s.Argv))
+	for _, a := range s.Argv {
+		argv = append(argv, Bytes(a))
+	}
+	names := make(ByteList, 0, len(s.Env.Env))
+	for _, e := range s.Env.Env {
+		names = append(names, append(Bytes(nil), e.Name...))
+	}
+	return ExecutionView{
+		Executable: Bytes(s.Executable),
+		Argv:       argv,
+		Cwd:        Bytes(s.Cwd),
+		EnvNames:   names,
+		EnvDigest:  envDigest,
+	}, nil
 }
 
 // PreparedAttempt is everything the guarded pre-flight established, travelling as ONE value.
@@ -752,50 +781,53 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 // assumed that was enough. The retained excerpts are SLICES: a collaborator receiving a value copy still
 // shares their backing arrays, so it could rewrite the evidence between acceptance and the record that
 // binds it - and the record's own digest check would then fail on bytes nobody meant to change.
+// checkRetainedOutput applies the combined ceiling and the deterministic allocation together.
+//
+// They belong together because neither is meaningful alone: a ceiling with no allocation rule does not
+// say which bytes to keep, and an allocation rule with no ceiling does not say how many.
+func checkRetainedOutput(stdout, stderr StreamRecord, combined uint64) error {
+	if !FitsCombinedOutputCeiling(stdout, stderr, combined) {
+		return fmt.Errorf("%w: the retained output is %d bytes, over the frozen ceiling of %d",
+			ErrLifecycle, stdout.RetainedBytes()+stderr.RetainedBytes(), combined)
+	}
+	outBudget, errBudget := AllocateOutputBudget(stdout.Present, stderr.Present, combined)
+	if err := stdout.CheckSplit("stdout", outBudget); err != nil {
+		return err
+	}
+	return stderr.CheckSplit("stderr", errBudget)
+}
+
 func cloneTerminal(t Terminal) Terminal {
 	t.Stdout, t.Stderr = cloneStream(t.Stdout), cloneStream(t.Stderr)
 	return t
 }
 
 func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (ResultRecord, error) {
-	names := make([][]byte, 0, len(prep.Spec.Env.Env))
-	for _, e := range prep.Spec.Env.Env {
-		names = append(names, append([]byte(nil), e.Name...))
-	}
-	argv := make([][]byte, 0, len(prep.Spec.Argv))
-	for _, a := range prep.Spec.Argv {
-		argv = append(argv, []byte(a))
-	}
-	envDigest, err := prep.Spec.Env.EnvIdentityDigest()
+	view, err := prep.Spec.View()
 	if err != nil {
-		return ResultRecord{}, fmt.Errorf("%w: digesting the environment identity: %v", ErrLifecycle, err)
+		return ResultRecord{}, err
 	}
 	rec := ResultRecord{
-		SchemaVersion:      ResultRecordVersion,
-		AttemptID:          prep.AttemptID,
-		TestedCommit:       prep.TestedCommit,
-		TestedTree:         prep.TestedTree,
-		SpecDigest:         prep.Spec.Digest,
-		Cwd:                prep.Spec.Cwd,
-		ResolvedExecutable: prep.Spec.Executable,
-		ResolvedArgv:       argv,
-		EnvNames:           names,
-		EnvDigest:          envDigest,
-		Execution:          term.Execution,
-		Identity:           ident.Value,
-		TerminalReason:     term.TerminalReason,
-		TerminalAuthor:     term.Author,
-		HasExitCode:        term.HasExitCode,
-		ExitCode:           term.ExitCode,
-		Stdout:             cloneStream(term.Stdout),
-		Stderr:             cloneStream(term.Stderr),
+		SchemaVersion:  ResultRecordVersion,
+		AttemptID:      prep.AttemptID,
+		TestedCommit:   prep.TestedCommit,
+		TestedTree:     prep.TestedTree,
+		View:           view,
+		Execution:      term.Execution,
+		Identity:       ident.Value,
+		TerminalReason: term.TerminalReason,
+		TerminalAuthor: term.Author,
+		HasExitCode:    term.HasExitCode,
+		ExitCode:       term.ExitCode,
+		Stdout:         cloneStream(term.Stdout),
+		Stderr:         cloneStream(term.Stderr),
 	}
-	// The COMBINED ceiling, applied where the record is built. Per-stream checking admits a record twice
-	// the size the operator allowed, and leaving it to the publisher means it is applied by whoever
-	// happens to hold the policy.
-	if !FitsCombinedOutputCeiling(rec.Stdout, rec.Stderr, prep.MaxOutputBytes) {
-		return ResultRecord{}, fmt.Errorf("%w: the retained output is %d bytes, over the frozen ceiling of %d",
-			ErrLifecycle, rec.Stdout.RetainedBytes()+rec.Stderr.RetainedBytes(), prep.MaxOutputBytes)
+	// The COMBINED ceiling and the split RULE, applied where the frozen bound is known. Per-stream
+	// checking admits a record twice the size the operator allowed; accepting any division of the right
+	// total makes "head+tail" a shape rather than a rule, so two producers could keep different bytes
+	// and each call itself correct.
+	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, prep.MaxOutputBytes); err != nil {
+		return ResultRecord{}, err
 	}
 	// Refused HERE if it contradicts itself, rather than handed on for the publisher to discover it
 	// cannot be written - at which point the attempt is already past the point of being retried cheaply.

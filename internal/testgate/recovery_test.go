@@ -28,11 +28,14 @@ var (
 	theTree       = strings.Repeat("b", 40)
 )
 
-func activeRef() *state.TestAttemptRef {
+func activeRef(t *testing.T) *state.TestAttemptRef {
+	t.Helper()
 	return &state.TestAttemptRef{
 		AttemptID: theAttemptID, StartRevision: 41,
 		TestedCommit: theCommit, TestedTree: theTree,
-		IntentDigest: theIntentHash,
+		// The digest of the REAL intent, so the reference and the durable record agree by construction
+		// rather than by a fixture constant that could drift from either.
+		IntentDigest: intentBody(t).Digest(),
 	}
 }
 
@@ -55,27 +58,68 @@ func noResult() ResultEvidence { return ResultEvidence{State: ArtifactAbsent} }
 
 func noStreams() StreamEvidence { return StreamEvidence{State: ArtifactAbsent} }
 
-func intentBody() *IntentProjection {
-	return &IntentProjection{
-		SpecDigest:         strings.Repeat("7a", 32),
-		Cwd:                "/work",
-		ResolvedExecutable: "/usr/bin/go",
-		ResolvedArgv:       bs("go", "test", "./..."),
-		EnvNames:           bs("PATH"),
-		EnvDigest:          strings.Repeat("5e", 32),
-		Digest:             theIntentHash,
+// theView is the ONE execution description both the intent and the result bind.
+func theView() ExecutionView {
+	return ExecutionView{
+		Executable: Bytes("/usr/bin/go"),
+		Argv:       ByteList{Bytes("go"), Bytes("test"), Bytes("./...")},
+		Cwd:        Bytes("/work"),
+		EnvNames:   ByteList{Bytes("PATH")},
+		EnvDigest:  strings.Repeat("5e", 32),
 	}
 }
 
-// stagedStream builds staging evidence in the head+tail shape a truncated excerpt must have, with the
-// digest over the WHOLE redacted stream - which is runner-attested and not recomputable from the
-// excerpt, so it stays a fixed value here.
-func stagedStream(head, tail string) StreamEvidence {
+func intentRecord() IntentRecord {
+	return IntentRecord{
+		SchemaVersion: IntentRecordVersion, AttemptID: theAttemptID,
+		TestedCommit: theCommit, TestedTree: theTree,
+		View: theView(), MaxOutputBytes: 32768,
+	}
+}
+
+// intentBody produces a GENUINELY verified intent, through the same rooted, digest-checked read
+// production uses - so these tests cannot assert evidence production could not produce.
+func intentBody(t *testing.T) *VerifiedIntent {
+	t.Helper()
+	return verifiedIntentOf(t, intentRecord())
+}
+
+func verifiedIntentOf(t *testing.T, rec IntentRecord) *VerifiedIntent {
+	t.Helper()
+	raw, digest, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("encoding the intent: %v", err)
+	}
+	v, err := ReadVerifiedIntent(&fakeRecords{id: rec.AttemptID, bytes: map[string][]byte{digest: raw}}, rec.AttemptID, digest)
+	if err != nil {
+		t.Fatalf("verifying the intent: %v", err)
+	}
+	return v
+}
+
+// stagedStream builds staging that obeys the DETERMINISTIC allocation for the fixture's frozen ceiling,
+// so the fixture cannot be one the production rule would refuse. The digest is over the whole redacted
+// stream, which is runner-attested and not recomputable from an excerpt, so it stays a fixed value.
+func stagedStream(t *testing.T, budget uint64, filler byte) StreamEvidence {
+	t.Helper()
+	// Deliberately LONGER than the budget, so the excerpt is genuinely truncated and the fixed digest is
+	// over a stream this record does not contain - which is the runner-attested case, not the
+	// recomputable one.
+	stream := bytes.Repeat([]byte{filler}, int(budget)*2+1)
+	head, tail, truncated := SplitExcerpt(stream, budget)
+	if !truncated {
+		t.Fatalf("the fixture stream was not truncated at a %d-byte budget", budget)
+	}
 	return StreamEvidence{State: ArtifactValid, AttemptID: theAttemptID, Record: &StreamRecord{
-		Present: true, SourceBytes: 4096, RedactedBytes: 4000,
+		Present: true, SourceBytes: uint64(len(stream)) + 96, RedactedBytes: uint64(len(stream)),
 		SHA256: strings.Repeat("3c", 32),
-		Head:   []byte(head), Tail: []byte(tail), Truncated: true,
+		Head:   head, Tail: tail, Truncated: truncated,
 	}}
+}
+
+// bothStreamBudgets is the allocation the fixture's ceiling produces when both streams are present.
+func bothStreamBudgets() (uint64, uint64) {
+	return AllocateOutputBudget(true, true, intentRecord().MaxOutputBytes)
 }
 
 // fakeRecords is a record source rooted at one attempt. Open returns whatever it was given, so the
@@ -104,6 +148,7 @@ func publishedResult(t *testing.T) *VerifiedRecord {
 	t.Helper()
 	rec := validRecord()
 	rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+	rec.View = theView()
 	raw, digest, err := rec.Encode()
 	if err != nil {
 		t.Fatalf("encoding the fixture result: %v", err)
@@ -136,13 +181,13 @@ func residueFor(t *testing.T, o observation) Residue {
 		Result: noResult(), Stdout: noStreams(), Stderr: noStreams()}
 	switch o.standing {
 	case StandingActive:
-		r.Active = activeRef()
-		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
-		r.IntentBody = intentBody()
+		r.Active = activeRef(t)
+		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: intentBody(t).Digest()}
+		r.IntentBody = intentBody(t)
 	case StandingFinalized:
 		r.Finalized = ledgerEntry(t)
-		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
-		r.IntentBody = intentBody()
+		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: intentBody(t).Digest()}
+		r.IntentBody = intentBody(t)
 	}
 	if o.hasResult {
 		r.Result = ResultEvidence{State: ArtifactValid, Verified: publishedResult(t)}
@@ -156,7 +201,7 @@ func residueFor(t *testing.T, o observation) Residue {
 // decision exists for each shape but that it is THE decision the design argued for. A test asserting
 // only that "some action is produced" would pass against any table at all.
 func TestEveryDesignCrashRowReachesItsStatedRecovery(t *testing.T) {
-	orphanIntent := Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
+	orphanIntent := Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: strings.Repeat("1a", 32)}
 	for _, tc := range []struct {
 		row     string
 		residue Residue
@@ -165,12 +210,12 @@ func TestEveryDesignCrashRowReachesItsStatedRecovery(t *testing.T) {
 		{"before intent published",
 			Residue{Standing: StandingNone, Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		{"after intent, before arming containment",
-			Residue{Standing: StandingNone, Intent: orphanIntent, IntentBody: intentBody(), Result: noResult(),
+			Residue{Standing: StandingNone, Intent: orphanIntent, IntentBody: intentBody(t), Result: noResult(),
 				Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		// Nothing was bound, so no containment domain was ever attributed to this run and no proof is
 		// owed - which is exactly why this row needs none on Windows.
 		{"after arming, before active CAS",
-			Residue{Standing: StandingNone, Intent: orphanIntent, IntentBody: intentBody(), Result: noResult(),
+			Residue{Standing: StandingNone, Intent: orphanIntent, IntentBody: intentBody(t), Result: noResult(),
 				Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		{"after active CAS, before GO, on Linux",
 			residueFor(t, observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
@@ -317,7 +362,7 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 		}
 	}
 	// The fixtures must satisfy the rules PRODUCTION applies, through the production predicates.
-	ref, entry, ver := activeRef(), ledgerEntry(t), publishedResult(t)
+	ref, entry, ver := activeRef(t), ledgerEntry(t), publishedResult(t)
 	rec := ver.Record()
 	for _, f := range []struct {
 		name string
@@ -430,7 +475,7 @@ func TestTheDecisionCarriesTheEvidenceItWasMadeFrom(t *testing.T) {
 	if got.Result.Digest() != publishedResult(t).Digest() || res.Execution != state.TestExecutionOK ||
 		res.Identity != state.TestIdentityUnchanged || res.TerminalReason != "exited 0" ||
 		res.TestedCommit != theCommit || res.TestedTree != theTree ||
-		res.TerminalAuthor != state.TerminalByRunner || res.ResolvedExecutable == "" || res.Cwd == "" {
+		res.TerminalAuthor != state.TerminalByRunner || len(res.View.Executable) == 0 || len(res.View.Cwd) == 0 {
 		t.Fatalf("the decision cannot be executed from what it carries: %+v", res)
 	}
 	// And the exact bytes the digest was taken over, so nothing has to be found again.
@@ -483,6 +528,7 @@ func TestAFinalizedAttemptMustAgreeWithTheResultOnDisk(t *testing.T) {
 	r := residueFor(t, observation{StandingFinalized, true, CompletionProven})
 	other := validRecord()
 	other.AttemptID, other.TestedCommit, other.TestedTree = theAttemptID, theCommit, theTree
+	other.View = theView()
 	other.TerminalReason = "exited 0 (a different record)"
 	r.Result.Verified = verifiedRecordOf(t, other)
 
@@ -509,11 +555,11 @@ func TestMissingCounterpartsForAStandingAreRefusedAsEvidence(t *testing.T) {
 			Residue{Standing: StandingFinalized, Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionProven)},
 			"no entry was supplied"},
 		{"finalized with an active reference too",
-			Residue{Standing: StandingFinalized, Finalized: ledgerEntry(t), Active: activeRef(),
+			Residue{Standing: StandingFinalized, Finalized: ledgerEntry(t), Active: activeRef(t),
 				Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionProven)},
 			"an active reference was supplied too"},
 		{"nothing outstanding but a reference supplied",
-			Residue{Standing: StandingNone, Active: activeRef(),
+			Residue{Standing: StandingNone, Active: activeRef(t),
 				Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionProven)},
 			"names no attempt but a reference"},
 	} {
@@ -612,8 +658,8 @@ func TestAnOrphanIntentChangesTheAccountButNotTheAction(t *testing.T) {
 	}
 	orphan, err := Recover(Residue{Standing: StandingNone, Result: noResult(),
 		Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionUnavailable),
-		Intent:     Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash},
-		IntentBody: intentBody()})
+		Intent:     Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: intentBody(t).Digest()},
+		IntentBody: intentBody(t)})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -767,7 +813,7 @@ func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
 	r.Active.IntentDigest = "MUTATED"
 	r.Active.TestedTree = "MUTATED"
 	if got.Attempt.AttemptID != theAttemptID || got.Attempt.StartRevision != 41 ||
-		got.Attempt.IntentDigest != theIntentHash || got.Attempt.TestedTree != theTree {
+		got.Attempt.IntentDigest != intentBody(t).Digest() || got.Attempt.TestedTree != theTree {
 		t.Fatalf("the caller rewrote the attempt the decision was about: %+v", got.Attempt)
 	}
 	// The verified record cannot be rewritten at all from outside this package - its fields are
@@ -797,8 +843,9 @@ func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
 // identity and the terminal reason, which are the facts nobody is entitled to invent after a crash.
 func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T) {
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream("head", "tail")
-	r.Stderr = stagedStream("out", "err")
+	outBudget, errBudget := bothStreamBudgets()
+	r.Stdout = stagedStream(t, outBudget, 'o')
+	r.Stderr = stagedStream(t, errBudget, 'e')
 
 	got, err := Recover(r)
 	if err != nil {
@@ -825,15 +872,13 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 	// The command and the environment identity come from the published intent. They cannot be
 	// re-derived: resolving now would describe THIS process's environment, not the one the attempt was
 	// authorised against.
-	if rec.ResolvedExecutable != "/usr/bin/go" || len(rec.ResolvedArgv) != 3 ||
-		string(rec.ResolvedArgv[0]) != "go" || string(rec.ResolvedArgv[2]) != "./..." {
-		t.Fatalf("the record does not say which command ran: %+v", rec)
+	gotView, gerr := rec.View.Digest()
+	wantView, werr := intentRecord().View.Digest()
+	if gerr != nil || werr != nil {
+		t.Fatalf("digesting: %v / %v", gerr, werr)
 	}
-	if rec.Cwd != "/work" || rec.SpecDigest != strings.Repeat("7a", 32) {
-		t.Fatalf("the record does not bind the execution spec it ran under: %+v", rec)
-	}
-	if len(rec.EnvNames) != 1 || string(rec.EnvNames[0]) != "PATH" || rec.EnvDigest != strings.Repeat("5e", 32) {
-		t.Fatalf("the record does not bind the environment identity: %+v", rec)
+	if gotView != wantView {
+		t.Fatalf("the planned record describes %s, the intent armed %s", gotView, wantView)
 	}
 	if rec.Execution != state.TestExecutionInterrupted || rec.Identity != state.TestIdentityUnobserved {
 		t.Fatalf("the record claims something about the code: %+v", rec)
@@ -843,11 +888,13 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 		t.Fatalf("recovery prose was attributed to the runner: %+v", rec)
 	}
 	// The retained bytes travel, per stream and in full - metadata alone cannot be embedded in a record.
-	if !bytes.Equal(rec.Stdout.Head, []byte("head")) || !bytes.Equal(rec.Stdout.Tail, []byte("tail")) || !rec.Stdout.Truncated {
-		t.Fatalf("stdout evidence did not survive: %+v", rec.Stdout)
+	if !bytes.Equal(rec.Stdout.Head, r.Stdout.Record.Head) || !bytes.Equal(rec.Stdout.Tail, r.Stdout.Record.Tail) ||
+		!rec.Stdout.Truncated || rec.Stdout.SHA256 != r.Stdout.Record.SHA256 {
+		t.Fatalf("stdout evidence did not survive: %d+%d bytes", len(rec.Stdout.Head), len(rec.Stdout.Tail))
 	}
-	if !bytes.Equal(rec.Stderr.Head, []byte("out")) || !bytes.Equal(rec.Stderr.Tail, []byte("err")) || !rec.Stderr.Truncated {
-		t.Fatalf("stderr evidence did not survive: %+v", rec.Stderr)
+	if !bytes.Equal(rec.Stderr.Head, r.Stderr.Record.Head) || !bytes.Equal(rec.Stderr.Tail, r.Stderr.Record.Tail) ||
+		!rec.Stderr.Truncated {
+		t.Fatalf("stderr evidence did not survive: %d+%d bytes", len(rec.Stderr.Head), len(rec.Stderr.Tail))
 	}
 	if rec.Stdout.SourceBytes == rec.Stdout.RedactedBytes {
 		t.Fatal("the fixture does not distinguish source bytes from redacted bytes")
@@ -891,12 +938,12 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 		want string
 	}{
 		{"stdout from another attempt", func(r *Residue) {
-			ev := stagedStream("h", "t")
+			ev := stagedStream(t, intentRecord().MaxOutputBytes, 'o')
 			ev.AttemptID = "somebody-else"
 			r.Stdout = ev
 		}, "stdout staging belongs to"},
 		{"stderr from another attempt", func(r *Residue) {
-			ev := stagedStream("h", "t")
+			ev := stagedStream(t, intentRecord().MaxOutputBytes, 'o')
 			ev.AttemptID = "somebody-else"
 			r.Stderr = ev
 		}, "stderr staging belongs to"},
@@ -918,7 +965,7 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 	}
 	// One stream present and the other absent is an ordinary crash, not an inconsistency.
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream("h", "t")
+	r.Stdout = stagedStream(t, intentRecord().MaxOutputBytes, 'o')
 	got, err := Recover(r)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -978,6 +1025,7 @@ func TestAResultAboutDifferentCodeCannotFinalizeThisAttempt(t *testing.T) {
 		r := residueFor(t, observation{StandingActive, true, CompletionProven})
 		rec := validRecord()
 		rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+		rec.View = theView()
 		mutate(&rec)
 		r.Result.Verified = verifiedRecordOf(t, rec)
 
@@ -1034,6 +1082,8 @@ func TestEachEvidenceStateHasExactlyOneShape(t *testing.T) {
 			r.Stderr = StreamEvidence{State: ArtifactValid, AttemptID: theAttemptID}
 		}, "no record behind it"},
 		{"a valid intent with no body", func(r *Residue) { r.IntentBody = nil }, "its body is missing"},
+		{"an intent that was never verified", func(r *Residue) { r.IntentBody = &VerifiedIntent{} },
+			"never verified"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := residueFor(t, observation{StandingActive, false, CompletionProven})
@@ -1211,10 +1261,12 @@ func TestTheDecisionCarriesTheSourceForWhatItOmits(t *testing.T) {
 // an exact intent digest. A body read from somewhere else would put a different command into the record
 // while every other check still passed.
 func TestTheIntentBodyMustBeTheIntentTheAttemptBINDS(t *testing.T) {
+	// A DIFFERENT durable intent - genuinely verified, so it is admissible evidence - whose digest is
+	// therefore not the one the active reference binds.
+	other := intentRecord()
+	other.View.Cwd = Bytes("/somewhere-else")
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	body := intentBody()
-	body.Digest = strings.Repeat("7f", 32)
-	r.IntentBody = body
+	r.IntentBody = verifiedIntentOf(t, other)
 
 	got, err := Recover(r)
 	if err != nil {
@@ -1225,13 +1277,49 @@ func TestTheIntentBodyMustBeTheIntentTheAttemptBINDS(t *testing.T) {
 	}
 }
 
+// TestAResultForADifferentExecutionCannotFinalizeThisAttempt.
+//
+// Same attempt and same tree is NOT the same command. A canonical, digest-verified result for a
+// different argv or working directory satisfied every other check here, which made the execution
+// binding a grammatical digest rather than proof of what was armed.
+func TestAResultForADifferentExecutionCannotFinalizeThisAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bend func(*ExecutionView)
+	}{
+		{"a different argv", func(v *ExecutionView) { v.Argv = ByteList{Bytes("go"), Bytes("vet")} }},
+		{"a different working directory", func(v *ExecutionView) { v.Cwd = Bytes("/elsewhere") }},
+		{"a different executable", func(v *ExecutionView) { v.Executable = Bytes("/bin/sh") }},
+		{"a different environment", func(v *ExecutionView) { v.EnvNames = ByteList{Bytes("HOME")} }},
+		{"a different environment digest", func(v *ExecutionView) { v.EnvDigest = strings.Repeat("6f", 32) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := validRecord()
+			rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+			rec.View = theView()
+			tc.bend(&rec.View)
+
+			r := residueFor(t, observation{StandingActive, true, CompletionProven})
+			r.Result = ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
+
+			got, err := Recover(r)
+			if err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if got.Action != ActionBlock || !strings.Contains(got.Reason, "but its result describes") {
+				t.Fatalf("%+v, want a block naming the execution mismatch", got)
+			}
+		})
+	}
+}
+
 // TestThePlannedRecordDoesNotShareTheCallersBytes.
 //
 // The retained excerpt travels into the plan, and it is bytes. If the plan aliased the staging the caller
 // supplied, the record about to be written could change between the decision and the write.
 func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream("h", "t")
+	r.Stdout = stagedStream(t, intentRecord().MaxOutputBytes, 'o')
 
 	got, err := Recover(r)
 	if err != nil {
@@ -1243,12 +1331,13 @@ func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 	for i := range r.Stdout.Record.Head {
 		r.Stdout.Record.Head[i] = 'Z'
 	}
-	r.IntentBody.ResolvedArgv[0][0] = 'X'
-	if !bytes.Equal(got.Publish.Record.Stdout.Head, []byte("h")) {
-		t.Fatalf("the planned record shares the caller's stream bytes: %q", got.Publish.Record.Stdout.Head)
+	// The verified intent cannot be rewritten from outside at all; its accessor hands out copies.
+	r.IntentBody.Record().View.Argv[0][0] = 'X'
+	if got.Publish.Record.Stdout.Head[0] == 'Z' {
+		t.Fatal("the planned record shares the caller's stream bytes")
 	}
-	if string(got.Publish.Record.ResolvedArgv[0]) != "go" {
-		t.Fatalf("the planned record shares the caller's argv: %q", got.Publish.Record.ResolvedArgv)
+	if string(got.Publish.Record.View.Argv[0]) != "go" {
+		t.Fatalf("the planned record shares the caller's argv: %q", got.Publish.Record.View.Argv.Strings())
 	}
 }
 
@@ -1279,6 +1368,7 @@ func verifiedFor(t *testing.T, attemptID string) ResultEvidence {
 	t.Helper()
 	rec := validRecord()
 	rec.AttemptID, rec.TestedCommit, rec.TestedTree = attemptID, theCommit, theTree
+	rec.View = theView()
 	return ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
 }
 
@@ -1302,5 +1392,28 @@ func TestALedgerEntryMustAgreeWithTheRecordAboutWHOSaidIt(t *testing.T) {
 	}
 	if got.Action != ActionBlock || !strings.Contains(got.Reason, "terminal authority") {
 		t.Fatalf("%+v, want a block naming the authority", got)
+	}
+}
+
+// TestTheDecisionSurvivesTheCallerZeroingItsEvidence.
+//
+// Unexported fields stop field assignment, not WHOLE-STRUCT assignment: external code can still write
+// `*vr = testgate.VerifiedRecord{}` through the pointer it supplied and blank the evidence the decision
+// was made from. The earlier alias test mutated only accessor copies and could never have seen it.
+func TestTheDecisionSurvivesTheCallerZeroingItsEvidence(t *testing.T) {
+	r := residueFor(t, observation{StandingActive, true, CompletionProven})
+	got, err := Recover(r)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	wantDigest := got.Result.Digest()
+
+	*r.Result.Verified = VerifiedRecord{}
+
+	if !got.Result.Verified() {
+		t.Fatal("the caller blanked the decision's evidence by zeroing the value it supplied")
+	}
+	if got.Result.Digest() != wantDigest || got.Result.Record().AttemptID != theAttemptID {
+		t.Fatalf("the decision's record changed underneath it: %+v", got.Result.Record())
 	}
 }

@@ -1,8 +1,12 @@
 package testgate
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/David-c0degeek/claudex/internal/canonjson"
 
 	"github.com/David-c0degeek/claudex/internal/state"
 )
@@ -152,6 +156,24 @@ type RecordBytes interface {
 // still reachable" is enforced here rather than promised in a comment. A caller cannot obtain bytes
 // without this check, because the check is the function.
 func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) (*VerifiedRecord, error) {
+	owned, err := readOwnedVerifiedBytes(src, attemptID, digest)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := DecodeResultRecord(owned)
+	if err != nil {
+		return nil, err
+	}
+	return &VerifiedRecord{record: rec, canonical: owned, verified: true}, nil
+}
+
+// readOwnedVerifiedBytes takes ownership FIRST and verifies what it owns.
+//
+// Hashing the source's own slice and cloning afterwards left a window in which the source could rewrite
+// the bytes between the check and the copy - so the verification held for an instant and the caller
+// walked away with something else. Copying first closes it: what is hashed and what is returned are the
+// same array, and nobody else has a reference to it.
+func readOwnedVerifiedBytes(src RecordBytes, attemptID, digest string) ([]byte, error) {
 	if src == nil {
 		return nil, fmt.Errorf("%w: no record source was supplied", ErrLifecycle)
 	}
@@ -166,18 +188,11 @@ func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) (*VerifiedRec
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("%w: reading record %q", ErrLifecycle, digest), err)
 	}
-	if got := sha256Hex(raw); got != digest {
+	owned := append([]byte(nil), raw...)
+	if got := sha256Hex(owned); got != digest {
 		return nil, fmt.Errorf("%w: record %q read back as %q", ErrLifecycle, digest, got)
 	}
-	// An OWNED copy. The source handed over its own backing array, so it could rewrite those bytes after
-	// the hash check and leave the caller holding something that no longer matches the digest it was
-	// just verified against - a verification that only held for an instant is not a verification.
-	owned := append([]byte(nil), raw...)
-	rec, err := DecodeResultRecord(owned)
-	if err != nil {
-		return nil, err
-	}
-	return &VerifiedRecord{record: rec, canonical: owned, verified: true}, nil
+	return owned, nil
 }
 
 // VerifiedRecord is a record read from an attempt-rooted source, hashed against the digest that named
@@ -218,22 +233,128 @@ type StreamEvidence struct {
 	Record *StreamRecord
 }
 
-// IntentProjection is the part of the published intent a result has to bind.
+// IntentRecord is the durable intent, in the shape recovery has to read it back.
 //
-// Recovery cannot write a result without it: the record binds the command that ran and the environment
-// identity it ran with, and neither can be re-derived after the fact - re-resolving the command now
-// would describe THIS process's environment, not the one the attempt was authorised against.
-type IntentProjection struct {
-	SpecDigest         string
-	Cwd                string
-	ResolvedExecutable string
-	// ResolvedArgv and EnvNames are BYTES for the same reason they are base64 on the wire: an argv
-	// element or a variable name may not be valid UTF-8, and a string field would normalize it - so the
-	// record would bind something the child never received.
-	ResolvedArgv [][]byte
-	EnvNames     [][]byte
-	EnvDigest    string
-	Digest       string
+// It carries the SAME ExecutionView the result carries, so proving that a result describes the execution
+// that was armed is one digest comparison rather than six hand-written field checks - the kind that
+// silently omits whichever field was added last. It also carries the frozen policy bounds, because the
+// design binds them here precisely so a recovering process can apply the same limits the live path did
+// without reading policy itself.
+type IntentRecord struct {
+	SchemaVersion int           `json:"schema_version"`
+	AttemptID     string        `json:"attempt_id"`
+	TestedCommit  string        `json:"tested_commit"`
+	TestedTree    string        `json:"tested_tree"`
+	View          ExecutionView `json:"execution_view"`
+	// MaxOutputBytes is the frozen COMBINED retained-output ceiling.
+	MaxOutputBytes uint64 `json:"max_output_bytes"`
+}
+
+// IntentRecordVersion is the on-disk schema version of an intent record.
+const IntentRecordVersion = 1
+
+func (r IntentRecord) validate() error {
+	if r.SchemaVersion != IntentRecordVersion {
+		return fmt.Errorf("%w: intent record schema version %d, want %d",
+			ErrLifecycle, r.SchemaVersion, IntentRecordVersion)
+	}
+	if r.AttemptID == "" {
+		return fmt.Errorf("%w: the intent names no attempt", ErrLifecycle)
+	}
+	if !state.IsGitOID(r.TestedCommit) || !state.IsGitOID(r.TestedTree) {
+		return fmt.Errorf("%w: the intent is about %q/%q, which are not git object ids",
+			ErrLifecycle, r.TestedCommit, r.TestedTree)
+	}
+	if r.MaxOutputBytes == 0 {
+		return fmt.Errorf("%w: the intent binds no output ceiling", ErrLifecycle)
+	}
+	return r.View.validate()
+}
+
+// Encode renders the intent canonically and returns it with its digest.
+func (r IntentRecord) Encode() ([]byte, string, error) {
+	if err := r.validate(); err != nil {
+		return nil, "", err
+	}
+	raw, err := canonjson.CanonicalizeValue(r)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: canonicalizing the intent record: %v", ErrLifecycle, err)
+	}
+	return raw, sha256Hex(raw), nil
+}
+
+// DecodeIntentRecord strictly decodes canonical bytes into a validated intent, by the same rule the
+// result boundary uses: decode, validate, re-encode, and require the bytes to match.
+func DecodeIntentRecord(raw []byte) (IntentRecord, error) {
+	var probe struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	probeDec := json.NewDecoder(bytes.NewReader(raw))
+	if err := probeDec.Decode(&probe); err != nil {
+		return IntentRecord{}, fmt.Errorf("%w: the intent record is not JSON: %v", ErrLifecycle, err)
+	}
+	if probeDec.More() {
+		return IntentRecord{}, fmt.Errorf("%w: the intent record has trailing content", ErrLifecycle)
+	}
+	if probe.SchemaVersion != IntentRecordVersion {
+		return IntentRecord{}, fmt.Errorf("%w: intent record schema version %d, want %d",
+			ErrLifecycle, probe.SchemaVersion, IntentRecordVersion)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var rec IntentRecord
+	if err := dec.Decode(&rec); err != nil {
+		return IntentRecord{}, fmt.Errorf("%w: decoding the intent record: %v", ErrLifecycle, err)
+	}
+	if dec.More() {
+		return IntentRecord{}, fmt.Errorf("%w: the intent record has trailing content", ErrLifecycle)
+	}
+	if err := rec.validate(); err != nil {
+		return IntentRecord{}, err
+	}
+	reencoded, _, err := rec.Encode()
+	if err != nil {
+		return IntentRecord{}, err
+	}
+	if !bytes.Equal(reencoded, raw) {
+		return IntentRecord{}, fmt.Errorf("%w: the intent record is not in canonical form", ErrLifecycle)
+	}
+	return rec, nil
+}
+
+// VerifiedIntent is an intent read from an attempt-rooted source and digest-checked, on the same terms
+// as a verified result. Unexported fields, for the same reason: an intent a caller can simply declare
+// valid proves nothing about what was actually armed.
+type VerifiedIntent struct {
+	record    IntentRecord
+	canonical []byte
+	verified  bool
+}
+
+// Record returns the validated intent, as an owned copy.
+func (v VerifiedIntent) Record() IntentRecord {
+	c := v.record
+	c.View = cloneView(v.record.View)
+	return c
+}
+
+// Verified reports whether this came from a rooted, digest-checked read.
+func (v VerifiedIntent) Verified() bool { return v.verified }
+
+// Digest is the identity the canonical bytes hash to.
+func (v VerifiedIntent) Digest() string { return sha256Hex(v.canonical) }
+
+// ReadVerifiedIntent is the rooted, digest-verified read for an intent.
+func ReadVerifiedIntent(src RecordBytes, attemptID, digest string) (*VerifiedIntent, error) {
+	owned, err := readOwnedVerifiedBytes(src, attemptID, digest)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := DecodeIntentRecord(owned)
+	if err != nil {
+		return nil, err
+	}
+	return &VerifiedIntent{record: rec, canonical: owned, verified: true}, nil
 }
 
 // InterruptionPlan is the exact record recovery must publish before it can settle an interrupted
@@ -281,8 +402,8 @@ type Residue struct {
 	// Intent and Result are the attempt's durable records.
 	Intent Artifact
 	Result ResultEvidence
-	// IntentBody is the validated projection of the published intent, required when the intent is valid.
-	IntentBody *IntentProjection
+	// IntentBody is the VERIFIED intent, required when the intent artifact is valid.
+	IntentBody *VerifiedIntent
 	// Stdout and Stderr are the crash-time staging for an attempt that produced no result, independently.
 	Stdout StreamEvidence
 	Stderr StreamEvidence
@@ -455,24 +576,24 @@ func Recover(r Residue) (Recovery, error) {
 	dec.Records = r.Records
 	switch dec.Action {
 	case ActionFinalizeFromResult:
-		dec.Result = r.Result.Verified
+		// A DEEP COPY. Returning the caller's pointer let external code zero the whole value after the
+		// decision was made - unexported fields stop field assignment, not whole-struct assignment.
+		dec.Result = cloneVerifiedRecord(r.Result.Verified)
 	case ActionLedgerOnlyInterrupted:
 		// Settling this attempt appends a ledger entry, and every entry binds a durable canonical
 		// result - which this attempt does not have. So the decision carries the record to write, whole:
 		// the identity the attempt was authorised against, the command and environment identity from the
 		// published intent (they cannot be re-derived, because re-resolving now would describe THIS
 		// process), and the retained bytes found on disk.
+		intent := r.IntentBody.Record()
 		rec := ResultRecord{
-			SchemaVersion:      ResultRecordVersion,
-			AttemptID:          r.Active.AttemptID,
-			TestedCommit:       r.Active.TestedCommit,
-			TestedTree:         r.Active.TestedTree,
-			SpecDigest:         r.IntentBody.SpecDigest,
-			Cwd:                r.IntentBody.Cwd,
-			ResolvedExecutable: r.IntentBody.ResolvedExecutable,
-			ResolvedArgv:       cloneByteSlices(r.IntentBody.ResolvedArgv),
-			EnvNames:           cloneByteSlices(r.IntentBody.EnvNames),
-			EnvDigest:          r.IntentBody.EnvDigest,
+			SchemaVersion: ResultRecordVersion,
+			AttemptID:     r.Active.AttemptID,
+			TestedCommit:  r.Active.TestedCommit,
+			TestedTree:    r.Active.TestedTree,
+			// The SAME view the intent bound. It cannot be re-derived: resolving now would describe THIS
+			// process's environment, not the one the attempt was authorised against.
+			View: intent.View,
 			// Fixed for this row, and carried rather than left implicit. The runner never reported an
 			// ending and no identity observation was ever made, so nothing about the code may be claimed.
 			Execution:      state.TestExecutionInterrupted,
@@ -488,6 +609,12 @@ func Recover(r Residue) (Recovery, error) {
 		}
 		if r.Stderr.State == ArtifactValid {
 			rec.Stderr = cloneStream(*r.Stderr.Record)
+		}
+		// The SAME bounds the live path applies, from the frozen policy the intent carries. Without them
+		// here, staging large enough to fit an unrelated encoder ceiling became a publishable result
+		// despite a smaller limit the operator actually set.
+		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, intent.MaxOutputBytes); err != nil {
+			return Recovery{}, err
 		}
 		// PUBLISHABLE, proved by the publication boundary itself rather than by the weaker internal
 		// check. Validating alone left the version unchecked, so the plan was refused only at the moment
@@ -636,9 +763,16 @@ func (r Residue) inconsistency() string {
 			return fmt.Sprintf("attempt %q binds intent digest %q but the durable intent is %q",
 				r.Active.AttemptID, r.Active.IntentDigest, r.Intent.Digest)
 		}
-		if r.IntentBody.Digest != r.Active.IntentDigest {
+		if !r.IntentBody.Verified() {
+			return fmt.Sprintf("attempt %q carries an intent that was never verified", r.Active.AttemptID)
+		}
+		if r.IntentBody.Digest() != r.Active.IntentDigest {
 			return fmt.Sprintf("attempt %q binds intent digest %q but the intent body read back as %q",
-				r.Active.AttemptID, r.Active.IntentDigest, r.IntentBody.Digest)
+				r.Active.AttemptID, r.Active.IntentDigest, r.IntentBody.Digest())
+		}
+		if intent := r.IntentBody.Record(); intent.AttemptID != r.Active.AttemptID {
+			return fmt.Sprintf("attempt %q is active but the durable intent belongs to %q",
+				r.Active.AttemptID, intent.AttemptID)
 		}
 		// A staging summary from another attempt embedded here would attest bytes this attempt never
 		// produced.
@@ -671,6 +805,18 @@ func (r Residue) inconsistency() string {
 			if rec.TestedCommit != r.Active.TestedCommit || rec.TestedTree != r.Active.TestedTree {
 				return fmt.Sprintf("attempt %q is a statement about %s/%s but its result is about %s/%s",
 					r.Active.AttemptID, r.Active.TestedCommit, r.Active.TestedTree, rec.TestedCommit, rec.TestedTree)
+			}
+			// And about the same EXECUTION. Same attempt and same tree is not the same command: a
+			// canonical, digest-verified result for a different argv or working directory satisfied
+			// every other check here. One digest comparison, so no field can be forgotten.
+			gotView, gerr := rec.View.Digest()
+			wantView, werr := r.IntentBody.Record().View.Digest()
+			if gerr != nil || werr != nil {
+				return fmt.Sprintf("attempt %q: the execution view could not be digested", r.Active.AttemptID)
+			}
+			if gotView != wantView {
+				return fmt.Sprintf("attempt %q was armed with execution %s but its result describes %s",
+					r.Active.AttemptID, wantView, gotView)
 			}
 		}
 		// The proof that authorises consuming this reference must be a proof about THIS attempt. The
@@ -740,6 +886,17 @@ func cloneAttemptRef(r *state.TestAttemptRef) *state.TestAttemptRef {
 	}
 	c := *r
 	return &c
+}
+
+func cloneVerifiedRecord(v *VerifiedRecord) *VerifiedRecord {
+	if v == nil {
+		return nil
+	}
+	return &VerifiedRecord{
+		record:    *cloneRecord(&v.record),
+		canonical: append([]byte(nil), v.canonical...),
+		verified:  v.verified,
+	}
 }
 
 func clonePlan(p *InterruptionPlan) *InterruptionPlan {

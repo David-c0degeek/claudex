@@ -44,23 +44,9 @@ type ResultRecord struct {
 
 	// ResolvedExecutable and ResolvedArgv are the command that actually ran, resolved at attempt start
 	// rather than re-derived. A verifier is expected to be able to see WHICH argv ran.
-	// SpecDigest is the identity of the whole execution spec that was ARMED - executable, argv, cwd and
-	// environment together. Without it the record can describe the same command in a different working
-	// directory and still look consistent.
-	SpecDigest string `json:"spec_digest"`
-	Cwd        string `json:"cwd"`
-
-	ResolvedExecutable string `json:"resolved_executable"`
-	// ResolvedArgv and EnvNames are base64 on the wire, in EVERY carrier of the execution view.
-	// Canonical JSON is not byte-lossless: an inherited value or an argv element may contain invalid
-	// UTF-8, and encoding it as a JSON string normalizes those bytes, so the digest would bind
-	// something the child never received. Same defect as the git paths at TURN 216.
-	ResolvedArgv [][]byte `json:"resolved_argv_b64"`
-	// EnvNames are the sorted frozen variable names; EnvDigest is over the canonical ACTUAL name/value
-	// list, not a redacted one - redacted pairs collapse distinct secrets onto one marker, so a
-	// redaction-based digest cannot prove equality.
-	EnvNames  [][]byte `json:"env_names_b64"`
-	EnvDigest string   `json:"env_digest"`
+	// View is the ONE description of what ran. Its digest is what proves this result describes the
+	// execution that was armed, rather than a similar-looking one.
+	View ExecutionView `json:"execution_view"`
 
 	// Execution and Identity are the two independent halves of the outcome.
 	Execution state.TestExecution `json:"execution"`
@@ -99,8 +85,8 @@ type StreamRecord struct {
 	// Head and Tail are the two halves of the bounded excerpt, stored SEPARATELY so that no byte
 	// sequence in the output can be mistaken for a boundary. Both are base64 on the wire, so the record
 	// is self-contained and lossless for output that is not valid UTF-8.
-	Head []byte `json:"head_b64"`
-	Tail []byte `json:"tail_b64"`
+	Head Bytes `json:"head_b64"`
+	Tail Bytes `json:"tail_b64"`
 	// Truncated says whether the excerpt is short of the full redacted stream.
 	Truncated bool `json:"truncated"`
 }
@@ -116,6 +102,45 @@ func (s StreamRecord) Retained() []byte {
 	out := make([]byte, 0, len(s.Head)+len(s.Tail))
 	out = append(out, s.Head...)
 	return append(out, s.Tail...)
+}
+
+// CheckSplit verifies the excerpt against the DETERMINISTIC allocation for the budget it was given.
+//
+// Validation without this accepted any head/tail division of the right total length, so "head+tail" was
+// a shape rather than a rule: an all-head excerpt and the documented split both passed, and two
+// producers could keep different bytes and each call itself correct. It takes the budget because the
+// record does not carry policy, which is why it lives at the collaborator boundary rather than inside
+// validate.
+func (s StreamRecord) CheckSplit(what string, budget uint64) error {
+	if !s.Present || !s.Truncated {
+		return nil
+	}
+	wantHead := (budget + 1) / 2
+	wantTail := budget - wantHead
+	if uint64(len(s.Head)) != wantHead || uint64(len(s.Tail)) != wantTail {
+		return fmt.Errorf("%w: %s keeps %d+%d bytes, but a %d-byte budget allocates %d+%d",
+			ErrLifecycle, what, len(s.Head), len(s.Tail), budget, wantHead, wantTail)
+	}
+	return nil
+}
+
+// AllocateOutputBudget divides ONE combined ceiling between the two streams.
+//
+// The policy bounds the streams together, and until the division is named a 100/0 allocation and a 50/50
+// allocation both respect the same ceiling - so a verifier could not say which bytes should have been
+// kept. A present stream gets an equal share; when only one is present it gets all of it; an odd byte
+// goes to stdout.
+func AllocateOutputBudget(stdoutPresent, stderrPresent bool, combined uint64) (outBudget, errBudget uint64) {
+	switch {
+	case stdoutPresent && stderrPresent:
+		outBudget = (combined + 1) / 2
+		return outBudget, combined - outBudget
+	case stdoutPresent:
+		return combined, 0
+	case stderrPresent:
+		return 0, combined
+	}
+	return 0, 0
 }
 
 // SplitExcerpt allocates a bounded excerpt DETERMINISTICALLY: the head takes the larger half of an odd
@@ -150,19 +175,8 @@ func (r ResultRecord) validate() error {
 		return fmt.Errorf("%w: the result is about %q/%q, which are not git object ids",
 			ErrLifecycle, r.TestedCommit, r.TestedTree)
 	}
-	if r.ResolvedExecutable == "" || len(r.ResolvedArgv) == 0 {
-		return fmt.Errorf("%w: the result records no command, so a verifier cannot see which argv ran", ErrLifecycle)
-	}
-	if r.Cwd == "" {
-		return fmt.Errorf("%w: the result records no working directory", ErrLifecycle)
-	}
-	// The spec digest is what proves this record describes the execution that was ARMED, rather than
-	// merely one that looks similar.
-	if !state.IsSHA256Hex(r.SpecDigest) {
-		return fmt.Errorf("%w: the execution spec digest %q is not a sha256", ErrLifecycle, r.SpecDigest)
-	}
-	if !state.IsSHA256Hex(r.EnvDigest) {
-		return fmt.Errorf("%w: the environment digest %q is not a sha256", ErrLifecycle, r.EnvDigest)
+	if err := r.View.validate(); err != nil {
+		return err
 	}
 	if !state.KnownTestExecution(r.Execution) {
 		return fmt.Errorf("%w: the result records the unknown execution %q", ErrLifecycle, r.Execution)
@@ -315,10 +329,10 @@ func FitsCombinedOutputCeiling(stdout, stderr StreamRecord, max uint64) bool {
 func cloneStream(s StreamRecord) StreamRecord {
 	c := s
 	if s.Head != nil {
-		c.Head = append([]byte(nil), s.Head...)
+		c.Head = append(Bytes(nil), s.Head...)
 	}
 	if s.Tail != nil {
-		c.Tail = append([]byte(nil), s.Tail...)
+		c.Tail = append(Bytes(nil), s.Tail...)
 	}
 	return c
 }
@@ -328,8 +342,7 @@ func cloneRecord(r *ResultRecord) *ResultRecord {
 		return nil
 	}
 	c := *r
-	c.ResolvedArgv = cloneByteSlices(r.ResolvedArgv)
-	c.EnvNames = cloneByteSlices(r.EnvNames)
+	c.View = cloneView(r.View)
 	c.Stdout = cloneStream(r.Stdout)
 	c.Stderr = cloneStream(r.Stderr)
 	return &c
@@ -420,16 +433,5 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// cloneByteSlices deep-copies a list of byte slices, preserving nil so a round trip is an identity.
-func cloneByteSlices(src [][]byte) [][]byte {
-	if src == nil {
-		return nil
-	}
-	out := make([][]byte, len(src))
-	for i, b := range src {
-		if b != nil {
-			out[i] = append([]byte(nil), b...)
-		}
-	}
-	return out
-}
+// isSHA256 is the record boundary's view of the one digest grammar.
+func isSHA256(s string) bool { return state.IsSHA256Hex(s) }
