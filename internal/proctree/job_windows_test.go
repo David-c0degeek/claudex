@@ -63,9 +63,12 @@ func TestArmContainmentAdoptsTheLimitsItClaims(t *testing.T) {
 
 	var got windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	var retlen uint32
-	if err := windows.QueryInformationJobObject(job.handle, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&got)), uint32(unsafe.Sizeof(got)), &retlen); err != nil {
-		t.Fatalf("QueryInformationJobObject: %v", err)
+	// Through the same direct-syscall helper production uses. The x/sys wrapper takes the buffer as a
+	// plain uintptr, which is exactly the construction that silently failed to apply the limits.
+	qerr := queryJobInfo(job.handle, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&got), uint32(unsafe.Sizeof(got)), &retlen)
+	if qerr != nil {
+		t.Fatalf("QueryInformationJobObject: %v", qerr)
 	}
 	flags := got.BasicLimitInformation.LimitFlags
 	if flags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
@@ -94,9 +97,10 @@ func TestConfirmContainmentRefusesAWeakenedJob(t *testing.T) {
 			job := armForTest(t)
 			var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 			info.BasicLimitInformation.LimitFlags = tc.flags
-			if _, err := windows.SetInformationJobObject(job.handle, windows.JobObjectExtendedLimitInformation,
-				uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
-				t.Fatalf("weaken the job: %v", err)
+			serr := setJobInfo(job.handle, windows.JobObjectExtendedLimitInformation,
+				unsafe.Pointer(&info), uint32(unsafe.Sizeof(info)))
+			if serr != nil {
+				t.Fatalf("weaken the job: %v", serr)
 			}
 			if err := confirmContainmentLimits(job.handle); !errors.Is(err, ErrJobLimitsUnenforced) {
 				t.Fatalf("err = %v, want ErrJobLimitsUnenforced", err)
@@ -191,9 +195,10 @@ func TestSpawnRefusesAWeakenedJobBeforeTheCommandRuns(t *testing.T) {
 	job := armForTest(t)
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	info.BasicLimitInformation.LimitFlags = 0 // kill-on-close dropped
-	if _, err := windows.SetInformationJobObject(job.handle, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
-		t.Fatalf("weaken the job: %v", err)
+	serr := setJobInfo(job.handle, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&info), uint32(unsafe.Sizeof(info)))
+	if serr != nil {
+		t.Fatalf("weaken the job: %v", serr)
 	}
 
 	exe, err := os.Executable()
@@ -257,13 +262,18 @@ func TestContainmentIsTransitive(t *testing.T) {
 	}
 }
 
-// TestOwnerDeathKillsTheContainedTree is the test the design requires, and on Windows it is also the
-// proof behind the recovery contract.
+// TestOwnerDeathKillsTheContainedTree is the containment test the design requires. It is NOT a recovery
+// proof, and the distinction is the whole point.
 //
 // No signal is sent to the tree and no cleanup code runs — the owner is killed outright, exactly as a
 // crashed coordinator would be. Process exit closes its handles, the last handle on a kill-on-close job
-// terminates the members, and that chain is entirely inside the kernel. It is why the Windows recovery
-// fact can be owner death itself rather than a published receipt.
+// terminates the members, and that chain is entirely inside the kernel. So the tree does die.
+//
+// What this does NOT establish is anything a LATER process could rely on. The test waits, with its own
+// handles, for as long as it needs; a recovering coordinator has no such handles and no ordering
+// guarantee between the lease it can observe and the job it cannot. Reading this test as a recovery
+// fact is precisely the inference that was withdrawn — so Windows recovery BLOCKS, and nothing here
+// says otherwise.
 func TestOwnerDeathKillsTheContainedTree(t *testing.T) {
 	owner, childPID, grandchildPID := startHelperOwner(t, attemptID(t))
 

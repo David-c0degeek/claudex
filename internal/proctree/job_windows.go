@@ -3,6 +3,7 @@ package proctree
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -45,10 +46,47 @@ import (
 const procThreadAttributeJobList = 13 | (1 << 17)
 
 var (
-	modkernel32              = windows.NewLazySystemDLL("kernel32.dll")
-	procIsProcessInJob       = modkernel32.NewProc("IsProcessInJob")
-	procGetHandleInformation = modkernel32.NewProc("GetHandleInformation")
+	modkernel32                   = windows.NewLazySystemDLL("kernel32.dll")
+	procIsProcessInJob            = modkernel32.NewProc("IsProcessInJob")
+	procGetHandleInformation      = modkernel32.NewProc("GetHandleInformation")
+	procSetInformationJobObject   = modkernel32.NewProc("SetInformationJobObject")
+	procQueryInformationJobObject = modkernel32.NewProc("QueryInformationJobObject")
 )
+
+// setJobInfo and queryJobInfo call the kernel DIRECTLY rather than through the x/sys wrappers, and the
+// reason is a correctness rule rather than taste.
+//
+// Those wrappers take the buffer as a plain `uintptr`, so the `uintptr(unsafe.Pointer(&buf))`
+// conversion has to happen at the CALL SITE and then be carried through an ordinary Go function. The
+// unsafe.Pointer rules permit that conversion only when it appears IN THE ARGUMENT LIST OF THE SYSCALL
+// ITSELF; passing it through an intervening function leaves the runtime with no reason to treat the
+// buffer as referenced, and its address is not guaranteed to remain meaningful for the duration.
+//
+// This is not theoretical. Through the wrapper, SetInformationJobObject returned SUCCESS while the
+// limits it had just written read back as 0x00000000 — kill-on-close silently absent, and with it the
+// entire Windows containment guarantee. Reproduced 12 times in 20 under `-race`, whose different
+// allocation behaviour is what exposes it, and never once in an ordinary build. Neither
+// runtime.KeepAlive nor moving the struct to a heap-allocated buffer fixed it; re-issuing the identical
+// Set on the SAME handle immediately afterwards succeeded, which is what proved the object was fine and
+// the call was not. Making the conversion inline at the syscall is the documented fix, and it is the
+// only one that addresses the actual rule being broken.
+func setJobInfo(job windows.Handle, class uint32, info unsafe.Pointer, size uint32) error {
+	r0, _, e1 := syscall.SyscallN(procSetInformationJobObject.Addr(),
+		uintptr(job), uintptr(class), uintptr(info), uintptr(size))
+	if r0 == 0 {
+		return e1
+	}
+	return nil
+}
+
+func queryJobInfo(job windows.Handle, class uint32, info unsafe.Pointer, size uint32, retlen *uint32) error {
+	r0, _, e1 := syscall.SyscallN(procQueryInformationJobObject.Addr(),
+		uintptr(job), uintptr(class), uintptr(info), uintptr(size), uintptr(unsafe.Pointer(retlen)))
+	if r0 == 0 {
+		return e1
+	}
+	return nil
+}
 
 var (
 	// ErrJobLimitsUnenforced means the job did not adopt, or no longer holds, the limits containment
@@ -142,8 +180,9 @@ func setContainmentLimits(h windows.Handle) error {
 	// without JOB_OBJECT_LIMIT_BREAKAWAY_OK a child passing CREATE_BREAKAWAY_FROM_JOB fails to start
 	// rather than escaping.
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(h, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	err := setJobInfo(h, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&info), uint32(unsafe.Sizeof(info)))
+	if err != nil {
 		return fmt.Errorf("proctree: set containment limits: %w", err)
 	}
 	return nil
@@ -161,8 +200,9 @@ func setContainmentLimits(h windows.Handle) error {
 func confirmContainmentLimits(h windows.Handle) error {
 	var got windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	var retlen uint32
-	if err := windows.QueryInformationJobObject(h, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&got)), uint32(unsafe.Sizeof(got)), &retlen); err != nil {
+	err := queryJobInfo(h, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&got), uint32(unsafe.Sizeof(got)), &retlen)
+	if err != nil {
 		return fmt.Errorf("proctree: read back containment limits: %w", err)
 	}
 	flags := got.BasicLimitInformation.LimitFlags
@@ -234,8 +274,9 @@ func (j *ArmedJob) MemberPIDs() ([]uint32, error) {
 		words := (int(unsafe.Sizeof(jobBasicProcessIDList{})) + (n-1)*int(unsafe.Sizeof(uintptr(0))) + 7) / 8
 		buf := make([]uintptr, words)
 		var retlen uint32
-		err := windows.QueryInformationJobObject(j.handle, windows.JobObjectBasicProcessIdList,
-			uintptr(unsafe.Pointer(&buf[0])), uint32(len(buf)*int(unsafe.Sizeof(uintptr(0)))), &retlen)
+		err := queryJobInfo(j.handle, windows.JobObjectBasicProcessIdList,
+			unsafe.Pointer(&buf[0]), uint32(len(buf)*int(unsafe.Sizeof(uintptr(0)))), &retlen)
+		runtime.KeepAlive(buf)
 		list := (*jobBasicProcessIDList)(unsafe.Pointer(&buf[0]))
 		if err != nil {
 			// ERROR_MORE_DATA means the list was truncated, and a truncated membership read as complete

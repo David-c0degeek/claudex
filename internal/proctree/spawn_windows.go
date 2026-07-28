@@ -16,8 +16,9 @@ const NullDevice = `NUL`
 
 // ContainedProcess is a started command, already a member of its containment domain.
 //
-// It carries no group id: on Windows the domain is the job, and the job is named. A pid here would be
-// a second identity for the same thing, which is the defect the Linux side just finished removing.
+// It carries no group id: on Windows the domain IS the job, held by handle and unnamed. A pid here
+// would be a second identity for the same thing, which is the defect the Linux side just finished
+// removing.
 type ContainedProcess struct {
 	handle windows.Handle
 	pid    uint32
