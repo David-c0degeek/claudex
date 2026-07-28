@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -64,6 +66,7 @@ func TestFirstAttachRefusesACredentialAndLeavesNothingBehind(t *testing.T) {
 			req := realRequest(t, repo, g, opID("a"), rand.Reader)
 			req.PolicyCanonical = policyWithSecretEnv(t, tc.disabled)
 
+			lay := layoutFor(repo)
 			_, err := FirstAttach(context.Background(), req)
 			if err == nil {
 				t.Fatal("a first attach carrying a credential-shaped environment entry succeeded")
@@ -72,59 +75,88 @@ func TestFirstAttachRefusesACredentialAndLeavesNothingBehind(t *testing.T) {
 				t.Fatalf("err = %v, want a credential refusal", err)
 			}
 
-			// Nothing durable. The whole point of refusing before the intent is built is that there is
-			// no journal holding the secret and no run to clean up.
-			claudex := filepath.Join(repo, ".claudex")
-			if entries, rerr := os.ReadDir(claudex); rerr == nil {
-				for _, e := range entries {
-					if e.Name() == "runs" {
-						runs, _ := os.ReadDir(filepath.Join(claudex, "runs"))
-						if len(runs) != 0 {
-							t.Fatalf("a refused attach left %d run directories behind", len(runs))
-						}
-					}
-				}
-			}
-			// And no active run was recorded.
-			lay := layoutFor(repo)
-			if cur, ok, cerr := state.OpenCurrentRun(lay.currentRunDir, lay.repoLock).Load(); cerr == nil && ok && cur.Active {
-				t.Fatalf("a refused attach left an active run: %+v", cur)
-			}
-			// The secret must not appear anywhere under .claudex, whatever the layout happens to be.
-			assertNoSecretOnDisk(t, claudex)
+			// Nothing durable — asserted as ABSENCE, not as "contains no secret".
+			//
+			// The requirement is that refusal happens BEFORE the intent is built, so the bootstrap
+			// journal and the active-run pointer must not exist at all. An earlier version of this test
+			// checked only that no literal token appeared on disk, which would have accepted a journal
+			// holding a redacted or malformed residue — and its active-run check passed whenever Load
+			// returned an error or an inactive record, so a decode failure read as success.
+			assertAbsent(t, lay.bootstrapJournal)
+			assertAbsent(t, lay.currentRunDir)
+			assertNoRunDirectories(t, filepath.Join(repo, ".claudex", "runs"))
+			assertNoSecretOnDisk(t, filepath.Join(repo, ".claudex"))
 		})
 	}
 }
 
-// assertNoSecretOnDisk walks the tool's whole directory looking for the credential. It searches by
-// CONTENT rather than by the paths this test expects to exist, so a future layout change cannot make
-// the check silently vacuous.
+// assertAbsent proves a durable artefact was never created.
+//
+// Absence is the claim, so anything other than "not there" is a failure — including a read error, which
+// an earlier version of this test would have accepted as success.
+func assertAbsent(t *testing.T, path string) {
+	t.Helper()
+	_, err := os.Stat(path)
+	if err == nil {
+		t.Fatalf("a refused attach created %s", path)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+}
+
+// assertNoRunDirectories proves no run was allocated. An absent runs directory is the expected shape;
+// an unreadable one is a failure rather than a pass.
+func assertNoRunDirectories(t *testing.T, runs string) {
+	t.Helper()
+	entries, err := os.ReadDir(runs)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", runs, err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("a refused attach left run directories behind: %v", names)
+	}
+}
+
+// assertNoSecretOnDisk is the belt to the absence braces above: even if some future artefact is
+// legitimately created before the refusal, the credential itself must not be in it.
+//
+// It searches by CONTENT across the whole tree rather than at the paths this test expects, so a layout
+// change cannot make it quietly vacuous — and it tolerates ONLY an absent root. Swallowing walk and read
+// errors, as it first did, turns an unreadable tree into a pass, which is the same defect one level up.
 func assertNoSecretOnDisk(t *testing.T, root string) {
 	t.Helper()
 	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
-	found := 0
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return
+	} else if err != nil {
+		t.Fatalf("stat %s: %v", root, err)
+	}
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil // absent is the expected case
+			return fmt.Errorf("walk %s: %w", p, err)
 		}
 		if d.IsDir() {
 			return nil
 		}
 		b, rerr := os.ReadFile(p)
 		if rerr != nil {
-			return nil
+			return fmt.Errorf("read %s: %w", p, rerr)
 		}
 		if strings.Contains(string(b), secret) {
-			found++
-			t.Errorf("the credential was written to %s", p)
+			return fmt.Errorf("the credential was written to %s", p)
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk %s: %v", root, err)
-	}
-	if found > 0 {
-		t.Fatalf("the credential reached disk in %d file(s)", found)
+		t.Fatal(err)
 	}
 }
 
@@ -152,15 +184,24 @@ func TestFirstAttachAcceptsADisabledGate(t *testing.T) {
 	}
 	req.PolicyCanonical = b
 
+	lay := layoutFor(repo)
 	res, err := FirstAttach(context.Background(), req)
 	if err != nil {
 		t.Fatalf("a disabled-gate policy could not bootstrap: %v", err)
 	}
 	assertProvisioned(t, g, repo, res.RunID)
 
+	// These are the artefacts the refusal test asserts ABSENT, so a successful attach must create them.
+	// Without this, that test could pass over paths nothing ever writes — an absence assertion about a
+	// thing that never exists proves nothing at all.
+	for _, p := range []string{lay.bootstrapJournal, lay.currentRunDir, filepath.Join(repo, ".claudex", "runs")} {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Fatalf("a successful attach did not create %s (%v); the refusal test's absence assertions would be vacuous", p, serr)
+		}
+	}
+
 	// And the persisted policy still compares equal to a fresh parse of its own snapshot — the exact
 	// equality the bootstrap intent enforces, asserted against durable bytes rather than in memory.
-	lay := layoutFor(repo)
 	runDir := lay.runDir(state.RunDirRelFor(res.RunID))
 	rs, ok, lerr := state.Open(filepath.Join(runDir, "state"), lay.repoLock).Load()
 	if lerr != nil || !ok {
