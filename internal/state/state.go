@@ -548,6 +548,13 @@ func Outcome(e TestExecution, i TestIdentity) (TestOutcome, error) {
 	return o, nil
 }
 
+// MaxTerminalReasonBytes bounds the ledger's terminal detail, measured on the CANONICAL bytes.
+//
+// Exported because the runner must apply it where the fact is accepted: enforcing it only at the state
+// CAS would let an oversized record become durable first and be refused afterwards, when it can no
+// longer be un-written.
+const MaxTerminalReasonBytes = 256
+
 // CanonicalTerminalReason is the ONE representation of a runner's terminal detail.
 //
 // It exists so the same bytes are hashed into the published result and bound into the ledger. The

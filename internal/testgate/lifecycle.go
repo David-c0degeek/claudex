@@ -251,8 +251,46 @@ type Handoff struct {
 	Prepared PreparedAttempt
 	// Containment is still ARMED and must be released by the recipient, not by this function.
 	Containment Containment
-	// Reason states why ownership moved, so the recipient need not infer it from an error string.
+	// Guard is what is known about the run guard, TYPED.
+	//
+	// Without it the recipient cannot act: reacquiring a guard this process still holds risks
+	// self-deadlock, and proceeding under a guard that was actually released risks unlocked mutation. A
+	// failed release establishes NEITHER, and no free-text reason can be reasoned about — which is why
+	// this is an enum the recipient must handle rather than prose it must interpret.
+	Guard GuardDisposition
+	// Reason states why ownership moved, for a human reading a log. Nothing decides on it.
 	Reason string
+}
+
+// GuardDisposition is what is known about the run guard at the moment of a handoff.
+type GuardDisposition int
+
+const (
+	// GuardReleased: the guard was released successfully. Recovery may acquire it normally.
+	GuardReleased GuardDisposition = iota + 1
+	// GuardHeld: this process deliberately kept the guard. Recovery must not acquire it.
+	//
+	// Run never produces this today — it always attempts release — and a test pins that, so the claim
+	// is checked rather than assumed. It is part of the vocabulary because the recipient's handling
+	// must be total: a value that appears later must not fall into a default that guesses.
+	GuardHeld
+	// GuardUnknown: the release FAILED, which establishes neither disposition.
+	//
+	// Recovery must BLOCK guarded work here rather than choose, and must retain the containment — the
+	// conservative direction, because both alternatives are unsafe and only one of them is loud.
+	GuardUnknown
+)
+
+func (g GuardDisposition) String() string {
+	switch g {
+	case GuardReleased:
+		return "released"
+	case GuardHeld:
+		return "held"
+	case GuardUnknown:
+		return "unknown"
+	}
+	return "unset"
 }
 
 // Result is what one completed attempt produced.
@@ -289,12 +327,15 @@ func Run(d Deps) (Result, error) {
 		// rather than folded into the error. If an attempt may exist, closing the containment would
 		// destroy the only proof recovery can use - so it is HANDED OVER rather than merely not closed.
 		if errors.Is(err, ErrRecoveryOwned) {
-			res := Result{Recovery: &Handoff{Prepared: prep, Containment: cont,
-				Reason: "the active binding could not be resolved, so an attempt may exist"}}
+			// The disposition is decided by what the release ACTUALLY did, so it is filled in after the
+			// attempt rather than predicted before it.
+			h := &Handoff{Prepared: clonePrepared(prep), Containment: cont, Guard: GuardReleased,
+				Reason: "the active binding could not be resolved, so an attempt may exist"}
 			if rerr := d.ReleaseGuard(); rerr != nil {
+				h.Guard = GuardUnknown
 				err = errors.Join(err, fmt.Errorf("%w: releasing the run guard", ErrLifecycle), rerr)
 			}
-			return res, err
+			return Result{Recovery: h}, err
 		}
 		cerr := closeContainment(cont)
 		if rerr := d.ReleaseGuard(); rerr != nil {
@@ -307,7 +348,8 @@ func Run(d Deps) (Result, error) {
 		// The state is DEFINITELY bound and the guard may still be held. Closing the containment here
 		// would volunteer for the Windows post-CAS row with no readable fact - destroying the sole
 		// handle over a lock failure that says nothing about the domain. It is handed to recovery.
-		return Result{Recovery: &Handoff{Prepared: prep, Containment: cont,
+		return Result{Recovery: &Handoff{Prepared: clonePrepared(prep), Containment: cont,
+				Guard:  GuardUnknown,
 				Reason: "the attempt is bound and the run guard could not be released"}},
 			errors.Join(fmt.Errorf("%w: releasing the run guard before GO", ErrRecoveryOwned), err)
 	}
@@ -367,13 +409,13 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 
 	// 2. The intent is durable before anything can act on it. From HERE the strict no-residue promise no
 	// longer holds: an orphan intent may exist, which is why later failures carry a weaker class.
-	if err := d.PublishIntent(prep); err != nil {
+	if err := d.PublishIntent(clonePrepared(prep)); err != nil {
 		return prep, nil, 0, errors.Join(fmt.Errorf("%w: publishing the attempt intent", ErrOrphanedIntent), err)
 	}
 
 	// 3. Armed DORMANT. A crash here leaves an armed containment with no command in it, which is cheap
 	// to prove empty — as opposed to a bound attempt whose containment never existed.
-	cont, err := d.ArmContainment(prep)
+	cont, err := d.ArmContainment(clonePrepared(prep))
 	if err != nil {
 		// cont may be non-nil when arming partially succeeded; the caller closes whatever exists.
 		return prep, cont, 0, errors.Join(fmt.Errorf("%w: arming the containment", ErrOrphanedIntent), err)
@@ -381,7 +423,7 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 
 	// 4. Only now does state carry an active reference — and by construction, every state that carries
 	// one is a state in which the containment already existed.
-	st, err := d.BindActive(prep)
+	st, err := d.BindActive(clonePrepared(prep))
 	if err != nil || st == BindUncertain {
 		// Uncertainty is settled WHILE THE GUARD IS STILL HELD, because this is the only moment it can
 		// be settled cheaply. Afterwards the question belongs to recovery.
@@ -420,9 +462,14 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 	// 9b. The final identity observation, UNDER the guard, is the linearization point the result's
 	// unchanged-versus-changed claim refers to. It receives what the runner saw, so the two independent
 	// axes come from the two parties that actually observed them.
-	ident, err := d.ObserveIdentity(prep, term)
+	ident, err := d.ObserveIdentity(clonePrepared(prep), term)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: observing the final identity", ErrLifecycle), err)
+	}
+	// Checked BEFORE the verdict is derived and long before anything is published, so a
+	// self-contradictory identity cannot authorize a pass.
+	if err := acceptIdentity(prep, ident); err != nil {
+		return Result{}, err
 	}
 
 	// The verdict is derived here, by the one total function that owns that decision, so an
@@ -434,14 +481,14 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 
 	// 10. Only now can the record be built: it is immutable and states the identity distinction, so
 	// before step 9b that field would have been a claim about a fact that did not exist.
-	digest, err := d.PublishResult(prep, term, ident)
+	digest, err := d.PublishResult(clonePrepared(prep), term, ident)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: publishing the result", ErrLifecycle), err)
 	}
 
 	// 11. The outcome CAS names the digest of a record that is ALREADY durable, so state never
 	// references a result a reader cannot fetch.
-	st, err := d.FinalizeOutcome(prep, term, ident, digest)
+	st, err := d.FinalizeOutcome(clonePrepared(prep), term, ident, digest)
 	if err != nil || st == BindUncertain {
 		// Settled while the guard is STILL held, and by READING rather than retrying: the design's row
 		// is "re-confirm; never double-apply", because re-applying an outcome that did commit would bind
@@ -474,14 +521,26 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 	if !state.KnownTestExecution(t.Execution) {
 		return Terminal{}, fmt.Errorf("%w: the runner reported the unknown execution %q", ErrLifecycle, t.Execution)
 	}
-	// An exit code exists for a normal exit and for nothing else. A timeout carries no code, and zero
-	// would be indistinguishable from success.
+	// The exit fact must AGREE with the verdict, not merely be present.
+	//
+	// Presence alone accepted `ok` with exit 17 — which state.Outcome turns into a PASS — and `nonzero`
+	// with exit 0. Both are self-contradictory records, and the first advances the run on the strength
+	// of a command that failed.
 	switch t.Execution {
-	case state.TestExecutionOK, state.TestExecutionNonzero:
-		if t.ExitCode == nil {
-			return Terminal{}, fmt.Errorf("%w: %q must carry an exit code", ErrLifecycle, t.Execution)
+	case state.TestExecutionOK:
+		if t.ExitCode == nil || *t.ExitCode != 0 {
+			return Terminal{}, fmt.Errorf("%w: %q requires exit code 0, got %s", ErrLifecycle, t.Execution, exitString(t.ExitCode))
+		}
+	case state.TestExecutionNonzero:
+		if t.ExitCode == nil || *t.ExitCode == 0 {
+			return Terminal{}, fmt.Errorf("%w: %q requires a non-zero exit code, got %s", ErrLifecycle, t.Execution, exitString(t.ExitCode))
+		}
+		if *t.ExitCode < 0 {
+			return Terminal{}, fmt.Errorf("%w: %q reported the impossible exit code %d", ErrLifecycle, t.Execution, *t.ExitCode)
 		}
 	default:
+		// A timeout, a cancel, a spawn failure and an interruption all end without the command
+		// reporting anything, so a code here would be invented.
 		if t.ExitCode != nil {
 			return Terminal{}, fmt.Errorf("%w: %q cannot carry an exit code", ErrLifecycle, t.Execution)
 		}
@@ -490,7 +549,76 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 		return Terminal{}, fmt.Errorf("%w: the runner reported no terminal detail", ErrLifecycle)
 	}
 	t.TerminalReason = state.CanonicalTerminalReason(t.TerminalReason)
+	// Bounded AFTER canonicalization, because canonicalization changes the length and the ledger's
+	// bound applies to the stored bytes. Checking it here rather than at the state CAS is what stops an
+	// oversized record becoming durable first and being refused afterwards, when it can no longer be
+	// un-written.
+	if len(t.TerminalReason) > state.MaxTerminalReasonBytes {
+		return Terminal{}, fmt.Errorf("%w: the terminal detail is %d bytes after canonicalization, limit %d",
+			ErrLifecycle, len(t.TerminalReason), state.MaxTerminalReasonBytes)
+	}
 	return t, nil
+}
+
+func exitString(c *int) string {
+	if c == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%d", *c)
+}
+
+// acceptIdentity proves the identity value AGREES with its own evidence.
+//
+// state.Outcome validates the enum, not what the enum claims. Without this, `unchanged` could carry a
+// commit and tree that differ from the ones the attempt was authorized against — and an `ok` execution
+// would then become a PASS certifying a tree nobody compared. `unobserved` could carry a claimed
+// identity it did not observe, and `changed` could carry the unchanged one.
+func acceptIdentity(prep PreparedAttempt, id Identity) error {
+	if !state.KnownTestIdentity(id.Value) {
+		return fmt.Errorf("%w: the observer reported the unknown identity %q", ErrLifecycle, id.Value)
+	}
+	switch id.Value {
+	case state.TestIdentityUnchanged:
+		if id.Commit != prep.TestedCommit || id.Tree != prep.TestedTree {
+			return fmt.Errorf("%w: identity says unchanged but names a different commit/tree than the attempt was authorized against", ErrLifecycle)
+		}
+	case state.TestIdentityChanged:
+		if id.Commit == "" || id.Tree == "" {
+			return fmt.Errorf("%w: identity says changed but observed no commit/tree to have changed to", ErrLifecycle)
+		}
+		if id.Commit == prep.TestedCommit && id.Tree == prep.TestedTree {
+			return fmt.Errorf("%w: identity says changed but names exactly the authorized commit/tree", ErrLifecycle)
+		}
+	case state.TestIdentityUnobserved:
+		if id.Commit != "" || id.Tree != "" {
+			return fmt.Errorf("%w: identity says unobserved but carries a commit/tree it cannot have observed", ErrLifecycle)
+		}
+	}
+	return nil
+}
+
+// clonePrepared returns an independently owned copy, nested bytes included.
+//
+// The same value is handed to intent publication, arming, binding, result publication and the handoff.
+// A shallow copy shares the argv backing array and every environment name and value, so a collaborator
+// that sorted or canonicalized in place would silently change what the NEXT step receives — after the
+// digest identifying those bytes had already been chosen. The "one execution travels" proof would then
+// hold only for collaborators that promised not to touch it, which is a convention, and conventions are
+// exactly what this package exists to replace.
+func clonePrepared(p PreparedAttempt) PreparedAttempt {
+	c := p
+	c.Spec.Argv = append([]string(nil), p.Spec.Argv...)
+	if p.Spec.Env.Env != nil {
+		env := make([]config.ResolvedVar, len(p.Spec.Env.Env))
+		for i, e := range p.Spec.Env.Env {
+			env[i] = config.ResolvedVar{
+				Name:  append([]byte(nil), e.Name...),
+				Value: append([]byte(nil), e.Value...),
+			}
+		}
+		c.Spec.Env.Env = env
+	}
+	return c
 }
 
 // closeContainment releases the domain, tolerating the case where none was ever armed.

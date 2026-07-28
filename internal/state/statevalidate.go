@@ -353,7 +353,7 @@ func validateTestAttempts(rs *RunState) error {
 		if _, err := Outcome(e.Execution, e.Identity); err != nil {
 			return fmt.Errorf("test_attempts[%d]: %w", i, err)
 		}
-		if strings.TrimSpace(e.TerminalReason) == "" || len(e.TerminalReason) > 256 {
+		if strings.TrimSpace(e.TerminalReason) == "" || len(e.TerminalReason) > MaxTerminalReasonBytes {
 			return fmt.Errorf("test_attempts[%d].terminal_reason is required and bounded", i)
 		}
 		// Already canonical, not made canonical here. This field is covered by the result digest, which

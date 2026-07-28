@@ -792,3 +792,221 @@ func TestTheOutcomeCASReportsAnAuthoritativeStatus(t *testing.T) {
 		}
 	})
 }
+
+// TestTheExitFactMustAgreeWithTheVerdict.
+//
+// Presence alone accepted `ok` with exit 17 — which the outcome function turns into a PASS — and
+// `nonzero` with exit 0. Both are self-contradictory records, and the first advances the run on the
+// strength of a command that failed.
+func TestTheExitFactMustAgreeWithTheVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		term Terminal
+	}{
+		{"ok with a non-zero code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "exited 17", ExitCode: intp(17)}},
+		{"nonzero with a zero code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited 0", ExitCode: intp(0)}},
+		{"a negative exit code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited -1", ExitCode: intp(-1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.cont.term = tc.term
+			if _, err := Run(h.deps); err == nil {
+				t.Fatal("a contradictory exit fact was accepted")
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("it reached the durable result seam: %v", h.r.steps)
+			}
+		})
+	}
+}
+
+// TestAnOversizedTerminalDetailIsRefusedBeforePublication.
+//
+// The ledger bounds this field, and enforcing that only at the state CAS would let the oversized record
+// become durable first and be refused afterwards — when it can no longer be un-written. The bound is
+// measured AFTER canonicalization, because canonicalization changes the length.
+func TestAnOversizedTerminalDetailIsRefusedBeforePublication(t *testing.T) {
+	h := newHarness(t)
+	h.cont.term = Terminal{
+		Execution:      state.TestExecutionTimeout,
+		TerminalReason: strings.Repeat("x", state.MaxTerminalReasonBytes+1),
+	}
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "after canonicalization") {
+		t.Fatalf("err = %v, want a post-canonicalization bound refusal", err)
+	}
+	if h.r.did("publish-result") {
+		t.Fatalf("an oversized record reached the durable seam: %v", h.r.steps)
+	}
+}
+
+// TestTheIdentityMustAgreeWithItsOwnEvidence.
+//
+// The outcome function validates the enum, not what the enum CLAIMS. Without this, `unchanged` could
+// name a commit and tree different from the ones the attempt was authorized against — and an `ok`
+// execution would then become a pass certifying a tree nobody compared.
+func TestTheIdentityMustAgreeWithItsOwnEvidence(t *testing.T) {
+	other := strings.Repeat("9", 40)
+	for _, tc := range []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"unchanged naming a different tree",
+			Identity{Value: state.TestIdentityUnchanged, Commit: thePrepared.TestedCommit, Tree: other},
+			"different commit/tree"},
+		{"unchanged naming a different commit",
+			Identity{Value: state.TestIdentityUnchanged, Commit: other, Tree: thePrepared.TestedTree},
+			"different commit/tree"},
+		{"changed naming exactly the authorized identity",
+			Identity{Value: state.TestIdentityChanged, Commit: thePrepared.TestedCommit, Tree: thePrepared.TestedTree},
+			"exactly the authorized"},
+		{"changed observing nothing",
+			Identity{Value: state.TestIdentityChanged},
+			"observed no commit/tree"},
+		{"unobserved carrying an identity it cannot have observed",
+			Identity{Value: state.TestIdentityUnobserved, Commit: other, Tree: other},
+			"cannot have observed"},
+		{"an unknown identity value",
+			Identity{Value: "probably-fine"},
+			"unknown identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.identity = tc.id
+			_, err := Run(h.deps)
+			if err == nil {
+				t.Fatal("a self-contradictory identity was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("it reached the durable result seam: %v", h.r.steps)
+			}
+		})
+	}
+}
+
+// TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive.
+//
+// The same prepared value goes to intent publication, arming, binding, result publication and the
+// handoff. Shared shallow copies mean a plausible canonicalizer or sorter in the FIRST collaborator
+// rewrites the backing array the LATER ones read — after the digest identifying those bytes was already
+// chosen. The read-only fakes elsewhere in this file cannot detect that, so this one mutates on purpose.
+func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
+	h := newHarness(t)
+	original := h.deps.PublishIntent
+	h.deps.PublishIntent = func(p PreparedAttempt) error {
+		// Exactly the kind of in-place tidying a real implementation might do.
+		for i := range p.Spec.Argv {
+			p.Spec.Argv[i] = "MUTATED"
+		}
+		for i := range p.Spec.Env.Env {
+			p.Spec.Env.Env[i].Value = []byte("MUTATED")
+			if len(p.Spec.Env.Env[i].Name) > 0 {
+				p.Spec.Env.Env[i].Name[0] = 'Z'
+			}
+		}
+		p.Spec.Cwd = "/mutated"
+		return original(p)
+	}
+
+	if _, err := Run(h.deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !slices.Equal(h.sawArmSpec.Argv, theSpec.Argv) {
+		t.Fatalf("arming received mutated argv %q, want the authorized %q", h.sawArmSpec.Argv, theSpec.Argv)
+	}
+	if h.sawArmSpec.Cwd != theSpec.Cwd {
+		t.Fatalf("arming received mutated cwd %q", h.sawArmSpec.Cwd)
+	}
+	if !reflect.DeepEqual(h.sawArmSpec.Env, theSpec.Env) {
+		t.Fatalf("arming received a mutated environment: %+v", h.sawArmSpec.Env)
+	}
+	// And the package's own fixture must be untouched, or every other test in this file has been
+	// running against corrupted data.
+	if !slices.Equal(theSpec.Argv, []string{"go", "test", "./..."}) {
+		t.Fatalf("the shared fixture was mutated: %q", theSpec.Argv)
+	}
+}
+
+// TestTheHandoffCarriesATypedGuardDisposition.
+//
+// Recovery cannot act on prose. Reacquiring a guard this process still holds risks self-deadlock;
+// proceeding under one that was actually released risks unlocked mutation. A failed release establishes
+// NEITHER, so the honest value is `unknown` and the recipient must block rather than choose.
+func TestTheHandoffCarriesATypedGuardDisposition(t *testing.T) {
+	t.Run("an unresolved bind with a clean release", func(t *testing.T) {
+		h := newHarness(t)
+		h.bindStatus, h.confirmStatus = BindUncertain, BindUncertain
+
+		res, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		assertHandedOver(t, res, h.cont)
+		if res.Recovery.Guard != GuardReleased {
+			t.Fatalf("guard disposition = %v, want released", res.Recovery.Guard)
+		}
+	})
+
+	// The COMBINATION, which neither condition alone exercises: the bind is unresolved AND the release
+	// then fails, so nothing is known about either the state or the lock.
+	t.Run("an unresolved bind whose release also fails", func(t *testing.T) {
+		h := newHarness(t)
+		h.bindStatus, h.confirmStatus = BindUncertain, BindUncertain
+		h.failRelease, h.failNthRelease = errors.New("lock stuck"), 1
+
+		res, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		assertHandedOver(t, res, h.cont)
+		if res.Recovery.Guard != GuardUnknown {
+			t.Fatalf("guard disposition = %v, want unknown", res.Recovery.Guard)
+		}
+		if h.cont.closed != 0 {
+			t.Fatalf("the containment was closed %d times", h.cont.closed)
+		}
+	})
+
+	t.Run("a bound attempt whose release fails", func(t *testing.T) {
+		h := newHarness(t)
+		h.failRelease, h.failNthRelease = errors.New("lock stuck"), 1
+
+		res, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		assertHandedOver(t, res, h.cont)
+		if res.Recovery.Guard != GuardUnknown {
+			t.Fatalf("guard disposition = %v, want unknown", res.Recovery.Guard)
+		}
+	})
+}
+
+// TestRunNeverClaimsToStillHoldTheGuard pins the disclosure attached to GuardHeld.
+//
+// The value exists so a recipient's handling is TOTAL over the vocabulary, but this function always
+// attempts release and therefore never produces it. Asserting that keeps the claim checked rather than
+// merely written down — and if a future path does hand off while holding, this fails and forces the
+// documentation to be updated with it.
+func TestRunNeverClaimsToStillHoldTheGuard(t *testing.T) {
+	for _, arrange := range []func(*harness){
+		func(h *harness) { h.bindStatus, h.confirmStatus = BindUncertain, BindUncertain },
+		func(h *harness) { h.failRelease, h.failNthRelease = errors.New("x"), 1 },
+		func(h *harness) { h.bindStatus = CommitStatus(99); h.confirmStatus = CommitStatus(99) },
+		func(h *harness) {
+			h.bindStatus, h.confirmStatus = BindUncertain, BindUncertain
+			h.failRelease, h.failNthRelease = errors.New("x"), 1
+		},
+	} {
+		h := newHarness(t)
+		arrange(h)
+		res, _ := Run(h.deps)
+		if res.Recovery != nil && res.Recovery.Guard == GuardHeld {
+			t.Fatal("Run handed off claiming to still hold the guard; the documented disclosure is now false")
+		}
+	}
+}
