@@ -1,17 +1,24 @@
-// Package testgate owns the ORDER in which one mechanical test attempt happens.
+// Package testgate owns the ORDER in which one mechanical test attempt happens, and the FACTS that
+// travel between its steps.
 //
 // Every step it sequences already exists somewhere else — the run guard, the attempt store, the
-// containment, the identity observation, the state CAS. What does not exist anywhere else is the
-// guarantee that they happen in the one order that makes each step's facts true when the next step
-// reads them. That guarantee cannot live in a call-site convention, because a convention is followed by
-// whoever remembers it; so it lives here, as one object's behaviour, the way the terminal sequence does
-// in internal/proctree.
+// containment, the identity observation, the state CAS. What does not exist anywhere else are two
+// things: the guarantee that they happen in the one order that makes each step's facts true when the
+// next step reads them, and the guarantee that what was armed, published, observed, hashed and bound is
+// the SAME execution. Neither can live in a call-site convention, because a convention is followed by
+// whoever remembers it.
+//
+// The second guarantee is why the seams pass typed values rather than bare errors. An earlier draft
+// sequenced the calls correctly and carried nothing between them: authorization resolved a command that
+// intent publication and arming could not see, and the runner's terminal facts vanished into an
+// `error` so the identity observer had to MANUFACTURE them. Production wiring would then have had to
+// recreate exactly the hidden mutable side channels this design rejects everywhere else.
 //
 // The order, and why each step is where it is:
 //
 //  1. UNDER THE RUN GUARD, authorize: exactly ownerless TESTS with NO active attempt, the frozen
 //     identity proven, the command resolved and the record's fit re-checked. All of it before anything
-//     is minted, so a resolution or fit failure is a pre-attempt refusal that binds nothing.
+//     is minted, so a resolution or fit failure is a refusal that wrote nothing.
 //  2. Durably publish the immutable intent.
 //  3. ARM THE CONTAINMENT DORMANT — no command in it yet.
 //  4. CAS-bind the active attempt.
@@ -40,21 +47,54 @@ package testgate
 import (
 	"errors"
 	"fmt"
+
+	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// ErrLifecycle marks a failure of the ordered lifecycle itself, as distinct from a failure of the
-// command under test. The two must never be confused: one is an infrastructure fault, the other is the
-// answer the gate exists to produce.
-var ErrLifecycle = errors.New("testgate: attempt lifecycle failed")
+// The four outcome classes, which differ in WHAT SURVIVES rather than in severity. Collapsing them was
+// a real defect: a caller cannot decide what to do next without knowing whether an attempt exists.
+var (
+	// ErrRefused means NOTHING durable was written: no intent, no containment, no state. Authorization
+	// and resolution failures only. A caller may retry freely.
+	ErrRefused = errors.New("testgate: refused before anything was written")
 
-// ErrPreAttempt marks a refusal that happened BEFORE anything was minted or bound.
+	// ErrOrphanedIntent means an intent may exist on disk and possibly a containment was armed and torn
+	// down again — but there is NO active reference and NO command. The design treats an orphan intent
+	// as ignorable and a fresh attempt as correct, which is why this is retryable; it is a separate
+	// class from ErrRefused because the promise is weaker and saying otherwise would be a lie.
+	ErrOrphanedIntent = errors.New("testgate: an orphan intent may exist, but no attempt was bound")
+
+	// ErrLifecycle means an attempt EXISTS and this process tore it down. The command's own failure is
+	// never reported this way: one is an infrastructure fault, the other is the answer the gate exists
+	// to produce.
+	ErrLifecycle = errors.New("testgate: attempt lifecycle failed")
+
+	// ErrRecoveryOwned means an attempt MAY exist and this process must not tear anything down.
+	//
+	// It exists for one situation: a state append that was visible but whose durability could not be
+	// confirmed. Closing the containment there would destroy the only handle that proves the domain is
+	// gone — on Windows, the sole job handle — producing exactly the post-CAS row with no readable fact
+	// that recovery must BLOCK on. Leaving it to recovery is the honest outcome.
+	ErrRecoveryOwned = errors.New("testgate: an attempt may exist; recovery owns the containment and the state")
+)
+
+// ResolvedCommand is what authorization actually resolved, carried so the steps that need it receive it
+// rather than re-deriving it from ambient state.
+type ResolvedCommand struct {
+	// Executable is the absolute path selected against the FROZEN PATH, never an ambient lookup.
+	Executable string
+	// Argv is the full vector including argv[0].
+	Argv []string
+	// EnvDigest binds the exact frozen environment this command will run with.
+	EnvDigest string
+}
+
+// PreparedAttempt is everything the guarded pre-flight established, travelling as ONE value.
 //
-// It is a distinct class because its promise is different: nothing was published, nothing was armed,
-// no state changed. A caller may retry it freely, which is not true of any later failure.
-var ErrPreAttempt = errors.New("testgate: refused before the attempt existed")
-
-// Authorization is what the guarded pre-flight proved, frozen for the rest of the attempt.
-type Authorization struct {
+// It is the answer to "what was authorized": the identity the attempt is a statement about, the command
+// that will run, and the digests that bind them. Every later step takes it, so no step has to reconstruct
+// a fact an earlier one already proved.
+type PreparedAttempt struct {
 	// AttemptID is the minted identity every later fact binds.
 	AttemptID string
 	// TestedCommit and TestedTree are the repository identity this attempt is a statement ABOUT.
@@ -62,71 +102,131 @@ type Authorization struct {
 	TestedTree   string
 	// IntentDigest binds the exact published intent.
 	IntentDigest string
+	// Command is what will run. Carried because arming and intent publication both need the exact
+	// command authorization chose, and neither may choose its own.
+	Command ResolvedCommand
 }
 
-// Observation is the final identity observation plus what the runner saw.
-type Observation struct {
-	// Commit and Tree are the identity at the END of the attempt.
+// Terminal is what the RUNNER observed about the command, in the closed vocabulary.
+//
+// It comes back from Wait rather than being reconstructed later, because the runner is the only party
+// that saw the command end. An earlier draft returned only an error here, so these facts disappeared and
+// the identity observer had to invent them.
+type Terminal struct {
+	Execution      state.TestExecution
+	TerminalReason string // already canonical; see state.CanonicalTerminalReason
+	// ExitCode is present for a normal exit and absent otherwise — a timeout has no exit code, and
+	// zero would be indistinguishable from success.
+	ExitCode *int
+}
+
+// Identity is the FINAL identity observation, in the closed vocabulary.
+//
+// `unobserved` is a first-class value, not an error. Its combinations produce durable indeterminate
+// outcomes by design, so an observation that could not be made must be RECORDED as unobserved rather
+// than recast as an unrecorded lifecycle failure — the gate is then honest about what it could not see,
+// instead of silently dropping the attempt.
+type Identity struct {
+	Value state.TestIdentity
+	// Commit and Tree are the identity at the END of the attempt, empty when unobserved.
 	Commit string
 	Tree   string
-	// Execution is the runner's terminal fact for the command.
-	Execution string
-	// TerminalReason is the runner's descriptive detail, ALREADY canonical.
-	TerminalReason string
 }
 
-// Deps are the collaborators, each one an authority that exists elsewhere.
+// BindStatus is the AUTHORITATIVE outcome of the active-attempt CAS.
 //
-// They are injected rather than reached for because this package's whole contribution is the ORDER, and
-// an order can only be proven by observing when each collaborator is called relative to the others.
-type Deps struct {
-	// AcquireGuard and ReleaseGuard bracket the two locked sections. The subprocess runs between them.
-	AcquireGuard func() error
-	ReleaseGuard func() error
+// Three outcomes, deliberately not collapsed into `error`. A clean conflict means no attempt exists and
+// the containment is this process's to destroy; a confirmed commit means an attempt exists; and a
+// visible-but-unconfirmed append means it MAY exist, which is the one case where tearing down would
+// destroy the evidence recovery needs.
+type BindStatus int
 
-	// Authorize proves ownerless TESTS with no active attempt, freezes the identity, resolves the
-	// command and re-checks the record fit. It runs under the guard and mints nothing until it has
-	// succeeded, so its failure binds nothing.
-	Authorize func() (Authorization, error)
+const (
+	// BindCommitted: the append is durable. An attempt exists.
+	BindCommitted BindStatus = iota + 1
+	// BindNotCommitted: nothing was written — a clean revision conflict, for instance. No attempt exists.
+	BindNotCommitted
+	// BindUncertain: the append may be visible but its durability is unconfirmed.
+	BindUncertain
+)
 
-	// PublishIntent durably writes the immutable intent.
-	PublishIntent func(Authorization) error
-
-	// ArmContainment arms the containment with NO command in it, and returns a Containment whose Go
-	// starts one.
-	ArmContainment func(Authorization) (Containment, error)
-
-	// BindActive CASes the active attempt reference into state.
-	BindActive func(Authorization) error
-
-	// Reauthorize proves the exact attempt is still the active one after the guard is reacquired.
-	Reauthorize func(Authorization) error
-
-	// ObserveIdentity makes the final exact identity observation, under the guard.
-	ObserveIdentity func(Authorization) (Observation, error)
-
-	// PublishResult durably writes the ONE canonical result and returns its digest.
-	PublishResult func(Authorization, Observation) (digest string, err error)
-
-	// FinalizeOutcome CASes the outcome into state, moving the active ref into the ledger.
-	FinalizeOutcome func(Authorization, Observation, string) error
+func (b BindStatus) String() string {
+	switch b {
+	case BindCommitted:
+		return "committed"
+	case BindNotCommitted:
+		return "not-committed"
+	case BindUncertain:
+		return "uncertain"
+	}
+	return "unknown"
 }
 
 // Containment is the armed domain the command runs inside.
 type Containment interface {
 	// Go starts the command. Before this call no command exists.
 	Go() error
-	// Wait blocks until the command is finished and its domain is torn down.
-	Wait() error
+	// Wait blocks until the command is finished and its domain is torn down, and returns what the
+	// runner observed.
+	Wait() (Terminal, error)
 	// Close releases the containment on every path, including those where Go was never called.
 	Close() error
 }
 
+// Deps are the collaborators, each an authority that exists elsewhere.
+type Deps struct {
+	// AcquireGuard and ReleaseGuard bracket the two locked sections. The subprocess runs between them.
+	AcquireGuard func() error
+	ReleaseGuard func() error
+
+	// Authorize proves ownerless TESTS with no active attempt, freezes the identity, resolves the
+	// command and re-checks the record fit — returning all of it as one value. It mints nothing until
+	// every check has passed, so its failure writes nothing.
+	Authorize func() (PreparedAttempt, error)
+
+	// PublishIntent durably writes the immutable intent for exactly this prepared attempt.
+	//
+	// Durability uncertainty here is BENIGN and needs no status: either the intent is on disk and
+	// orphaned, or it is not, and the design treats an orphan intent as ignorable with a fresh attempt
+	// superseding it. Nothing acts on an intent that no active reference points at.
+	PublishIntent func(PreparedAttempt) error
+
+	// ArmContainment arms the containment with NO command in it. It returns the Containment even on
+	// failure when anything was partially armed, so the caller can always release what exists.
+	ArmContainment func(PreparedAttempt) (Containment, error)
+
+	// BindActive CASes the active attempt into state and reports the AUTHORITATIVE status.
+	BindActive func(PreparedAttempt) (BindStatus, error)
+
+	// ConfirmBind settles an uncertain append while the guard is STILL HELD. It is a separate seam
+	// because that is the only moment the uncertainty can be resolved cheaply — afterwards the answer
+	// belongs to recovery.
+	ConfirmBind func(PreparedAttempt) (BindStatus, error)
+
+	// Reauthorize proves the exact attempt is still the active one after the guard is reacquired.
+	Reauthorize func(PreparedAttempt) error
+
+	// ObserveIdentity makes the final exact identity observation, under the guard, given what the
+	// runner saw. It may legitimately return `unobserved`; it returns an error only when the
+	// observation itself could not be attempted.
+	ObserveIdentity func(PreparedAttempt, Terminal) (Identity, error)
+
+	// PublishResult durably writes the ONE canonical result and returns its digest.
+	PublishResult func(PreparedAttempt, Terminal, Identity) (digest string, err error)
+
+	// FinalizeOutcome CASes the outcome into state, moving the active ref into the ledger.
+	FinalizeOutcome func(PreparedAttempt, Terminal, Identity, string) error
+}
+
 // Result is what one completed attempt produced.
 type Result struct {
-	Authorization Authorization
-	Observation   Observation
-	ResultDigest  string
+	Prepared     PreparedAttempt
+	Terminal     Terminal
+	Identity     Identity
+	ResultDigest string
+	// Outcome is the verdict derived from the two independent observations by the one total function
+	// that owns that decision.
+	Outcome state.TestOutcome
 }
 
 // Run executes one attempt in the pinned order.
@@ -141,29 +241,28 @@ func Run(d Deps) (Result, error) {
 
 	// ---- First guarded section -------------------------------------------------------------------
 	if err := d.AcquireGuard(); err != nil {
-		return Result{}, errors.Join(fmt.Errorf("%w: acquiring the run guard", ErrPreAttempt), err)
+		return Result{}, errors.Join(fmt.Errorf("%w: acquiring the run guard", ErrRefused), err)
 	}
 
-	auth, cont, err := d.armUnderGuard()
+	prep, cont, bound, err := d.armUnderGuard()
 	if err != nil {
-		// BOTH resources are released on every path out of the first section.
-		//
-		// The guard, because a refusal that left the run locked would be worse than the refusal. And the
-		// CONTAINMENT, because arming happens before the CAS — so a failed bind returns with a domain
-		// already armed, and returning without closing it would abandon exactly the thing the arming
-		// order exists to make recoverable. That is the same asymmetry the terminal sequence in
-		// internal/proctree had to be corrected for three times, arriving here one layer up; this test
-		// caught it rather than a review round.
-		cerr := closeContainment(cont)
+		// Teardown ownership depends on WHAT SURVIVED, which is why the bind status is carried out here
+		// rather than folded into the error. If an attempt may exist, closing the containment would
+		// destroy the only proof recovery can use — so this process releases the guard and stops.
+		var cerr error
+		if !errors.Is(err, ErrRecoveryOwned) {
+			cerr = closeContainment(cont)
+		}
 		if rerr := d.ReleaseGuard(); rerr != nil {
 			err = errors.Join(err, fmt.Errorf("%w: releasing the run guard after a refusal", ErrLifecycle), rerr)
 		}
 		return Result{}, errors.Join(err, cerr)
 	}
+	_ = bound
 
 	if err := d.ReleaseGuard(); err != nil {
-		// The containment is armed and the state is bound, so this is NOT a pre-attempt refusal: an
-		// attempt now exists and must be torn down rather than abandoned.
+		// The containment is armed and the state is bound, so an attempt now exists and must be torn
+		// down rather than abandoned.
 		return Result{}, errors.Join(fmt.Errorf("%w: releasing the run guard before GO", ErrLifecycle), err, closeContainment(cont))
 	}
 
@@ -173,7 +272,8 @@ func Run(d Deps) (Result, error) {
 	if err := cont.Go(); err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: starting the command", ErrLifecycle), err, closeContainment(cont))
 	}
-	if err := cont.Wait(); err != nil {
+	term, err := cont.Wait()
+	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: awaiting the command", ErrLifecycle), err, closeContainment(cont))
 	}
 
@@ -181,7 +281,7 @@ func Run(d Deps) (Result, error) {
 	if err := d.AcquireGuard(); err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: reacquiring the run guard", ErrLifecycle), err, closeContainment(cont))
 	}
-	res, ferr := d.finalizeUnderGuard(auth)
+	res, ferr := d.finalizeUnderGuard(prep, term)
 	rerr := d.ReleaseGuard()
 	cerr := closeContainment(cont)
 	if ferr != nil || rerr != nil || cerr != nil {
@@ -202,63 +302,92 @@ func Run(d Deps) (Result, error) {
 
 // armUnderGuard is steps 1 to 4: authorize, publish the intent, arm dormant, CAS.
 //
-// The containment is armed BEFORE the CAS and returned even on later failure, so the caller can tear it
-// down. Returning it only on success would mean a failed CAS left an armed domain with no handle to it.
-func (d Deps) armUnderGuard() (Authorization, Containment, error) {
-	// 1. Nothing is minted until every check has passed, so this failure binds nothing.
-	auth, err := d.Authorize()
+// The containment is returned even on failure, so the caller can always release what exists — and the
+// bind status is returned so the caller can tell whether releasing is its job at all.
+func (d Deps) armUnderGuard() (PreparedAttempt, Containment, BindStatus, error) {
+	// 1. Nothing is written until every check has passed, so this failure leaves no residue at all.
+	prep, err := d.Authorize()
 	if err != nil {
-		return Authorization{}, nil, errors.Join(fmt.Errorf("%w: authorizing the attempt", ErrPreAttempt), err)
+		return PreparedAttempt{}, nil, 0, errors.Join(fmt.Errorf("%w: authorizing the attempt", ErrRefused), err)
 	}
 
-	// 2. The intent is durable before anything can act on it.
-	if err := d.PublishIntent(auth); err != nil {
-		return auth, nil, errors.Join(fmt.Errorf("%w: publishing the attempt intent", ErrPreAttempt), err)
+	// 2. The intent is durable before anything can act on it. From HERE the strict no-residue promise no
+	// longer holds: an orphan intent may exist, which is why later failures carry a weaker class.
+	if err := d.PublishIntent(prep); err != nil {
+		return prep, nil, 0, errors.Join(fmt.Errorf("%w: publishing the attempt intent", ErrOrphanedIntent), err)
 	}
 
-	// 3. Armed DORMANT. From here a crash leaves an armed containment with no command in it, which is
-	// cheap to prove empty — as opposed to a bound attempt whose containment never existed.
-	cont, err := d.ArmContainment(auth)
+	// 3. Armed DORMANT. A crash here leaves an armed containment with no command in it, which is cheap
+	// to prove empty — as opposed to a bound attempt whose containment never existed.
+	cont, err := d.ArmContainment(prep)
 	if err != nil {
-		return auth, nil, errors.Join(fmt.Errorf("%w: arming the containment", ErrPreAttempt), err)
+		// cont may be non-nil when arming partially succeeded; the caller closes whatever exists.
+		return prep, cont, 0, errors.Join(fmt.Errorf("%w: arming the containment", ErrOrphanedIntent), err)
 	}
 
 	// 4. Only now does state carry an active reference — and by construction, every state that carries
 	// one is a state in which the containment already existed.
-	if err := d.BindActive(auth); err != nil {
-		return auth, cont, errors.Join(fmt.Errorf("%w: binding the active attempt", ErrLifecycle), err)
+	st, err := d.BindActive(prep)
+	if err != nil || st == BindUncertain {
+		// Uncertainty is settled WHILE THE GUARD IS STILL HELD, because this is the only moment it can
+		// be settled cheaply. Afterwards the question belongs to recovery.
+		confirmed, cerr := d.ConfirmBind(prep)
+		if cerr != nil {
+			return prep, cont, BindUncertain, errors.Join(
+				fmt.Errorf("%w: the active binding could not be confirmed", ErrRecoveryOwned), err, cerr)
+		}
+		st = confirmed
 	}
-	return auth, cont, nil
+	switch st {
+	case BindCommitted:
+		return prep, cont, st, nil
+	case BindNotCommitted:
+		// No attempt exists. The containment is this process's to destroy, and the caller may retry.
+		return prep, cont, st, errors.Join(fmt.Errorf("%w: the active attempt was not bound", ErrOrphanedIntent), err)
+	case BindUncertain:
+		// It may exist. Tearing down here would destroy the proof recovery needs.
+		return prep, cont, st, fmt.Errorf("%w: the active binding is visible but unconfirmed", ErrRecoveryOwned)
+	default:
+		return prep, cont, st, fmt.Errorf("%w: the active binding reported the unknown status %v", ErrLifecycle, st)
+	}
 }
 
 // finalizeUnderGuard is steps 9 to 11: re-authorize, observe, publish, CAS.
-func (d Deps) finalizeUnderGuard(auth Authorization) (Result, error) {
+func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, error) {
 	// 9a. The attempt being finalized must still be THE active one. Between releasing and reacquiring
 	// the guard, another party may have cancelled it or a recovery may have finalized it.
-	if err := d.Reauthorize(auth); err != nil {
+	if err := d.Reauthorize(prep); err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: re-authorizing the attempt", ErrLifecycle), err)
 	}
 
 	// 9b. The final identity observation, UNDER the guard, is the linearization point the result's
-	// unchanged-versus-changed claim refers to.
-	obs, err := d.ObserveIdentity(auth)
+	// unchanged-versus-changed claim refers to. It receives what the runner saw, so the two independent
+	// axes come from the two parties that actually observed them.
+	ident, err := d.ObserveIdentity(prep, term)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: observing the final identity", ErrLifecycle), err)
 	}
 
+	// The verdict is derived here, by the one total function that owns that decision, so an
+	// unrepresentable pair is refused before a record claims it.
+	outcome, err := state.Outcome(term.Execution, ident.Value)
+	if err != nil {
+		return Result{}, errors.Join(fmt.Errorf("%w: deriving the outcome", ErrLifecycle), err)
+	}
+
 	// 10. Only now can the record be built: it is immutable and states the identity distinction, so
 	// before step 9b that field would have been a claim about a fact that did not exist.
-	digest, err := d.PublishResult(auth, obs)
+	digest, err := d.PublishResult(prep, term, ident)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: publishing the result", ErrLifecycle), err)
 	}
 
 	// 11. The outcome CAS names the digest of a record that is ALREADY durable, so state never
 	// references a result a reader cannot fetch.
-	if err := d.FinalizeOutcome(auth, obs, digest); err != nil {
+	if err := d.FinalizeOutcome(prep, term, ident, digest); err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: finalizing the outcome", ErrLifecycle), err)
 	}
-	return Result{Authorization: auth, Observation: obs, ResultDigest: digest}, nil
+	return Result{Prepared: prep, Terminal: term, Identity: ident, ResultDigest: digest, Outcome: outcome}, nil
 }
 
 // closeContainment releases the domain, tolerating the case where none was ever armed.
@@ -273,35 +402,29 @@ func closeContainment(c Containment) error {
 }
 
 func (d Deps) validate() error {
-	missing := []string{}
-	for name, fn := range map[string]bool{
-		"AcquireGuard":    d.AcquireGuard == nil,
-		"ReleaseGuard":    d.ReleaseGuard == nil,
-		"Authorize":       d.Authorize == nil,
-		"PublishIntent":   d.PublishIntent == nil,
-		"ArmContainment":  d.ArmContainment == nil,
-		"BindActive":      d.BindActive == nil,
-		"Reauthorize":     d.Reauthorize == nil,
-		"ObserveIdentity": d.ObserveIdentity == nil,
-		"PublishResult":   d.PublishResult == nil,
-		"FinalizeOutcome": d.FinalizeOutcome == nil,
+	var missing []string
+	for _, f := range []struct {
+		name  string
+		blank bool
+	}{
+		{"AcquireGuard", d.AcquireGuard == nil},
+		{"ReleaseGuard", d.ReleaseGuard == nil},
+		{"Authorize", d.Authorize == nil},
+		{"PublishIntent", d.PublishIntent == nil},
+		{"ArmContainment", d.ArmContainment == nil},
+		{"BindActive", d.BindActive == nil},
+		{"ConfirmBind", d.ConfirmBind == nil},
+		{"Reauthorize", d.Reauthorize == nil},
+		{"ObserveIdentity", d.ObserveIdentity == nil},
+		{"PublishResult", d.PublishResult == nil},
+		{"FinalizeOutcome", d.FinalizeOutcome == nil},
 	} {
-		if fn {
-			missing = append(missing, name)
+		if f.blank {
+			missing = append(missing, f.name)
 		}
 	}
 	if len(missing) > 0 {
-		// Sorted so the message is stable rather than dependent on map iteration.
-		sortStrings(missing)
-		return fmt.Errorf("%w: incomplete wiring, missing %v", ErrPreAttempt, missing)
+		return fmt.Errorf("%w: incomplete wiring, missing %v", ErrRefused, missing)
 	}
 	return nil
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
 }
