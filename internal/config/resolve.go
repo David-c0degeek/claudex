@@ -164,6 +164,24 @@ func (re *ResolvedExecution) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("resolved execution: %s is required", k)
 		}
 	}
+	// Required-ness has to reach EVERY ELEMENT, not just the outer object. An omitted `value_b64`
+	// decodes to the canonical empty string, which is indistinguishable from a value that was
+	// deliberately frozen as empty — so a truncated or hand-edited carrier would validate as
+	// `NAME=` and the command would run with an environment nobody chose.
+	var rawEnv []map[string]json.RawMessage
+	if err := json.Unmarshal(present["env"], &rawEnv); err != nil {
+		return fmt.Errorf("resolved execution env: %w", err)
+	}
+	if len(rawEnv) != len(w.Env) {
+		return fmt.Errorf("resolved execution env: %d entries decoded from %d", len(w.Env), len(rawEnv))
+	}
+	for i, m := range rawEnv {
+		for _, k := range []string{"name_b64", "value_b64"} {
+			if _, ok := m[k]; !ok {
+				return fmt.Errorf("resolved execution env[%d]: %s is required", i, k)
+			}
+		}
+	}
 	out := ResolvedExecution{
 		Identity:     NameIdentity(w.Identity),
 		Env:          make([]ResolvedVar, 0, len(w.Env)),

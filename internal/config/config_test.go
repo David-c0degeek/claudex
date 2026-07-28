@@ -243,41 +243,30 @@ func TestPolicyMarshalParseRoundTrips(t *testing.T) {
 			if err != nil {
 				t.Fatalf("the marshalled policy could not be parsed back: %v\n%s", err, b)
 			}
-			// Semantic equality, which is what the bootstrap invariant actually compares.
-			if !reflect.DeepEqual(got, mustParse(t, b)) {
-				t.Fatal("parsing the same bytes twice disagreed with itself")
+			// DeepEqual on the WHOLE policy, which is exactly what BootstrapIntent compares — and
+			// deliberately not a slices.Equal helper that normalizes nil to empty first. An earlier
+			// version of this test did precisely that, and so passed while parse-marshal-parse was not
+			// an identity: parse gave nil, marshal gave `[]`, re-parse gave empty, and a disabled-gate
+			// policy could strand a run on a difference the helper was hiding.
+			again, err := ParseRunPolicy(b)
+			if err != nil {
+				t.Fatalf("re-parse: %v", err)
 			}
-			if got.TestGate.Disabled != tc.gate.Disabled || !slices.Equal(got.TestGate.Argv, nonNil(tc.gate.Argv)) {
-				t.Fatalf("gate round-trip lost data: %+v -> %+v", tc.gate, got.TestGate)
+			if !reflect.DeepEqual(got, again) {
+				t.Fatalf("parse-marshal-parse is not an identity: %+v vs %+v", got, again)
 			}
-			if !slices.Equal(got.TestGate.Env.Set, nonNilAssignments(tc.gate.Env.Set)) {
-				t.Fatalf("env.set round-trip lost data: %+v -> %+v", tc.gate.Env.Set, got.TestGate.Env.Set)
+			b2, err := json.Marshal(again)
+			if err != nil {
+				t.Fatalf("re-marshal: %v", err)
+			}
+			if string(b) != string(b2) {
+				t.Fatalf("marshaling twice produced different bytes: %s vs %s", b, b2)
+			}
+			if got.TestGate.Disabled != tc.gate.Disabled {
+				t.Fatalf("gate round-trip lost the disabled flag: %+v -> %+v", tc.gate, got.TestGate)
 			}
 		})
 	}
-}
-
-func mustParse(t *testing.T, b []byte) RunPolicy {
-	t.Helper()
-	rp, err := ParseRunPolicy(b)
-	if err != nil {
-		t.Fatalf("re-parse: %v", err)
-	}
-	return rp
-}
-
-func nonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
-}
-
-func nonNilAssignments(s []EnvAssignment) []EnvAssignment {
-	if s == nil {
-		return []EnvAssignment{}
-	}
-	return s
 }
 
 // TestPlatformRequiredEnvIsClosedAndNamed. The platform set is part of the authority model, so it must

@@ -408,6 +408,18 @@ func TestTheExecutionViewDecoderIsStrictAndCanonical(t *testing.T) {
 			"canonical encoding",
 		},
 		{
+			// Per ELEMENT, not just the outer object: an omitted value_b64 decodes to the canonical
+			// empty string, which is indistinguishable from a value deliberately frozen as empty.
+			"an env entry missing its value",
+			strings.Replace(string(valid), `,"value_b64":"L3Vzci9iaW4="`, ``, 1),
+			"value_b64 is required",
+		},
+		{
+			"an env entry missing its name",
+			strings.Replace(string(valid), `"name_b64":"UEFUSA==",`, ``, 1),
+			"name_b64 is required",
+		},
+		{
 			"a missing required field",
 			strings.Replace(string(valid), `,"scratch_temp":"`+p[2]+`"`, ``, 1),
 			"required",

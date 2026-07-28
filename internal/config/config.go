@@ -272,7 +272,7 @@ func DefaultRunPolicy() RunPolicy {
 		// platform could not be validated on another. The platform-required set therefore belongs to
 		// resolution, where it is recorded in ResolvedExecution and bound like every other resolved
 		// value, rather than to the portable policy document.
-		TestGate: TestGate{Env: TestGateEnv{Inherit: []string{"PATH"}, Set: []EnvAssignment{}}},
+		TestGate: TestGate{Argv: []string{}, Env: TestGateEnv{Inherit: []string{"PATH"}, Set: []EnvAssignment{}}},
 		Limits: Limits{
 			MaxArtifactBytesPerSubmit: 262144,
 			MaxRunTurns:               200,
@@ -415,10 +415,32 @@ func ParseRunPolicy(data []byte) (RunPolicy, error) {
 	if rp.SchemaVersion != RunPolicyVersion {
 		return RunPolicy{}, fmt.Errorf("run policy: schema_version must be %d (got %d)", RunPolicyVersion, rp.SchemaVersion)
 	}
+	// Absent collections are normalized to EMPTY before validation, so parsing is idempotent under
+	// marshaling.
+	//
+	// This is not tidiness. BootstrapIntent requires reflect.DeepEqual between the frozen policy and a
+	// re-parse of its snapshot, and a nil slice is not DeepEqual to an empty one — while MarshalJSON
+	// deliberately writes absent collections as `[]` so the document can be read back at all. Without
+	// normalization, parse produced nil, marshal produced `[]`, and re-parse produced empty: the round
+	// trip was not an identity, and a policy that had been through it could strand a run on an
+	// invariant about a difference nothing can observe. A disabled gate hit it first, because that is
+	// the shape with no argv.
+	rp.TestGate.Argv = orEmpty(rp.TestGate.Argv)
+	rp.TestGate.Env.Inherit = orEmpty(rp.TestGate.Env.Inherit)
+	rp.TestGate.Env.Set = orEmpty(rp.TestGate.Env.Set)
 	if err := rp.Validate(); err != nil {
 		return RunPolicy{}, fmt.Errorf("run policy: %w", err)
 	}
 	return rp, nil
+}
+
+// orEmpty replaces an absent collection with an empty one, so "absent" and "empty" — which mean the
+// same thing here — also COMPARE the same.
+func orEmpty[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
 }
 
 // Validate checks the run policy's structural invariants (positive ceilings,
