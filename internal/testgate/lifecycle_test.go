@@ -80,6 +80,12 @@ var theSpec = ExecutionSpec{
 // not an inconvenience.
 func rebind(t *testing.T, p PreparedAttempt) PreparedAttempt {
 	t.Helper()
+	// The budget is derived from the attempt, so bending a ceiling changes it - and the gate re-derives
+	// and refuses a mismatch, which is the rule working rather than an inconvenience.
+	b, err := deriveEffectiveOutputBudget(p)
+	if err == nil {
+		p.EffectiveOutputBudget = b
+	}
 	_, digest, err := buildIntentRecord(p)
 	if err != nil {
 		t.Fatalf("rebinding the intent: %v", err)
@@ -92,6 +98,12 @@ func rebind(t *testing.T, p PreparedAttempt) PreparedAttempt {
 // which is the property the lifecycle now enforces, so a constant here would simply be refused.
 var thePrepared = func() PreparedAttempt {
 	p := preparedShape
+	// Derived by the PRODUCTION rule, so the fixture cannot assert a budget the gate would refuse.
+	b, err := deriveEffectiveOutputBudget(p)
+	if err != nil {
+		panic("fixture budget does not derive: " + err.Error())
+	}
+	p.EffectiveOutputBudget = b
 	_, digest, err := buildIntentRecord(p)
 	if err != nil {
 		panic("fixture intent does not encode: " + err.Error())
@@ -1870,16 +1882,19 @@ func TestTheCombinedRetainedOutputRespectsTheFrozenCeiling(t *testing.T) {
 	authorize := h.deps.Authorize
 	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
 		p, err := authorize(rev)
-		p.MaxOutputBytes = 8
+		// Above the reserve, so the PRE-attempt gate passes and the builder check is the one under test.
+		p.MaxOutputBytes = MinRetainedExcerptBytes
 		return rebind(t, p), err
 	}
-	half := []byte("12345")
+	// Each stream is within the ceiling; together they are not.
+	half := bytes.Repeat([]byte{'o'}, MinRetainedExcerptBytes)
 	h.cont.term = Terminal{
 		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
 		HasExitCode: true,
-		// Each stream is within the ceiling; together they are not.
-		Stdout: StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 5, SHA256: sha256Hex(half), Head: half},
-		Stderr: StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 5, SHA256: sha256Hex(half), Head: half},
+		Stdout: StreamRecord{Present: true, SourceBytes: uint64(len(half)), RedactedBytes: uint64(len(half)),
+			SHA256: sha256Hex(half), Head: half},
+		Stderr: StreamRecord{Present: true, SourceBytes: uint64(len(half)), RedactedBytes: uint64(len(half)),
+			SHA256: sha256Hex(half), Head: half},
 	}
 
 	_, err := Run(h.deps)
@@ -1928,15 +1943,18 @@ func TestASkewedExcerptIsRefusedAtTheCollaboratorBoundary(t *testing.T) {
 	authorize := h.deps.Authorize
 	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
 		p, err := authorize(rev)
-		p.MaxOutputBytes = 8
+		// Above the reserve, so the PRE-attempt gate passes and the builder check is the one under test.
+		p.MaxOutputBytes = MinRetainedExcerptBytes
 		return rebind(t, p), err
 	}
 	// The right total, divided the wrong way: all head, no tail.
 	h.cont.term = Terminal{
 		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
 		HasExitCode: true,
-		Stdout: StreamRecord{Present: true, SourceBytes: 100, RedactedBytes: 100,
-			SHA256: strings.Repeat("3c", 32), Head: Bytes("01234567"), Truncated: true},
+		// The right total, divided the wrong way: all head, no tail.
+		Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+			SHA256: strings.Repeat("3c", 32),
+			Head:   bytes.Repeat(Bytes{'o'}, MinRetainedExcerptBytes), Truncated: true},
 	}
 
 	_, err := Run(h.deps)
@@ -2087,6 +2105,9 @@ func TestThePreAttemptGateUsesTheWORSTCaseRecord(t *testing.T) {
 	realGate := func(maxRecord uint64) error {
 		p := preparedShape
 		p.MaxRecordBytes = maxRecord
+		if b, err := deriveEffectiveOutputBudget(p); err == nil {
+			p.EffectiveOutputBudget = b
+		}
 		return checkAttemptCanProduceAStorableRecord(p)
 	}
 	view, err := preparedShape.Spec.View()
@@ -2160,50 +2181,84 @@ func TestThePreAttemptGateUsesTheWORSTCaseRecord(t *testing.T) {
 func TestTheGateAndTheBuilderAgreeOnOneBudget(t *testing.T) {
 	h := newHarness(t)
 	// A record ceiling that binds BELOW the raw output ceiling, which is the case the contradiction
-	// lived in.
-	const tightRecord = 2200
+	// lived in: the excerpt was sized against one ceiling and validated against the other, so nothing
+	// could satisfy both.
+	const tightRecord = 4000
+	var frozen uint64
 	authorize := h.deps.Authorize
 	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
 		p, err := authorize(rev)
 		p.MaxRecordBytes = tightRecord
-		return rebind(t, p), err
+		p = rebind(t, p)
+		frozen = p.EffectiveOutputBudget
+		return p, err
 	}
 
-	// Size the excerpt the way a producer would: from the effective budget, not the raw one.
-	probe := ResultRecord{
-		SchemaVersion: ResultRecordVersion, AttemptID: thePrepared.AttemptID,
-		TestedCommit: thePrepared.TestedCommit, TestedTree: thePrepared.TestedTree,
-		SpecDigest: theSpec.Digest, Execution: state.TestExecutionOK,
-		Identity: state.TestIdentityUnchanged, TerminalReason: "exited 0",
-		TerminalAuthor: state.TerminalByRunner, HasExitCode: true,
-		Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
-			SHA256: strings.Repeat("3c", 32), Truncated: true},
-	}
-	view, err := theSpec.View()
-	if err != nil {
-		t.Fatalf("View: %v", err)
-	}
-	probe.View = view
-	budget, err := EffectiveOutputBudget(probe, thePrepared.MaxOutputBytes, tightRecord)
-	if err != nil {
-		t.Fatalf("EffectiveOutputBudget: %v", err)
-	}
-	if budget >= thePrepared.MaxOutputBytes {
-		t.Fatalf("budget %d did not bind below the raw ceiling %d, so this case is not the one under test",
-			budget, thePrepared.MaxOutputBytes)
-	}
-	outBudget, _ := AllocateOutputBudget(budget)
-	head := (outBudget + 1) / 2
-	h.cont.term = Terminal{
-		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
-		HasExitCode: true,
-		Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
-			SHA256: strings.Repeat("3c", 32),
-			Head:   bytes.Repeat([]byte{'o'}, int(head)), Tail: bytes.Repeat([]byte{'o'}, int(outBudget-head)),
-			Truncated: true},
+	// Size the excerpt the way a runner would: from the FROZEN budget it was handed, which exists before
+	// the command runs and does not depend on the identity that does not exist yet.
+	h.deps.ArmContainment = func(p PreparedAttempt) (Containment, error) {
+		outBudget, _ := AllocateOutputBudget(p.EffectiveOutputBudget)
+		head := (outBudget + 1) / 2
+		h.cont.term = Terminal{
+			Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
+			HasExitCode: true,
+			Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+				SHA256: strings.Repeat("3c", 32),
+				Head:   bytes.Repeat([]byte{'o'}, int(head)), Tail: bytes.Repeat([]byte{'o'}, int(outBudget-head)),
+				Truncated: true},
+		}
+		h.r.step("arm")
+		return h.cont, nil
 	}
 
 	if _, err := Run(h.deps); err != nil {
-		t.Fatalf("an excerpt sized from the effective budget was refused: %v", err)
+		t.Fatalf("an excerpt sized from the frozen budget was refused: %v", err)
+	}
+	if frozen == 0 || frozen >= thePrepared.MaxOutputBytes {
+		t.Fatalf("budget %d did not bind below the raw ceiling %d, so this case is not the one under test",
+			frozen, thePrepared.MaxOutputBytes)
+	}
+	// The intent carries the FROZEN number, not the raw ceiling - which is the value recovery will read
+	// instead of deriving its own.
+	if h.sawIntentRecord.EffectiveOutputBudget != frozen {
+		t.Fatalf("the intent binds %d, the attempt froze %d", h.sawIntentRecord.EffectiveOutputBudget, frozen)
+	}
+}
+
+// TestTheBudgetIsFrozenBeforeTheAttemptAndNeverReDerived.
+//
+// Deriving it later cannot work in either direction. On the live path the derivation depends on the
+// final record - including the identity, which does not exist when the runner has to fill an exact
+// split. On the crash path it is worse: re-deriving from whichever artifacts SURVIVED makes the budget a
+// function of what was lost, so losing stderr's metadata enlarges it and the surviving stdout excerpt is
+// rejected for not filling a half that grew after the fact.
+func TestTheBudgetIsFrozenBeforeTheAttemptAndNeverReDerived(t *testing.T) {
+	h := newHarness(t)
+	if _, err := Run(h.deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The intent binds it, so recovery reads the same number rather than deriving its own.
+	if h.sawIntentRecord.EffectiveOutputBudget != thePrepared.EffectiveOutputBudget {
+		t.Fatalf("the intent binds budget %d, the attempt froze %d",
+			h.sawIntentRecord.EffectiveOutputBudget, thePrepared.EffectiveOutputBudget)
+	}
+	if thePrepared.EffectiveOutputBudget == 0 {
+		t.Fatal("no budget was frozen at all")
+	}
+
+	// And authorization cannot choose its own: the gate re-derives and refuses a mismatch.
+	h2 := newHarness(t)
+	authorize := h2.deps.Authorize
+	h2.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.EffectiveOutputBudget = p.EffectiveOutputBudget - 1
+		return p, err
+	}
+	_, err := Run(h2.deps)
+	if err == nil || !strings.Contains(err.Error(), "authorization froze an output budget") {
+		t.Fatalf("err = %v, want a refusal of an invented budget", err)
+	}
+	if h2.r.did("publish-intent") {
+		t.Fatalf("an invented budget was published: %v", h2.r.steps)
 	}
 }

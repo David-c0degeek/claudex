@@ -47,7 +47,6 @@ package testgate
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -173,6 +172,20 @@ type PreparedAttempt struct {
 	// Both travel with the attempt because this lifecycle has to enforce them and does not read policy.
 	MaxOutputBytes uint64
 	MaxRecordBytes uint64
+	// EffectiveOutputBudget is the ONE resolved combined excerpt allowance, frozen before the attempt
+	// starts and carried from there on.
+	//
+	// Deriving it later cannot work in either direction. On the live path it would depend on the final
+	// record - including the identity, which does not exist yet - so the runner would have to fill an
+	// exact split before it could know the size of the split. On the crash path it is worse: recovery
+	// derives it from whichever stream artifacts SURVIVED, so losing stderr's metadata makes the budget
+	// larger and the surviving stdout excerpt is then rejected for not filling a half that grew after the
+	// fact. That is availability rewriting history, which is the thing the allocation rule exists to
+	// forbid.
+	//
+	// Authorization supplies it and the guarded gate re-derives and refuses a mismatch, the same shape as
+	// the intent digest and the reserved revision.
+	EffectiveOutputBudget uint64
 }
 
 // Terminal is what the RUNNER observed about the command, in the closed vocabulary.
@@ -824,29 +837,7 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 // argv and environment metadata are variable and a policy can be perfectly valid while making a
 // zero-output record unissuable for THIS command.
 func checkAttemptCanProduceAStorableRecord(prep PreparedAttempt) error {
-	view, err := prep.Spec.View()
-	if err != nil {
-		return err
-	}
-	worst := ResultRecord{
-		SchemaVersion: ResultRecordVersion,
-		AttemptID:     prep.AttemptID,
-		TestedCommit:  prep.TestedCommit,
-		TestedTree:    prep.TestedTree,
-		View:          view,
-		SpecDigest:    prep.Spec.Digest,
-		Execution:     state.TestExecutionNonzero,
-		Identity:      state.TestIdentityUnobserved,
-		// The longest account the ledger will accept, so the gate is not passed by an attempt that only
-		// fits while nothing goes wrong.
-		TerminalReason: strings.Repeat("x", state.MaxTerminalReasonBytes),
-		TerminalAuthor: state.TerminalByRunner,
-		HasExitCode:    true,
-		ExitCode:       255,
-		Stdout:         worstStream(),
-		Stderr:         worstStream(),
-	}
-	budget, err := ExcerptBudget(worst, prep.MaxRecordBytes)
+	budget, err := deriveEffectiveOutputBudget(prep)
 	if err != nil {
 		return err
 	}
@@ -854,15 +845,63 @@ func checkAttemptCanProduceAStorableRecord(prep PreparedAttempt) error {
 		return fmt.Errorf("%w: this command's record leaves room for %d excerpt bytes, below the %d it must be able to keep",
 			ErrLifecycle, budget, MinRetainedExcerptBytes)
 	}
+	// Authorization supplies the number and this re-derives it, so the value the intent binds and the
+	// runner sizes against is one nobody could have chosen for themselves.
+	if prep.EffectiveOutputBudget != budget {
+		return fmt.Errorf("%w: authorization froze an output budget of %d, but this attempt's records allow %d",
+			ErrLifecycle, prep.EffectiveOutputBudget, budget)
+	}
 	return nil
 }
+
+// deriveEffectiveOutputBudget computes the one conservative allowance from the WORST record this attempt
+// could produce.
+//
+// Worst means worst ENCODED, not worst in raw bytes. An earlier version used 256 repeated 'x' characters
+// as the longest admissible terminal account; the contract only requires canonical, non-blank text within
+// 256 bytes, and canonicalization leaves control characters alone, so 256 of them are equally admissible
+// and canonical JSON writes each as six bytes. The real worst account is 1280 canonical bytes larger than
+// the one the gate was measuring - enough for an attempt to pass the gate, run, and then produce a record
+// that cannot be stored, which is precisely the hole the gate exists to close.
+func deriveEffectiveOutputBudget(prep PreparedAttempt) (uint64, error) {
+	view, err := prep.Spec.View()
+	if err != nil {
+		return 0, err
+	}
+	worst := ResultRecord{
+		SchemaVersion:  ResultRecordVersion,
+		AttemptID:      prep.AttemptID,
+		TestedCommit:   prep.TestedCommit,
+		TestedTree:     prep.TestedTree,
+		View:           view,
+		SpecDigest:     prep.Spec.Digest,
+		Execution:      state.TestExecutionNonzero,
+		Identity:       state.TestIdentityUnobserved,
+		TerminalReason: WorstTerminalAccount(),
+		TerminalAuthor: state.TerminalByRunner,
+		HasExitCode:    true,
+		ExitCode:       255,
+		Stdout:         worstStream(),
+		Stderr:         worstStream(),
+	}
+	derived, err := ExcerptBudget(worst, prep.MaxRecordBytes)
+	if err != nil {
+		return 0, err
+	}
+	if derived > prep.MaxOutputBytes {
+		return prep.MaxOutputBytes, nil
+	}
+	return derived, nil
+}
+
+const worstDigest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 
 func worstStream() StreamRecord {
 	return StreamRecord{
 		// The largest counts the canonical encoder can represent, which is what makes this a worst case
 		// rather than merely a large one.
 		Present: true, SourceBytes: MaxRepresentableCount, RedactedBytes: MaxRepresentableCount,
-		SHA256: strings.Repeat("f", 64), Truncated: true,
+		SHA256: worstDigest, Truncated: true,
 	}
 }
 
@@ -908,15 +947,16 @@ func buildIntentRecord(prep PreparedAttempt) (IntentRecord, string, error) {
 		return IntentRecord{}, "", err
 	}
 	rec := IntentRecord{
-		SchemaVersion:  IntentRecordVersion,
-		AttemptID:      prep.AttemptID,
-		StartRevision:  prep.StartRevision,
-		TestedCommit:   prep.TestedCommit,
-		TestedTree:     prep.TestedTree,
-		View:           view,
-		SpecDigest:     prep.Spec.Digest,
-		MaxOutputBytes: prep.MaxOutputBytes,
-		MaxRecordBytes: prep.MaxRecordBytes,
+		SchemaVersion:         IntentRecordVersion,
+		AttemptID:             prep.AttemptID,
+		StartRevision:         prep.StartRevision,
+		TestedCommit:          prep.TestedCommit,
+		TestedTree:            prep.TestedTree,
+		View:                  view,
+		SpecDigest:            prep.Spec.Digest,
+		MaxOutputBytes:        prep.MaxOutputBytes,
+		MaxRecordBytes:        prep.MaxRecordBytes,
+		EffectiveOutputBudget: prep.EffectiveOutputBudget,
 	}
 	_, digest, err := rec.Encode()
 	if err != nil {
@@ -953,11 +993,9 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 	// ONE effective budget, so the allocation, the split rule and the final size check all describe the
 	// same thing. Sizing against one ceiling and validating against the other left no excerpt that could
 	// satisfy both.
-	budget, err := EffectiveOutputBudget(rec, prep.MaxOutputBytes, prep.MaxRecordBytes)
-	if err != nil {
-		return ResultRecord{}, err
-	}
-	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
+	// The FROZEN budget, not a fresh derivation. Recomputing here would depend on the identity that did
+	// not exist when the runner sized its excerpt.
+	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, prep.EffectiveOutputBudget); err != nil {
 		return ResultRecord{}, err
 	}
 	if err := checkRecordFits(rec, prep.MaxRecordBytes); err != nil {

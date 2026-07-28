@@ -75,6 +75,9 @@ func intentRecord() IntentRecord {
 		TestedCommit: theCommit, TestedTree: theTree,
 		View: theView(), SpecDigest: strings.Repeat("7a", 32),
 		MaxOutputBytes: 32768, MaxRecordBytes: 65536,
+		// Strictly BELOW the raw ceiling, which is the realistic case (the record ceiling binds first) and
+		// the only one in which using the wrong number is observable.
+		EffectiveOutputBudget: 4096,
 	}
 }
 
@@ -120,7 +123,7 @@ func stagedStream(t *testing.T, budget uint64, filler byte) StreamEvidence {
 
 // bothStreamBudgets is the allocation the fixture's ceiling produces when both streams are present.
 func bothStreamBudgets() (uint64, uint64) {
-	return AllocateOutputBudget(intentRecord().MaxOutputBytes)
+	return AllocateOutputBudget(intentRecord().EffectiveOutputBudget)
 }
 
 // fakeRecords is a record source rooted at one attempt. Open returns whatever it was given, so the
@@ -1491,6 +1494,11 @@ func TestAnIntentRecordIsRefusedWhenItCannotDescribeAnAttempt(t *testing.T) {
 		// A different bound measuring a different thing: raw retained bytes against canonical record
 		// bytes, where the excerpt is base64 and the metadata is variable-length.
 		{"no record ceiling", func(in *IntentRecord) { in.MaxRecordBytes = 0 }, "binds no record ceiling"},
+		// The RESOLVED allowance, frozen before the attempt ran. Without it a recovering process would
+		// have to derive one from whatever survived, which makes the budget a function of what was lost.
+		{"no resolved output budget", func(in *IntentRecord) { in.EffectiveOutputBudget = 0 }, "resolved output budget"},
+		{"a resolved budget above its own ceiling", func(in *IntentRecord) { in.EffectiveOutputBudget = in.MaxOutputBytes + 1 },
+			"exceeds the frozen ceiling"},
 		{"no executable", func(in *IntentRecord) { in.View.Executable = nil }, "names no executable"},
 		{"no argv", func(in *IntentRecord) { in.View.Argv = nil }, "has no argv"},
 		{"no working directory", func(in *IntentRecord) { in.View.Cwd = nil }, "names no working directory"},
@@ -1619,4 +1627,46 @@ func TestAPublishedResultMustHonourTheContractItsOwnIntentFROZE(t *testing.T) {
 			t.Fatalf("%+v, want a block naming the ceiling", got)
 		}
 	})
+}
+
+// TestRecoveryUsesTheBudgETTheAttemptFroze.
+//
+// A published result was sized by the runner against the budget frozen before the attempt ran. If
+// recovery validates it against the raw ceiling instead, a legitimately written excerpt is rejected for
+// not filling an allocation that never applied to it - and if it re-derived the budget from whichever
+// artifacts survived, losing one stream's metadata would enlarge the other's half after the fact.
+func TestRecoveryUsesTheBudgETTheAttemptFroze(t *testing.T) {
+	in := intentRecord()
+	if in.EffectiveOutputBudget >= in.MaxOutputBytes {
+		t.Fatal("the fixture's frozen budget does not bind below its ceiling, so this proves nothing")
+	}
+	outBudget, errBudget := AllocateOutputBudget(in.EffectiveOutputBudget)
+
+	sized := func(budget uint64, filler byte) StreamRecord {
+		stream := bytes.Repeat([]byte{filler}, int(budget)*2+1)
+		head, tail, truncated := SplitExcerpt(stream, budget)
+		if !truncated {
+			t.Fatalf("the fixture was not truncated at %d", budget)
+		}
+		return StreamRecord{Present: true, SourceBytes: uint64(len(stream)), RedactedBytes: uint64(len(stream)),
+			SHA256: strings.Repeat("3c", 32), Head: head, Tail: tail, Truncated: true}
+	}
+
+	rec := validRecord()
+	rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+	rec.View = theView()
+	rec.SpecDigest = in.SpecDigest
+	rec.Stdout = sized(outBudget, 'o')
+	rec.Stderr = sized(errBudget, 'e')
+
+	r := residueFor(t, observation{StandingActive, true, CompletionProven})
+	r.Result = ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
+
+	got, err := Recover(r)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got.Action != ActionFinalizeFromResult {
+		t.Fatalf("a result sized against the frozen budget was refused: %+v", got)
+	}
 }

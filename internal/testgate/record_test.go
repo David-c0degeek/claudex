@@ -605,3 +605,54 @@ func TestCountsBeyondTheEncodersRangeAreRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestTheWorstTerminalAccountIsWorstWHENENCODED.
+//
+// The gate sized its worst case with 256 repeated letters, which is the longest RAW account and nowhere
+// near the largest ENCODED one. The field's contract is canonical, non-blank, within 256 bytes, and
+// canonicalization is redaction - which leaves control characters untouched. Canonical JSON writes each
+// control byte as a six-character escape, so an equally admissible account encodes 1280 bytes larger.
+// That is enough for an attempt to pass the gate, run, and then produce a record nobody can store.
+func TestTheWorstTerminalAccountIsWorstWHENENCODED(t *testing.T) {
+	encodedLen := func(t *testing.T, reason string) int {
+		t.Helper()
+		if state.CanonicalTerminalReason(reason) != reason {
+			t.Fatalf("the candidate is not canonical, so it is not admissible")
+		}
+		rec := validRecord()
+		rec.TerminalReason = reason
+		raw, _, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("Encode(%q...): %v", reason[:4], err)
+		}
+		return len(raw)
+	}
+
+	worst := encodedLen(t, WorstTerminalAccount())
+	// Every other admissible filler of the same raw length must encode no larger, or the "worst" case is
+	// not the worst one.
+	for _, c := range []struct {
+		name string
+		b    byte
+	}{
+		{"letters", 0x78},
+		{"quotes", 0x22},
+		{"backslashes", 0x5c},
+		{"delete", 0x7f},
+		{"another control byte", 0x1f},
+		{"tab", '\t'},
+	} {
+		filler := strings.Repeat(string(rune(c.b)), state.MaxTerminalReasonBytes)
+		if state.CanonicalTerminalReason(filler) != filler || strings.TrimSpace(filler) == "" {
+			continue // not admissible, so not a candidate
+		}
+		if got := encodedLen(t, filler); got > worst {
+			t.Fatalf("%s encodes to %d, larger than the supposed worst case at %d", c.name, got, worst)
+		}
+	}
+	// And it really is dramatically larger than the letters the gate used to assume.
+	letters := encodedLen(t, strings.Repeat("x", state.MaxTerminalReasonBytes))
+	if worst <= letters {
+		t.Fatalf("the worst account encodes to %d, no larger than plain letters at %d", worst, letters)
+	}
+}

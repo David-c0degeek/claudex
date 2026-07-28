@@ -260,6 +260,10 @@ type IntentRecord struct {
 	// same limits the live path did without reading policy itself.
 	MaxOutputBytes uint64 `json:"max_output_bytes"`
 	MaxRecordBytes uint64 `json:"max_record_bytes"`
+	// EffectiveOutputBudget is the resolved allowance, frozen before the attempt ran. It is bound HERE so
+	// a recovering process uses the number the runner sized against rather than re-deriving one from
+	// whatever survived - which would make the budget a function of what was lost.
+	EffectiveOutputBudget uint64 `json:"effective_output_budget"`
 }
 
 // IntentRecordVersion is the on-disk schema version of an intent record.
@@ -288,6 +292,13 @@ func (r IntentRecord) validate() error {
 	}
 	if r.MaxRecordBytes == 0 {
 		return fmt.Errorf("%w: the intent binds no record ceiling", ErrLifecycle)
+	}
+	if r.EffectiveOutputBudget == 0 {
+		return fmt.Errorf("%w: the intent binds no resolved output budget", ErrLifecycle)
+	}
+	if r.EffectiveOutputBudget > r.MaxOutputBytes {
+		return fmt.Errorf("%w: the resolved output budget %d exceeds the frozen ceiling %d",
+			ErrLifecycle, r.EffectiveOutputBudget, r.MaxOutputBytes)
 	}
 	return r.View.validate()
 }
@@ -636,11 +647,7 @@ func Recover(r Residue) (Recovery, error) {
 		// The SAME bounds the live path applies, from the frozen policy the intent carries. Without them
 		// here, staging large enough to fit an unrelated encoder ceiling became a publishable result
 		// despite a smaller limit the operator actually set.
-		budget, berr := EffectiveOutputBudget(rec, intent.MaxOutputBytes, intent.MaxRecordBytes)
-		if berr != nil {
-			return Recovery{}, berr
-		}
-		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
+		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, intent.EffectiveOutputBudget); err != nil {
 			return Recovery{}, err
 		}
 		if err := checkRecordFits(rec, intent.MaxRecordBytes); err != nil {
@@ -881,12 +888,11 @@ func (r Residue) inconsistency() string {
 			// sound, which says nothing about whether it respects the bounds this attempt froze: reading
 			// it back does not re-check them, so finalizing without this adopts a record the live path
 			// would have refused to write.
-			budget, berr := EffectiveOutputBudget(rec, in.MaxOutputBytes, in.MaxRecordBytes)
-			if berr != nil {
-				return fmt.Sprintf("attempt %q has a published result whose budget cannot be derived: %v",
-					r.Active.AttemptID, berr)
-			}
-			if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
+			// The budget the intent FROZE, not one re-derived from what survived. Re-deriving here made
+			// the allowance depend on which staging file was still readable: losing stderr's metadata
+			// enlarges it, and the surviving stdout excerpt is then rejected for not filling a half that
+			// grew after the fact.
+			if err := checkRetainedOutput(rec.Stdout, rec.Stderr, in.EffectiveOutputBudget); err != nil {
 				return fmt.Sprintf("attempt %q has a published result that breaks its own output contract: %v",
 					r.Active.AttemptID, err)
 			}

@@ -228,22 +228,17 @@ func fillExcerpt(s StreamRecord, budget uint64) StreamRecord {
 	return s
 }
 
-// EffectiveOutputBudget is the ONE budget both builders use.
+// WorstTerminalAccount is the admissible terminal account with the LARGEST canonical encoding.
 //
-// The two ceilings have to become one number before anything is allocated or checked. Sizing the excerpt
-// against the record ceiling while validating the split against the raw ceiling made the two constraints
-// contradictory: a correctly shrunk excerpt failed the split rule, which requires the allocation to be
-// filled exactly, and an excerpt that filled the raw allocation failed the record ceiling. There was no
-// excerpt that satisfied both.
-func EffectiveOutputBudget(rec ResultRecord, maxOutputBytes, maxRecordBytes uint64) (uint64, error) {
-	derived, err := ExcerptBudget(rec, maxRecordBytes)
-	if err != nil {
-		return 0, err
-	}
-	if derived < maxOutputBytes {
-		return derived, nil
-	}
-	return maxOutputBytes, nil
+// The contract on that field is canonical, non-blank, at most 256 bytes - and canonicalization is
+// redaction, which leaves control characters untouched. Canonical JSON writes each control byte as a
+// six-character escape, so 256 of them encode to 1536 bytes where 256 letters encode to 256. Sizing a
+// worst case by RAW length therefore measured something 1280 bytes smaller than the real maximum.
+//
+// Kept as a function beside the rule it embodies, so a change to the field's contract has one place to
+// break rather than several fixtures to notice.
+func WorstTerminalAccount() string {
+	return strings.Repeat("\x01", state.MaxTerminalReasonBytes)
 }
 
 // AllocateOutputBudget divides ONE combined ceiling between the two streams.
