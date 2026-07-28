@@ -602,16 +602,39 @@ type FinalizedAttempt struct {
 type TerminalAuthor string
 
 const (
-	// TerminalByRunner means the process that ran the command reported how it ended.
+	// TerminalByRunner means the process that ran the command reported how it ended. It is the only
+	// authority that ever saw the command itself.
 	TerminalByRunner TerminalAuthor = "runner"
-	// TerminalByRecovery means no runner account exists, because the attempt was interrupted, and the
-	// account was authored deterministically while settling it.
+	// TerminalByCoordinator means the coordinator was ALIVE and observed an infrastructure fault - the
+	// supervisor died, its frames were corrupt, a GO could not be delivered. Nobody saw the command
+	// end, so nothing can be claimed about it, but this is not a crash either: recovery is not running
+	// and there is a live process making the observation.
+	//
+	// It exists because the first version of this vocabulary had only runner and recovery, which left
+	// the live launch-fault rows with no truthful value at all: a dead supervisor cannot author its own
+	// obituary, and recovery is not there to author it.
+	TerminalByCoordinator TerminalAuthor = "coordinator"
+	// TerminalByRecovery means no live process observed anything, because the owner crashed, and the
+	// account was authored deterministically while settling the attempt afterwards.
 	TerminalByRecovery TerminalAuthor = "recovery"
 )
 
 // AllTerminalAuthors is the closed vocabulary.
 func AllTerminalAuthors() []TerminalAuthor {
-	return []TerminalAuthor{TerminalByRunner, TerminalByRecovery}
+	return []TerminalAuthor{TerminalByRunner, TerminalByCoordinator, TerminalByRecovery}
+}
+
+// AuthorityAgreesWithExecution is the ONE rule about who may say what, exported so the record boundary,
+// the lifecycle and the ledger all apply it rather than each spelling out its own version.
+//
+// `interrupted` means nobody obtained an outcome, which is precisely the thing the RUNNER cannot report
+// - if it were alive to report, it would have reported the outcome. Every other execution is something
+// the runner watched happen, so neither the coordinator nor recovery may claim it: they were not there.
+func AuthorityAgreesWithExecution(a TerminalAuthor, e TestExecution) bool {
+	if e == TestExecutionInterrupted {
+		return a == TerminalByCoordinator || a == TerminalByRecovery
+	}
+	return a == TerminalByRunner
 }
 
 // KnownTerminalAuthor reports whether a is in the vocabulary.

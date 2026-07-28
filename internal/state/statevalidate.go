@@ -350,11 +350,12 @@ func validateTestAttempts(rs *RunState) error {
 		if !KnownTerminalAuthor(e.TerminalAuthor) {
 			return fmt.Errorf("test_attempts[%d].terminal_author is %q, which is not a known authority", i, e.TerminalAuthor)
 		}
-		// Only an interrupted attempt can carry a recovery-authored account, because it is the only row
-		// with no runner left to report one. Anything else recording recovery prose would be presenting
-		// an inference as an observation.
-		if e.TerminalAuthor == TerminalByRecovery && e.Execution != TestExecutionInterrupted {
-			return fmt.Errorf("test_attempts[%d] is %q but its terminal account is authored by recovery", i, e.Execution)
+		// The authority and the execution have to be consistent with each other, through the one rule.
+		// `interrupted` is exactly what a live runner cannot report - it would have reported the outcome
+		// instead - and everything else is something only the runner watched happen.
+		if !AuthorityAgreesWithExecution(e.TerminalAuthor, e.Execution) {
+			return fmt.Errorf("test_attempts[%d] is %q but its terminal account is authored by %q, which cannot have observed it",
+				i, e.Execution, e.TerminalAuthor)
 		}
 		if seenDigest[e.ResultDigest] {
 			return fmt.Errorf("test_attempts[%d] reuses a result digest already bound to another outcome", i)

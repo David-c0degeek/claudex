@@ -1,8 +1,6 @@
 package testgate
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -153,7 +151,7 @@ type RecordBytes interface {
 // It computes the digest of what it got back and refuses anything else, so "the omitted evidence is
 // still reachable" is enforced here rather than promised in a comment. A caller cannot obtain bytes
 // without this check, because the check is the function.
-func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) ([]byte, error) {
+func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) (*VerifiedRecord, error) {
 	if src == nil {
 		return nil, fmt.Errorf("%w: no record source was supplied", ErrLifecycle)
 	}
@@ -171,12 +169,25 @@ func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) ([]byte, erro
 	if got := sha256Hex(raw); got != digest {
 		return nil, fmt.Errorf("%w: record %q read back as %q", ErrLifecycle, digest, got)
 	}
-	return raw, nil
+	// An OWNED copy. The source handed over its own backing array, so it could rewrite those bytes after
+	// the hash check and leave the caller holding something that no longer matches the digest it was
+	// just verified against - a verification that only held for an instant is not a verification.
+	owned := append([]byte(nil), raw...)
+	rec, err := DecodeResultRecord(owned)
+	if err != nil {
+		return nil, err
+	}
+	return &VerifiedRecord{Record: rec, Canonical: owned}, nil
 }
 
-func sha256Hex(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+// VerifiedRecord is a record that was read, hashed against the digest that named it, strictly decoded
+// and validated.
+//
+// It exists because returning bytes made ArtifactValid something the CALLER asserted. A digest-correct
+// []byte("not a result") satisfied every check and was handed back as a verified record.
+type VerifiedRecord struct {
+	Record    ResultRecord
+	Canonical []byte
 }
 
 // StreamEvidence is one stream's non-authoritative crash-time staging, as recovery found it.

@@ -2,6 +2,7 @@ package testgate
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"maps"
 	"slices"
@@ -61,11 +62,14 @@ func intentBody() *IntentProjection {
 	}
 }
 
-func stagedStream(bytesRetained int) StreamEvidence {
+// stagedStream builds staging evidence in the head+tail shape a truncated excerpt must have, with the
+// digest over the WHOLE redacted stream - which is runner-attested and not recomputable from the
+// excerpt, so it stays a fixed value here.
+func stagedStream(head, tail string) StreamEvidence {
+	retained := truncatedExcerpt(head, tail)
 	return StreamEvidence{State: ArtifactValid, AttemptID: theAttemptID, Record: &StreamRecord{
 		Present: true, SourceBytes: 4096, RedactedBytes: 4000,
-		SHA256: strings.Repeat("3c", 32), Retained: []byte(strings.Repeat("x", bytesRetained)),
-		Truncated: uint64(bytesRetained) < 4000,
+		SHA256: strings.Repeat("3c", 32), Retained: retained, Truncated: true,
 	}}
 }
 
@@ -767,8 +771,8 @@ func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
 // identity and the terminal reason, which are the facts nobody is entitled to invent after a crash.
 func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T) {
 	r := residueFor(observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream(64)
-	r.Stderr = stagedStream(4000)
+	r.Stdout = stagedStream("head", "tail")
+	r.Stderr = stagedStream("out", "err")
 
 	got, err := Recover(r)
 	if err != nil {
@@ -806,10 +810,10 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 		t.Fatalf("recovery prose was attributed to the runner: %+v", rec)
 	}
 	// The retained bytes travel, per stream and in full - metadata alone cannot be embedded in a record.
-	if !bytes.Equal(rec.Stdout.Retained, []byte(strings.Repeat("x", 64))) || !rec.Stdout.Truncated {
+	if !bytes.Equal(rec.Stdout.Retained, truncatedExcerpt("head", "tail")) || !rec.Stdout.Truncated {
 		t.Fatalf("stdout evidence did not survive: %+v", rec.Stdout)
 	}
-	if !bytes.Equal(rec.Stderr.Retained, []byte(strings.Repeat("x", 4000))) || rec.Stderr.Truncated {
+	if !bytes.Equal(rec.Stderr.Retained, truncatedExcerpt("out", "err")) || !rec.Stderr.Truncated {
 		t.Fatalf("stderr evidence did not survive: %+v", rec.Stderr)
 	}
 	if rec.Stdout.SourceBytes == rec.Stdout.RedactedBytes {
@@ -854,12 +858,12 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 		want string
 	}{
 		{"stdout from another attempt", func(r *Residue) {
-			ev := stagedStream(8)
+			ev := stagedStream("h", "t")
 			ev.AttemptID = "somebody-else"
 			r.Stdout = ev
 		}, "stdout staging belongs to"},
 		{"stderr from another attempt", func(r *Residue) {
-			ev := stagedStream(8)
+			ev := stagedStream("h", "t")
 			ev.AttemptID = "somebody-else"
 			r.Stderr = ev
 		}, "stderr staging belongs to"},
@@ -881,7 +885,7 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 	}
 	// One stream present and the other absent is an ordinary crash, not an inconsistency.
 	r := residueFor(observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream(16)
+	r.Stdout = stagedStream("h", "t")
 	got, err := Recover(r)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1036,20 +1040,25 @@ func TestABlockedDecisionAlsoCannotBeRewrittenThroughTheCallersPointer(t *testin
 // verification living in a comment. The check has to BE the function, so a caller cannot obtain bytes
 // without it having run.
 func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
-	good := []byte(`{"canonical":"record"}`)
-	digest := sha256Hex(good)
+	good, digest, err := canonicalValidRecord()
+	if err != nil {
+		t.Fatalf("encoding the fixture: %v", err)
+	}
 	src := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{digest: good}}
 
 	got, err := ReadVerifiedRecord(src, theAttemptID, digest)
 	if err != nil {
 		t.Fatalf("a matching record was refused: %v", err)
 	}
-	if !bytes.Equal(got, good) {
-		t.Fatalf("got %q, want the stored bytes", got)
+	if got.Record.AttemptID != theAttemptID {
+		t.Fatalf("the verified record is not the one asked for: %+v", got.Record)
+	}
+	if !bytes.Equal(got.Canonical, good) {
+		t.Fatalf("the canonical bytes were not preserved")
 	}
 
 	t.Run("tampered bytes", func(t *testing.T) {
-		tampered := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{digest: []byte(`{"canonical":"REPLACED"}`)}}
+		tampered := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{digest: append([]byte(nil), append(good, ' ')...)}}
 		if _, err := ReadVerifiedRecord(tampered, theAttemptID, digest); err == nil ||
 			!strings.Contains(err.Error(), "read back as") {
 			t.Fatalf("err = %v, want a digest mismatch refusal", err)
@@ -1064,7 +1073,31 @@ func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
 		}
 	})
 
-	t.Run("a record that is simply missing reads back as a mismatch", func(t *testing.T) {
+	// A digest-correct blob that is not a result. Returning bytes made ArtifactValid something the
+	// CALLER asserted; this is the case that proves it is now established by code.
+	t.Run("digest-correct bytes that are not a result", func(t *testing.T) {
+		junk := []byte("not a result")
+		jd := sha256Hex(junk)
+		bad := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{jd: junk}}
+		if _, err := ReadVerifiedRecord(bad, theAttemptID, jd); err == nil ||
+			!strings.Contains(err.Error(), "not JSON") {
+			t.Fatalf("err = %v, want a decode refusal", err)
+		}
+	})
+
+	t.Run("a well-formed record from another schema version", func(t *testing.T) {
+		rec := validRecord()
+		rec.SchemaVersion = ResultRecordVersion + 1
+		raw, _ := json.Marshal(rec)
+		d := sha256Hex(raw)
+		src := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{d: raw}}
+		if _, err := ReadVerifiedRecord(src, theAttemptID, d); err == nil ||
+			!strings.Contains(err.Error(), "schema version") {
+			t.Fatalf("err = %v, want version remediation", err)
+		}
+	})
+
+	t.Run("a record that is missing reads back as a mismatch", func(t *testing.T) {
 		empty := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{}}
 		if _, err := ReadVerifiedRecord(empty, theAttemptID, digest); err == nil {
 			t.Fatal("absent bytes were accepted")
@@ -1081,6 +1114,26 @@ func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
 	t.Run("no source at all", func(t *testing.T) {
 		if _, err := ReadVerifiedRecord(nil, theAttemptID, digest); err == nil {
 			t.Fatal("a nil source was accepted")
+		}
+	})
+
+	// The source hands over its own backing array, so it can rewrite those bytes after the hash check.
+	// A verification that held only for an instant is not a verification.
+	t.Run("the source mutating its bytes after the check", func(t *testing.T) {
+		shared := append([]byte(nil), good...)
+		mut := &fakeRecords{id: theAttemptID, bytes: map[string][]byte{digest: shared}}
+		v, err := ReadVerifiedRecord(mut, theAttemptID, digest)
+		if err != nil {
+			t.Fatalf("ReadVerifiedRecord: %v", err)
+		}
+		for i := range shared {
+			shared[i] = 'X'
+		}
+		if sha256Hex(v.Canonical) != digest {
+			t.Fatal("the source rewrote the bytes the caller had verified")
+		}
+		if v.Record.AttemptID != theAttemptID {
+			t.Fatalf("the decoded record changed underneath the caller: %+v", v.Record)
 		}
 	})
 }
@@ -1139,7 +1192,7 @@ func TestTheIntentBodyMustBeTheIntentTheAttemptBINDS(t *testing.T) {
 // supplied, the record about to be written could change between the decision and the write.
 func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 	r := residueFor(observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream(8)
+	r.Stdout = stagedStream("h", "t")
 
 	got, err := Recover(r)
 	if err != nil {
@@ -1153,10 +1206,18 @@ func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 		retained[i] = 'Z'
 	}
 	r.IntentBody.ResolvedArgv[0] = "MUTATED"
-	if string(got.Publish.Record.Stdout.Retained) != strings.Repeat("x", 8) {
+	if !bytes.Equal(got.Publish.Record.Stdout.Retained, truncatedExcerpt("h", "t")) {
 		t.Fatalf("the planned record shares the caller's stream bytes: %q", got.Publish.Record.Stdout.Retained)
 	}
 	if got.Publish.Record.ResolvedArgv[0] != "go" {
 		t.Fatalf("the planned record shares the caller's argv: %q", got.Publish.Record.ResolvedArgv)
 	}
+}
+
+// canonicalValidRecord encodes the shared fixture through the real boundary, so these tests exercise
+// bytes production would actually produce rather than a hand-rolled approximation of them.
+func canonicalValidRecord() ([]byte, string, error) {
+	rec := validRecord()
+	rec.SchemaVersion = ResultRecordVersion
+	return rec.Encode()
 }

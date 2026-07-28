@@ -47,7 +47,6 @@ package testgate
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -150,6 +149,16 @@ type Terminal struct {
 	// validated fact is not.
 	HasExitCode bool
 	ExitCode    int
+	// Author says WHO observed this ending. The runner ordinarily did; a live coordinator that watched
+	// its supervisor die authors `interrupted`, because nobody saw the command end and the runner is not
+	// there to say so. Without it the record could not be built truthfully, and the ledger field would
+	// have to be guessed at publication time.
+	Author state.TerminalAuthor
+	// Stdout and Stderr are the runner's validated stream evidence, carried here because the runner is
+	// the only party that saw the streams. An earlier version left them out, so whoever published the
+	// result had to find them again through the side channel this package exists to remove.
+	Stdout StreamRecord
+	Stderr StreamRecord
 }
 
 // Identity is the FINAL identity observation, in the closed vocabulary.
@@ -272,7 +281,12 @@ type Deps struct {
 	ObserveIdentity func(PreparedAttempt, Terminal) (Identity, error)
 
 	// PublishResult durably writes the ONE canonical result and returns its digest.
-	PublishResult func(PreparedAttempt, Terminal, Identity) (digest string, err error)
+	//
+	// It receives the RECORD, already built and validated, rather than the pieces. Handing over the
+	// pieces meant the publisher had to assemble the canonical record itself - and it had no way to
+	// reach the stream evidence or the terminal authority, so it would have had to find them through
+	// exactly the side channel this package exists to remove.
+	PublishResult func(ResultRecord) (digest string, err error)
 
 	// FinalizeOutcome CASes the outcome into state, moving the active ref into the ledger, and reports
 	// the AUTHORITATIVE status — the same three-way answer the active binding gives, for the same
@@ -577,7 +591,7 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 	// 9b. The final identity observation, UNDER the guard, is the linearization point the result's
 	// unchanged-versus-changed claim refers to. It receives what the runner saw, so the two independent
 	// axes come from the two parties that actually observed them.
-	ident, err := d.ObserveIdentity(clonePrepared(prep), term)
+	ident, err := d.ObserveIdentity(clonePrepared(prep), cloneTerminal(term))
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: observing the final identity", ErrLifecycle), err)
 	}
@@ -596,16 +610,25 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 
 	// 10. Only now can the record be built: it is immutable and states the identity distinction, so
 	// before step 9b that field would have been a claim about a fact that did not exist.
-	digest, err := d.PublishResult(clonePrepared(prep), term, ident)
+	//
+	// It is built and VALIDATED here, on the main path, from facts this function already holds - the
+	// command and environment identity the attempt was authorised with, the runner's terminal and its
+	// stream evidence, and the identity just observed. Handing the publisher the pieces instead left it
+	// to assemble the canonical record with no way to reach half of what the record binds.
+	rec, err := buildResultRecord(prep, term, ident)
+	if err != nil {
+		return Result{}, err
+	}
+	digest, err := d.PublishResult(rec)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: publishing the result", ErrLifecycle), err)
 	}
 
 	// 11. The outcome CAS names the digest of a record that is ALREADY durable, so state never
 	// references a result a reader cannot fetch.
-	st, err := d.FinalizeOutcome(clonePrepared(prep), term, ident, digest)
+	st, err := d.FinalizeOutcome(clonePrepared(prep), cloneTerminal(term), ident, digest)
 	if err != nil || st == BindUncertain {
-		conf, cerr := d.ConfirmFinalize(clonePrepared(prep), term, ident, digest)
+		conf, cerr := d.ConfirmFinalize(clonePrepared(prep), cloneTerminal(term), ident, digest)
 		if cerr != nil {
 			return Result{}, errors.Join(fmt.Errorf("%w: the outcome could not be confirmed", ErrLifecycle), err, cerr)
 		}
@@ -632,7 +655,7 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 		// there is nothing live to preserve here - only the state question, which recovery re-reads.
 		return Result{}, fmt.Errorf("%w: the outcome is visible but unconfirmed", ErrLifecycle)
 	}
-	return Result{Prepared: clonePrepared(prep), Terminal: term, Identity: ident, ResultDigest: digest, Outcome: outcome}, nil
+	return Result{Prepared: clonePrepared(prep), Terminal: cloneTerminal(term), Identity: ident, ResultDigest: digest, Outcome: outcome}, nil
 }
 
 // acceptTerminal canonicalizes and shape-checks the runner's fact at the boundary where it enters this
@@ -664,6 +687,7 @@ func disagreesWithPublished(e state.FinalizedAttempt, prep PreparedAttempt, term
 		{"execution", string(e.Execution), string(term.Execution)},
 		{"identity", string(e.Identity), string(ident.Value)},
 		{"terminal reason", e.TerminalReason, term.TerminalReason},
+		{"terminal authority", string(e.TerminalAuthor), string(term.Author)},
 	} {
 		if f.got != f.want {
 			return fmt.Sprintf("the bound %s is %q, published %q", f.name, f.got, f.want)
@@ -673,53 +697,80 @@ func disagreesWithPublished(e state.FinalizedAttempt, prep PreparedAttempt, term
 }
 
 func acceptTerminal(t Terminal) (Terminal, error) {
-	if !state.KnownTestExecution(t.Execution) {
-		return Terminal{}, fmt.Errorf("%w: the runner reported the unknown execution %q", ErrLifecycle, t.Execution)
-	}
-	// The exit fact must AGREE with the verdict, not merely be present.
-	//
-	// Presence alone accepted `ok` with exit 17 — which state.Outcome turns into a PASS — and `nonzero`
-	// with exit 0. Both are self-contradictory records, and the first advances the run on the strength
-	// of a command that failed.
-	switch t.Execution {
-	case state.TestExecutionOK:
-		if !t.HasExitCode || t.ExitCode != 0 {
-			return Terminal{}, fmt.Errorf("%w: %q requires exit code 0, got %s", ErrLifecycle, t.Execution, exitString(t))
-		}
-	case state.TestExecutionNonzero:
-		if !t.HasExitCode || t.ExitCode == 0 {
-			return Terminal{}, fmt.Errorf("%w: %q requires a non-zero exit code, got %s", ErrLifecycle, t.Execution, exitString(t))
-		}
-		if t.ExitCode < 0 {
-			return Terminal{}, fmt.Errorf("%w: %q reported the impossible exit code %d", ErrLifecycle, t.Execution, t.ExitCode)
-		}
-	default:
-		// A timeout, a cancel, a spawn failure and an interruption all end without the command
-		// reporting anything, so a code here would be invented.
-		if t.HasExitCode {
-			return Terminal{}, fmt.Errorf("%w: %q cannot carry an exit code", ErrLifecycle, t.Execution)
-		}
-	}
-	// Absent must have exactly ONE representation. Checking only the boolean let {false, 17} through, and
-	// it then travelled to every result seam claiming to carry no code while carrying 17 — leaving
-	// whether that 17 is serialized to depend on each publisher remembering to look at the boolean
-	// first. A fact with two shapes is a fact two readers can disagree about.
-	if !t.HasExitCode && t.ExitCode != 0 {
-		return Terminal{}, fmt.Errorf("%w: no exit code is claimed but %d is carried", ErrLifecycle, t.ExitCode)
-	}
-	if strings.TrimSpace(t.TerminalReason) == "" {
-		return Terminal{}, fmt.Errorf("%w: the runner reported no terminal detail", ErrLifecycle)
-	}
+	// Canonicalization happens HERE, and BEFORE the shared check, because this is the boundary where the
+	// runner's raw account enters the process: the shared table refuses non-canonical text, which is
+	// right for a record already on its way to disk but would reject every genuine runner report if it
+	// ran first. Doing it here rather than at persistence is what keeps the result digest identifying
+	// the bytes that are actually stored.
 	t.TerminalReason = state.CanonicalTerminalReason(t.TerminalReason)
-	// Bounded AFTER canonicalization, because canonicalization changes the length and the ledger's
-	// bound applies to the stored bytes. Checking it here rather than at the state CAS is what stops an
-	// oversized record becoming durable first and being refused afterwards, when it can no longer be
-	// un-written.
-	if len(t.TerminalReason) > state.MaxTerminalReasonBytes {
-		return Terminal{}, fmt.Errorf("%w: the terminal detail is %d bytes after canonicalization, limit %d",
-			ErrLifecycle, len(t.TerminalReason), state.MaxTerminalReasonBytes)
+	// ONE truth table, shared with the record boundary - including the length bound, which applies AFTER
+	// canonicalization because canonicalization changes the length. Two validators for one fact is one
+	// validator and one liability: the record boundary was admitting contradictions this function had
+	// already learned to refuse.
+	if err := checkTerminalFacts(t.Execution, "", t.TerminalReason, t.Author, t.HasExitCode, t.ExitCode); err != nil {
+		return Terminal{}, err
 	}
+	for _, st := range []struct {
+		what string
+		s    StreamRecord
+	}{{"stdout", t.Stdout}, {"stderr", t.Stderr}} {
+		if err := st.s.validate(st.what); err != nil {
+			return Terminal{}, err
+		}
+	}
+	t.Stdout, t.Stderr = cloneStream(t.Stdout), cloneStream(t.Stderr)
 	return t, nil
+}
+
+// buildResultRecord assembles the ONE canonical record from what the guarded section already knows.
+//
+// Nothing here is re-derived. The command and the environment identity come from the prepared attempt,
+// which is what authorization froze; recomputing them now would describe this process rather than the
+// attempt.
+// cloneTerminal hands out an owned copy, including the stream excerpts.
+//
+// A Terminal is nearly all scalars, which is why an earlier version passed it around by value and
+// assumed that was enough. The retained excerpts are SLICES: a collaborator receiving a value copy still
+// shares their backing arrays, so it could rewrite the evidence between acceptance and the record that
+// binds it - and the record's own digest check would then fail on bytes nobody meant to change.
+func cloneTerminal(t Terminal) Terminal {
+	t.Stdout, t.Stderr = cloneStream(t.Stdout), cloneStream(t.Stderr)
+	return t
+}
+
+func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (ResultRecord, error) {
+	names := make([]string, 0, len(prep.Spec.Env.Env))
+	for _, e := range prep.Spec.Env.Env {
+		names = append(names, string(e.Name))
+	}
+	envDigest, err := prep.Spec.Env.EnvIdentityDigest()
+	if err != nil {
+		return ResultRecord{}, fmt.Errorf("%w: digesting the environment identity: %v", ErrLifecycle, err)
+	}
+	rec := ResultRecord{
+		SchemaVersion:      ResultRecordVersion,
+		AttemptID:          prep.AttemptID,
+		TestedCommit:       prep.TestedCommit,
+		TestedTree:         prep.TestedTree,
+		ResolvedExecutable: prep.Spec.Executable,
+		ResolvedArgv:       append([]string(nil), prep.Spec.Argv...),
+		EnvNames:           names,
+		EnvDigest:          envDigest,
+		Execution:          term.Execution,
+		Identity:           ident.Value,
+		TerminalReason:     term.TerminalReason,
+		TerminalAuthor:     term.Author,
+		HasExitCode:        term.HasExitCode,
+		ExitCode:           term.ExitCode,
+		Stdout:             cloneStream(term.Stdout),
+		Stderr:             cloneStream(term.Stderr),
+	}
+	// Refused HERE if it contradicts itself, rather than handed on for the publisher to discover it
+	// cannot be written - at which point the attempt is already past the point of being retried cheaply.
+	if err := rec.validate(); err != nil {
+		return ResultRecord{}, err
+	}
+	return rec, nil
 }
 
 func exitString(t Terminal) string {

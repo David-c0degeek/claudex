@@ -305,7 +305,7 @@ func TestFinalizingAndStartingAreSeparateOperations(t *testing.T) {
 		n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 			AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
 			TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(14),
-			Execution: TestExecutionInterrupted, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone", TerminalAuthor: TerminalByRunner,
+			Execution: TestExecutionInterrupted, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone", TerminalAuthor: TerminalByCoordinator,
 		})
 		n.ActiveTestAttempt = attemptRef("attempt-0002", rev)
 		return nil
@@ -424,6 +424,7 @@ func TestLedgerIsAppendOnlyByValue(t *testing.T) {
 	t.Run("rewritten in place", func(t *testing.T) {
 		_, err := s.Mutate(one.Revision, func(_ uint64, n *RunState) error {
 			n.TestAttempts[0].Execution = TestExecutionInterrupted
+			n.TestAttempts[0].TerminalAuthor = TerminalByCoordinator
 			return nil
 		})
 		if err == nil || !strings.Contains(err.Error(), "immutable") {
@@ -791,9 +792,16 @@ func TestATerminalAccountMustNameItsAuthority(t *testing.T) {
 		{"the zero value is not an authority", "", TestExecutionOK, "not a known authority"},
 		{"an invented authority", "the operator", TestExecutionOK, "not a known authority"},
 		{"recovery may author an interrupted account", TerminalByRecovery, TestExecutionInterrupted, ""},
-		{"the runner may author an interrupted account", TerminalByRunner, TestExecutionInterrupted, ""},
-		{"recovery may not author an ok account", TerminalByRecovery, TestExecutionOK, "authored by recovery"},
-		{"recovery may not author a timeout account", TerminalByRecovery, TestExecutionTimeout, "authored by recovery"},
+		// A LIVE coordinator observing an infrastructure fault is a third authority. Without it those
+		// rows had no truthful value: a dead supervisor cannot author its own obituary and recovery is
+		// not running.
+		{"the coordinator may author an interrupted account", TerminalByCoordinator, TestExecutionInterrupted, ""},
+		// `interrupted` is exactly what a live runner cannot report - had it been alive to report, it
+		// would have reported the outcome instead.
+		{"the runner may not author an interrupted account", TerminalByRunner, TestExecutionInterrupted, "cannot have observed it"},
+		{"recovery may not author an ok account", TerminalByRecovery, TestExecutionOK, "cannot have observed it"},
+		{"recovery may not author a timeout account", TerminalByRecovery, TestExecutionTimeout, "cannot have observed it"},
+		{"the coordinator may not author a nonzero account", TerminalByCoordinator, TestExecutionNonzero, "cannot have observed it"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newStore(t)

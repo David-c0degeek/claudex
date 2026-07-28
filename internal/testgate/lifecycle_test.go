@@ -1,6 +1,7 @@
 package testgate
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
 	"slices"
@@ -84,6 +85,7 @@ var theTerminal = Terminal{
 	Execution:      state.TestExecutionOK,
 	TerminalReason: "exited 0",
 	HasExitCode:    true,
+	Author:         state.TerminalByRunner,
 }
 
 type fakeContainment struct {
@@ -119,6 +121,12 @@ func (c *fakeContainment) Close() error {
 	c.r.t.Helper()
 	c.closed++
 	c.r.step("close")
+	// A runner that reuses its output buffer once the domain is gone. It handed those bytes over at
+	// Wait; if the accepted terminal merely pointed at them, the evidence would change underneath
+	// everything downstream that had already been told what it was.
+	for i := range c.term.Stdout.Retained {
+		c.term.Stdout.Retained[i] = 'R'
+	}
 	return c.closeErr
 }
 
@@ -146,6 +154,7 @@ type harness struct {
 	confirmFinExecution              state.TestExecution
 	confirmFinIdentity               state.TestIdentity
 	confirmFinReason                 string
+	confirmFinAuthor                 state.TerminalAuthor
 	confirmFinTree                   string
 	confirmFinCommit                 string
 	confirmFinStart                  uint64
@@ -162,6 +171,7 @@ type harness struct {
 	sawObserveTerminal   Terminal
 	sawResultTerminal    Terminal
 	sawResultIdentity    Identity
+	sawResultRecord      *ResultRecord
 	sawFinalizeDigest    string
 }
 
@@ -297,13 +307,19 @@ func newHarness(t *testing.T) *harness {
 			h.sawObserveTerminal = term
 			return h.identity, h.failObserve
 		},
-		PublishResult: func(_ PreparedAttempt, term Terminal, id Identity) (string, error) {
+		PublishResult: func(rec ResultRecord) (string, error) {
 			t.Helper()
 			h.r.requireGuard("publish-result", 1)
 			h.r.requireBefore("publish-result", "observe-identity")
 			h.r.requireNotYet("publish-result", "finalize")
 			h.r.step("publish-result")
-			h.sawResultTerminal, h.sawResultIdentity = term, id
+			h.sawResultRecord = &rec
+			h.sawResultTerminal = Terminal{
+				Execution: rec.Execution, TerminalReason: rec.TerminalReason, Author: rec.TerminalAuthor,
+				HasExitCode: rec.HasExitCode, ExitCode: rec.ExitCode,
+				Stdout: rec.Stdout, Stderr: rec.Stderr,
+			}
+			h.sawResultIdentity = Identity{Value: rec.Identity, Commit: rec.TestedCommit, Tree: rec.TestedTree}
 			return strings.Repeat("d", 64), h.failPublishResult
 		},
 		FinalizeOutcome: func(_ PreparedAttempt, _ Terminal, _ Identity, digest string) (CommitStatus, error) {
@@ -327,7 +343,7 @@ func newHarness(t *testing.T) *harness {
 					TestedCommit: p.TestedCommit, TestedTree: p.TestedTree,
 					StartRevision: p.StartRevision,
 					Execution:     term.Execution, Identity: id.Value,
-					TerminalReason: term.TerminalReason,
+					TerminalReason: term.TerminalReason, TerminalAuthor: term.Author,
 				}
 				if h.confirmFinDigest != "" {
 					entry.ResultDigest = h.confirmFinDigest
@@ -343,6 +359,9 @@ func newHarness(t *testing.T) *harness {
 				}
 				if h.confirmFinReason != "" {
 					entry.TerminalReason = h.confirmFinReason
+				}
+				if h.confirmFinAuthor != "" {
+					entry.TerminalAuthor = h.confirmFinAuthor
 				}
 				if h.confirmFinTree != "" {
 					entry.TestedTree = h.confirmFinTree
@@ -442,7 +461,7 @@ func TestTheFactsTravelBetweenTheSteps(t *testing.T) {
 	if h.sawResultTerminal.Execution != theTerminal.Execution {
 		t.Fatalf("the result saw %+v, want the runner's terminal", h.sawResultTerminal)
 	}
-	if h.sawResultIdentity != h.identity {
+	if h.sawResultIdentity.Value != h.identity.Value {
 		t.Fatalf("the result saw identity %+v, want %+v", h.sawResultIdentity, h.identity)
 	}
 	if h.sawFinalizeDigest != res.ResultDigest {
@@ -787,7 +806,7 @@ func TestTheRunnerFactIsCanonicalizedBeforeItCanReachDisk(t *testing.T) {
 	raw := "exec failed: token=" + secret
 
 	h := newHarness(t)
-	h.cont.term = Terminal{Execution: state.TestExecutionSpawnFailed, TerminalReason: raw}
+	h.cont.term = Terminal{Author: authorFor(state.TestExecutionSpawnFailed), Execution: state.TestExecutionSpawnFailed, TerminalReason: raw}
 
 	res, err := Run(h.deps)
 	if err != nil {
@@ -820,9 +839,9 @@ func TestAMalformedRunnerFactIsRefusedBeforePublication(t *testing.T) {
 		term Terminal
 	}{
 		{"an unknown execution", Terminal{Execution: "probably-fine", TerminalReason: "x"}},
-		{"a normal exit with no exit code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "x"}},
-		{"a timeout carrying an exit code", Terminal{Execution: state.TestExecutionTimeout, TerminalReason: "x", HasExitCode: true, ExitCode: 0}},
-		{"no terminal detail at all", Terminal{Execution: state.TestExecutionOK, TerminalReason: "  ", HasExitCode: true, ExitCode: 0}},
+		{"a normal exit with no exit code", Terminal{Author: authorFor(state.TestExecutionOK), Execution: state.TestExecutionOK, TerminalReason: "x"}},
+		{"a timeout carrying an exit code", Terminal{Author: authorFor(state.TestExecutionTimeout), Execution: state.TestExecutionTimeout, TerminalReason: "x", HasExitCode: true, ExitCode: 0}},
+		{"no terminal detail at all", Terminal{Author: authorFor(state.TestExecutionOK), Execution: state.TestExecutionOK, TerminalReason: "  ", HasExitCode: true, ExitCode: 0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -887,9 +906,9 @@ func TestTheExitFactMustAgreeWithTheVerdict(t *testing.T) {
 		name string
 		term Terminal
 	}{
-		{"ok with a non-zero code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "exited 17", HasExitCode: true, ExitCode: 17}},
-		{"nonzero with a zero code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited 0", HasExitCode: true, ExitCode: 0}},
-		{"a negative exit code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited -1", HasExitCode: true, ExitCode: -1}},
+		{"ok with a non-zero code", Terminal{Author: authorFor(state.TestExecutionOK), Execution: state.TestExecutionOK, TerminalReason: "exited 17", HasExitCode: true, ExitCode: 17}},
+		{"nonzero with a zero code", Terminal{Author: authorFor(state.TestExecutionNonzero), Execution: state.TestExecutionNonzero, TerminalReason: "exited 0", HasExitCode: true, ExitCode: 0}},
+		{"a negative exit code", Terminal{Author: authorFor(state.TestExecutionNonzero), Execution: state.TestExecutionNonzero, TerminalReason: "exited -1", HasExitCode: true, ExitCode: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -913,6 +932,7 @@ func TestAnOversizedTerminalDetailIsRefusedBeforePublication(t *testing.T) {
 	h := newHarness(t)
 	h.cont.term = Terminal{
 		Execution:      state.TestExecutionTimeout,
+		Author:         state.TerminalByRunner,
 		TerminalReason: strings.Repeat("x", state.MaxTerminalReasonBytes+1),
 	}
 	_, err := Run(h.deps)
@@ -992,11 +1012,11 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 	}{
 		{"the ordinary path", func(*harness) {}, []string{
 			"intent publication", "arming", "binding", "re-authorization",
-			"identity observation", "result publication", "finalization", "the returned result"}},
+			"identity observation", "finalization", "the returned result"}},
 		{"an unresolved active bind", func(h *harness) {
 			h.bindStatus, h.confirmStatus = BindUncertain, BindCommitted
 		}, []string{"bind confirmation", "re-authorization", "identity observation",
-			"result publication", "finalization", "the returned result"}},
+			"finalization", "the returned result"}},
 		{"an unresolved outcome append", func(h *harness) {
 			h.finalizeStatus, h.confirmFinStatus = BindUncertain, BindCommitted
 		}, []string{"finalize confirmation", "the returned result"}},
@@ -1065,9 +1085,11 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 				observe("identity observation", p)
 				return observeID(p, term)
 			}
-			h.deps.PublishResult = func(p PreparedAttempt, term Terminal, id Identity) (string, error) {
-				observe("result publication", p)
-				return publishResult(p, term, id)
+			h.deps.PublishResult = func(rec ResultRecord) (string, error) {
+				// The record is built from the prepared attempt inside Run, so this seam sees the
+				// RESULT of that build rather than the value itself. Auditing it as a prepared attempt
+				// would be auditing something the seam never receives.
+				return publishResult(rec)
 			}
 			h.deps.FinalizeOutcome = func(p PreparedAttempt, term Terminal, id Identity, digest string) (CommitStatus, error) {
 				observe("finalization", p)
@@ -1135,7 +1157,9 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 	h := newHarness(t)
 	accepted := Terminal{
 		Execution: theTerminal.Execution, TerminalReason: theTerminal.TerminalReason,
-		HasExitCode: true, ExitCode: 0,
+		HasExitCode: true, ExitCode: 0, Author: state.TerminalByRunner,
+		Stdout: StreamRecord{Present: true, SourceBytes: 12, RedactedBytes: 3,
+			SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")},
 	}
 	h.cont.term = accepted
 
@@ -1146,15 +1170,28 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		seen["identity observation"] = term
 		term.ExitCode, term.Execution = 17, state.TestExecutionTimeout
 		term.TerminalReason = "MUTATED"
+		// The stream excerpt is the one part of a terminal that is a SLICE, so this is the only field a
+		// collaborator can rewrite through a value copy - and it happens BEFORE the record is built.
+		for i := range term.Stdout.Retained {
+			term.Stdout.Retained[i] = 'Z'
+		}
 		return observeID(p, term)
 	}
-	h.deps.PublishResult = func(p PreparedAttempt, term Terminal, id Identity) (string, error) {
-		seen["result publication"] = term
-		term.ExitCode = 17
-		return publishResult(p, term, id)
+	h.deps.PublishResult = func(rec ResultRecord) (string, error) {
+		seen["result publication"] = Terminal{
+			Execution: rec.Execution, TerminalReason: rec.TerminalReason, Author: rec.TerminalAuthor,
+			HasExitCode: rec.HasExitCode, ExitCode: rec.ExitCode,
+		}
+		rec.ExitCode = 17
+		return publishResult(rec)
 	}
 	h.deps.FinalizeOutcome = func(p PreparedAttempt, term Terminal, id Identity, digest string) (CommitStatus, error) {
 		seen["finalization"] = term
+		// The LAST collaborator to see the terminal, and the returned Result is built after it. Without
+		// its own copy, whatever it leaves behind is what the caller is told happened.
+		for i := range term.Stdout.Retained {
+			term.Stdout.Retained[i] = 'Q'
+		}
 		return finalize(p, term, id, digest)
 	}
 
@@ -1163,6 +1200,9 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	seen["the returned result"] = res.Terminal
+	if !bytes.Equal(res.Terminal.Stdout.Retained, []byte("abc")) {
+		t.Fatalf("the returned result carries evidence a later collaborator rewrote: %q", res.Terminal.Stdout.Retained)
+	}
 	for who, got := range seen {
 		if got.Execution != accepted.Execution || !got.HasExitCode || got.ExitCode != 0 {
 			t.Fatalf("%s received %+v, want the accepted %+v", who, got, accepted)
@@ -1173,6 +1213,15 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 	}
 	if len(seen) != 4 {
 		t.Fatalf("only %d seams were audited: %v", len(seen), seen)
+	}
+	// The evidence the record bound must be what was ACCEPTED, not what a later collaborator left behind.
+	if !bytes.Equal(h.sawResultRecord.Stdout.Retained, []byte("abc")) {
+		t.Fatalf("a collaborator rewrote the stream evidence before it was recorded: %q", h.sawResultRecord.Stdout.Retained)
+	}
+	// The runner is entitled to reuse its own buffer once the domain is gone - and it does, in Close.
+	// What must NOT happen is that reuse reaching the evidence this process accepted.
+	if !bytes.Equal(res.Terminal.Stdout.Retained, []byte("abc")) {
+		t.Fatalf("the runner's buffer reuse reached the returned result: %q", res.Terminal.Stdout.Retained)
 	}
 	// The runner still holds whatever it returned, and it must not be a handle into the accepted fact.
 	if h.cont.term.ExitCode != 0 || h.cont.term.Execution != accepted.Execution {
@@ -1278,6 +1327,24 @@ func TestConfirmationMustFindTHISLifecyclesOutcome(t *testing.T) {
 			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
 		}
 		if !strings.Contains(err.Error(), "terminal reason") {
+			t.Fatalf("err = %v, want it to name the field", err)
+		}
+	})
+
+	// The ledger stores WHO wrote the account beside the account itself. An entry naming the same digest
+	// and verdict while attributing them to a different authority is a record that disagrees with this
+	// lifecycle about who observed the ending.
+	t.Run("a committed entry recording a different terminal authority", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinAuthor = state.TerminalByRecovery
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		if !strings.Contains(err.Error(), "terminal authority") {
 			t.Fatalf("err = %v, want it to name the field", err)
 		}
 	})
@@ -1582,4 +1649,129 @@ func TestAnAbsentExitCodeHasExactlyOneShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// authorFor names the authority that can truthfully report an execution, so fixtures do not have to
+// restate the rule the production validator applies.
+func authorFor(e state.TestExecution) state.TerminalAuthor {
+	if e == state.TestExecutionInterrupted {
+		return state.TerminalByCoordinator
+	}
+	return state.TerminalByRunner
+}
+
+// TestARecordThatCannotBePublishedIsRefusedBeforeItIsHandedOver.
+//
+// The record is assembled on the main path from what authorization froze, and it is validated THERE
+// rather than left for the publisher to discover it cannot be written - by which point the attempt is
+// bound and past being retried cheaply. Nothing this lifecycle builds is normally invalid, which is
+// exactly why the backstop needs a vector: it is otherwise a branch no test ever enters.
+func TestARecordThatCannotBePublishedIsRefusedBeforeItIsHandedOver(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(*PreparedAttempt)
+		want  string
+	}{
+		{"no argv to say which command ran", func(p *PreparedAttempt) { p.Spec.Argv = nil }, "records no command"},
+		{"no executable", func(p *PreparedAttempt) { p.Spec.Executable = "" }, "records no command"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			authorize := h.deps.Authorize
+			h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+				p, err := authorize(rev)
+				tc.spoil(&p)
+				return p, err
+			}
+
+			_, err := Run(h.deps)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a record refusal containing %q", err, tc.want)
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("an unpublishable record reached the durable seam: %v", h.r.steps)
+			}
+		})
+	}
+}
+
+// TestThePublishedRecordCarriesWhatOnlyTheRunnerSaw.
+//
+// The stream evidence and the terminal authority exist nowhere else: the runner is the only party that
+// watched the streams, and only it knows whether the ending it is reporting is its own observation or a
+// live coordinator's account of losing the supervisor. If the record did not carry them, whoever
+// published it would have to find them through the side channel this package exists to remove - which is
+// precisely what the earlier three-argument publisher forced.
+func TestThePublishedRecordCarriesWhatOnlyTheRunnerSaw(t *testing.T) {
+	t.Run("the runner's own observation, with both streams", func(t *testing.T) {
+		h := newHarness(t)
+		out := StreamRecord{Present: true, SourceBytes: 12, RedactedBytes: 3,
+			SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")}
+		errS := StreamRecord{Present: true, SourceBytes: 9, RedactedBytes: 2,
+			SHA256: sha256Hex([]byte("hi")), Retained: []byte("hi")}
+		h.cont.term = Terminal{
+			Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
+			HasExitCode: true, Stdout: out, Stderr: errS,
+		}
+
+		if _, err := Run(h.deps); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		rec := h.sawResultRecord
+		if rec == nil {
+			t.Fatal("nothing was published")
+		}
+		if !bytes.Equal(rec.Stdout.Retained, []byte("abc")) || !bytes.Equal(rec.Stderr.Retained, []byte("hi")) {
+			t.Fatalf("the record lost the stream evidence: %+v / %+v", rec.Stdout, rec.Stderr)
+		}
+		if rec.Stdout.SourceBytes != 12 || rec.Stdout.RedactedBytes != 3 {
+			t.Fatalf("the record collapsed the separately named counts: %+v", rec.Stdout)
+		}
+		if rec.TerminalAuthor != state.TerminalByRunner {
+			t.Fatalf("authority = %q, want the runner's", rec.TerminalAuthor)
+		}
+		// And the record it published is one that could actually be written.
+		if _, _, err := rec.Encode(); err != nil {
+			t.Fatalf("the published record cannot be encoded: %v", err)
+		}
+	})
+
+	// A LIVE coordinator that watched its supervisor die authors `interrupted`. Nobody saw the command
+	// end, so the runner cannot be the authority - and if the record simply assumed the runner, the
+	// ledger would attribute an inference to an observer that never made it.
+	t.Run("a live coordinator's account of an interruption", func(t *testing.T) {
+		h := newHarness(t)
+		h.cont.term = Terminal{
+			Execution: state.TestExecutionInterrupted, TerminalReason: "the supervisor stopped responding",
+			Author: state.TerminalByCoordinator,
+		}
+		h.identity = Identity{Value: state.TestIdentityUnobserved}
+
+		res, err := Run(h.deps)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if h.sawResultRecord.TerminalAuthor != state.TerminalByCoordinator {
+			t.Fatalf("authority = %q, want the coordinator's", h.sawResultRecord.TerminalAuthor)
+		}
+		if res.Outcome == state.OutcomePass || res.Outcome == state.OutcomeFail {
+			t.Fatalf("an interruption routed to %q", res.Outcome)
+		}
+	})
+
+	// The runner cannot author an interruption: had it been alive to report, it would have reported the
+	// outcome instead.
+	t.Run("the runner claiming an interruption is refused", func(t *testing.T) {
+		h := newHarness(t)
+		h.cont.term = Terminal{
+			Execution: state.TestExecutionInterrupted, TerminalReason: "x", Author: state.TerminalByRunner,
+		}
+		_, err := Run(h.deps)
+		if err == nil || !strings.Contains(err.Error(), "cannot have observed it") {
+			t.Fatalf("err = %v, want an authority refusal", err)
+		}
+		if h.r.did("publish-result") {
+			t.Fatalf("it reached the durable seam: %v", h.r.steps)
+		}
+	})
 }

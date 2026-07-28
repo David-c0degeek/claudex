@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/David-c0degeek/claudex/internal/canonjson"
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
 
@@ -488,3 +489,28 @@ func NoAmbientEnv(string) (string, bool) { return "", false }
 
 // HostGOOS is the platform resolution happens on.
 func HostGOOS() string { return runtime.GOOS }
+
+// EnvIdentityDigest is the digest a result and an intent bind to prove they describe the same
+// environment.
+//
+// It is over the canonical ACTUAL name/value list, base64-encoded, in the order this value already
+// holds — which is the order the identity rule sorted it into, after the Windows fold and its
+// duplicate check. Not a redacted list: redaction collapses distinct secrets onto one marker, so a
+// redaction-based digest cannot prove two environments equal.
+//
+// It lives here rather than at the caller because the canonical wire form lives here. A caller
+// spelling out its own encoding would be a second definition of one identity, and the two would
+// diverge the first time this shape changed.
+func (r ResolvedExecution) EnvIdentityDigest() (string, error) {
+	wire := make([]wireResolvedVar, 0, len(r.Env))
+	for _, v := range r.Env {
+		wire = append(wire, wireResolvedVar{
+			NameB64:  base64.StdEncoding.EncodeToString(v.Name),
+			ValueB64: base64.StdEncoding.EncodeToString(v.Value),
+		})
+	}
+	return canonjson.DigestValue(struct {
+		Identity string            `json:"identity"`
+		Env      []wireResolvedVar `json:"env"`
+	}{Identity: string(r.Identity), Env: wire})
+}
