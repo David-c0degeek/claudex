@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -173,7 +174,20 @@ func queryCloudSyncRoot(path string) (cloudState, uintptr) {
 	var buf [512]byte
 	var returned uint32
 	const cfSyncRootInfoBasic = 0
-	hr, _, _ := procCfGetSyncRootInfoByPath.Call(
+	// syscall.SyscallN, not LazyProc.Call, and the difference is a correctness rule rather than style.
+	//
+	// The unsafe.Pointer rules permit a Pointer-to-uintptr conversion only where it appears in the
+	// ARGUMENT LIST OF THE SYSCALL itself; there the compiler arranges for the referenced object to be
+	// retained for the call's duration. LazyProc.Call is an ordinary variadic Go function that collects
+	// those uintptrs into a slice first, so the guarantee does not apply and the buffer this writes into
+	// is not known to the runtime as referenced.
+	//
+	// This is not a theoretical tidy-up. The identical construction in internal/proctree — an x/sys
+	// wrapper taking the buffer as a plain uintptr — caused SetInformationJobObject to report success
+	// while writing nothing, silently removing the Windows containment guarantee, reproducibly under the
+	// race detector and never in an ordinary build. Find() has already succeeded above, so Addr() is
+	// safe here.
+	hr, _, _ := syscall.SyscallN(procCfGetSyncRootInfoByPath.Addr(),
 		uintptr(unsafe.Pointer(p)),
 		uintptr(cfSyncRootInfoBasic),
 		uintptr(unsafe.Pointer(&buf[0])),
