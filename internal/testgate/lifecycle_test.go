@@ -131,6 +131,10 @@ type harness struct {
 	failNthAcquire, failNthRelease   int
 	acquireCalls, releaseCalls       int
 	failAuthorize, failPublishIntent error
+	failReserve                      error
+	reservedRevision                 uint64
+	authorizedRevision               uint64
+	boundRevision                    uint64
 	publishedDigest                  string
 	failArm, failBind                error
 	armReturnsContainment            bool
@@ -144,6 +148,7 @@ type harness struct {
 	confirmFinReason                 string
 	confirmFinTree                   string
 	confirmFinCommit                 string
+	confirmFinStart                  uint64
 	confirmFinNoEntry                bool
 	failConfirm                      error
 	failReauthorize, failObserve     error
@@ -151,12 +156,13 @@ type harness struct {
 	identity                         Identity
 
 	// What each step actually received, so the facts can be proven to travel.
-	sawIntentSpec      ExecutionSpec
-	sawArmSpec         ExecutionSpec
-	sawObserveTerminal Terminal
-	sawResultTerminal  Terminal
-	sawResultIdentity  Identity
-	sawFinalizeDigest  string
+	sawIntentSpec        ExecutionSpec
+	sawAuthorizeRevision uint64
+	sawArmSpec           ExecutionSpec
+	sawObserveTerminal   Terminal
+	sawResultTerminal    Terminal
+	sawResultIdentity    Identity
+	sawFinalizeDigest    string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -168,6 +174,7 @@ func newHarness(t *testing.T) *harness {
 		finalizeStatus:        BindCommitted,
 		confirmFinStatus:      BindCommitted,
 		armReturnsContainment: true,
+		reservedRevision:      41,
 		identity:              Identity{Value: state.TestIdentityUnchanged, Commit: thePrepared.TestedCommit, Tree: thePrepared.TestedTree},
 	}
 	h.cont = &fakeContainment{r: h.r, term: theTerminal}
@@ -191,15 +198,29 @@ func newHarness(t *testing.T) *harness {
 			h.r.step("release-guard")
 			return nil
 		},
-		Authorize: func() (PreparedAttempt, error) {
+		ReserveStartRevision: func() (uint64, error) {
+			t.Helper()
+			h.r.requireGuard("reserve-start-revision", 1)
+			h.r.requireNotYet("reserve-start-revision", "authorize")
+			h.r.step("reserve-start-revision")
+			return h.reservedRevision, h.failReserve
+		},
+		Authorize: func(startRevision uint64) (PreparedAttempt, error) {
 			t.Helper()
 			h.r.requireGuard("authorize", 1)
+			h.r.requireBefore("authorize", "reserve-start-revision")
 			h.r.requireNotYet("authorize", "publish-intent")
 			h.r.step("authorize")
+			h.sawAuthorizeRevision = startRevision
 			// A CLONE of the package fixture. Returning it directly makes the fixture itself mutable
 			// through every test that runs, so one mutation test would corrupt the data every other test
 			// in this file asserts against - and the corruption would depend on execution order.
-			return clonePrepared(thePrepared), h.failAuthorize
+			p := clonePrepared(thePrepared)
+			p.StartRevision = startRevision
+			if h.authorizedRevision != 0 {
+				p.StartRevision = h.authorizedRevision
+			}
+			return p, h.failAuthorize
 		},
 		PublishIntent: func(p PreparedAttempt) (string, error) {
 			t.Helper()
@@ -235,21 +256,29 @@ func newHarness(t *testing.T) *harness {
 			}
 			return h.cont, nil
 		},
-		BindActive: func(PreparedAttempt) (CommitStatus, error) {
+		BindActive: func(p PreparedAttempt) (Bind, error) {
 			t.Helper()
 			h.r.requireGuard("bind-active", 1)
 			h.r.requireBefore("bind-active", "arm")
 			h.r.requireNotYet("bind-active", "go")
 			h.r.step("bind-active")
-			return h.bindStatus, h.failBind
+			rev := h.reservedRevision
+			if h.boundRevision != 0 {
+				rev = h.boundRevision
+			}
+			return Bind{Status: h.bindStatus, Revision: rev}, h.failBind
 		},
-		ConfirmBind: func(PreparedAttempt) (CommitStatus, error) {
+		ConfirmBind: func(p PreparedAttempt) (Bind, error) {
 			t.Helper()
 			// Uncertainty is settled while the guard is STILL held; afterwards it belongs to recovery.
 			h.r.requireGuard("confirm-bind", 1)
 			h.r.requireBefore("confirm-bind", "bind-active")
 			h.r.step("confirm-bind")
-			return h.confirmStatus, h.failConfirm
+			rev := h.reservedRevision
+			if h.boundRevision != 0 {
+				rev = h.boundRevision
+			}
+			return Bind{Status: h.confirmStatus, Revision: rev}, h.failConfirm
 		},
 		Reauthorize: func(PreparedAttempt) error {
 			t.Helper()
@@ -296,7 +325,8 @@ func newHarness(t *testing.T) *harness {
 				entry := state.FinalizedAttempt{
 					AttemptID: p.AttemptID, ResultDigest: digest,
 					TestedCommit: p.TestedCommit, TestedTree: p.TestedTree,
-					Execution: term.Execution, Identity: id.Value,
+					StartRevision: p.StartRevision,
+					Execution:     term.Execution, Identity: id.Value,
 					TerminalReason: term.TerminalReason,
 				}
 				if h.confirmFinDigest != "" {
@@ -320,6 +350,9 @@ func newHarness(t *testing.T) *harness {
 				if h.confirmFinCommit != "" {
 					entry.TestedCommit = h.confirmFinCommit
 				}
+				if h.confirmFinStart != 0 {
+					entry.StartRevision = h.confirmFinStart
+				}
 				if h.confirmFinNoEntry {
 					return FinalizeConfirmation{Status: BindCommitted}, h.failConfirmFin
 				}
@@ -340,7 +373,7 @@ func TestTheOrderIsEnforced(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	want := []string{
-		"acquire-guard", "authorize", "publish-intent", "arm", "bind-active", "release-guard",
+		"acquire-guard", "reserve-start-revision", "authorize", "publish-intent", "arm", "bind-active", "release-guard",
 		"go", "wait",
 		"acquire-guard", "reauthorize", "observe-identity", "publish-result", "finalize",
 		"release-guard", "close",
@@ -993,8 +1026,8 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 			// very next seam clones defensively and hides it.
 			var retained PreparedAttempt
 			authorize := h.deps.Authorize
-			h.deps.Authorize = func() (PreparedAttempt, error) {
-				p, err := authorize()
+			h.deps.Authorize = func(startRevision uint64) (PreparedAttempt, error) {
+				p, err := authorize(startRevision)
 				retained = p
 				return p, err
 			}
@@ -1016,11 +1049,11 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 				observe("arming", p)
 				return arm(p)
 			}
-			h.deps.BindActive = func(p PreparedAttempt) (CommitStatus, error) {
+			h.deps.BindActive = func(p PreparedAttempt) (Bind, error) {
 				observe("binding", p)
 				return bind(p)
 			}
-			h.deps.ConfirmBind = func(p PreparedAttempt) (CommitStatus, error) {
+			h.deps.ConfirmBind = func(p PreparedAttempt) (Bind, error) {
 				observe("bind confirmation", p)
 				return confirmBind(p)
 			}
@@ -1408,5 +1441,119 @@ func TestRunNeverClaimsToStillHoldTheGuard(t *testing.T) {
 		if res.Recovery != nil && res.Recovery.Guard == GuardHeld {
 			t.Fatal("Run handed off claiming to still hold the guard; the documented disclosure is now false")
 		}
+	}
+}
+
+// TestTheStartRevisionIsReservedAndCheckedNeverGuessed.
+//
+// The intent binds the revision the attempt becomes active at, and it is published BEFORE the append
+// that creates that revision. Deriving it as head+1 would be wrong whenever the generation store skips
+// an occupied or quarantined slot - and the wrong number would already be inside a durable digest by the
+// time anything could notice. So it is read under the guard, handed to authorization, and the binding
+// CAS is checked against it.
+func TestTheStartRevisionIsReservedAndCheckedNeverGuessed(t *testing.T) {
+	t.Run("the reserved revision reaches authorization and the prepared attempt", func(t *testing.T) {
+		h := newHarness(t)
+		res, err := Run(h.deps)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if h.sawAuthorizeRevision != h.reservedRevision {
+			t.Fatalf("authorization saw revision %d, reserved %d", h.sawAuthorizeRevision, h.reservedRevision)
+		}
+		if res.Prepared.StartRevision != h.reservedRevision {
+			t.Fatalf("the prepared attempt carries revision %d, reserved %d", res.Prepared.StartRevision, h.reservedRevision)
+		}
+	})
+
+	t.Run("reservation fails before anything is written", func(t *testing.T) {
+		h := newHarness(t)
+		h.failReserve = errors.New("store unreadable")
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRefused) {
+			t.Fatalf("err = %v, want ErrRefused", err)
+		}
+		if h.r.did("authorize") || h.r.did("publish-intent") {
+			t.Fatalf("work proceeded without a reserved revision: %v", h.r.steps)
+		}
+	})
+
+	// The authorizer receives the reservation so it can bind it into the intent it digests. Returning a
+	// different one would publish an intent naming a revision this lifecycle never reserved, and the
+	// digest would make that permanent.
+	t.Run("authorization may not substitute its own revision", func(t *testing.T) {
+		h := newHarness(t)
+		h.authorizedRevision = 999
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRefused) {
+			t.Fatalf("err = %v, want ErrRefused", err)
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("err = %v, want it to name the reservation", err)
+		}
+		if h.r.did("publish-intent") {
+			t.Fatalf("an intent naming an unreserved revision was published: %v", h.r.steps)
+		}
+	})
+
+	// The reservation is a value to be CHECKED, not a promise nothing can intervene. When the append
+	// lands elsewhere, durable state names a revision the already-published intent does not, and neither
+	// can be withdrawn - so this is recovery's, and the containment must be handed over rather than
+	// destroyed.
+	t.Run("a CAS that commits at a different revision is handed to recovery", func(t *testing.T) {
+		h := newHarness(t)
+		h.boundRevision = 44
+
+		res, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		if !strings.Contains(err.Error(), "44") || !strings.Contains(err.Error(), "41") {
+			t.Fatalf("err = %v, want it to name both revisions", err)
+		}
+		assertHandedOver(t, res, h.cont)
+	})
+
+	t.Run("a bound ledger entry with a different start revision", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinStart = 77
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		if !strings.Contains(err.Error(), "start revision") {
+			t.Fatalf("err = %v, want it to name the field", err)
+		}
+	})
+}
+
+// TestAnAbsentExitCodeHasExactlyOneShape.
+//
+// Checking only the boolean let {HasExitCode:false, ExitCode:17} through, and it then travelled to every
+// result seam claiming to carry no code while carrying seventeen. Whether that seventeen is serialized
+// would depend on each publisher remembering to consult the boolean first, which makes it a fact two
+// readers can legitimately disagree about.
+func TestAnAbsentExitCodeHasExactlyOneShape(t *testing.T) {
+	for _, e := range []state.TestExecution{
+		state.TestExecutionTimeout, state.TestExecutionCancelled,
+		state.TestExecutionSpawnFailed, state.TestExecutionInterrupted,
+	} {
+		t.Run(string(e), func(t *testing.T) {
+			h := newHarness(t)
+			h.cont.term = Terminal{Execution: e, TerminalReason: "x", HasExitCode: false, ExitCode: 17}
+
+			_, err := Run(h.deps)
+			if err == nil || !strings.Contains(err.Error(), "no exit code is claimed") {
+				t.Fatalf("err = %v, want a refusal of the second representation of absent", err)
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("it reached the durable result seam: %v", h.r.steps)
+			}
+		})
 	}
 }

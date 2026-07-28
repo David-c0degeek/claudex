@@ -112,6 +112,16 @@ type ExecutionSpec struct {
 type PreparedAttempt struct {
 	// AttemptID is the minted identity every later fact binds.
 	AttemptID string
+	// StartRevision is the state revision at which this attempt becomes active — the SAME number the
+	// active CAS will commit at, not an approximation of it.
+	//
+	// The intent is published before that CAS and its schema binds this value, so it has to be known
+	// beforehand. It cannot be computed as head+1: the generation store deliberately skips occupied and
+	// quarantined slots, so the next generation is whatever it turns out to be, and state validates the
+	// attempt's start revision against the revision that actually created it. It is therefore RESERVED
+	// under the held guard, which is the window in which the answer cannot change, and the binding CAS is
+	// required to have committed exactly it.
+	StartRevision uint64
 	// TestedCommit and TestedTree are the repository identity this attempt is a statement ABOUT.
 	TestedCommit string
 	TestedTree   string
@@ -201,10 +211,21 @@ type Deps struct {
 	AcquireGuard func() error
 	ReleaseGuard func() error
 
+	// ReserveStartRevision returns the revision the next state append will commit at, under the guard
+	// this lifecycle already holds.
+	//
+	// It exists because the intent binds that revision and is published BEFORE the append. Guessing
+	// head+1 would be wrong whenever the store skips an occupied or quarantined slot, and the guess
+	// would be baked into a durable digest. Reserving is not a promise that nothing can intervene — it
+	// is a value the binding CAS is checked against, so an intervention fails closed into an orphaned
+	// intent rather than into a durable record naming a revision that never happened.
+	ReserveStartRevision func() (uint64, error)
+
 	// Authorize proves ownerless TESTS with no active attempt, freezes the identity, resolves the
-	// command and re-checks the record fit — returning all of it as one value. It mints nothing until
-	// every check has passed, so its failure writes nothing.
-	Authorize func() (PreparedAttempt, error)
+	// command and re-checks the record fit — returning all of it as one value, INCLUDING the reserved
+	// start revision it was given, because that revision is part of the intent it digests. It mints
+	// nothing until every check has passed, so its failure writes nothing.
+	Authorize func(startRevision uint64) (PreparedAttempt, error)
 
 	// PublishIntent durably writes the immutable intent and returns the digest of the EXACT canonical
 	// bytes it wrote.
@@ -222,13 +243,15 @@ type Deps struct {
 	// failure when anything was partially armed, so the caller can always release what exists.
 	ArmContainment func(PreparedAttempt) (Containment, error)
 
-	// BindActive CASes the active attempt into state and reports the AUTHORITATIVE status.
-	BindActive func(PreparedAttempt) (CommitStatus, error)
+	// BindActive CASes the active attempt into state and reports the AUTHORITATIVE status TOGETHER WITH
+	// the revision it committed at. The revision is not decoration: it is the only way to establish that
+	// the durable state agrees with the intent that was already published.
+	BindActive func(PreparedAttempt) (Bind, error)
 
 	// ConfirmBind settles an uncertain append while the guard is STILL HELD. It is a separate seam
 	// because that is the only moment the uncertainty can be resolved cheaply — afterwards the answer
 	// belongs to recovery.
-	ConfirmBind func(PreparedAttempt) (CommitStatus, error)
+	ConfirmBind func(PreparedAttempt) (Bind, error)
 
 	// Reauthorize proves the exact attempt is still the active one after the guard is reacquired.
 	Reauthorize func(PreparedAttempt) error
@@ -322,6 +345,13 @@ type FinalizeConfirmation struct {
 	// version omitted TerminalReason, so an entry with the same digest and verdict but a different
 	// reason compared equal to a result that does not contain it.
 	Entry *state.FinalizedAttempt
+}
+
+// Bind is the authoritative answer about the active-attempt CAS.
+type Bind struct {
+	Status CommitStatus
+	// Revision is the revision the append committed at, meaningful when Status is committed.
+	Revision uint64
 }
 
 // Result is what one completed attempt produced.
@@ -432,10 +462,25 @@ func Run(d Deps) (Result, error) {
 // The containment is returned even on failure, so the caller can always release what exists — and the
 // bind status is returned so the caller can tell whether releasing is its job at all.
 func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error) {
+	// 0. The revision the binding CAS will commit at, reserved while the guard is held. The intent
+	// published in step 2 binds this number, so it must exist before the intent is hashed — and it must
+	// be READ rather than predicted, because the store skips occupied and quarantined slots.
+	startRevision, err := d.ReserveStartRevision()
+	if err != nil {
+		return PreparedAttempt{}, nil, 0, errors.Join(fmt.Errorf("%w: reserving the start revision", ErrRefused), err)
+	}
+
 	// 1. Nothing is written until every check has passed, so this failure leaves no residue at all.
-	authorized, err := d.Authorize()
+	authorized, err := d.Authorize(startRevision)
 	if err != nil {
 		return PreparedAttempt{}, nil, 0, errors.Join(fmt.Errorf("%w: authorizing the attempt", ErrRefused), err)
+	}
+	// The authorizer does not get to change the reservation. It receives the revision so it can bind it
+	// into the intent it digests; returning a different one would publish an intent naming a revision
+	// this lifecycle never reserved.
+	if authorized.StartRevision != startRevision {
+		return PreparedAttempt{}, nil, 0, fmt.Errorf("%w: authorization bound start revision %d, reserved %d",
+			ErrRefused, authorized.StartRevision, startRevision)
 	}
 	// Cloned IMMEDIATELY on return, so this function owns the master copy outright. Anything the
 	// authorizer still holds a reference to cannot reach through and change what later steps receive.
@@ -464,8 +509,8 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 
 	// 4. Only now does state carry an active reference — and by construction, every state that carries
 	// one is a state in which the containment already existed.
-	st, err := d.BindActive(clonePrepared(prep))
-	if err != nil || st == BindUncertain {
+	bind, err := d.BindActive(clonePrepared(prep))
+	if err != nil || bind.Status == BindUncertain {
 		// Uncertainty is settled WHILE THE GUARD IS STILL HELD, because this is the only moment it can
 		// be settled cheaply. Afterwards the question belongs to recovery.
 		confirmed, cerr := d.ConfirmBind(clonePrepared(prep))
@@ -473,10 +518,19 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 			return prep, cont, BindUncertain, errors.Join(
 				fmt.Errorf("%w: the active binding could not be confirmed", ErrRecoveryOwned), err, cerr)
 		}
-		st = confirmed
+		bind = confirmed
 	}
+	st := bind.Status
 	switch st {
 	case BindCommitted:
+		// The reservation was a value to be CHECKED, not a promise. If the append landed anywhere else,
+		// durable state now names a revision the already-published intent does not, and neither can be
+		// withdrawn — so this hands over rather than continuing on a record that disagrees with itself.
+		if bind.Revision != prep.StartRevision {
+			return prep, cont, BindUncertain, fmt.Errorf(
+				"%w: the attempt bound at revision %d but its published intent names %d",
+				ErrRecoveryOwned, bind.Revision, prep.StartRevision)
+		}
 		return prep, cont, st, nil
 	case BindNotCommitted:
 		// No attempt exists. The containment is this process's to destroy, and the caller may retry.
@@ -578,6 +632,7 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 func disagreesWithPublished(e state.FinalizedAttempt, prep PreparedAttempt, term Terminal, ident Identity, digest string) string {
 	for _, f := range []struct{ name, got, want string }{
 		{"attempt id", e.AttemptID, prep.AttemptID},
+		{"start revision", fmt.Sprintf("%d", e.StartRevision), fmt.Sprintf("%d", prep.StartRevision)},
 		{"tested commit", e.TestedCommit, prep.TestedCommit},
 		{"tested tree", e.TestedTree, prep.TestedTree},
 		{"result digest", e.ResultDigest, digest},
@@ -619,6 +674,13 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 		if t.HasExitCode {
 			return Terminal{}, fmt.Errorf("%w: %q cannot carry an exit code", ErrLifecycle, t.Execution)
 		}
+	}
+	// Absent must have exactly ONE representation. Checking only the boolean let {false, 17} through, and
+	// it then travelled to every result seam claiming to carry no code while carrying 17 — leaving
+	// whether that 17 is serialized to depend on each publisher remembering to look at the boolean
+	// first. A fact with two shapes is a fact two readers can disagree about.
+	if !t.HasExitCode && t.ExitCode != 0 {
+		return Terminal{}, fmt.Errorf("%w: no exit code is claimed but %d is carried", ErrLifecycle, t.ExitCode)
 	}
 	if strings.TrimSpace(t.TerminalReason) == "" {
 		return Terminal{}, fmt.Errorf("%w: the runner reported no terminal detail", ErrLifecycle)
@@ -722,6 +784,7 @@ func (d Deps) validate() error {
 	}{
 		{"AcquireGuard", d.AcquireGuard == nil},
 		{"ReleaseGuard", d.ReleaseGuard == nil},
+		{"ReserveStartRevision", d.ReserveStartRevision == nil},
 		{"Authorize", d.Authorize == nil},
 		{"PublishIntent", d.PublishIntent == nil},
 		{"ArmContainment", d.ArmContainment == nil},
