@@ -130,9 +130,16 @@ type PreparedAttempt struct {
 type Terminal struct {
 	Execution      state.TestExecution
 	TerminalReason string // already canonical; see state.CanonicalTerminalReason
-	// ExitCode is present for a normal exit and absent otherwise — a timeout has no exit code, and
-	// zero would be indistinguishable from success.
-	ExitCode *int
+	// HasExitCode/ExitCode carry the optional exit fact BY VALUE.
+	//
+	// A pointer would be validated once and then travel as a shallow alias through identity observation,
+	// result publication and both CAS seams — and the runner keeps its own copy of it too. A collaborator
+	// setting *ExitCode = 17 after `ok + 0` was accepted leaves outcome derivation still producing a
+	// pass while publication records a command that failed, and nothing downstream can catch it: the
+	// ledger does not store the exit code. Optionality is worth a second field; a mutable alias to a
+	// validated fact is not.
+	HasExitCode bool
+	ExitCode    int
 }
 
 // Identity is the FINAL identity observation, in the closed vocabulary.
@@ -304,20 +311,17 @@ func (g GuardDisposition) String() string {
 	return "unset"
 }
 
-// FinalizedEntry is the ledger entry confirmation actually found.
-type FinalizedEntry struct {
-	AttemptID    string
-	ResultDigest string
-	Execution    state.TestExecution
-	Identity     state.TestIdentity
-}
-
 // FinalizeConfirmation is the authoritative answer about an uncertain outcome append.
 type FinalizeConfirmation struct {
 	Status CommitStatus
-	// Entry is what is bound, and must be present when Status is committed — otherwise "committed" is
-	// an assertion with nothing behind it.
-	Entry *FinalizedEntry
+	// Entry is the ledger record that is bound, and must be present when Status is committed —
+	// otherwise "committed" is an assertion with nothing behind it.
+	//
+	// It is the STATE type rather than a shape local to this package. A parallel copy carrying the
+	// fields this package happened to think of drifts from the record it claims to describe: the first
+	// version omitted TerminalReason, so an entry with the same digest and verdict but a different
+	// reason compared equal to a result that does not contain it.
+	Entry *state.FinalizedAttempt
 }
 
 // Result is what one completed attempt produced.
@@ -538,10 +542,9 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 			if conf.Entry == nil {
 				return Result{}, fmt.Errorf("%w: the outcome was reported committed with no entry to show for it", ErrRecoveryOwned)
 			}
-			if conf.Entry.AttemptID != prep.AttemptID || conf.Entry.ResultDigest != digest ||
-				conf.Entry.Execution != term.Execution || conf.Entry.Identity != ident.Value {
-				return Result{}, fmt.Errorf("%w: the bound outcome for attempt %q is not the one published here (bound digest %q, published %q)",
-					ErrRecoveryOwned, prep.AttemptID, conf.Entry.ResultDigest, digest)
+			if mismatch := disagreesWithPublished(*conf.Entry, prep, term, ident, digest); mismatch != "" {
+				return Result{}, fmt.Errorf("%w: the bound outcome for attempt %q is not the one published here: %s",
+					ErrRecoveryOwned, prep.AttemptID, mismatch)
 			}
 		}
 		st = conf.Status
@@ -564,6 +567,31 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 // Canonicalization happens HERE rather than at persistence because the result digest is computed over
 // these bytes: rewriting them later would leave the digest identifying text that no longer exists, which
 // is the defect the state boundary had to be corrected for. Once is the right number of times.
+// disagreesWithPublished names the first immutable field on which a bound ledger record differs from
+// what this lifecycle published, or "" when they agree.
+//
+// Every field the lifecycle KNOWS is compared, not only the ones that change routing. The terminal
+// reason does not steer the run anywhere, but it is the text a human reads to understand the verdict,
+// and a record pairing this attempt's digest with somebody else's account of how the command ended is
+// evidence that disagrees with itself. The revisions are deliberately not compared: they are assigned by
+// the store, so this process does not know them and could only pretend to check them.
+func disagreesWithPublished(e state.FinalizedAttempt, prep PreparedAttempt, term Terminal, ident Identity, digest string) string {
+	for _, f := range []struct{ name, got, want string }{
+		{"attempt id", e.AttemptID, prep.AttemptID},
+		{"tested commit", e.TestedCommit, prep.TestedCommit},
+		{"tested tree", e.TestedTree, prep.TestedTree},
+		{"result digest", e.ResultDigest, digest},
+		{"execution", string(e.Execution), string(term.Execution)},
+		{"identity", string(e.Identity), string(ident.Value)},
+		{"terminal reason", e.TerminalReason, term.TerminalReason},
+	} {
+		if f.got != f.want {
+			return fmt.Sprintf("the bound %s is %q, published %q", f.name, f.got, f.want)
+		}
+	}
+	return ""
+}
+
 func acceptTerminal(t Terminal) (Terminal, error) {
 	if !state.KnownTestExecution(t.Execution) {
 		return Terminal{}, fmt.Errorf("%w: the runner reported the unknown execution %q", ErrLifecycle, t.Execution)
@@ -575,20 +603,20 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 	// of a command that failed.
 	switch t.Execution {
 	case state.TestExecutionOK:
-		if t.ExitCode == nil || *t.ExitCode != 0 {
-			return Terminal{}, fmt.Errorf("%w: %q requires exit code 0, got %s", ErrLifecycle, t.Execution, exitString(t.ExitCode))
+		if !t.HasExitCode || t.ExitCode != 0 {
+			return Terminal{}, fmt.Errorf("%w: %q requires exit code 0, got %s", ErrLifecycle, t.Execution, exitString(t))
 		}
 	case state.TestExecutionNonzero:
-		if t.ExitCode == nil || *t.ExitCode == 0 {
-			return Terminal{}, fmt.Errorf("%w: %q requires a non-zero exit code, got %s", ErrLifecycle, t.Execution, exitString(t.ExitCode))
+		if !t.HasExitCode || t.ExitCode == 0 {
+			return Terminal{}, fmt.Errorf("%w: %q requires a non-zero exit code, got %s", ErrLifecycle, t.Execution, exitString(t))
 		}
-		if *t.ExitCode < 0 {
-			return Terminal{}, fmt.Errorf("%w: %q reported the impossible exit code %d", ErrLifecycle, t.Execution, *t.ExitCode)
+		if t.ExitCode < 0 {
+			return Terminal{}, fmt.Errorf("%w: %q reported the impossible exit code %d", ErrLifecycle, t.Execution, t.ExitCode)
 		}
 	default:
 		// A timeout, a cancel, a spawn failure and an interruption all end without the command
 		// reporting anything, so a code here would be invented.
-		if t.ExitCode != nil {
+		if t.HasExitCode {
 			return Terminal{}, fmt.Errorf("%w: %q cannot carry an exit code", ErrLifecycle, t.Execution)
 		}
 	}
@@ -607,11 +635,11 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 	return t, nil
 }
 
-func exitString(c *int) string {
-	if c == nil {
+func exitString(t Terminal) string {
+	if !t.HasExitCode {
 		return "none"
 	}
-	return fmt.Sprintf("%d", *c)
+	return fmt.Sprintf("%d", t.ExitCode)
 }
 
 // acceptIdentity proves the identity value AGREES with its own evidence.

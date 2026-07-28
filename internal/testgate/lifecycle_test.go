@@ -83,10 +83,8 @@ var thePrepared = PreparedAttempt{
 var theTerminal = Terminal{
 	Execution:      state.TestExecutionOK,
 	TerminalReason: "exited 0",
-	ExitCode:       intp(0),
+	HasExitCode:    true,
 }
-
-func intp(i int) *int { return &i }
 
 type fakeContainment struct {
 	r        *recorder
@@ -143,6 +141,9 @@ type harness struct {
 	confirmFinAttemptID              string
 	confirmFinExecution              state.TestExecution
 	confirmFinIdentity               state.TestIdentity
+	confirmFinReason                 string
+	confirmFinTree                   string
+	confirmFinCommit                 string
 	confirmFinNoEntry                bool
 	failConfirm                      error
 	failReauthorize, failObserve     error
@@ -292,9 +293,11 @@ func newHarness(t *testing.T) *harness {
 			h.r.step("confirm-finalize")
 			conf := FinalizeConfirmation{Status: h.confirmFinStatus}
 			if h.confirmFinStatus == BindCommitted {
-				entry := FinalizedEntry{
+				entry := state.FinalizedAttempt{
 					AttemptID: p.AttemptID, ResultDigest: digest,
+					TestedCommit: p.TestedCommit, TestedTree: p.TestedTree,
 					Execution: term.Execution, Identity: id.Value,
+					TerminalReason: term.TerminalReason,
 				}
 				if h.confirmFinDigest != "" {
 					entry.ResultDigest = h.confirmFinDigest
@@ -307,6 +310,15 @@ func newHarness(t *testing.T) *harness {
 				}
 				if h.confirmFinIdentity != "" {
 					entry.Identity = h.confirmFinIdentity
+				}
+				if h.confirmFinReason != "" {
+					entry.TerminalReason = h.confirmFinReason
+				}
+				if h.confirmFinTree != "" {
+					entry.TestedTree = h.confirmFinTree
+				}
+				if h.confirmFinCommit != "" {
+					entry.TestedCommit = h.confirmFinCommit
 				}
 				if h.confirmFinNoEntry {
 					return FinalizeConfirmation{Status: BindCommitted}, h.failConfirmFin
@@ -776,8 +788,8 @@ func TestAMalformedRunnerFactIsRefusedBeforePublication(t *testing.T) {
 	}{
 		{"an unknown execution", Terminal{Execution: "probably-fine", TerminalReason: "x"}},
 		{"a normal exit with no exit code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "x"}},
-		{"a timeout carrying an exit code", Terminal{Execution: state.TestExecutionTimeout, TerminalReason: "x", ExitCode: intp(0)}},
-		{"no terminal detail at all", Terminal{Execution: state.TestExecutionOK, TerminalReason: "  ", ExitCode: intp(0)}},
+		{"a timeout carrying an exit code", Terminal{Execution: state.TestExecutionTimeout, TerminalReason: "x", HasExitCode: true, ExitCode: 0}},
+		{"no terminal detail at all", Terminal{Execution: state.TestExecutionOK, TerminalReason: "  ", HasExitCode: true, ExitCode: 0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -842,9 +854,9 @@ func TestTheExitFactMustAgreeWithTheVerdict(t *testing.T) {
 		name string
 		term Terminal
 	}{
-		{"ok with a non-zero code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "exited 17", ExitCode: intp(17)}},
-		{"nonzero with a zero code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited 0", ExitCode: intp(0)}},
-		{"a negative exit code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited -1", ExitCode: intp(-1)}},
+		{"ok with a non-zero code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "exited 17", HasExitCode: true, ExitCode: 17}},
+		{"nonzero with a zero code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited 0", HasExitCode: true, ExitCode: 0}},
+		{"a negative exit code", Terminal{Execution: state.TestExecutionNonzero, TerminalReason: "exited -1", HasExitCode: true, ExitCode: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -934,92 +946,207 @@ func TestTheIdentityMustAgreeWithItsOwnEvidence(t *testing.T) {
 // rewrites the backing array the LATER ones read — after the digest identifying those bytes was already
 // chosen. The read-only fakes elsewhere in this file cannot detect that, so this one mutates on purpose.
 func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
-	h := newHarness(t)
 	// Every seam that receives a PreparedAttempt records what it was handed and then scribbles over it,
 	// which is the kind of in-place tidying a real canonicalizer or sorter would do. Wrapping only ONE
-	// seam proves only that seam: the value flows through six of them, and the clone that protects the
-	// next collaborator is invisible to a test whose mutator runs after it.
-	seen := map[string]PreparedAttempt{}
-	scribble := func(p PreparedAttempt) {
-		for i := range p.Spec.Argv {
-			p.Spec.Argv[i] = "MUTATED"
-		}
-		for i := range p.Spec.Env.Env {
-			p.Spec.Env.Env[i].Value = []byte("MUTATED")
-			if len(p.Spec.Env.Env[i].Name) > 0 {
-				p.Spec.Env.Env[i].Name[0] = 'Z'
+	// seam proves only that seam: the value flows through nine of them, and the clone that protects the
+	// next collaborator is invisible to a test whose mutator runs after it. The confirmation seams run
+	// only on their uncertain branches, so each gets its own arrangement rather than being asserted from
+	// a path that never calls them.
+	for _, tc := range []struct {
+		name    string
+		arrange func(*harness)
+		expect  []string
+	}{
+		{"the ordinary path", func(*harness) {}, []string{
+			"intent publication", "arming", "binding", "re-authorization",
+			"identity observation", "result publication", "finalization", "the returned result"}},
+		{"an unresolved active bind", func(h *harness) {
+			h.bindStatus, h.confirmStatus = BindUncertain, BindCommitted
+		}, []string{"bind confirmation", "re-authorization", "identity observation",
+			"result publication", "finalization", "the returned result"}},
+		{"an unresolved outcome append", func(h *harness) {
+			h.finalizeStatus, h.confirmFinStatus = BindUncertain, BindCommitted
+		}, []string{"finalize confirmation", "the returned result"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			tc.arrange(h)
+			seen := map[string]PreparedAttempt{}
+			scribble := func(p PreparedAttempt) {
+				for i := range p.Spec.Argv {
+					p.Spec.Argv[i] = "MUTATED"
+				}
+				for i := range p.Spec.Env.Env {
+					p.Spec.Env.Env[i].Value = []byte("MUTATED")
+					if len(p.Spec.Env.Env[i].Name) > 0 {
+						p.Spec.Env.Env[i].Name[0] = 'Z'
+					}
+				}
 			}
-		}
-	}
-	observe := func(who string, p PreparedAttempt) {
-		seen[who] = clonePrepared(p) // a SNAPSHOT: recording p directly would alias the thing under audit.
-		scribble(p)
-	}
+			observe := func(who string, p PreparedAttempt) {
+				seen[who] = clonePrepared(p) // a SNAPSHOT: recording p would alias the thing under audit.
+				scribble(p)
+			}
 
-	// The authorizer keeps its own reference and mutates it LATER, once the lifecycle is under way.
-	// Nothing else can detect a missing clone at the authorization boundary, because the very next seam
-	// clones defensively and hides it.
-	var retained PreparedAttempt
-	authorize := h.deps.Authorize
-	h.deps.Authorize = func() (PreparedAttempt, error) {
-		p, err := authorize()
-		retained = p
-		return p, err
-	}
+			// The authorizer keeps its own reference and mutates it LATER, once the lifecycle is under
+			// way. Nothing else can detect a missing clone at the authorization boundary, because the
+			// very next seam clones defensively and hides it.
+			var retained PreparedAttempt
+			authorize := h.deps.Authorize
+			h.deps.Authorize = func() (PreparedAttempt, error) {
+				p, err := authorize()
+				retained = p
+				return p, err
+			}
 
-	publishIntent, arm := h.deps.PublishIntent, h.deps.ArmContainment
-	bind, reauth := h.deps.BindActive, h.deps.Reauthorize
+			var reportedDigest string
+			publishIntent, arm := h.deps.PublishIntent, h.deps.ArmContainment
+			bind, confirmBind := h.deps.BindActive, h.deps.ConfirmBind
+			reauth, observeID := h.deps.Reauthorize, h.deps.ObserveIdentity
+			publishResult, finalize := h.deps.PublishResult, h.deps.FinalizeOutcome
+			confirmFin := h.deps.ConfirmFinalize
+			h.deps.PublishIntent = func(p PreparedAttempt) (string, error) {
+				observe("intent publication", p)
+				scribble(retained) // the authorizer, reaching back through the value it handed over
+				d, err := publishIntent(p)
+				reportedDigest = d
+				return d, err
+			}
+			h.deps.ArmContainment = func(p PreparedAttempt) (Containment, error) {
+				observe("arming", p)
+				return arm(p)
+			}
+			h.deps.BindActive = func(p PreparedAttempt) (CommitStatus, error) {
+				observe("binding", p)
+				return bind(p)
+			}
+			h.deps.ConfirmBind = func(p PreparedAttempt) (CommitStatus, error) {
+				observe("bind confirmation", p)
+				return confirmBind(p)
+			}
+			h.deps.Reauthorize = func(p PreparedAttempt) error {
+				observe("re-authorization", p)
+				return reauth(p)
+			}
+			h.deps.ObserveIdentity = func(p PreparedAttempt, term Terminal) (Identity, error) {
+				observe("identity observation", p)
+				return observeID(p, term)
+			}
+			h.deps.PublishResult = func(p PreparedAttempt, term Terminal, id Identity) (string, error) {
+				observe("result publication", p)
+				return publishResult(p, term, id)
+			}
+			h.deps.FinalizeOutcome = func(p PreparedAttempt, term Terminal, id Identity, digest string) (CommitStatus, error) {
+				observe("finalization", p)
+				return finalize(p, term, id, digest)
+			}
+			h.deps.ConfirmFinalize = func(p PreparedAttempt, term Terminal, id Identity, digest string) (FinalizeConfirmation, error) {
+				observe("finalize confirmation", p)
+				return confirmFin(p, term, id, digest)
+			}
+
+			res, err := Run(h.deps)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			seen["the returned result"] = res.Prepared
+			for _, who := range tc.expect {
+				got, ok := seen[who]
+				if !ok {
+					t.Fatalf("%s was never audited; the coverage claim is wider than the test: %v", who, keysOf(seen))
+				}
+				if !slices.Equal(got.Spec.Argv, theSpec.Argv) {
+					t.Fatalf("%s received argv %q, want the authorized %q", who, got.Spec.Argv, theSpec.Argv)
+				}
+				if got.Spec.Cwd != theSpec.Cwd {
+					t.Fatalf("%s received cwd %q, want %q", who, got.Spec.Cwd, theSpec.Cwd)
+				}
+				if !reflect.DeepEqual(got.Spec.Env, theSpec.Env) {
+					t.Fatalf("%s received a mutated environment: %+v", who, got.Spec.Env)
+				}
+			}
+			// PUBLISHED and ARMED must both be the authorized execution. Asserting only the second would
+			// leave the two free to differ - a green test with the intent describing command B while
+			// command A runs. The digest the publisher REPORTED must therefore still describe the bytes
+			// its own recorder snapshotted.
+			if reportedDigest != seen["intent publication"].IntentDigest {
+				t.Fatalf("the publisher reported digest %q for the bytes %q", reportedDigest, seen["intent publication"].IntentDigest)
+			}
+			// And the package fixture is untouched, or every other test here has been running on corrupt
+			// data.
+			if !slices.Equal(theSpec.Argv, []string{"go", "test", "./..."}) {
+				t.Fatalf("the shared fixture was mutated: %q", theSpec.Argv)
+			}
+		})
+	}
+}
+
+func keysOf(m map[string]PreparedAttempt) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal.
+//
+// The exit fact is checked for agreement with the verdict ONCE, at acceptance. While it travelled as a
+// pointer, an identity collaborator could set the pointed value to 17 after ok-with-0 had been accepted:
+// outcome derivation still produced a pass, result publication recorded a command that failed, and
+// nothing downstream could notice, because the ledger does not store the exit code. The runner's own
+// copy of that pointer was live the whole time too. The audit that caught this class for the prepared
+// value never touched the terminal.
+func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
+	h := newHarness(t)
+	accepted := Terminal{
+		Execution: theTerminal.Execution, TerminalReason: theTerminal.TerminalReason,
+		HasExitCode: true, ExitCode: 0,
+	}
+	h.cont.term = accepted
+
+	seen := map[string]Terminal{}
 	observeID, publishResult := h.deps.ObserveIdentity, h.deps.PublishResult
-	h.deps.PublishIntent = func(p PreparedAttempt) (string, error) {
-		observe("intent publication", p)
-		scribble(retained) // the authorizer, reaching back through the value it handed over
-		return publishIntent(p)
-	}
-	h.deps.ArmContainment = func(p PreparedAttempt) (Containment, error) {
-		observe("arming", p)
-		return arm(p)
-	}
-	h.deps.BindActive = func(p PreparedAttempt) (CommitStatus, error) {
-		observe("binding", p)
-		return bind(p)
-	}
-	h.deps.Reauthorize = func(p PreparedAttempt) error {
-		observe("re-authorization", p)
-		return reauth(p)
-	}
+	finalize := h.deps.FinalizeOutcome
 	h.deps.ObserveIdentity = func(p PreparedAttempt, term Terminal) (Identity, error) {
-		observe("identity observation", p)
+		seen["identity observation"] = term
+		term.ExitCode, term.Execution = 17, state.TestExecutionTimeout
+		term.TerminalReason = "MUTATED"
 		return observeID(p, term)
 	}
 	h.deps.PublishResult = func(p PreparedAttempt, term Terminal, id Identity) (string, error) {
-		observe("result publication", p)
+		seen["result publication"] = term
+		term.ExitCode = 17
 		return publishResult(p, term, id)
+	}
+	h.deps.FinalizeOutcome = func(p PreparedAttempt, term Terminal, id Identity, digest string) (CommitStatus, error) {
+		seen["finalization"] = term
+		return finalize(p, term, id, digest)
 	}
 
 	res, err := Run(h.deps)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	seen["the returned result"] = res.Prepared
+	seen["the returned result"] = res.Terminal
 	for who, got := range seen {
-		if !slices.Equal(got.Spec.Argv, theSpec.Argv) {
-			t.Fatalf("%s received argv %q, want the authorized %q", who, got.Spec.Argv, theSpec.Argv)
+		if got.Execution != accepted.Execution || !got.HasExitCode || got.ExitCode != 0 {
+			t.Fatalf("%s received %+v, want the accepted %+v", who, got, accepted)
 		}
-		if got.Spec.Cwd != theSpec.Cwd {
-			t.Fatalf("%s received cwd %q, want %q", who, got.Spec.Cwd, theSpec.Cwd)
-		}
-		if !reflect.DeepEqual(got.Spec.Env, theSpec.Env) {
-			t.Fatalf("%s received a mutated environment: %+v", who, got.Spec.Env)
+		if got.TerminalReason != state.CanonicalTerminalReason(accepted.TerminalReason) {
+			t.Fatalf("%s received terminal reason %q", who, got.TerminalReason)
 		}
 	}
-	// PUBLISHED and ARMED must both be the authorized execution. Asserting only the second would leave
-	// the two free to differ - a green test with the intent describing command B and command A running.
-	if len(seen) != 7 {
+	if len(seen) != 4 {
 		t.Fatalf("only %d seams were audited: %v", len(seen), seen)
 	}
-	// And the package fixture is untouched, or every other test here has been running on corrupt data.
-	if !slices.Equal(theSpec.Argv, []string{"go", "test", "./..."}) {
-		t.Fatalf("the shared fixture was mutated: %q", theSpec.Argv)
+	// The runner still holds whatever it returned, and it must not be a handle into the accepted fact.
+	if h.cont.term.ExitCode != 0 || h.cont.term.Execution != accepted.Execution {
+		t.Fatalf("the runner's own copy was rewritten: %+v", h.cont.term)
+	}
+	if res.Outcome != state.OutcomePass {
+		t.Fatalf("outcome = %q, want pass for an accepted ok/0 with an unchanged identity", res.Outcome)
 	}
 }
 
@@ -1097,6 +1224,48 @@ func TestConfirmationMustFindTHISLifecyclesOutcome(t *testing.T) {
 		h.finalizeStatus = BindUncertain
 		h.confirmFinStatus = BindCommitted
 		h.confirmFinIdentity = state.TestIdentityUnobserved
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	// The reason does not steer routing anywhere, which is exactly why it was left out of the first
+	// comparison. It is still the text a human reads to understand the verdict, so a record pairing this
+	// attempt's digest with somebody else's account of how the command ended disagrees with itself.
+	t.Run("a committed entry recording a different terminal reason", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinReason = "something else entirely"
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		if !strings.Contains(err.Error(), "terminal reason") {
+			t.Fatalf("err = %v, want it to name the field", err)
+		}
+	})
+
+	t.Run("a committed entry recording a different tested commit", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinCommit = strings.Repeat("d", 40)
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	t.Run("a committed entry recording a different tested tree", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinTree = strings.Repeat("c", 40)
 
 		_, err := Run(h.deps)
 		if !errors.Is(err, ErrRecoveryOwned) {
