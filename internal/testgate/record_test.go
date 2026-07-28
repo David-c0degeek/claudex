@@ -656,3 +656,81 @@ func TestTheWorstTerminalAccountIsWorstWHENENCODED(t *testing.T) {
 		t.Fatalf("the worst account encodes to %d, no larger than plain letters at %d", worst, letters)
 	}
 }
+
+// TestNoAdmittedResultShapeEncodesLargerThanTheGateTemplate.
+//
+// The gate's template used to fix the outcome at nonzero/unobserved/runner/255 and maximise only the
+// terminal account. The already-admitted live fault row - interrupted/unobserved/coordinator, no exit
+// code - encodes larger, because the components trade off: `interrupted` is longer than `nonzero` but
+// forbids an exit code, and `false` is longer than `true` while a short code is shorter than a long one.
+// Picking the longest of each field separately does not give the longest tuple, so it is searched.
+//
+// This test is the guard on that search: EVERY shape the boundary admits must encode no larger than the
+// one the gate chose. If a vocabulary grows, this fails rather than the gate silently under-budgeting.
+func TestNoAdmittedResultShapeEncodesLargerThanTheGateTemplate(t *testing.T) {
+	base := validRecord()
+	base.Stdout = StreamRecord{Present: true, SourceBytes: MaxRepresentableCount,
+		RedactedBytes: MaxRepresentableCount, SHA256: strings.Repeat("f", 64), Truncated: true}
+	base.Stderr = base.Stdout
+
+	chosen, err := WorstTerminalShape(base)
+	if err != nil {
+		t.Fatalf("WorstTerminalShape: %v", err)
+	}
+	sizeOf := func(sh terminalShape) int {
+		rec := base
+		rec.Execution, rec.Identity = sh.Execution, sh.Identity
+		rec.TerminalAuthor, rec.HasExitCode, rec.ExitCode = sh.Author, sh.HasExit, sh.Exit
+		rec.TerminalReason = WorstTerminalAccount()
+		raw, _, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("encoding %+v: %v", sh, err)
+		}
+		return len(raw)
+	}
+	worst := sizeOf(chosen)
+
+	shapes := AdmissibleTerminalShapes()
+	if len(shapes) == 0 {
+		t.Fatal("no admissible terminal shapes at all, so the search proves nothing")
+	}
+	for _, sh := range shapes {
+		if got := sizeOf(sh); got > worst {
+			t.Fatalf("%+v encodes to %d, larger than the chosen worst %+v at %d", sh, got, chosen, worst)
+		}
+	}
+
+	// The rows CX named are among the admitted ones, so this is not vacuous.
+	for _, want := range []terminalShape{
+		{state.TestExecutionInterrupted, state.TestIdentityUnobserved, state.TerminalByCoordinator, false, 0},
+		{state.TestExecutionInterrupted, state.TestIdentityUnobserved, state.TerminalByRecovery, false, 0},
+		{state.TestExecutionNonzero, state.TestIdentityUnobserved, state.TerminalByRunner, true, WorstExitCode},
+	} {
+		found := false
+		for _, sh := range shapes {
+			if sh == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%+v is admissible but not enumerated, so the search cannot have considered it", want)
+		}
+	}
+}
+
+// TestAnExitCodeBeyondTheEncodersRangeIsRefusedAtTheBoundary.
+//
+// Without a bound the boundary admits codes that pass every check here and fail at publication, after
+// the command has run - and a pre-attempt gate cannot budget for a value with no upper limit.
+func TestAnExitCodeBeyondTheEncodersRangeIsRefusedAtTheBoundary(t *testing.T) {
+	err := checkTerminalFacts(state.TestExecutionNonzero, state.TestIdentityUnchanged, "exited",
+		state.TerminalByRunner, true, WorstExitCode+1)
+	if err == nil || !strings.Contains(err.Error(), "canonical encoder can carry") {
+		t.Fatalf("err = %v, want a representability refusal", err)
+	}
+	if err := checkTerminalFacts(state.TestExecutionNonzero, state.TestIdentityUnchanged, "exited",
+		state.TerminalByRunner, true, WorstExitCode); err != nil {
+		t.Fatalf("the largest representable code was refused: %v", err)
+	}
+}

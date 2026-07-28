@@ -2262,3 +2262,61 @@ func TestTheBudgetIsFrozenBeforeTheAttemptAndNeverReDerived(t *testing.T) {
 		t.Fatalf("an invented budget was published: %v", h2.r.steps)
 	}
 }
+
+// TestTheGateBudgetsForTheWorstADMITTEDTerminalNotAHandPickedOne.
+//
+// The template used to fix the outcome at nonzero/unobserved/runner/255 and maximise only the account.
+// The already-admitted live fault row - interrupted/unobserved/coordinator with no exit code - encodes
+// larger, so at a ceiling where the hand-picked template leaves exactly the minimum excerpt, that real
+// terminal shape can run and then fail the final fit check. The late-fit hole, still open.
+//
+// The ceiling is COMPUTED from the production pieces: the largest one at which a hand-picked template
+// would still pass. The real gate must refuse there.
+func TestTheGateBudgetsForTheWorstADMITTEDTerminalNotAHandPickedOne(t *testing.T) {
+	view, err := preparedShape.Spec.View()
+	if err != nil {
+		t.Fatalf("View: %v", err)
+	}
+	template := func(sh terminalShape) ResultRecord {
+		return ResultRecord{
+			SchemaVersion: ResultRecordVersion, AttemptID: preparedShape.AttemptID,
+			TestedCommit: preparedShape.TestedCommit, TestedTree: preparedShape.TestedTree,
+			View: view, SpecDigest: preparedShape.Spec.Digest,
+			Execution: sh.Execution, Identity: sh.Identity, TerminalAuthor: sh.Author,
+			HasExitCode: sh.HasExit, ExitCode: sh.Exit,
+			TerminalReason: WorstTerminalAccount(),
+			Stdout:         worstStream(), Stderr: worstStream(),
+		}
+	}
+	handPicked := terminalShape{state.TestExecutionNonzero, state.TestIdentityUnobserved,
+		state.TerminalByRunner, true, 255}
+
+	// The smallest ceiling at which the HAND-PICKED template still leaves the minimum excerpt.
+	smallestAccepting := func(rec ResultRecord) uint64 {
+		lo, hi := uint64(1), uint64(1<<20)
+		for lo < hi {
+			mid := lo + (hi-lo)/2
+			if b, err := ExcerptBudget(rec, mid); err == nil && b >= MinRetainedExcerptBytes {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		return lo
+	}
+	ceiling := smallestAccepting(template(handPicked))
+
+	// The hand-picked shape accepts here...
+	if b, err := ExcerptBudget(template(handPicked), ceiling); err != nil || b < MinRetainedExcerptBytes {
+		t.Fatalf("the hand-picked template does not accept at %d: budget=%d err=%v", ceiling, b, err)
+	}
+	// ...and the real gate, which must budget for the worst ADMITTED shape, must not.
+	p := preparedShape
+	p.MaxRecordBytes = ceiling
+	if b, derr := deriveEffectiveOutputBudget(p); derr == nil {
+		p.EffectiveOutputBudget = b
+	}
+	if err := checkAttemptCanProduceAStorableRecord(p); err == nil {
+		t.Fatalf("the gate accepts a %d-byte ceiling that only a hand-picked terminal shape fits", ceiling)
+	}
+}

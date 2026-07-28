@@ -875,15 +875,21 @@ func deriveEffectiveOutputBudget(prep PreparedAttempt) (uint64, error) {
 		TestedTree:     prep.TestedTree,
 		View:           view,
 		SpecDigest:     prep.Spec.Digest,
-		Execution:      state.TestExecutionNonzero,
-		Identity:       state.TestIdentityUnobserved,
 		TerminalReason: WorstTerminalAccount(),
-		TerminalAuthor: state.TerminalByRunner,
-		HasExitCode:    true,
-		ExitCode:       255,
 		Stdout:         worstStream(),
 		Stderr:         worstStream(),
 	}
+	// The worst whole TUPLE, searched over the production vocabularies rather than hand-picked. Fixing
+	// the outcome and maximising only the account left the already-admitted live fault row
+	// interrupted/unobserved/coordinator/no-exit eight bytes larger than the template, so an attempt
+	// could pass this gate, run, and then fail the exact check afterwards - which is the hole the gate
+	// exists to close.
+	shape, err := WorstTerminalShape(worst)
+	if err != nil {
+		return 0, err
+	}
+	worst.Execution, worst.Identity = shape.Execution, shape.Identity
+	worst.TerminalAuthor, worst.HasExitCode, worst.ExitCode = shape.Author, shape.HasExit, shape.Exit
 	derived, err := ExcerptBudget(worst, prep.MaxRecordBytes)
 	if err != nil {
 		return 0, err

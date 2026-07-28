@@ -348,6 +348,12 @@ func checkTerminalFacts(e state.TestExecution, id state.TestIdentity, reason str
 		if exit < 0 {
 			return fmt.Errorf("%w: %q reported the impossible exit code %d", ErrLifecycle, e, exit)
 		}
+		// Bounded by what the canonical encoder can carry. Without this the boundary admits codes that
+		// encode fine here and fail at publication, after the command has run - and the pre-attempt gate
+		// cannot budget for a value with no upper limit.
+		if uint64(exit) > MaxRepresentableCount {
+			return fmt.Errorf("%w: exit code %d is outside the range the canonical encoder can carry", ErrLifecycle, exit)
+		}
 	default:
 		// A timeout, a cancel, a spawn failure and an interruption all end without the command
 		// reporting anything, so a code here would be invented.
@@ -556,3 +562,79 @@ func sha256Hex(b []byte) string {
 
 // isSHA256 is the record boundary's view of the one digest grammar.
 func isSHA256(s string) bool { return state.IsSHA256Hex(s) }
+
+// WorstExitCode is the largest exit code the boundary admits, and therefore the longest one to encode.
+const WorstExitCode = int(MaxRepresentableCount)
+
+// terminalShape is one admissible combination of the facts a result records about how a command ended.
+type terminalShape struct {
+	Execution state.TestExecution
+	Identity  state.TestIdentity
+	Author    state.TerminalAuthor
+	HasExit   bool
+	Exit      int
+}
+
+// AdmissibleTerminalShapes enumerates every terminal tuple the boundary accepts, from the PRODUCTION
+// vocabularies.
+//
+// It is a search rather than a list because a hand-picked template is only worst until somebody adds a
+// vocabulary member. The gate that uses it then silently under-budgets for exactly the row that was
+// added, which is how an outcome fixed at nonzero/runner/255 came to miss the live fault row
+// interrupted/coordinator/no-exit - eight bytes larger, and already admitted.
+func AdmissibleTerminalShapes() []terminalShape {
+	var out []terminalShape
+	for _, e := range state.AllTestExecutions() {
+		for _, id := range state.AllTestIdentities() {
+			for _, a := range state.AllTerminalAuthors() {
+				for _, exit := range []struct {
+					has  bool
+					code int
+				}{{false, 0}, {true, 0}, {true, WorstExitCode}} {
+					sh := terminalShape{e, id, a, exit.has, exit.code}
+					if err := checkTerminalFacts(e, id, "x", a, exit.has, exit.code); err != nil {
+						continue
+					}
+					out = append(out, sh)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// WorstTerminalShape is the admissible tuple whose canonical encoding is largest, measured against the
+// record it will actually appear in.
+//
+// Measured rather than reasoned about: the components trade off - `interrupted` is longer than `nonzero`
+// but forbids an exit code, and `false` is longer than `true` while `0` is shorter than a long code - so
+// picking the longest of each field separately does not give the longest tuple.
+func WorstTerminalShape(rec ResultRecord) (terminalShape, error) {
+	var best terminalShape
+	var lastErr error
+	bestLen := -1
+	for _, sh := range AdmissibleTerminalShapes() {
+		probe := rec
+		probe.Execution, probe.Identity = sh.Execution, sh.Identity
+		probe.TerminalAuthor, probe.HasExitCode, probe.ExitCode = sh.Author, sh.HasExit, sh.Exit
+		probe.TerminalReason = WorstTerminalAccount()
+		raw, _, err := probe.Encode()
+		if err != nil {
+			// KEPT, not discarded. When no shape encodes it is because the record is unencodable for a
+			// reason that has nothing to do with the terminal - a missing argv, say - and reporting "no
+			// admissible shape" would hide the actual defect behind a message about this search.
+			lastErr = err
+			continue
+		}
+		if len(raw) > bestLen {
+			best, bestLen = sh, len(raw)
+		}
+	}
+	if bestLen < 0 {
+		if lastErr != nil {
+			return terminalShape{}, lastErr
+		}
+		return terminalShape{}, fmt.Errorf("%w: no admissible terminal shape encodes at all", ErrLifecycle)
+	}
+	return best, nil
+}
