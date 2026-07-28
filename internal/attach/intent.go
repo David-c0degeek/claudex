@@ -29,9 +29,12 @@ const intentKind = "bootstrap"
 // bootstrapIntentVersion is the bootstrap PAYLOAD schema version, independent of the txn
 // envelope version. It is bumped whenever the persisted BootstrapIntent shape changes in a way
 // an older reader cannot honor (a durable required-field change is a version change).
-// Version 1 is the first explicitly-versioned shape and carries PairJoinOperationID; a payload
-// with any other version (including a pre-versioning payload that decodes to 0) is refused.
-const bootstrapIntentVersion = 1
+// Version 1 is the first explicitly-versioned shape and carries PairJoinOperationID.
+// Version 2 adds the REQUIRED ResolvedExecution: the environment the mechanical test gate will run
+// with, frozen once here so no attempt and no recovery re-reads ambient values afterwards. It is a
+// durable required-field change, so it is a version change; a payload with any other version
+// (including a pre-versioning payload that decodes to 0) is refused.
+const bootstrapIntentVersion = 2
 
 // ErrBootstrapIntentVersion means a bootstrap journal payload is not the current schema version.
 // Migration of an older bootstrap is intentionally out of scope: the run must be re-bootstrapped
@@ -83,6 +86,12 @@ type BootstrapIntent struct {
 	// The effective policy, carried so state-init is deterministic without
 	// re-deriving it; its canonical serialization is PolicyCanonical.
 	EffectivePolicy config.RunPolicy `json:"effective_policy"`
+
+	// ResolvedExecution is the environment the test gate will run with, resolved from the host ONCE
+	// here. It is separate from EffectivePolicy because the invariant above requires the policy to
+	// equal its own parsed snapshot exactly — host values inside it would break the proof that the
+	// frozen policy is the document the operator supplied.
+	ResolvedExecution config.ResolvedExecution `json:"resolved_execution"`
 
 	// Frozen workspace identity (resolved read-only during preparation). The
 	// worktree is addressed by a run-relative locator + a run branch, never an
@@ -213,6 +222,14 @@ func (in BootstrapIntent) validate() error {
 	}
 	if err := config.ValidateEffective(task, policy); err != nil {
 		return fmt.Errorf("attach: intent task/policy: %w", err)
+	}
+	// The resolved environment must be authorized by the very gate this intent froze, and must fit the
+	// ceilings, BEFORE anything is journaled. An inherited value is not bounded by the 16 KiB policy
+	// source — it comes from the host — while the transaction payload caps at 64 KiB, so a small policy
+	// could otherwise resolve to an intent that cannot be written, discovered only once the run was
+	// already being created.
+	if err := in.ResolvedExecution.ValidateFor(policy.TestGate, config.HostGOOS()); err != nil {
+		return fmt.Errorf("attach: intent resolved_execution: %w", err)
 	}
 	if in.Base != policy.BaseBranch {
 		return fmt.Errorf("attach: intent base must equal the policy base branch")

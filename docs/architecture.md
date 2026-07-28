@@ -44,12 +44,21 @@ truth.
 A run's inputs are explicit and frozen at bootstrap, never ambient. The first
 `attach` resolves a **versioned task-contract file** (goal, desired behaviour,
 scope, non-goals, acceptance criteria, required tests, relevant files) and a
-**config / run-policy** (mechanical `test_command`, observable caps, timeouts,
+**config / run-policy** (the mechanical test gate, observable caps, timeouts,
 evidence limits, base/repo policy) from a config file + flags, validates both,
 hashes and copies them into the run directory, and persists the **effective run
 policy** into run state. Later config edits cannot change a live run.
 `internal/config` owns parse/default/validate; `internal/state` persists the
 frozen policy and the task-contract hash.
+
+At run-policy v2 the gate is exactly one of an explicit `argv` vector or
+`disabled: true` — never a command string, which would need a splitter and
+therefore an implicit shell — and it carries the environment it is authorized to
+run with (`env{inherit,set}`). Attach resolves that environment from the host
+ONCE and persists the frozen result as `ResolvedExecution`; attempts and recovery
+read it from state and never re-read ambient values. `HOME` is deliberately not
+inherited, and a closed platform-required set is part of the authority rather
+than something resolution adds. See D016.
 
 ## Transport protocol (D001, D004)
 

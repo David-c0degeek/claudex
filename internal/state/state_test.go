@@ -53,6 +53,17 @@ func evidenceFor(phase Phase, rs *RunState) *GitCommitEvidence {
 	return nil
 }
 
+// testResolved is the frozen environment a bootstrap would have produced for pol on this host. Tests
+// build it through the real resolver rather than hand-writing one, so a change to the authority model
+// shows up here instead of being papered over by a fixture.
+func testResolved(pol config.RunPolicy) config.ResolvedExecution {
+	re, err := config.ResolveForRun(pol.TestGate, config.HostGOOS(), config.NoAmbientEnv, ".claudex/runs/run-a")
+	if err != nil {
+		panic(err)
+	}
+	return re
+}
+
 // initState populates a valid first-generation run state.
 func initState(next *RunState) {
 	next.RunID = "run-a"
@@ -64,6 +75,7 @@ func initState(next *RunState) {
 	pol := config.DefaultRunPolicy()
 	pol.TestGate = config.TestGate{Disabled: true} // explicit, per state boundary
 	next.EffectivePolicy = pol
+	next.ResolvedExecution = testResolved(pol)
 	next.FS = FSResult{Class: "supported-local", Reason: "local fixed drive"}
 	next.Base = pol.BaseBranch // == effective policy base branch
 	next.BaseCommit = hex40()
@@ -272,7 +284,7 @@ func TestSecretInControlFieldRejected(t *testing.T) {
 		{"an env value", func(rs *RunState) {
 			rs.EffectivePolicy.TestGate = config.TestGate{
 				Argv: []string{"go", "test"},
-				Env:  config.TestGateEnv{Set: map[string]string{"TOKEN": secret}},
+				Env:  config.TestGateEnv{Set: []config.EnvAssignment{{Name: "TOKEN", Value: secret}}},
 			}
 		}},
 	} {

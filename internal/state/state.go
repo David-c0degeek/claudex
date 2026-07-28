@@ -50,8 +50,12 @@ import (
 // half-upgraded shape where some read-only assignments carry a binding and others
 // do not.
 //
-// v8 added the mechanical test gate's attempt identity: the at-most-one
-// ActiveTestAttempt and the append-only TestAttempts ledger. Before it, RunState
+// v8 added the mechanical test gate's attempt identity — the at-most-one
+// ActiveTestAttempt and the append-only TestAttempts ledger — together with
+// ResolvedExecution, the environment the gate runs with, frozen at first attach.
+// The three land in one version because each is a required authority the others
+// assume: an attempt with no frozen environment could execute differently on
+// recovery than it was authorized to. Before it, RunState
 // could say a run was in TESTS but not WHICH run of the tests, so a runner
 // finishing after a crash had nothing to prove it was finalizing its own attempt
 // and an outcome could not be tied to the tree it was a statement about. It lands
@@ -306,39 +310,44 @@ type PauseContext struct {
 // RunState is the authoritative typed state of a run. Absent refs/projections are
 // nil (distinct from a present all-zero record).
 type RunState struct {
-	SchemaVersion   int                     `json:"schema_version"`
-	RunID           string                  `json:"run_id"`
-	Revision        uint64                  `json:"revision"`
-	Lifecycle       Lifecycle               `json:"lifecycle"`
-	Phase           Phase                   `json:"phase"`
-	CreatedUnix     int64                   `json:"created_unix"`
-	StartedUnix     int64                   `json:"started_unix"`
-	DeadlineUnix    int64                   `json:"deadline_unix"`
-	TaskSnapshot    SnapshotRef             `json:"task_snapshot"`
-	PolicySnapshot  SnapshotRef             `json:"policy_snapshot"`
-	EffectivePolicy config.RunPolicy        `json:"effective_policy"`
-	FS              FSResult                `json:"fs"`
-	Base            string                  `json:"base"`
-	BaseCommit      string                  `json:"base_commit"`
-	WorktreeRelPath string                  `json:"worktree_rel_path"`
-	RunBranch       string                  `json:"run_branch"`
-	Counters        Counters                `json:"counters"`
-	Assignment      *Ref                    `json:"assignment,omitempty"`
-	Evidence        *AssignmentEvidence     `json:"evidence,omitempty"`
-	FirstTurn       *Ref                    `json:"first_turn,omitempty"`
-	Gate            *Ref                    `json:"gate,omitempty"`
-	CandidatePlan   *PlanRef                `json:"candidate_plan,omitempty"`
-	CandidateChecks *CheckSetRef            `json:"candidate_checks,omitempty"`
-	PendingFindings *FindingObligations     `json:"pending_findings,omitempty"`
-	AgreedPlan      *PlanAgreement          `json:"agreed_plan,omitempty"`
-	StepIndex       *int                    `json:"step_index,omitempty"`
-	FixReturn       Phase                   `json:"fix_return,omitempty"`
-	Verify          *VerifyRequirement      `json:"verify,omitempty"`
-	Pause           *PauseContext           `json:"pause,omitempty"`
-	AcceptedTurns   map[string]AcceptedTurn `json:"accepted_turns"`
-	PendingTxnID    string                  `json:"pending_txn_id"`
-	Recovery        *Projection             `json:"recovery,omitempty"`
-	Failure         *Projection             `json:"failure,omitempty"`
+	SchemaVersion   int              `json:"schema_version"`
+	RunID           string           `json:"run_id"`
+	Revision        uint64           `json:"revision"`
+	Lifecycle       Lifecycle        `json:"lifecycle"`
+	Phase           Phase            `json:"phase"`
+	CreatedUnix     int64            `json:"created_unix"`
+	StartedUnix     int64            `json:"started_unix"`
+	DeadlineUnix    int64            `json:"deadline_unix"`
+	TaskSnapshot    SnapshotRef      `json:"task_snapshot"`
+	PolicySnapshot  SnapshotRef      `json:"policy_snapshot"`
+	EffectivePolicy config.RunPolicy `json:"effective_policy"`
+	// ResolvedExecution is the environment the mechanical test gate runs with, frozen at first attach
+	// and bound here from the completed bootstrap intent. Attempts AND recovery read it from STATE and
+	// never re-derive it, so a recovered attempt cannot silently execute in a different environment
+	// than the one that was authorized.
+	ResolvedExecution config.ResolvedExecution `json:"resolved_execution"`
+	FS                FSResult                 `json:"fs"`
+	Base              string                   `json:"base"`
+	BaseCommit        string                   `json:"base_commit"`
+	WorktreeRelPath   string                   `json:"worktree_rel_path"`
+	RunBranch         string                   `json:"run_branch"`
+	Counters          Counters                 `json:"counters"`
+	Assignment        *Ref                     `json:"assignment,omitempty"`
+	Evidence          *AssignmentEvidence      `json:"evidence,omitempty"`
+	FirstTurn         *Ref                     `json:"first_turn,omitempty"`
+	Gate              *Ref                     `json:"gate,omitempty"`
+	CandidatePlan     *PlanRef                 `json:"candidate_plan,omitempty"`
+	CandidateChecks   *CheckSetRef             `json:"candidate_checks,omitempty"`
+	PendingFindings   *FindingObligations      `json:"pending_findings,omitempty"`
+	AgreedPlan        *PlanAgreement           `json:"agreed_plan,omitempty"`
+	StepIndex         *int                     `json:"step_index,omitempty"`
+	FixReturn         Phase                    `json:"fix_return,omitempty"`
+	Verify            *VerifyRequirement       `json:"verify,omitempty"`
+	Pause             *PauseContext            `json:"pause,omitempty"`
+	AcceptedTurns     map[string]AcceptedTurn  `json:"accepted_turns"`
+	PendingTxnID      string                   `json:"pending_txn_id"`
+	Recovery          *Projection              `json:"recovery,omitempty"`
+	Failure           *Projection              `json:"failure,omitempty"`
 	// ActiveTestAttempt is the at-most-one mechanical test attempt this run currently owns.
 	//
 	// Without it RunState has no attempt identity whatsoever: engine.Apply records no TESTS source, so

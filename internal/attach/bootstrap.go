@@ -551,6 +551,14 @@ func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy con
 		return BootstrapIntent{}, fmt.Errorf("attach: resolve base: %w", err)
 	}
 
+	// The environment is resolved ONCE, here, from the host — before anything is journaled, so a policy
+	// whose resolved environment cannot be carried is refused while the run does not yet exist. The
+	// scratch directories are run-relative and tool-owned: HOME is not inherited, so tools that insist
+	// on one get a directory inside the run rather than the operator's.
+	resolved, rerr := config.ResolveForRun(policy.TestGate, config.HostGOOS(), os.LookupEnv, relDir)
+	if rerr != nil {
+		return BootstrapIntent{}, fmt.Errorf("attach: resolve execution environment: %w", rerr)
+	}
 	in := BootstrapIntent{
 		SchemaVersion:           bootstrapIntentVersion,
 		RunID:                   runID,
@@ -568,6 +576,7 @@ func prepare(ctx context.Context, lay layout, req FirstAttachRequest, policy con
 		PolicyDigest:            config.Hash(req.PolicyCanonical),
 		PolicyCanonical:         req.PolicyCanonical,
 		EffectivePolicy:         policy,
+		ResolvedExecution:       resolved,
 		Base:                    policy.BaseBranch,
 		BaseCommit:              baseCommit,
 		WorktreeRelPath:         relDir + "/worktree",

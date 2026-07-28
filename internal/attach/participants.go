@@ -425,6 +425,11 @@ func initRunState(next *state.RunState, in BootstrapIntent) {
 	next.TaskSnapshot = state.SnapshotRef{RelPath: in.TaskRelPath, Digest: in.TaskDigest}
 	next.PolicySnapshot = state.SnapshotRef{RelPath: in.PolicyRelPath, Digest: in.PolicyDigest}
 	next.EffectivePolicy = in.EffectivePolicy
+	// Bound from the COMPLETED intent, never re-derived. Re-resolving here would read the host a second
+	// time, so a value that had changed between preparing the intent and applying it would be adopted
+	// silently — which is the drift freezing exists to prevent, arriving through the code that is
+	// supposed to freeze it.
+	next.ResolvedExecution = in.ResolvedExecution
 	next.FS = state.FSResult{Class: in.FSClass, Reason: in.FSReason, Acknowledged: in.FSAck}
 	next.Base = in.Base
 	next.BaseCommit = in.BaseCommit

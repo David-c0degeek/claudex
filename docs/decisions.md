@@ -115,9 +115,48 @@ The first `attach` (the sole bootstrap, D003) resolves:
 - a **versioned task-contract file** (the harvested `TASK_CONTRACT` shape: goal,
   desired behaviour, scope, non-goals, acceptance criteria, required tests,
   relevant files) — required, with a documented default location/flag;
-- a **config / run-policy** (from a config file + flags): the mechanical
-  `test_command`, the observable caps (turn/fix counts, artifact bytes, wall
-  time), timeouts, evidence limits, and base/repo policy.
+- a **config / run-policy** (from a config file + flags): the mechanical test
+  gate, the observable caps (turn/fix counts, artifact bytes, wall time),
+  timeouts, evidence limits, and base/repo policy.
+
+**Amendment (run-policy v2, subject 04.5).** The gate was originally a single
+`test_command` string. A string has to be split by somebody, and every candidate
+splitter is either a shell — which would give the gate an implicit interpreter
+and its whole injection surface — or a quoting dialect that differs between
+platforms. It is now **exactly one of** a non-empty `argv` vector or an explicit
+`disabled: true`; a shell must be NAMED to be used (`["sh","-c","…"]`), and
+empty later arguments are preserved because dropping one changes what ran.
+
+The amendment also closes a gap the original contract left open. "Inputs are
+never ambient" was true of the task and the policy and silently false of the
+ENVIRONMENT the command ran in, which was whatever the host happened to hold.
+The gate therefore carries `env{inherit,set}`: `inherit` names variables whose
+values are taken from the host **once, at first attach**, and `set` states values
+outright. Naming a variable makes inheritance intentional; **resolving it at
+attach** is what freezes the value, and the frozen result is persisted as
+`ResolvedExecution` — a shape SEPARATE from the effective policy, because the
+bootstrap intent requires the policy to equal its own parsed snapshot exactly.
+
+Two consequences are part of the contract rather than implementation detail:
+
+- **`HOME` is not inherited by default.** Git, npm and cloud tooling load
+  credential-bearing configuration from it, so inheriting it would have
+  contradicted this project's own "no provider token" rule. The run supplies a
+  tool-owned per-run scratch `HOME`/cache/temp inside the run directory.
+- **A closed, enumerated platform-required set** (`ComSpec`, `PATHEXT`,
+  `SystemRoot` on Windows; nothing extra elsewhere) is part of the authority,
+  not something resolution adds. Recording an implicitly added value would not
+  make it policy-authorized, and putting the names in the DEFAULT would make one
+  document parse differently per host. The authorized allowlist is
+  `env.inherit` ∪ the platform set, and every resolved name is validated against
+  that union.
+
+Three ceilings join the caps — `max_test_attempts`, `max_test_output_bytes` and
+`max_test_record_bytes` — and they are **cross-validated**, not merely present:
+`max_test_record_bytes <= evidence_max_file_bytes`, because a result is issued to
+the verifier as a file inside an evidence packet, so a record ceiling above the
+packet's per-file ceiling would describe a run whose outcome exists and cannot be
+shown to the party who has to review it.
 
 `attach` validates both, hashes and copies them into the run directory, and
 persists the **effective run policy** into run state so later config edits cannot
@@ -125,8 +164,8 @@ change a live run (frozen-at-bootstrap). `internal/config` owns parsing,
 defaulting, and validation; `internal/state` persists the frozen policy + the
 task-contract hash. An `init` command that scaffolds a task/config file is
 optional sugar; the input *source* is mandatory. This closes the orphaned
-`TASK_CONTRACT` and gives `test_command`/caps/timeouts a definite owner before
-subject 01 shapes state.
+`TASK_CONTRACT` and gives the test gate, caps and timeouts a definite owner
+before subject 01 shapes state.
 
 ### Implementation notes (00.4 research — decisions locked for subject 01)
 - **Advisory locks with death-semantics** — an OS-held advisory lock is released

@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/evidence"
@@ -76,19 +75,69 @@ const (
 	UnknownFSAcknowledge UnknownFSPolicy = "acknowledge" // proceed at operator's risk
 )
 
+// PlatformRequiredEnv is the fixed set of names the OPERATING SYSTEM requires for a process to start
+// and for executable lookup to work, per GOOS. It is part of the authority model, not an addition made
+// during resolution.
+//
+// The distinction is the whole point of naming it here (TURN-268 pin 5). An earlier draft had the
+// default allowlist contain only PATH and had resolution quietly add SystemRoot, ComSpec and PATHEXT on
+// Windows. That contradicted this package's own claim that nothing unnamed reaches the command:
+// recording an implicitly added value does not make it policy-authorized, and it let resolution enlarge
+// the effective policy. The alternative — putting them in the DEFAULT — is worse in a different way,
+// because then one policy document would parse to different values on different hosts and the
+// bootstrap intent's parse-equality invariant could not hold.
+//
+// So they are neither defaulted nor injected: they are ENUMERATED, closed, and not operator-
+// configurable. The authorized allowlist is `env.inherit` ∪ PlatformRequiredEnv[GOOS], every resolved
+// name is validated against that union, and an operator naming one of them explicitly is redundant
+// rather than an error.
+//
+// PATHEXT is present on Windows because executable lookup consults it; its absence was a real defect
+// found earlier, not a completeness gesture.
+var PlatformRequiredEnv = map[string][]string{
+	"windows": {"ComSpec", "PATHEXT", "SystemRoot"},
+	// Unix needs nothing beyond what the operator names; PATH is already the default.
+}
+
+// PlatformRequired returns the enumerated platform set for a GOOS, sorted and never nil.
+func PlatformRequired(goos string) []string {
+	names := PlatformRequiredEnv[goos]
+	out := make([]string, len(names))
+	copy(out, names)
+	return out
+}
+
+// EnvAssignment is one explicitly stated environment entry.
+//
+// It is an OBJECT with name and value fields rather than a JSON map entry, and that is forced by a real
+// conflict rather than preference. The strict reader rejects any object key that is not canonical
+// lower-case, at every depth — which is what stops a case variant aliasing a schema field, since Go's
+// decoder matches keys case-insensitively. Environment names are conventionally UPPER-case, so as a map
+// `{"set":{"PATH":"..."}}` could never be accepted: the check would fire on the name before any
+// environment rule was reached. Teaching that walker where data begins would give a deliberately total
+// check a set of exemptions, which is how such a check quietly stops applying. Moving the data into
+// values keeps the walker dumb and correct.
+type EnvAssignment struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 // TestGateEnv is the environment the mechanical test command is authorized to run with.
 //
 // It exists because naming what the command may see is the only way the environment can be a frozen
 // input rather than an ambient one. Inherit lists the variables whose values are taken from the host
-// AT FIRST ATTACH and frozen from then on; Set supplies values the policy states outright. Anything not
-// named here does not reach the command.
+// AT FIRST ATTACH and frozen from then on; Set supplies values the policy states outright. Nothing
+// reaches the command except what is named here and the enumerated PlatformRequiredEnv set below.
 //
 // HOME is deliberately NOT in the default allowlist. Git, npm and cloud tooling load credential-bearing
 // configuration from it, so inheriting it by default would have contradicted this contract's own
 // "no provider token" rule; the run supplies a tool-owned per-run scratch HOME instead.
 type TestGateEnv struct {
-	Inherit []string          `json:"inherit"`
-	Set     map[string]string `json:"set"`
+	Inherit []string `json:"inherit"`
+	// Set preserves document order. Order is not semantic — duplicates are refused, so no entry can be
+	// shadowed by another — but it is preserved so a re-parse of the same bytes compares equal to the
+	// frozen policy, which BootstrapIntent requires.
+	Set []EnvAssignment `json:"set"`
 }
 
 // MarshalJSON renders absent collections as empty ones rather than null.
@@ -102,15 +151,15 @@ type TestGateEnv struct {
 // "Absent" and "empty" mean the same thing here — no variables — so collapsing them loses nothing.
 func (e TestGateEnv) MarshalJSON() ([]byte, error) {
 	type wire struct {
-		Inherit []string          `json:"inherit"`
-		Set     map[string]string `json:"set"`
+		Inherit []string        `json:"inherit"`
+		Set     []EnvAssignment `json:"set"`
 	}
 	w := wire{Inherit: e.Inherit, Set: e.Set}
 	if w.Inherit == nil {
 		w.Inherit = []string{}
 	}
 	if w.Set == nil {
-		w.Set = map[string]string{}
+		w.Set = []EnvAssignment{}
 	}
 	return json.Marshal(w)
 }
@@ -209,7 +258,7 @@ func DefaultRunPolicy() RunPolicy {
 		// platform could not be validated on another. The platform-required set therefore belongs to
 		// resolution, where it is recorded in ResolvedExecution and bound like every other resolved
 		// value, rather than to the portable policy document.
-		TestGate: TestGate{Env: TestGateEnv{Inherit: []string{"PATH"}, Set: map[string]string{}}},
+		TestGate: TestGate{Env: TestGateEnv{Inherit: []string{"PATH"}, Set: []EnvAssignment{}}},
 		Limits: Limits{
 			MaxArtifactBytesPerSubmit: 262144,
 			MaxRunTurns:               200,
@@ -334,6 +383,16 @@ func ParseRunPolicy(data []byte) (RunPolicy, error) {
 	}
 	if probe.SchemaVersion == nil {
 		return RunPolicy{}, fmt.Errorf("run policy: schema_version is required")
+	}
+	// The version is compared BEFORE the v2 shape is decoded, and the order is the whole remediation.
+	//
+	// Decoding first meant a genuine v1 document — one carrying `test_gate.command` — was reported as
+	// an unknown field. That tells an operator their file is malformed when in fact it is a previous
+	// version of a schema that has moved, so the one useful instruction, "this is v1, migrate it", was
+	// exactly what the error withheld.
+	if *probe.SchemaVersion != RunPolicyVersion {
+		return RunPolicy{}, fmt.Errorf("run policy: schema_version must be %d (got %d); v1 documents use test_gate.command, which v2 replaced with an explicit argv vector and env allowlist — migrate the document",
+			RunPolicyVersion, *probe.SchemaVersion)
 	}
 	rp := DefaultRunPolicy()
 	if err := strictDecode(data, &rp); err != nil {
@@ -466,22 +525,6 @@ func (g TestGate) validate() error {
 			return fmt.Errorf("test_gate.env.inherit[%d]: %w", i, err)
 		}
 	}
-	// Sorted so the error a user sees does not depend on Go's map iteration order.
-	names := make([]string, 0, len(g.Env.Set))
-	for n := range g.Env.Set {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		if err := validateEnvName(n); err != nil {
-			return fmt.Errorf("test_gate.env.set: %w", err)
-		}
-		if strings.ContainsRune(g.Env.Set[n], 0) {
-			return fmt.Errorf("test_gate.env.set[%s] contains NUL", n)
-		}
-	}
-	// A name in both halves has two answers for one variable, and which one wins would be an
-	// implementation detail rather than a stated policy.
 	inherited := make(map[string]bool, len(g.Env.Inherit))
 	for _, n := range g.Env.Inherit {
 		if inherited[n] {
@@ -489,9 +532,22 @@ func (g TestGate) validate() error {
 		}
 		inherited[n] = true
 	}
-	for _, n := range names {
-		if inherited[n] {
-			return fmt.Errorf("test_gate.env names %s in both inherit and set", n)
+	assigned := make(map[string]bool, len(g.Env.Set))
+	for i, e := range g.Env.Set {
+		if err := validateEnvName(e.Name); err != nil {
+			return fmt.Errorf("test_gate.env.set[%d]: %w", i, err)
+		}
+		if strings.ContainsRune(e.Value, 0) {
+			return fmt.Errorf("test_gate.env.set[%d] value of %s contains NUL", i, e.Name)
+		}
+		if assigned[e.Name] {
+			return fmt.Errorf("test_gate.env.set names %s twice", e.Name)
+		}
+		assigned[e.Name] = true
+		// A name in both halves has two answers for one variable, and which one wins would be an
+		// implementation detail rather than a stated policy.
+		if inherited[e.Name] {
+			return fmt.Errorf("test_gate.env names %s in both inherit and set", e.Name)
 		}
 	}
 	return nil

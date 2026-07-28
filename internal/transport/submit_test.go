@@ -75,6 +75,11 @@ func initValid(n *state.RunState) {
 	pol := config.DefaultRunPolicy()
 	pol.TestGate = config.TestGate{Disabled: true}
 	n.EffectivePolicy = pol
+	re, rerr := config.ResolveForRun(pol.TestGate, config.HostGOOS(), config.NoAmbientEnv, ".claudex/runs/run-a")
+	if rerr != nil {
+		panic(rerr)
+	}
+	n.ResolvedExecution = re
 	n.FS = state.FSResult{Class: "supported-local", Reason: "local fixed drive"}
 	n.Base = pol.BaseBranch
 	n.BaseCommit = strings.Repeat("a", 40)

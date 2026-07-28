@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -112,55 +114,62 @@ func TestParseRunPolicyValidKeepsNestedDefaults(t *testing.T) {
 	}
 }
 
+// Each case must be rejected for the reason it NAMES, so every entry asserts the error TEXT and not
+// merely that an error happened.
+//
+// Both halves of that were learned the hard way. The table once declared schema_version 1 throughout,
+// so every case was refused by the version check before reaching its own defect; and the env cases were
+// silently passing on key spelling and on a duplicate `test_gate` key rather than on the environment
+// rules they claimed to cover. An `err != nil` assertion cannot tell any of that apart.
 func TestParseRunPolicyRejections(t *testing.T) {
-	// Each case must be rejected for the reason it NAMES. Every entry therefore carries the current
-	// schema version and a valid test gate, so nothing is refused by the version check or the gate XOR
-	// on its way to the defect under test — which is what these cases looked like before the v2 bump,
-	// when they all declared schema_version 1 and would have passed while proving nothing.
 	const gate = `"test_gate":{"argv":["x"]},`
-	cases := map[string]string{
-		"empty":            ``,
-		"missing version":  `{` + gate + `"base_branch":"main"}`,
-		"bad version":      `{"schema_version":9,` + gate + `"base_branch":"main"}`,
-		"negative budget":  `{"schema_version":2,` + gate + `"budgets":{"plan_rounds":-1}}`,
-		"zero limit":       `{"schema_version":2,` + gate + `"limits":{"max_run_turns":0}}`,
-		"bad fs policy":    `{"schema_version":2,` + gate + `"unknown_fs_policy":"maybe"}`,
-		"blank base":       `{"schema_version":2,` + gate + `"base_branch":"   "}`,
-		"file>total":       `{"schema_version":2,` + gate + `"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`,
-		"null value":       `{"schema_version":2,` + gate + `"base_branch":null}`,
-		"case variant":     `{"Schema_Version":2}`,
-		"duplicate key":    `{"schema_version":2,"schema_version":2}`,
-		"trailing content": `{"schema_version":2} x`,
+	cases := map[string]struct{ body, want string }{
+		"empty":            {``, "empty document"},
+		"missing version":  {`{` + gate + `"base_branch":"main"}`, "schema_version is required"},
+		"bad version":      {`{"schema_version":9,` + gate + `"base_branch":"main"}`, "schema_version must be 2"},
+		"negative budget":  {`{"schema_version":2,` + gate + `"budgets":{"plan_rounds":-1}}`, "budgets.plan_rounds must be >= 0"},
+		"zero limit":       {`{"schema_version":2,` + gate + `"limits":{"max_run_turns":0}}`, "limits.max_run_turns must be positive"},
+		"bad fs policy":    {`{"schema_version":2,` + gate + `"unknown_fs_policy":"maybe"}`, "unknown_fs_policy must be"},
+		"blank base":       {`{"schema_version":2,` + gate + `"base_branch":"   "}`, "base_branch is required"},
+		"file>total":       {`{"schema_version":2,` + gate + `"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`, "exceeds evidence_max_total_bytes"},
+		"null value":       {`{"schema_version":2,` + gate + `"base_branch":null}`, "explicit null"},
+		"case variant":     {`{"Schema_Version":2}`, "non-canonical key spelling"},
+		"duplicate key":    {`{"schema_version":2,"schema_version":2}`, "duplicate key"},
+		"trailing content": {`{"schema_version":2} x`, "after top-level value"},
+
+		// A REAL v1 document. Before the version check moved ahead of decoding, this was reported as an
+		// unknown field — telling the operator their file was malformed when it was simply a previous
+		// version of a schema that had moved.
+		"a genuine v1 document": {`{"schema_version":1,"test_gate":{"command":"go test ./..."},"base_branch":"main"}`, "schema_version must be 2"},
 
 		// Run-policy v2's own rules.
-		"gate with neither argv nor disabled": `{"schema_version":2,"test_gate":{}}`,
-		"gate with both":                      `{"schema_version":2,"test_gate":{"argv":["x"],"disabled":true}}`,
-		"blank argv[0]":                       `{"schema_version":2,"test_gate":{"argv":["   ","y"]}}`,
-		"no implicit shell split":             `{"schema_version":2,"test_gate":{"command":"go test ./..."}}`,
-		"env name not a name":                 `{"schema_version":2,` + gate + `"test_gate":{"argv":["x"],"env":{"inherit":["not-a-name"]}}}`,
-		"env name starts with a digit":        `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["1PATH"]}}}`,
-		"env named twice":                     `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH","PATH"]}}}`,
-		"env both inherited and set":          `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH"],"set":{"PATH":"/bin"}}}}`,
-		"zero max_test_attempts":              `{"schema_version":2,` + gate + `"limits":{"max_test_attempts":0}}`,
-		"max_test_attempts over the ceiling":  `{"schema_version":2,` + gate + `"limits":{"max_test_attempts":99999}}`,
-		"zero max_test_output_bytes":          `{"schema_version":2,` + gate + `"limits":{"max_test_output_bytes":0}}`,
-		"record ceiling above the packet's":   `{"schema_version":2,` + gate + `"limits":{"max_test_record_bytes":99999,"evidence_max_file_bytes":98304}}`,
+		"gate with neither argv nor disabled": {`{"schema_version":2,"test_gate":{}}`, "exactly one of argv or disabled"},
+		"gate with both":                      {`{"schema_version":2,"test_gate":{"argv":["x"],"disabled":true}}`, "exactly one of argv or disabled"},
+		"blank argv[0]":                       {`{"schema_version":2,"test_gate":{"argv":["   ","y"]}}`, "argv[0] must name a command"},
+		"v2 gate still using command":         {`{"schema_version":2,"test_gate":{"command":"go test ./..."}}`, "unknown field"},
+		"env name not a name":                 {`{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["not-a-name"]}}}`, "is not [A-Za-z_][A-Za-z0-9_]*"},
+		"env name starts with a digit":        {`{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["1PATH"]}}}`, "starts with a digit"},
+		"env inherited twice":                 {`{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH","PATH"]}}}`, "inherit names PATH twice"},
+		"env set twice":                       {`{"schema_version":2,"test_gate":{"argv":["x"],"env":{"set":[{"name":"TOKEN","value":"a"},{"name":"TOKEN","value":"b"}]}}}`, "set names TOKEN twice"},
+		"env both inherited and set":          {`{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH"],"set":[{"name":"PATH","value":"/bin"}]}}}`, "both inherit and set"},
+		"zero max_test_attempts":              {`{"schema_version":2,` + gate + `"limits":{"max_test_attempts":0}}`, "limits.max_test_attempts must be positive"},
+		"max_test_attempts over the ceiling":  {`{"schema_version":2,` + gate + `"limits":{"max_test_attempts":99999}}`, "max_test_attempts must be <="},
+		"zero max_test_output_bytes":          {`{"schema_version":2,` + gate + `"limits":{"max_test_output_bytes":0}}`, "limits.max_test_output_bytes must be positive"},
+		"record ceiling above the packet's":   {`{"schema_version":2,` + gate + `"limits":{"max_test_record_bytes":99999,"evidence_max_file_bytes":98304}}`, "could never be issued as evidence"},
 	}
-	for name, body := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRunPolicy([]byte(body)); err == nil {
+			_, err := ParseRunPolicy([]byte(tc.body))
+			if err == nil {
 				t.Fatalf("expected rejection for %q", name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
 			}
 		})
 	}
 }
 
-// TestParseRunPolicyRejectionsAreForTheStatedReason guards the guard.
-//
-// A rejection table proves nothing if every case is refused by an earlier check than the one it names,
-// which is exactly what happened when the schema version moved and the fixtures did not. This asserts
-// the shared prefix each case is built on is itself ACCEPTED, so any rejection above is attributable to
-// the case's own mutation.
 func TestParseRunPolicyRejectionsAreForTheStatedReason(t *testing.T) {
 	if _, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["x"]},"base_branch":"main"}`)); err != nil {
 		t.Fatalf("the rejection table's baseline is itself invalid, so its cases prove nothing: %v", err)
@@ -180,6 +189,119 @@ func TestRunPolicyDefaultsSatisfyTheirOwnCrossValidation(t *testing.T) {
 	if !(l.MaxTestRecordBytes <= l.EvidenceMaxFileBytes && l.EvidenceMaxFileBytes <= l.EvidenceMaxTotalBytes) {
 		t.Fatalf("defaults violate max_test_record_bytes <= evidence_max_file_bytes <= evidence_max_total_bytes: %d, %d, %d",
 			l.MaxTestRecordBytes, l.EvidenceMaxFileBytes, l.EvidenceMaxTotalBytes)
+	}
+}
+
+// TestEnvSetAcceptsOrdinaryUppercaseNames is the positive half the rejection table cannot supply.
+//
+// Environment names are conventionally UPPER-case, and the strict reader refuses any object KEY that is
+// not canonical lower-case at every depth. As a JSON map, `"set":{"PATH":"..."}` was therefore
+// unrepresentable — the walker fired on the name before any environment rule ran, so the collision case
+// that claimed to test "inherit and set" was really passing on key spelling. An entry array moves the
+// data into values, and this test is what proves the shape can express what it is for.
+func TestEnvSetAcceptsOrdinaryUppercaseNames(t *testing.T) {
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["go","test"],` +
+		`"env":{"inherit":["PATH"],"set":[{"name":"CI","value":"1"},{"name":"GOFLAGS","value":"-count=1"}]}}}`))
+	if err != nil {
+		t.Fatalf("ParseRunPolicy: %v", err)
+	}
+	want := []EnvAssignment{{Name: "CI", Value: "1"}, {Name: "GOFLAGS", Value: "-count=1"}}
+	if !slices.Equal(rp.TestGate.Env.Set, want) {
+		t.Fatalf("env.set = %+v, want %+v", rp.TestGate.Env.Set, want)
+	}
+}
+
+// TestPolicyMarshalParseRoundTrips pins the property the empty-not-null wire choice exists for, over
+// the shapes that actually occur.
+//
+// The frozen policy is embedded in persisted run state and BootstrapIntent requires the re-parsed
+// policy to equal it exactly, so a value that marshals to something this package's own parser refuses
+// is a value that can strand a run. The zero TestGate did precisely that: nil collections marshal as
+// null, and null is refused on the way back in.
+func TestPolicyMarshalParseRoundTrips(t *testing.T) {
+	base := DefaultRunPolicy()
+	for _, tc := range []struct {
+		name string
+		gate TestGate
+	}{
+		{"disabled with zero-valued collections", TestGate{Disabled: true}},
+		{"argv with explicitly empty collections", TestGate{Argv: []string{"go", "test"}, Env: TestGateEnv{Inherit: []string{}, Set: []EnvAssignment{}}}},
+		{"uppercase env.set", TestGate{
+			Argv: []string{"go", "test"},
+			Env:  TestGateEnv{Inherit: []string{"PATH"}, Set: []EnvAssignment{{Name: "CI", Value: "1"}}},
+		}},
+		{"an argument that is deliberately empty", TestGate{Argv: []string{"prog", "", "tail"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rp := base
+			rp.TestGate = tc.gate
+			b, err := json.Marshal(rp)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got, err := ParseRunPolicy(b)
+			if err != nil {
+				t.Fatalf("the marshalled policy could not be parsed back: %v\n%s", err, b)
+			}
+			// Semantic equality, which is what the bootstrap invariant actually compares.
+			if !reflect.DeepEqual(got, mustParse(t, b)) {
+				t.Fatal("parsing the same bytes twice disagreed with itself")
+			}
+			if got.TestGate.Disabled != tc.gate.Disabled || !slices.Equal(got.TestGate.Argv, nonNil(tc.gate.Argv)) {
+				t.Fatalf("gate round-trip lost data: %+v -> %+v", tc.gate, got.TestGate)
+			}
+			if !slices.Equal(got.TestGate.Env.Set, nonNilAssignments(tc.gate.Env.Set)) {
+				t.Fatalf("env.set round-trip lost data: %+v -> %+v", tc.gate.Env.Set, got.TestGate.Env.Set)
+			}
+		})
+	}
+}
+
+func mustParse(t *testing.T, b []byte) RunPolicy {
+	t.Helper()
+	rp, err := ParseRunPolicy(b)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	return rp
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func nonNilAssignments(s []EnvAssignment) []EnvAssignment {
+	if s == nil {
+		return []EnvAssignment{}
+	}
+	return s
+}
+
+// TestPlatformRequiredEnvIsClosedAndNamed. The platform set is part of the authority model, so it must
+// be enumerated rather than assembled at resolution time — otherwise "nothing unnamed reaches the
+// command" is contradicted by the very code that builds the environment.
+func TestPlatformRequiredEnvIsClosedAndNamed(t *testing.T) {
+	win := PlatformRequired("windows")
+	for _, want := range []string{"ComSpec", "PATHEXT", "SystemRoot"} {
+		if !slices.Contains(win, want) {
+			t.Fatalf("windows platform set %v omits %q", win, want)
+		}
+	}
+	for _, n := range win {
+		if err := validateEnvName(n); err != nil {
+			t.Fatalf("platform-required name %q is not a valid environment name: %v", n, err)
+		}
+	}
+	if got := PlatformRequired("linux"); len(got) != 0 {
+		t.Fatalf("linux platform set = %v, want empty; PATH is already the default allowlist", got)
+	}
+	// Returned by value: a caller must not be able to enlarge the authority model by appending to it.
+	win = append(win, "SECRET")
+	if slices.Contains(PlatformRequired("windows"), "SECRET") {
+		t.Fatal("PlatformRequired handed out its own backing array; the authorized set is mutable")
 	}
 }
 

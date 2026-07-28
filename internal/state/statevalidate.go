@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/evidence"
 	"github.com/David-c0degeek/claudex/internal/redact"
 )
@@ -144,6 +145,117 @@ func validate(rs *RunState) error {
 	}
 	if err := validateTestAttempts(rs); err != nil {
 		return err
+	}
+	// The frozen environment must still be authorized by the frozen policy. Validating it here rather
+	// than trusting the bootstrap means a state that was hand-edited, or written by a build whose
+	// authority model differed, cannot hand a command variables the policy never allowed.
+	if err := rs.ResolvedExecution.ValidateFor(rs.EffectivePolicy.TestGate, config.HostGOOS()); err != nil {
+		return fmt.Errorf("resolved_execution: %w", err)
+	}
+	return nil
+}
+
+// validateAttemptTransition binds the attempt lifecycle to the transitions that may produce it.
+//
+// The structural rules in validateTestAttempts prove an entry is WELL FORMED. They do not prove it
+// describes anything that happened, and that gap is the whole of this function: without it a mutation
+// could invent a finalized attempt out of nothing, swap the active ref's tested tree, un-cancel a
+// cancelled one, or append several outcomes at once. Every rule below closes one of those.
+func validateAttemptTransition(old, next *RunState) error {
+	// 1. Append-only, BY VALUE. A length check alone would let an entry be rewritten in place while the
+	// count stayed the same — precisely how an indeterminate attempt could later be reclassified as a
+	// clean pass, erasing the distinction between a broken environment and failing code.
+	if len(next.TestAttempts) < len(old.TestAttempts) {
+		return fmt.Errorf("test attempts must not shrink (%d -> %d)", len(old.TestAttempts), len(next.TestAttempts))
+	}
+	for i := range old.TestAttempts {
+		if !reflect.DeepEqual(next.TestAttempts[i], old.TestAttempts[i]) {
+			return fmt.Errorf("finalized test attempt %d is immutable", i)
+		}
+	}
+	// 2. At most ONE finalization per transition. Finalization is the act of moving the single active
+	// ref into the ledger, and there is only ever one ref to move.
+	appended := len(next.TestAttempts) - len(old.TestAttempts)
+	if appended > 1 {
+		return fmt.Errorf("a transition finalized %d attempts; only the one active attempt can be finalized", appended)
+	}
+	if appended == 1 {
+		e := next.TestAttempts[len(next.TestAttempts)-1]
+		if e.BoundRevision != next.Revision {
+			return fmt.Errorf("newly finalized test attempt must bind to revision %d, got %d", next.Revision, e.BoundRevision)
+		}
+		// 3. It must be THE active attempt, not a fabricated one. Comparing the whole identity — not
+		// just the id — is what stops a finalization claiming a different tree than the one the attempt
+		// was started against.
+		a := old.ActiveTestAttempt
+		if a == nil {
+			return fmt.Errorf("test attempt %q was finalized with no active attempt to finalize", e.AttemptID)
+		}
+		if e.AttemptID != a.AttemptID || e.StartRevision != a.StartRevision ||
+			e.TestedCommit != a.TestedCommit || e.TestedTree != a.TestedTree {
+			return fmt.Errorf("finalized attempt %q does not match the active attempt %q it claims to finalize", e.AttemptID, a.AttemptID)
+		}
+		// Finalization CONSUMES the ref, and that is enforced STRUCTURALLY rather than here: an entry
+		// whose attempt is also the active one is not a representable state at all (see
+		// validateTestAttempts), so a duplicate check at this level could never fire. It is left out
+		// rather than written as a guard that reads like one and cannot.
+	}
+
+	switch {
+	case old.ActiveTestAttempt == nil && next.ActiveTestAttempt != nil:
+		// 5. A new attempt starts AT the revision that starts it, so its identity cannot be
+		// back-dated to borrow an earlier state's authorization.
+		if next.ActiveTestAttempt.StartRevision != next.Revision {
+			return fmt.Errorf("a new active attempt must start at revision %d, got %d", next.Revision, next.ActiveTestAttempt.StartRevision)
+		}
+		if next.ActiveTestAttempt.CancelPending {
+			return fmt.Errorf("a new active attempt cannot already be cancel-pending")
+		}
+	case old.ActiveTestAttempt != nil && next.ActiveTestAttempt != nil:
+		o, n := old.ActiveTestAttempt, next.ActiveTestAttempt
+		if o.AttemptID != n.AttemptID {
+			// Replacing one live attempt with another in a single step would silently abandon the
+			// first: it never reaches the ledger, so nothing records that it ran.
+			if appended == 0 {
+				return fmt.Errorf("active attempt %q was replaced by %q without finalizing it", o.AttemptID, n.AttemptID)
+			}
+			if n.StartRevision != next.Revision {
+				return fmt.Errorf("the replacement active attempt must start at revision %d, got %d", next.Revision, n.StartRevision)
+			}
+			break
+		}
+		// 6. A live attempt's identity is frozen. Its tree, its intent and its start are what the
+		// eventual outcome is a statement ABOUT, so changing them mid-flight would let the answer be
+		// re-pointed at a different question.
+		if o.StartRevision != n.StartRevision || o.TestedCommit != n.TestedCommit ||
+			o.TestedTree != n.TestedTree || o.IntentDigest != n.IntentDigest {
+			return fmt.Errorf("the active attempt %q is immutable while it is active", o.AttemptID)
+		}
+		// 7. Cancellation is monotone. Un-cancelling would let a run that had already told status and
+		// wait it was cancelled quietly continue.
+		if o.CancelPending && !n.CancelPending {
+			return fmt.Errorf("the active attempt %q cannot un-cancel", o.AttemptID)
+		}
+	case old.ActiveTestAttempt != nil && next.ActiveTestAttempt == nil:
+		// 8. The ref may only be cleared BY finalizing it. Dropping it silently would leave a runner
+		// holding facts that nothing can accept, and a live command with no record that it exists.
+		if appended == 0 {
+			return fmt.Errorf("active attempt %q was cleared without being finalized", old.ActiveTestAttempt.AttemptID)
+		}
+	}
+
+	// 9. Where an attempt may be active at all. It belongs to an ownerless TESTS phase — no agent holds
+	// the turn, the coordinator is running the gate — or to a run already marked cancelled whose
+	// in-flight attempt still has to be bound. The second arm is what lets a cancel take effect
+	// immediately, so status and wait wake, without discarding the only identity the runner can
+	// finalize.
+	if a := next.ActiveTestAttempt; a != nil {
+		cancelled := next.Lifecycle == LifecycleCancelled && a.CancelPending
+		ownerlessTests := next.Phase == PhaseTests && next.Assignment == nil
+		if !cancelled && !ownerlessTests {
+			return fmt.Errorf("an active test attempt requires ownerless TESTS or a cancelled run awaiting its terminal binding, got phase %s lifecycle %s assigned=%v",
+				next.Phase, next.Lifecycle, next.Assignment != nil)
+		}
 	}
 	return nil
 }
@@ -335,6 +447,13 @@ func validateTransition(old, next *RunState) error {
 	if !reflect.DeepEqual(old.EffectivePolicy, next.EffectivePolicy) {
 		return fmt.Errorf("effective_policy is immutable")
 	}
+	// Frozen means frozen. The environment was resolved from the host ONCE, at first attach, precisely
+	// so no later step re-reads ambient values; a mutation able to edit it would reintroduce exactly the
+	// drift that freezing exists to prevent, and would do so invisibly, since the command would still
+	// report running with "the frozen environment".
+	if !reflect.DeepEqual(old.ResolvedExecution, next.ResolvedExecution) {
+		return fmt.Errorf("resolved_execution is immutable")
+	}
 	if old.FS != next.FS {
 		return fmt.Errorf("filesystem decision is immutable")
 	}
@@ -371,25 +490,8 @@ func validateTransition(old, next *RunState) error {
 			return fmt.Errorf("step fix %d must not decrease", i)
 		}
 	}
-	// The attempt ledger is append-only in the strong sense: existing entries are frozen BY VALUE and
-	// the sequence may only grow at the end.
-	//
-	// Checking only the length would let an entry be rewritten in place while the count stayed the
-	// same — which is precisely how an indeterminate attempt could be quietly reclassified as a clean
-	// pass after the fact, erasing the distinction between a broken environment and working code that
-	// the ledger exists to preserve.
-	if len(next.TestAttempts) < len(old.TestAttempts) {
-		return fmt.Errorf("test attempts must not shrink (%d -> %d)", len(old.TestAttempts), len(next.TestAttempts))
-	}
-	for i := range old.TestAttempts {
-		if !reflect.DeepEqual(next.TestAttempts[i], old.TestAttempts[i]) {
-			return fmt.Errorf("finalized test attempt %d is immutable", i)
-		}
-	}
-	for i := len(old.TestAttempts); i < len(next.TestAttempts); i++ {
-		if next.TestAttempts[i].BoundRevision != next.Revision {
-			return fmt.Errorf("newly finalized test attempt %d must bind to revision %d, got %d", i, next.Revision, next.TestAttempts[i].BoundRevision)
-		}
+	if err := validateAttemptTransition(old, next); err != nil {
+		return err
 	}
 	// Accepted turns are append-only; existing entries are frozen and a NEW turn
 	// must have been accepted at the resulting revision.
@@ -719,8 +821,9 @@ func redactAndGuard(rs *RunState) error {
 	for i, n := range rs.EffectivePolicy.TestGate.Env.Inherit {
 		control[fmt.Sprintf("effective_policy.test_gate.env.inherit.%d", i)] = n
 	}
-	for n, v := range rs.EffectivePolicy.TestGate.Env.Set {
-		control[fmt.Sprintf("effective_policy.test_gate.env.set.%s", n)] = n + "=" + v
+	for i, e := range rs.EffectivePolicy.TestGate.Env.Set {
+		control[fmt.Sprintf("effective_policy.test_gate.env.set.%d.name", i)] = e.Name
+		control[fmt.Sprintf("effective_policy.test_gate.env.set.%d.value", i)] = e.Value
 	}
 	if rs.Assignment != nil {
 		control["assignment.id"] = rs.Assignment.ID

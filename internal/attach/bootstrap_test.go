@@ -33,10 +33,21 @@ func validIntent() BootstrapIntent {
 		RelDir:              ".claudex/runs/" + runID, TaskRelPath: "inputs/task.json",
 		TaskDigest: config.Hash(taskBytes()), TaskCanonical: taskBytes(),
 		PolicyRelPath: "inputs/policy.json", PolicyDigest: config.Hash(policyBytes()), PolicyCanonical: policyBytes(),
-		EffectivePolicy: pol, Base: pol.BaseBranch, BaseCommit: strings.Repeat("a", 40),
+		EffectivePolicy: pol, ResolvedExecution: mustResolve(pol, ".claudex/runs/"+runID),
+		Base: pol.BaseBranch, BaseCommit: strings.Repeat("a", 40),
 		WorktreeRelPath: ".claudex/runs/" + runID + "/worktree", RunBranch: "claudex/" + runID,
 		FSClass: "supported-local", FSReason: "local fixed drive", FSAck: false,
 	}
+}
+
+// mustResolve builds the frozen environment a real bootstrap would have produced, through the shipped
+// resolver — so a change to the authority model surfaces here rather than being hidden by a fixture.
+func mustResolve(pol config.RunPolicy, relDir string) config.ResolvedExecution {
+	re, err := config.ResolveForRun(pol.TestGate, config.HostGOOS(), config.NoAmbientEnv, relDir)
+	if err != nil {
+		panic(err)
+	}
+	return re
 }
 
 func fsResultUnknown() fsclass.Result {
