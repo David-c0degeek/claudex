@@ -1444,14 +1444,14 @@ func TestRunNeverClaimsToStillHoldTheGuard(t *testing.T) {
 	}
 }
 
-// TestTheStartRevisionIsReservedAndCheckedNeverGuessed.
+// TestTheStartRevisionIsReservedAndConstrainsTheBinding.
 //
 // The intent binds the revision the attempt becomes active at, and it is published BEFORE the append
 // that creates that revision. Deriving it as head+1 would be wrong whenever the generation store skips
 // an occupied or quarantined slot - and the wrong number would already be inside a durable digest by the
-// time anything could notice. So it is read under the guard, handed to authorization, and the binding
-// CAS is checked against it.
-func TestTheStartRevisionIsReservedAndCheckedNeverGuessed(t *testing.T) {
+// time anything could notice. So it is read under the guard, handed to authorization, and it CONSTRAINS
+// the append: the binding commits at exactly that revision or does not commit at all.
+func TestTheStartRevisionIsReservedAndConstrainsTheBinding(t *testing.T) {
 	t.Run("the reserved revision reaches authorization and the prepared attempt", func(t *testing.T) {
 		h := newHarness(t)
 		res, err := Run(h.deps)
@@ -1498,11 +1498,34 @@ func TestTheStartRevisionIsReservedAndCheckedNeverGuessed(t *testing.T) {
 		}
 	})
 
-	// The reservation is a value to be CHECKED, not a promise nothing can intervene. When the append
-	// lands elsewhere, durable state names a revision the already-published intent does not, and neither
-	// can be withdrawn - so this is recovery's, and the containment must be handed over rather than
-	// destroyed.
-	t.Run("a CAS that commits at a different revision is handed to recovery", func(t *testing.T) {
+	// The ORDINARY intervention: the reserved slot was taken while the guard was held, so the constrained
+	// CAS cannot commit and says so. Nothing is bound, the residue is the orphaned intent the design
+	// treats as ignorable, and the containment is this process's to destroy - it must NOT be handed to
+	// recovery, because there is no attempt for recovery to own.
+	t.Run("an intervening append leaves the binding not committed", func(t *testing.T) {
+		h := newHarness(t)
+		h.bindStatus, h.confirmStatus = BindNotCommitted, BindNotCommitted
+
+		res, err := Run(h.deps)
+		if !errors.Is(err, ErrOrphanedIntent) {
+			t.Fatalf("err = %v, want ErrOrphanedIntent", err)
+		}
+		if res.Recovery != nil {
+			t.Fatalf("an unbound attempt was handed to recovery: %+v", res.Recovery)
+		}
+		if h.cont.closed != 1 {
+			t.Fatalf("the containment was closed %d times, want once", h.cont.closed)
+		}
+	})
+
+	// A DEPENDENCY-CONTRACT VIOLATION, and deliberately not the intervention row above.
+	//
+	// State refuses a new active attempt whose start revision is not the revision that created it, and
+	// refuses it before serialization, so a record committed at some other revision cannot exist
+	// durably. A collaborator reporting one is reporting something impossible, and this process cannot
+	// tell which half of the claim is false - so the containment is handed over on the strength of the
+	// uncertainty, NOT because durable state is allowed to disagree with the published intent.
+	t.Run("a binding that claims to have committed at another revision is a contract violation", func(t *testing.T) {
 		h := newHarness(t)
 		h.boundRevision = 44
 
@@ -1512,6 +1535,9 @@ func TestTheStartRevisionIsReservedAndCheckedNeverGuessed(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "44") || !strings.Contains(err.Error(), "41") {
 			t.Fatalf("err = %v, want it to name both revisions", err)
+		}
+		if !strings.Contains(err.Error(), "cannot hold that record") {
+			t.Fatalf("err = %v, want it to say the state is impossible rather than merely unexpected", err)
 		}
 		assertHandedOver(t, res, h.cont)
 	})

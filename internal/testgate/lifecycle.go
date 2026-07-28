@@ -216,9 +216,14 @@ type Deps struct {
 	//
 	// It exists because the intent binds that revision and is published BEFORE the append. Guessing
 	// head+1 would be wrong whenever the store skips an occupied or quarantined slot, and the guess
-	// would be baked into a durable digest. Reserving is not a promise that nothing can intervene — it
-	// is a value the binding CAS is checked against, so an intervention fails closed into an orphaned
-	// intent rather than into a durable record naming a revision that never happened.
+	// would be baked into a durable digest.
+	//
+	// The reserved value CONSTRAINS the binding append: it must commit at exactly this revision or
+	// report BindNotCommitted. It is not a prediction that the caller then reconciles afterwards. State
+	// requires a new active attempt's start revision to equal the revision that created it, and refuses
+	// anything else BEFORE serialization, so "committed somewhere else" is not a durable state that can
+	// exist — an intervening append means the slot is gone, the binding does not commit, and the residue
+	// is the orphaned intent the design already treats as ignorable.
 	ReserveStartRevision func() (uint64, error)
 
 	// Authorize proves ownerless TESTS with no active attempt, freezes the identity, resolves the
@@ -243,9 +248,14 @@ type Deps struct {
 	// failure when anything was partially armed, so the caller can always release what exists.
 	ArmContainment func(PreparedAttempt) (Containment, error)
 
-	// BindActive CASes the active attempt into state and reports the AUTHORITATIVE status TOGETHER WITH
-	// the revision it committed at. The revision is not decoration: it is the only way to establish that
-	// the durable state agrees with the intent that was already published.
+	// BindActive CASes the active attempt into state at EXACTLY PreparedAttempt.StartRevision, and
+	// reports the AUTHORITATIVE status together with the revision it committed at.
+	//
+	// Committing anywhere else is not permitted, and not merely discouraged: state validates a new
+	// active attempt's start revision against the revision that created it and refuses the record
+	// before it is serialized. If the reserved slot is no longer available, this reports
+	// BindNotCommitted. The revision comes back so the lifecycle can VERIFY that contract rather than
+	// assume it.
 	BindActive func(PreparedAttempt) (Bind, error)
 
 	// ConfirmBind settles an uncertain append while the guard is STILL HELD. It is a separate seam
@@ -523,17 +533,27 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 	st := bind.Status
 	switch st {
 	case BindCommitted:
-		// The reservation was a value to be CHECKED, not a promise. If the append landed anywhere else,
-		// durable state now names a revision the already-published intent does not, and neither can be
-		// withdrawn — so this hands over rather than continuing on a record that disagrees with itself.
+		// A DEPENDENCY-CONTRACT VIOLATION, not a state recovery is designed around.
+		//
+		// State refuses a new active attempt whose start revision is not the revision that created it,
+		// and it refuses it before serialization — so a record committed at another revision cannot
+		// exist durably. A collaborator that reports one is therefore reporting something impossible,
+		// and this process cannot tell which half of the claim is false: the commit may have landed at
+		// the reserved slot, elsewhere, or not at all. It is handed over for exactly that reason, and
+		// NOT because durable state is allowed to disagree with the published intent.
+		//
+		// The ordinary intervention — the reserved slot taken while the guard was held — does not arrive
+		// here at all. It arrives as BindNotCommitted, below.
 		if bind.Revision != prep.StartRevision {
 			return prep, cont, BindUncertain, fmt.Errorf(
-				"%w: the attempt bound at revision %d but its published intent names %d",
-				ErrRecoveryOwned, bind.Revision, prep.StartRevision)
+				"%w: the binding reported committing attempt %q at revision %d, but it was reserved at %d and state cannot hold that record",
+				ErrRecoveryOwned, prep.AttemptID, bind.Revision, prep.StartRevision)
 		}
 		return prep, cont, st, nil
 	case BindNotCommitted:
-		// No attempt exists. The containment is this process's to destroy, and the caller may retry.
+		// No attempt exists. This is also where an intervening append lands: the reserved slot was taken
+		// while the guard was held, so the constrained CAS could not commit. The containment is this
+		// process's to destroy, and the caller may retry.
 		return prep, cont, st, errors.Join(fmt.Errorf("%w: the active attempt was not bound", ErrOrphanedIntent), err)
 	case BindUncertain:
 		// It may exist. Tearing down here would destroy the proof recovery needs.
@@ -627,8 +647,13 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 // Every field the lifecycle KNOWS is compared, not only the ones that change routing. The terminal
 // reason does not steer the run anywhere, but it is the text a human reads to understand the verdict,
 // and a record pairing this attempt's digest with somebody else's account of how the command ended is
-// evidence that disagrees with itself. The revisions are deliberately not compared: they are assigned by
-// the store, so this process does not know them and could only pretend to check them.
+// evidence that disagrees with itself.
+//
+// StartRevision IS compared. This lifecycle reserved it, bound it into the published intent and checked
+// the binding CAS against it, so it is a fact this process knows exactly. BoundRevision is the only
+// excluded field: the store assigns it at finalization, this process never learns it, and a comparison
+// against a value it invented could not fail. Saying "the revisions" would license removing the
+// StartRevision comparison on the strength of a sentence that was meant to describe only the other one.
 func disagreesWithPublished(e state.FinalizedAttempt, prep PreparedAttempt, term Terminal, ident Identity, digest string) string {
 	for _, f := range []struct{ name, got, want string }{
 		{"attempt id", e.AttemptID, prep.AttemptID},
