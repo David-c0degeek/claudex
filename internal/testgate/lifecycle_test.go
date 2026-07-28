@@ -2,10 +2,12 @@ package testgate
 
 import (
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
@@ -47,10 +49,27 @@ func (r *recorder) requireGuard(now string, want int) {
 	}
 }
 
-var theCommand = ResolvedCommand{
+// weirdValue is invalid UTF-8 on purpose. Go's JSON encoder replaces such bytes, so a carrier that
+// passed the environment as strings would silently deliver something else — and a digest alone could
+// never have revealed it, because a digest is not the bytes.
+var weirdValue = []byte{0xff, 0xfe, 'x', 0x80}
+
+var theSpec = ExecutionSpec{
 	Executable: "/usr/bin/go",
 	Argv:       []string{"go", "test", "./..."},
-	EnvDigest:  strings.Repeat("e", 64),
+	Cwd:        "/repo/.claudex/runs/run-a/worktree",
+	Env: config.ResolvedExecution{
+		Identity: config.NameByteExact,
+		Env: []config.ResolvedVar{
+			{Name: []byte("LONG"), Value: []byte(strings.Repeat("v", 300))},
+			{Name: []byte("PATH"), Value: []byte("/usr/bin")},
+			{Name: []byte("WEIRD"), Value: weirdValue},
+		},
+		ScratchHome:  "/repo/.claudex/runs/run-a/scratch/home",
+		ScratchCache: "/repo/.claudex/runs/run-a/scratch/cache",
+		ScratchTemp:  "/repo/.claudex/runs/run-a/scratch/tmp",
+	},
+	Digest: strings.Repeat("e", 64),
 }
 
 var thePrepared = PreparedAttempt{
@@ -58,7 +77,7 @@ var thePrepared = PreparedAttempt{
 	TestedCommit: strings.Repeat("a", 40),
 	TestedTree:   strings.Repeat("b", 40),
 	IntentDigest: strings.Repeat("c", 64),
-	Command:      theCommand,
+	Spec:         theSpec,
 }
 
 var theTerminal = Terminal{
@@ -116,15 +135,17 @@ type harness struct {
 	failAuthorize, failPublishIntent error
 	failArm, failBind                error
 	armReturnsContainment            bool
-	bindStatus, confirmStatus        BindStatus
+	bindStatus, confirmStatus        CommitStatus
+	finalizeStatus, confirmFinStatus CommitStatus
+	failConfirmFin                   error
 	failConfirm                      error
 	failReauthorize, failObserve     error
 	failPublishResult, failFinalize  error
 	identity                         Identity
 
 	// What each step actually received, so the facts can be proven to travel.
-	sawIntentCommand   ResolvedCommand
-	sawArmCommand      ResolvedCommand
+	sawIntentSpec      ExecutionSpec
+	sawArmSpec         ExecutionSpec
 	sawObserveTerminal Terminal
 	sawResultTerminal  Terminal
 	sawResultIdentity  Identity
@@ -137,6 +158,8 @@ func newHarness(t *testing.T) *harness {
 		r:                     &recorder{t: t},
 		bindStatus:            BindCommitted,
 		confirmStatus:         BindCommitted,
+		finalizeStatus:        BindCommitted,
+		confirmFinStatus:      BindCommitted,
 		armReturnsContainment: true,
 		identity:              Identity{Value: state.TestIdentityUnchanged, Commit: thePrepared.TestedCommit, Tree: thePrepared.TestedTree},
 	}
@@ -174,7 +197,7 @@ func newHarness(t *testing.T) *harness {
 			h.r.requireBefore("publish-intent", "authorize")
 			h.r.requireNotYet("publish-intent", "arm")
 			h.r.step("publish-intent")
-			h.sawIntentCommand = p.Command
+			h.sawIntentSpec = p.Spec
 			return h.failPublishIntent
 		},
 		ArmContainment: func(p PreparedAttempt) (Containment, error) {
@@ -185,7 +208,7 @@ func newHarness(t *testing.T) *harness {
 			// the containment already existed.
 			h.r.requireNotYet("arm", "bind-active")
 			h.r.step("arm")
-			h.sawArmCommand = p.Command
+			h.sawArmSpec = p.Spec
 			if h.failArm != nil {
 				if h.armReturnsContainment {
 					// A partial arm still hands back what exists, so the caller can release it.
@@ -195,7 +218,7 @@ func newHarness(t *testing.T) *harness {
 			}
 			return h.cont, nil
 		},
-		BindActive: func(PreparedAttempt) (BindStatus, error) {
+		BindActive: func(PreparedAttempt) (CommitStatus, error) {
 			t.Helper()
 			h.r.requireGuard("bind-active", 1)
 			h.r.requireBefore("bind-active", "arm")
@@ -203,7 +226,7 @@ func newHarness(t *testing.T) *harness {
 			h.r.step("bind-active")
 			return h.bindStatus, h.failBind
 		},
-		ConfirmBind: func(PreparedAttempt) (BindStatus, error) {
+		ConfirmBind: func(PreparedAttempt) (CommitStatus, error) {
 			t.Helper()
 			// Uncertainty is settled while the guard is STILL held; afterwards it belongs to recovery.
 			h.r.requireGuard("confirm-bind", 1)
@@ -237,13 +260,21 @@ func newHarness(t *testing.T) *harness {
 			h.sawResultTerminal, h.sawResultIdentity = term, id
 			return strings.Repeat("d", 64), h.failPublishResult
 		},
-		FinalizeOutcome: func(_ PreparedAttempt, _ Terminal, _ Identity, digest string) error {
+		FinalizeOutcome: func(_ PreparedAttempt, _ Terminal, _ Identity, digest string) (CommitStatus, error) {
 			t.Helper()
 			h.r.requireGuard("finalize", 1)
 			h.r.requireBefore("finalize", "publish-result")
 			h.r.step("finalize")
 			h.sawFinalizeDigest = digest
-			return h.failFinalize
+			return h.finalizeStatus, h.failFinalize
+		},
+		ConfirmFinalize: func(PreparedAttempt) (CommitStatus, error) {
+			t.Helper()
+			// Settled while the second guard is STILL held, and by reading rather than retrying.
+			h.r.requireGuard("confirm-finalize", 1)
+			h.r.requireBefore("confirm-finalize", "finalize")
+			h.r.step("confirm-finalize")
+			return h.confirmFinStatus, h.failConfirmFin
 		},
 	}
 	return h
@@ -285,30 +316,53 @@ func TestTheFactsTravelBetweenTheSteps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// The command authorization resolved is the command the intent and the containment received.
-	if !slices.Equal(h.sawIntentCommand.Argv, theCommand.Argv) || h.sawIntentCommand.Executable != theCommand.Executable {
-		t.Fatalf("intent publication saw %+v, want the authorized command", h.sawIntentCommand)
-	}
-	if !slices.Equal(h.sawArmCommand.Argv, theCommand.Argv) || h.sawArmCommand.EnvDigest != theCommand.EnvDigest {
-		t.Fatalf("arming saw %+v, want the authorized command", h.sawArmCommand)
+	// The complete spec authorization resolved is the spec the intent and the containment received —
+	// argv, cwd, AND the environment bytes. A digest could not have carried the last of those, which is
+	// exactly why arming would otherwise have had to reach for a side channel.
+	for _, got := range []struct {
+		who  string
+		spec ExecutionSpec
+	}{{"intent publication", h.sawIntentSpec}, {"arming", h.sawArmSpec}} {
+		if got.spec.Executable != theSpec.Executable || !slices.Equal(got.spec.Argv, theSpec.Argv) {
+			t.Fatalf("%s saw executable/argv %q %q, want %q %q", got.who,
+				got.spec.Executable, got.spec.Argv, theSpec.Executable, theSpec.Argv)
+		}
+		if got.spec.Cwd != theSpec.Cwd {
+			t.Fatalf("%s saw cwd %q, want %q", got.who, got.spec.Cwd, theSpec.Cwd)
+		}
+		if !reflect.DeepEqual(got.spec.Env, theSpec.Env) {
+			t.Fatalf("%s did not receive the frozen environment: %+v", got.who, got.spec.Env)
+		}
+		// The two values that a stringly carrier would have destroyed, asserted by content.
+		var weird, long []byte
+		for _, e := range got.spec.Env.Env {
+			switch string(e.Name) {
+			case "WEIRD":
+				weird = e.Value
+			case "LONG":
+				long = e.Value
+			}
+		}
+		if !reflect.DeepEqual(weird, weirdValue) {
+			t.Fatalf("%s received %v for the invalid-UTF-8 value, want %v", got.who, weird, weirdValue)
+		}
+		if len(long) != 300 {
+			t.Fatalf("%s received a %d-byte value, want 300", got.who, len(long))
+		}
 	}
 	// The runner's terminal facts reach the identity observation and the result rather than being
 	// invented by them.
-	if h.sawObserveTerminal != theTerminal {
-		t.Fatalf("the identity observation saw %+v, want the runner's terminal %+v", h.sawObserveTerminal, theTerminal)
+	if h.sawObserveTerminal.Execution != theTerminal.Execution {
+		t.Fatalf("the identity observation saw %+v, want the runner's terminal", h.sawObserveTerminal)
 	}
-	if h.sawResultTerminal != theTerminal {
+	if h.sawResultTerminal.Execution != theTerminal.Execution {
 		t.Fatalf("the result saw %+v, want the runner's terminal", h.sawResultTerminal)
 	}
 	if h.sawResultIdentity != h.identity {
 		t.Fatalf("the result saw identity %+v, want %+v", h.sawResultIdentity, h.identity)
 	}
-	// And the outcome CAS names the digest of the record that was actually published.
 	if h.sawFinalizeDigest != res.ResultDigest {
 		t.Fatalf("the outcome CAS named %q, not the published digest %q", h.sawFinalizeDigest, res.ResultDigest)
-	}
-	if res.Terminal != theTerminal || res.Identity != h.identity {
-		t.Fatalf("the result value lost facts: %+v", res)
 	}
 }
 
@@ -367,13 +421,17 @@ func TestTheBindStatusDecidesWhoOwnsTheTeardown(t *testing.T) {
 		h.bindStatus = BindUncertain
 		h.confirmStatus = BindUncertain
 
-		_, err := Run(h.deps)
+		res, err := Run(h.deps)
 		if !errors.Is(err, ErrRecoveryOwned) {
 			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
 		}
 		if h.cont.closed != 0 {
 			t.Fatalf("the containment was closed %d times; closing it destroys the proof recovery needs", h.cont.closed)
 		}
+		// Not closing it is only half the job. Ownership has to move to somebody LIVE, or the handle is
+		// merely abandoned in an unreachable local — which on Windows loses the sole handle to the
+		// unnamed job, the very fact being preserved.
+		assertHandedOver(t, res, h.cont)
 		if !h.r.did("confirm-bind") {
 			t.Fatal("the uncertainty was never put to the confirmation seam")
 		}
@@ -414,13 +472,14 @@ func TestTheBindStatusDecidesWhoOwnsTheTeardown(t *testing.T) {
 		h.bindStatus = BindUncertain
 		h.failConfirm = errors.New("store unreadable")
 
-		_, err := Run(h.deps)
+		res, err := Run(h.deps)
 		if !errors.Is(err, ErrRecoveryOwned) {
 			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
 		}
 		if h.cont.closed != 0 {
 			t.Fatalf("the containment was closed %d times despite unresolved uncertainty", h.cont.closed)
 		}
+		assertHandedOver(t, res, h.cont)
 	})
 }
 
@@ -507,9 +566,6 @@ func TestAFailureAfterBindingStillTearsTheContainmentDown(t *testing.T) {
 		// by weakening the sweep, so the exception stays visible.
 		guardMayBeHeld bool
 	}{
-		{"the guard cannot be released", func(h *harness) {
-			h.failRelease, h.failNthRelease = errors.New("lock stuck"), 1
-		}, true},
 		{"the command cannot start", func(h *harness) { h.cont.goErr = errors.New("exec failed") }, false},
 		{"the command cannot be awaited", func(h *harness) { h.cont.waitErr = errors.New("supervisor gone") }, false},
 		{"the guard cannot be reacquired", func(h *harness) {
@@ -518,7 +574,12 @@ func TestAFailureAfterBindingStillTearsTheContainmentDown(t *testing.T) {
 		{"re-authorization fails", func(h *harness) { h.failReauthorize = errors.New("no longer active") }, false},
 		{"the identity cannot be observed", func(h *harness) { h.failObserve = errors.New("git failed") }, false},
 		{"the result cannot be published", func(h *harness) { h.failPublishResult = errors.New("disk full") }, false},
-		{"the outcome CAS fails", func(h *harness) { h.failFinalize = errors.New("CAS conflict") }, false},
+		{"the outcome CAS fails", func(h *harness) {
+			// The status matters as much as the error: an error whose confirmation reports COMMITTED is
+			// a success, not a failure, so the fixture has to say the outcome was not applied.
+			h.failFinalize = errors.New("CAS conflict")
+			h.confirmFinStatus = BindNotCommitted
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -554,6 +615,7 @@ func TestIncompleteWiringIsRefusedBeforeAnythingHappens(t *testing.T) {
 		{"ObserveIdentity", func(d *Deps) { d.ObserveIdentity = nil }},
 		{"PublishResult", func(d *Deps) { d.PublishResult = nil }},
 		{"FinalizeOutcome", func(d *Deps) { d.FinalizeOutcome = nil }},
+		{"ConfirmFinalize", func(d *Deps) { d.ConfirmFinalize = nil }},
 	} {
 		t.Run(drop.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -570,4 +632,163 @@ func TestIncompleteWiringIsRefusedBeforeAnythingHappens(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertHandedOver proves ownership MOVED rather than merely not being exercised.
+func assertHandedOver(t *testing.T, res Result, want Containment) {
+	t.Helper()
+	if res.Recovery == nil {
+		t.Fatal("no recovery handoff: the containment was abandoned in an unreachable local, not transferred")
+	}
+	if res.Recovery.Containment != want {
+		t.Fatalf("the handoff carries %v, not the armed containment", res.Recovery.Containment)
+	}
+	if res.Recovery.Prepared.AttemptID != thePrepared.AttemptID {
+		t.Fatalf("the handoff names attempt %q, not the prepared %q", res.Recovery.Prepared.AttemptID, thePrepared.AttemptID)
+	}
+	if strings.TrimSpace(res.Recovery.Reason) == "" {
+		t.Fatal("the handoff states no reason, so the recipient must infer it from an error string")
+	}
+}
+
+// TestAnUnknownBindStatusIsRecoveryOwned.
+//
+// An unrecognised status does NOT establish that no active reference exists, so treating it as an
+// ordinary failure tore the containment down on the strength of an answer nobody understood.
+func TestAnUnknownBindStatusIsRecoveryOwned(t *testing.T) {
+	h := newHarness(t)
+	h.bindStatus = CommitStatus(99)
+	h.confirmStatus = CommitStatus(99)
+
+	res, err := Run(h.deps)
+	if !errors.Is(err, ErrRecoveryOwned) {
+		t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+	}
+	if h.cont.closed != 0 {
+		t.Fatalf("an unknown status tore the containment down %d times", h.cont.closed)
+	}
+	assertHandedOver(t, res, h.cont)
+}
+
+// TestABoundAttemptSurvivesAFailedGuardRelease.
+//
+// The state is definitely bound and the guard may still be held. Closing the containment there would
+// volunteer for the Windows post-CAS row with no readable fact — destroying the sole handle over a lock
+// failure that says nothing at all about the domain.
+func TestABoundAttemptSurvivesAFailedGuardRelease(t *testing.T) {
+	h := newHarness(t)
+	h.failRelease, h.failNthRelease = errors.New("lock stuck"), 1
+
+	res, err := Run(h.deps)
+	if !errors.Is(err, ErrRecoveryOwned) {
+		t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+	}
+	if h.cont.closed != 0 {
+		t.Fatalf("the containment was closed %d times over a lock failure", h.cont.closed)
+	}
+	assertHandedOver(t, res, h.cont)
+	if h.r.did("go") {
+		t.Fatal("a command started although the guard was never released")
+	}
+}
+
+// TestTheRunnerFactIsCanonicalizedBeforeItCanReachDisk.
+//
+// "Already canonical" was only a comment, so a containment returning a token-shaped spawn detail reached
+// the durable result seam raw. The state boundary can refuse such a record afterwards, but it cannot
+// un-write it — so the canonical form has to be established the moment the fact is accepted, which is
+// also before the digest is computed over it.
+func TestTheRunnerFactIsCanonicalizedBeforeItCanReachDisk(t *testing.T) {
+	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
+	raw := "exec failed: token=" + secret
+
+	h := newHarness(t)
+	h.cont.term = Terminal{Execution: state.TestExecutionSpawnFailed, TerminalReason: raw}
+
+	res, err := Run(h.deps)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(h.sawResultTerminal.TerminalReason, secret) {
+		t.Fatalf("the result publisher saw the raw credential: %q", h.sawResultTerminal.TerminalReason)
+	}
+	if h.sawResultTerminal.TerminalReason != state.CanonicalTerminalReason(raw) {
+		t.Fatalf("the publisher saw %q, want the canonical form", h.sawResultTerminal.TerminalReason)
+	}
+	// Length-changing, as it must be: the digest is computed over these bytes, so canonicalizing later
+	// would have left it identifying text that no longer exists.
+	if len(h.sawResultTerminal.TerminalReason) == len(raw) {
+		t.Fatal("canonicalization did not change the text; the vector proves nothing")
+	}
+	if h.sawObserveTerminal.TerminalReason != h.sawResultTerminal.TerminalReason {
+		t.Fatal("the identity observation and the result saw different terminal text")
+	}
+	if res.Outcome != state.OutcomeIndeterminate {
+		t.Fatalf("outcome = %q, want indeterminate for a spawn failure", res.Outcome)
+	}
+}
+
+// TestAMalformedRunnerFactIsRefusedBeforePublication. The shape is checked where the fact enters, so an
+// impossible pair never reaches a durable record.
+func TestAMalformedRunnerFactIsRefusedBeforePublication(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		term Terminal
+	}{
+		{"an unknown execution", Terminal{Execution: "probably-fine", TerminalReason: "x"}},
+		{"a normal exit with no exit code", Terminal{Execution: state.TestExecutionOK, TerminalReason: "x"}},
+		{"a timeout carrying an exit code", Terminal{Execution: state.TestExecutionTimeout, TerminalReason: "x", ExitCode: intp(0)}},
+		{"no terminal detail at all", Terminal{Execution: state.TestExecutionOK, TerminalReason: "  ", ExitCode: intp(0)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.cont.term = tc.term
+			if _, err := Run(h.deps); err == nil {
+				t.Fatal("a malformed runner fact was accepted")
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("a malformed fact reached the durable result seam: %v", h.r.steps)
+			}
+			if h.cont.closed != 1 {
+				t.Fatalf("the containment was closed %d times, want 1", h.cont.closed)
+			}
+		})
+	}
+}
+
+// TestTheOutcomeCASReportsAnAuthoritativeStatus.
+//
+// The same erased-status seam as the active binding: "it failed" does not say whether the outcome was
+// applied. Confirmation READS rather than retries, because re-applying an outcome that did commit would
+// bind a second verdict to one attempt.
+func TestTheOutcomeCASReportsAnAuthoritativeStatus(t *testing.T) {
+	t.Run("uncertain then confirmed committed succeeds", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+
+		if _, err := Run(h.deps); err != nil {
+			t.Fatalf("a confirmed outcome was rejected: %v", err)
+		}
+		if !h.r.did("confirm-finalize") {
+			t.Fatal("the uncertainty was never put to the confirmation seam")
+		}
+	})
+	t.Run("not committed is reported as such", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindNotCommitted
+
+		if _, err := Run(h.deps); err == nil || !strings.Contains(err.Error(), "not applied") {
+			t.Fatalf("err = %v, want a not-applied refusal", err)
+		}
+	})
+	t.Run("still uncertain after confirmation", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindUncertain
+
+		if _, err := Run(h.deps); err == nil || !strings.Contains(err.Error(), "visible but unconfirmed") {
+			t.Fatalf("err = %v, want an unconfirmed report", err)
+		}
+	})
 }
