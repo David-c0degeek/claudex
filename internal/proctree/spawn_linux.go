@@ -5,24 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"syscall"
 )
 
 // NullDevice is what the command receives as stdin.
 const NullDevice = "/dev/null"
-
-// CommandSpawn is everything needed to start the test command under containment.
-type CommandSpawn struct {
-	// Spec is the frozen execution description. Nothing about the command is taken from anywhere else.
-	Spec ExecSpec
-	// Stdout and Stderr are the write ends the COORDINATOR created. The supervisor passes them to the
-	// child and closes its own copies immediately afterwards, so the coordinator can see stream EOF
-	// when the command exits.
-	Stdout *os.File
-	Stderr *os.File
-}
 
 // SpawnContained starts the command as the leader of a fresh process group, holding exactly the
 // descriptors it is entitled to and nothing else.
@@ -114,34 +102,11 @@ func SpawnContained(s CommandSpawn) (cmd *exec.Cmd, err error) {
 
 // validateExecutionBoundary refuses anything that would reintroduce resolution at execution time.
 //
-// ExecSpec.Validate proves the spec is well formed; it does not prove it is EXECUTABLE as written. A
-// relative executable or cwd reaching exec.Cmd would be resolved against whatever directory this
-// process happens to be in — exactly the ambient-resolution defect the resolved absolute path exists
-// to eliminate. The supervisor will separately compare these against the rooted intent, but this is
-// the last boundary before the kernel and it refuses independently rather than trusting that an
-// earlier check ran.
+// The rule itself is portable and lives in spawn.go; Linux supplies the identity it requires. The fold
+// identity belongs to Windows, and executing under it here would mean the digest bound one comparison
+// rule while the kernel applied another.
 func validateExecutionBoundary(spec ExecSpec) error {
-	for _, f := range []struct {
-		what string
-		path string
-	}{
-		{"executable", string(spec.Executable)},
-		{"cwd", string(spec.Cwd)},
-	} {
-		if !filepath.IsAbs(f.path) {
-			return fmt.Errorf("%w: %s %q is not absolute", ErrSpecInvalid, f.what, f.path)
-		}
-		if filepath.Clean(f.path) != f.path {
-			return fmt.Errorf("%w: %s %q is not clean", ErrSpecInvalid, f.what, f.path)
-		}
-	}
-	// The fold identity belongs to Windows. Executing under it on Linux would mean the digest bound
-	// one comparison rule while the kernel applied another, so names differing only in case would be
-	// one variable to the record and two to the process.
-	if spec.Identity != NameByteExact {
-		return fmt.Errorf("%w: environment identity %v is not Linux semantics", ErrSpecInvalid, spec.Identity)
-	}
-	return nil
+	return validateExecutionBoundaryFor(spec, NameByteExact)
 }
 
 // markInheritedCloexec sets FD_CLOEXEC on every descriptor above stderr.
@@ -167,26 +132,4 @@ func markInheritedCloexec() error {
 		}
 	}
 	return nil
-}
-
-// CloseStreamCopies drops the supervisor's own handles on the stream write ends.
-//
-// It runs immediately after a successful Start and on every failure path. If any copy survives here,
-// the coordinator never sees EOF on those streams when the command exits, so the drain that the
-// terminal ordering depends on would hang forever. This is a separate function because it must also
-// be called when the spawn fails, where there is no cmd to hang it off.
-func CloseStreamCopies(s CommandSpawn) error {
-	var first error
-	for _, f := range []*os.File{s.Stdout, s.Stderr} {
-		if f == nil {
-			continue
-		}
-		// Idempotent: SpawnContained closes these on its own error paths, and the caller closes them
-		// after a successful start, so an already-closed handle is an expected state rather than a
-		// fault. Anything else is reported.
-		if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) && first == nil {
-			first = fmt.Errorf("proctree: close stream copy: %w", err)
-		}
-	}
-	return first
 }
