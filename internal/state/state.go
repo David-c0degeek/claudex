@@ -49,7 +49,17 @@ import (
 // atomically with every issuance authority — no generation can exist in a
 // half-upgraded shape where some read-only assignments carry a binding and others
 // do not.
-const RunStateVersion = 7
+//
+// v8 added the mechanical test gate's attempt identity: the at-most-one
+// ActiveTestAttempt and the append-only TestAttempts ledger. Before it, RunState
+// could say a run was in TESTS but not WHICH run of the tests, so a runner
+// finishing after a crash had nothing to prove it was finalizing its own attempt
+// and an outcome could not be tied to the tree it was a statement about. It lands
+// atomically with run-policy v2 for a mechanical reason as well as a conceptual
+// one: state embeds the frozen policy and decode calls the CURRENT validator, so a
+// policy-only bump would make every existing generation undecodable while the
+// state schema still claimed to be the old one.
+const RunStateVersion = 8
 
 // stateRetention{Keep,Trigger} configure the state stores' pre-append hysteresis compaction
 // (genstore.WithRetention): each generation is a full self-sufficient snapshot, so recovery
@@ -329,6 +339,92 @@ type RunState struct {
 	PendingTxnID    string                  `json:"pending_txn_id"`
 	Recovery        *Projection             `json:"recovery,omitempty"`
 	Failure         *Projection             `json:"failure,omitempty"`
+	// ActiveTestAttempt is the at-most-one mechanical test attempt this run currently owns.
+	//
+	// Without it RunState has no attempt identity whatsoever: engine.Apply records no TESTS source, so
+	// "which run of the tests produced this outcome" was a question the durable state could not answer,
+	// and a runner finishing after a crash had nothing to prove it was finalizing its own attempt.
+	ActiveTestAttempt *TestAttemptRef `json:"active_test_attempt,omitempty"`
+	// TestAttempts is the APPEND-ONLY ledger of finalized attempts.
+	//
+	// Append-only because an attempt that was superseded is still a thing that ran: an indeterminate
+	// attempt retried three times is a different situation from one clean pass, and overwriting would
+	// erase exactly the evidence that distinguishes a broken environment from failing code.
+	TestAttempts []FinalizedAttempt `json:"test_attempts,omitempty"`
+}
+
+// TestAttemptRef binds the one in-flight mechanical test attempt.
+//
+// It is written BEFORE the command is spawned and read by whoever finalizes the attempt, which may be a
+// different process than the one that started it. Every field exists so a finalization can be checked
+// against the attempt it claims to be finalizing rather than trusted.
+type TestAttemptRef struct {
+	// AttemptID is the identity the containment, the intent and the result all bind.
+	AttemptID string `json:"attempt_id"`
+	// StartRevision is the state revision at which this attempt became active.
+	StartRevision uint64 `json:"start_revision"`
+	// TestedCommit and TestedTree are the repository identity the attempt is a statement about. An
+	// outcome without them would be a claim about "the code" with no way to say which code.
+	TestedCommit string `json:"tested_commit"`
+	TestedTree   string `json:"tested_tree"`
+	// IntentDigest binds the exact published intent — argv, resolved executable, environment identity.
+	IntentDigest string `json:"intent_digest"`
+	// CancelPending records that a cancel bound BEFORE the runner finalized.
+	//
+	// It exists so a cancelled run can be marked cancelled immediately — so status and wait wake up —
+	// without discarding the only identity with which the in-flight attempt can still be finalized.
+	// Clearing the ref instead would have left a live runner holding facts nothing could accept.
+	CancelPending bool `json:"cancel_pending,omitempty"`
+}
+
+// TestExecution is what the RUNNER observed: whether the command produced an outcome at all.
+//
+// It is deliberately independent of TestIdentity below. The two were once a single precedence list, and
+// a precedence list has to be read in order to be understood — whereas a pair of independent facts makes
+// the outcome a total function of both, with no case left implicit.
+type TestExecution string
+
+const (
+	// TestExecutionPassed means the command ran to completion and reported success.
+	TestExecutionPassed TestExecution = "passed"
+	// TestExecutionFailed means the command ran to completion and reported failure. This is a statement
+	// about the CODE.
+	TestExecutionFailed TestExecution = "failed"
+	// TestExecutionIndeterminate means the runner could not obtain an outcome — the supervisor died, a
+	// frame was malformed, cleanup could not be proven. This is a statement about the ENVIRONMENT, and
+	// the distinction matters because it must not spend the fix budget.
+	TestExecutionIndeterminate TestExecution = "indeterminate"
+)
+
+// TestIdentity is whether the repository was the same at the end as at the start.
+type TestIdentity string
+
+const (
+	// TestIdentityUnchanged means the tested tree was identical at both observations.
+	TestIdentityUnchanged TestIdentity = "unchanged"
+	// TestIdentityChanged means it was not, so the outcome describes a tree that no longer exists.
+	TestIdentityChanged TestIdentity = "changed"
+	// TestIdentityUnobserved means identity could not be established at all.
+	TestIdentityUnobserved TestIdentity = "unobserved"
+)
+
+// FinalizedAttempt is one immutable ledger entry.
+type FinalizedAttempt struct {
+	AttemptID     string `json:"attempt_id"`
+	StartRevision uint64 `json:"start_revision"`
+	// BoundRevision is the revision at which this entry was appended.
+	BoundRevision uint64 `json:"bound_revision"`
+	TestedCommit  string `json:"tested_commit"`
+	TestedTree    string `json:"tested_tree"`
+	// ResultDigest is the canonical digest of the published result record. It is the ledger's identity
+	// for the attempt's evidence: the same digest may not authorize two differing outcomes.
+	ResultDigest string `json:"result_digest"`
+	// Execution and Identity are the two independent halves of the outcome.
+	Execution TestExecution `json:"execution"`
+	Identity  TestIdentity  `json:"identity"`
+	// TerminalReason is the runner's own word for how the command ended (exited, signalled, timed out,
+	// cancelled, spawn failure class). It is descriptive; Execution is what decides anything.
+	TerminalReason string `json:"terminal_reason"`
 }
 
 // Store is the run-state store over a genstore.
@@ -482,6 +578,17 @@ func cloneForNext(prev *RunState) *RunState {
 	}
 	n := *prev
 	n.Counters.StepFixes = cloneInts(prev.Counters.StepFixes)
+	// Copied, not shared. A struct copy duplicates only the slice HEADER, so a mutator writing
+	// next.TestAttempts[i] would write through to the previous state as well — and the append-only
+	// check compares next against prev, so the rewrite it exists to catch would be invisible to it.
+	// A test caught exactly that: rewriting a finalized entry in place was accepted.
+	if prev.TestAttempts != nil {
+		n.TestAttempts = append([]FinalizedAttempt(nil), prev.TestAttempts...)
+	}
+	if prev.ActiveTestAttempt != nil {
+		a := *prev.ActiveTestAttempt
+		n.ActiveTestAttempt = &a
+	}
 	n.AcceptedTurns = make(map[string]AcceptedTurn, len(prev.AcceptedTurns))
 	for k, v := range prev.AcceptedTurns {
 		n.AcceptedTurns[k] = v

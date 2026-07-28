@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -33,7 +34,7 @@ func mustJSON(t *testing.T, v any) []byte {
 }
 
 func validPolicy() string {
-	return `{"schema_version":1,"test_gate":{"command":"go test ./..."},"base_branch":"main"}`
+	return `{"schema_version":2,"test_gate":{"argv":["go","test","./..."]},"base_branch":"main"}`
 }
 
 func TestParseTaskContractValid(t *testing.T) {
@@ -91,12 +92,17 @@ func TestParseTaskContractRejections(t *testing.T) {
 }
 
 func TestParseRunPolicyValidKeepsNestedDefaults(t *testing.T) {
-	rp, err := ParseRunPolicy([]byte(`{"schema_version":1,"test_gate":{"command":"make test"},"base_branch":"trunk","limits":{"max_wall_seconds":600}}`))
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["make","test"]},"base_branch":"trunk","limits":{"max_wall_seconds":600}}`))
 	if err != nil {
 		t.Fatalf("ParseRunPolicy: %v", err)
 	}
-	if rp.BaseBranch != "trunk" || rp.TestGate.Command != "make test" {
+	if rp.BaseBranch != "trunk" || !slices.Equal(rp.TestGate.Argv, []string{"make", "test"}) {
 		t.Fatalf("override not applied: %+v", rp)
+	}
+	// The nested env default must survive an override that names only argv: a policy that supplied a
+	// command and silently lost PATH would fail at execution rather than at parse.
+	if !slices.Equal(rp.TestGate.Env.Inherit, []string{"PATH"}) {
+		t.Fatalf("test_gate.env default lost: %+v", rp.TestGate.Env)
 	}
 	if rp.Limits.MaxWallSeconds != 600 {
 		t.Fatalf("max_wall_seconds override lost: %d", rp.Limits.MaxWallSeconds)
@@ -107,19 +113,38 @@ func TestParseRunPolicyValidKeepsNestedDefaults(t *testing.T) {
 }
 
 func TestParseRunPolicyRejections(t *testing.T) {
+	// Each case must be rejected for the reason it NAMES. Every entry therefore carries the current
+	// schema version and a valid test gate, so nothing is refused by the version check or the gate XOR
+	// on its way to the defect under test — which is what these cases looked like before the v2 bump,
+	// when they all declared schema_version 1 and would have passed while proving nothing.
+	const gate = `"test_gate":{"argv":["x"]},`
 	cases := map[string]string{
 		"empty":            ``,
-		"missing version":  `{"test_gate":{"command":"x"},"base_branch":"main"}`,
-		"bad version":      `{"schema_version":9,"test_gate":{"command":"x"},"base_branch":"main"}`,
-		"negative budget":  `{"schema_version":1,"budgets":{"plan_rounds":-1}}`,
-		"zero limit":       `{"schema_version":1,"limits":{"max_run_turns":0}}`,
-		"bad fs policy":    `{"schema_version":1,"unknown_fs_policy":"maybe"}`,
-		"blank base":       `{"schema_version":1,"base_branch":"   "}`,
-		"file>total":       `{"schema_version":1,"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`,
-		"null value":       `{"schema_version":1,"base_branch":null}`,
-		"case variant":     `{"Schema_Version":1}`,
-		"duplicate key":    `{"schema_version":1,"schema_version":1}`,
-		"trailing content": `{"schema_version":1} x`,
+		"missing version":  `{` + gate + `"base_branch":"main"}`,
+		"bad version":      `{"schema_version":9,` + gate + `"base_branch":"main"}`,
+		"negative budget":  `{"schema_version":2,` + gate + `"budgets":{"plan_rounds":-1}}`,
+		"zero limit":       `{"schema_version":2,` + gate + `"limits":{"max_run_turns":0}}`,
+		"bad fs policy":    `{"schema_version":2,` + gate + `"unknown_fs_policy":"maybe"}`,
+		"blank base":       `{"schema_version":2,` + gate + `"base_branch":"   "}`,
+		"file>total":       `{"schema_version":2,` + gate + `"limits":{"evidence_max_file_bytes":999999,"evidence_max_total_bytes":1000}}`,
+		"null value":       `{"schema_version":2,` + gate + `"base_branch":null}`,
+		"case variant":     `{"Schema_Version":2}`,
+		"duplicate key":    `{"schema_version":2,"schema_version":2}`,
+		"trailing content": `{"schema_version":2} x`,
+
+		// Run-policy v2's own rules.
+		"gate with neither argv nor disabled": `{"schema_version":2,"test_gate":{}}`,
+		"gate with both":                      `{"schema_version":2,"test_gate":{"argv":["x"],"disabled":true}}`,
+		"blank argv[0]":                       `{"schema_version":2,"test_gate":{"argv":["   ","y"]}}`,
+		"no implicit shell split":             `{"schema_version":2,"test_gate":{"command":"go test ./..."}}`,
+		"env name not a name":                 `{"schema_version":2,` + gate + `"test_gate":{"argv":["x"],"env":{"inherit":["not-a-name"]}}}`,
+		"env name starts with a digit":        `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["1PATH"]}}}`,
+		"env named twice":                     `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH","PATH"]}}}`,
+		"env both inherited and set":          `{"schema_version":2,"test_gate":{"argv":["x"],"env":{"inherit":["PATH"],"set":{"PATH":"/bin"}}}}`,
+		"zero max_test_attempts":              `{"schema_version":2,` + gate + `"limits":{"max_test_attempts":0}}`,
+		"max_test_attempts over the ceiling":  `{"schema_version":2,` + gate + `"limits":{"max_test_attempts":99999}}`,
+		"zero max_test_output_bytes":          `{"schema_version":2,` + gate + `"limits":{"max_test_output_bytes":0}}`,
+		"record ceiling above the packet's":   `{"schema_version":2,` + gate + `"limits":{"max_test_record_bytes":99999,"evidence_max_file_bytes":98304}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -130,8 +155,48 @@ func TestParseRunPolicyRejections(t *testing.T) {
 	}
 }
 
+// TestParseRunPolicyRejectionsAreForTheStatedReason guards the guard.
+//
+// A rejection table proves nothing if every case is refused by an earlier check than the one it names,
+// which is exactly what happened when the schema version moved and the fixtures did not. This asserts
+// the shared prefix each case is built on is itself ACCEPTED, so any rejection above is attributable to
+// the case's own mutation.
+func TestParseRunPolicyRejectionsAreForTheStatedReason(t *testing.T) {
+	if _, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["x"]},"base_branch":"main"}`)); err != nil {
+		t.Fatalf("the rejection table's baseline is itself invalid, so its cases prove nothing: %v", err)
+	}
+}
+
+// TestRunPolicyDefaultsSatisfyTheirOwnCrossValidation. The record ceiling is only meaningful if the
+// shipped defaults can actually issue a result as evidence; defaults that failed their own rule would
+// make every no-file run unstartable.
+func TestRunPolicyDefaultsSatisfyTheirOwnCrossValidation(t *testing.T) {
+	rp := DefaultRunPolicy()
+	rp.TestGate = TestGate{Argv: []string{"go", "test", "./..."}}
+	if err := rp.Validate(); err != nil {
+		t.Fatalf("the shipped defaults do not validate: %v", err)
+	}
+	l := rp.Limits
+	if !(l.MaxTestRecordBytes <= l.EvidenceMaxFileBytes && l.EvidenceMaxFileBytes <= l.EvidenceMaxTotalBytes) {
+		t.Fatalf("defaults violate max_test_record_bytes <= evidence_max_file_bytes <= evidence_max_total_bytes: %d, %d, %d",
+			l.MaxTestRecordBytes, l.EvidenceMaxFileBytes, l.EvidenceMaxTotalBytes)
+	}
+}
+
+// TestTestGatePreservesEmptyArguments. An empty argument is meaningful to some commands, and a vector
+// exists precisely so nothing has to guess where the boundaries are.
+func TestTestGatePreservesEmptyArguments(t *testing.T) {
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["prog","--flag","","tail"]}}`))
+	if err != nil {
+		t.Fatalf("ParseRunPolicy: %v", err)
+	}
+	if !slices.Equal(rp.TestGate.Argv, []string{"prog", "--flag", "", "tail"}) {
+		t.Fatalf("argv = %q, want the empty argument preserved", rp.TestGate.Argv)
+	}
+}
+
 func TestParseRunPolicyBudgetZeroAllowed(t *testing.T) {
-	rp, err := ParseRunPolicy([]byte(`{"schema_version":1,"test_gate":{"command":"x"},"budgets":{"plan_rounds":0,"checkpoint_rounds":0,"test_rounds":0,"verify_rounds":0}}`))
+	rp, err := ParseRunPolicy([]byte(`{"schema_version":2,"test_gate":{"argv":["x"]},"budgets":{"plan_rounds":0,"checkpoint_rounds":0,"test_rounds":0,"verify_rounds":0}}`))
 	if err != nil {
 		t.Fatalf("zero budgets should be allowed: %v", err)
 	}
@@ -148,7 +213,7 @@ func TestValidateEffectiveRunsStructural(t *testing.T) {
 	// An override that zeroes a limit must be caught by the final gate even
 	// though it never went through ParseRunPolicy.
 	rp := DefaultRunPolicy()
-	rp.TestGate = TestGate{Command: "go test ./..."}
+	rp.TestGate = TestGate{Argv: []string{"go", "test", "./..."}}
 	rp.Limits.MaxWallSeconds = 0
 	if err := ValidateEffective(tc, rp); err == nil {
 		t.Fatalf("ValidateEffective should reject a zero limit from an override")
@@ -165,11 +230,11 @@ func TestValidateEffectiveTestGate(t *testing.T) {
 
 	base := DefaultRunPolicy()
 	cmd := base
-	cmd.TestGate = TestGate{Command: "go test ./..."}
+	cmd.TestGate = TestGate{Argv: []string{"go", "test", "./..."}}
 	disabled := base
 	disabled.TestGate = TestGate{Disabled: true}
 	both := base
-	both.TestGate = TestGate{Command: "x", Disabled: true}
+	both.TestGate = TestGate{Argv: []string{"x"}, Disabled: true}
 	neither := base
 	neither.TestGate = TestGate{}
 
@@ -214,7 +279,7 @@ func TestParseTaskContractRejectsDuplicateCriteria(t *testing.T) {
 
 func TestRunPolicyBudgetCeiling(t *testing.T) {
 	base := DefaultRunPolicy()
-	base.TestGate = TestGate{Command: "go test ./..."}
+	base.TestGate = TestGate{Argv: []string{"go", "test", "./..."}}
 
 	// Every ceiling-bound field, so a later refactor cannot leave one policy field
 	// unrepresentable: each is accepted at the ceiling and rejected one above it.

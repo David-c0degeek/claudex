@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -126,15 +127,23 @@ func TestEvidenceBindingCannotChangeUnderALiveAssignment(t *testing.T) {
 	}
 }
 
-// v7 is a semantic format change, not an additive one: v6 never carried an evidence binding, so a v6
-// generation's read-only assignments would silently violate the invariant if they were accepted. A
-// v6 document is therefore refused outright, with version remediation rather than a vague error.
-func TestDecodeRejectsV6State(t *testing.T) {
-	v6 := []byte(`{"schema_version":6,"run_id":"r","revision":2,"accepted_turns":{}}`)
-	if _, err := decodeRunState(genstore.Record{Generation: 2, Payload: v6}); !errors.Is(err, ErrUnsupportedSchema) {
-		t.Fatalf("v6 decode err = %v, want ErrUnsupportedSchema", err)
+// Every superseded schema version is refused OUTRIGHT, with version remediation rather than a vague
+// error. Each bump here was a semantic format change, not an additive one:
+//
+//   - v6 never carried an evidence binding, so its read-only assignments would silently violate the v7
+//     invariant if they were accepted;
+//   - v7 never carried attempt identity, so a v7 generation in TESTS names no attempt — and it also
+//     embeds a run-policy v1 test gate, which the current validator cannot accept at all. That second
+//     point is why the policy and state bumps had to land together: a policy-only bump would have made
+//     every existing generation undecodable while the state schema still claimed to be current.
+func TestDecodeRejectsSupersededStateVersions(t *testing.T) {
+	for _, v := range []int{6, 7} {
+		doc := []byte(fmt.Sprintf(`{"schema_version":%d,"run_id":"r","revision":2,"accepted_turns":{}}`, v))
+		if _, err := decodeRunState(genstore.Record{Generation: 2, Payload: doc}); !errors.Is(err, ErrUnsupportedSchema) {
+			t.Fatalf("v%d decode err = %v, want ErrUnsupportedSchema", v, err)
+		}
 	}
-	if RunStateVersion != 7 {
-		t.Fatalf("RunStateVersion = %d, want 7", RunStateVersion)
+	if RunStateVersion != 8 {
+		t.Fatalf("RunStateVersion = %d, want 8", RunStateVersion)
 	}
 }

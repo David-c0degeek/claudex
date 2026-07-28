@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/evidence"
@@ -30,7 +31,7 @@ import (
 // review. A v1 document therefore fails the version check outright.
 const (
 	TaskContractVersion = 2
-	RunPolicyVersion    = 1
+	RunPolicyVersion    = 2
 )
 
 // MaxBudget is the shared ceiling for every quality budget and the run-turn cap.
@@ -75,11 +76,74 @@ const (
 	UnknownFSAcknowledge UnknownFSPolicy = "acknowledge" // proceed at operator's risk
 )
 
-// TestGate is the mechanical test gate. Exactly one of a non-blank Command or
-// Disabled=true must hold; an empty command never silently disables the gate.
+// TestGateEnv is the environment the mechanical test command is authorized to run with.
+//
+// It exists because naming what the command may see is the only way the environment can be a frozen
+// input rather than an ambient one. Inherit lists the variables whose values are taken from the host
+// AT FIRST ATTACH and frozen from then on; Set supplies values the policy states outright. Anything not
+// named here does not reach the command.
+//
+// HOME is deliberately NOT in the default allowlist. Git, npm and cloud tooling load credential-bearing
+// configuration from it, so inheriting it by default would have contradicted this contract's own
+// "no provider token" rule; the run supplies a tool-owned per-run scratch HOME instead.
+type TestGateEnv struct {
+	Inherit []string          `json:"inherit"`
+	Set     map[string]string `json:"set"`
+}
+
+// MarshalJSON renders absent collections as empty ones rather than null.
+//
+// Go marshals a nil slice and a nil map as `null`, and this package refuses explicit nulls on the way
+// back in — so the zero value of this struct could be written and then not read, which makes
+// marshal-then-parse a partial function. That matters beyond ergonomics: the frozen policy is embedded
+// in persisted run state, and BootstrapIntent requires the re-parsed policy to equal the frozen one
+// exactly, so a shape that cannot round-trip is a shape that can strand a run.
+//
+// "Absent" and "empty" mean the same thing here — no variables — so collapsing them loses nothing.
+func (e TestGateEnv) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Inherit []string          `json:"inherit"`
+		Set     map[string]string `json:"set"`
+	}
+	w := wire{Inherit: e.Inherit, Set: e.Set}
+	if w.Inherit == nil {
+		w.Inherit = []string{}
+	}
+	if w.Set == nil {
+		w.Set = map[string]string{}
+	}
+	return json.Marshal(w)
+}
+
+// TestGate is the mechanical test gate. Exactly one of a non-empty Argv or Disabled=true must hold; an
+// empty command never silently disables the gate.
+//
+// Argv replaced a single Command string at run-policy v2. A string has to be split by somebody, and
+// every candidate splitter is either a shell — which would give the gate an implicit interpreter and
+// its whole injection surface — or a quoting dialect that differs between platforms. An explicit vector
+// means a shell must be NAMED to be used: ["sh", "-c", "…"]. Empty later elements are preserved,
+// because an empty argument is meaningful to some commands and silently dropping it would change what
+// ran.
 type TestGate struct {
-	Command  string `json:"command"`
-	Disabled bool   `json:"disabled"`
+	Argv     []string    `json:"argv"`
+	Disabled bool        `json:"disabled"`
+	Env      TestGateEnv `json:"env"`
+}
+
+// MarshalJSON renders an absent argv as an empty vector rather than null, for the same reason
+// TestGateEnv does: this struct is embedded in persisted run state, and a value that marshals to
+// something the parser refuses makes the round-trip a partial function.
+func (g TestGate) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Argv     []string    `json:"argv"`
+		Disabled bool        `json:"disabled"`
+		Env      TestGateEnv `json:"env"`
+	}
+	w := wire{Argv: g.Argv, Disabled: g.Disabled, Env: g.Env}
+	if w.Argv == nil {
+		w.Argv = []string{}
+	}
+	return json.Marshal(w)
 }
 
 // Budgets are the number of allowed revise/fix cycles per phase. Zero is valid
@@ -102,6 +166,18 @@ type Limits struct {
 	EvidenceMaxTotalBytes     int64 `json:"evidence_max_total_bytes"`
 	EvidenceMaxFileBytes      int64 `json:"evidence_max_file_bytes"`
 	EvidenceMaxRequests       int   `json:"evidence_max_requests"`
+	// MaxTestAttempts bounds the append-only attempt ledger. It is NOT the same thing as the TestFixes
+	// budget: an indeterminate attempt — one the runner could not decide, as opposed to one the code
+	// failed — is retried without spending a fix, so without a separate ceiling those retries would be
+	// unbounded. Exhausting it halts for operator action rather than reporting a code failure.
+	MaxTestAttempts int `json:"max_test_attempts"`
+	// MaxTestOutputBytes bounds the combined RETAINED excerpt of the command's streams, counted in RAW
+	// bytes before encoding.
+	MaxTestOutputBytes int64 `json:"max_test_output_bytes"`
+	// MaxTestRecordBytes bounds the CANONICAL encoding of one attempt result. The result is issued to
+	// the verifier as an evidence-packet file, so a record that cannot be packetized would be a run
+	// whose outcome exists and cannot be shown; see the cross-validation in Validate.
+	MaxTestRecordBytes int64 `json:"max_test_record_bytes"`
 }
 
 // RunPolicy is the operational envelope. There is no agent/turn timeout that
@@ -125,6 +201,15 @@ func DefaultRunPolicy() RunPolicy {
 		BaseBranch:      "main",
 		UnknownFSPolicy: UnknownFSRefuse,
 		Budgets:         Budgets{PlanRounds: 1, CheckpointRounds: 3, TestRounds: 2, VerifyRounds: 2},
+		// The default allowlist is PATH and nothing else, and it is deliberately PLATFORM-INDEPENDENT.
+		// Windows additionally requires SystemRoot, ComSpec and PATHEXT for a process to start and for
+		// executable lookup to work, but putting those in the default here would make the same policy
+		// document parse to different values on different hosts — and BootstrapIntent requires the
+		// re-parsed policy to equal the frozen EffectivePolicy exactly, so a run bootstrapped on one
+		// platform could not be validated on another. The platform-required set therefore belongs to
+		// resolution, where it is recorded in ResolvedExecution and bound like every other resolved
+		// value, rather than to the portable policy document.
+		TestGate: TestGate{Env: TestGateEnv{Inherit: []string{"PATH"}, Set: map[string]string{}}},
 		Limits: Limits{
 			MaxArtifactBytesPerSubmit: 262144,
 			MaxRunTurns:               200,
@@ -133,6 +218,11 @@ func DefaultRunPolicy() RunPolicy {
 			EvidenceMaxTotalBytes:     262144,
 			EvidenceMaxFileBytes:      98304,
 			EvidenceMaxRequests:       8,
+			MaxTestAttempts:           20,
+			MaxTestOutputBytes:        32768,
+			// Chosen to satisfy the cross-validation below at the defaults:
+			// 65536 <= 98304 <= 262144.
+			MaxTestRecordBytes: 65536,
 		},
 	}
 }
@@ -307,11 +397,30 @@ func (rp RunPolicy) Validate() error {
 		{"evidence_max_total_bytes", rp.Limits.EvidenceMaxTotalBytes},
 		{"evidence_max_file_bytes", rp.Limits.EvidenceMaxFileBytes},
 		{"evidence_max_requests", int64(rp.Limits.EvidenceMaxRequests)},
+		{"max_test_attempts", int64(rp.Limits.MaxTestAttempts)},
+		{"max_test_output_bytes", rp.Limits.MaxTestOutputBytes},
+		{"max_test_record_bytes", rp.Limits.MaxTestRecordBytes},
 	}
 	for _, l := range limits {
 		if l.v <= 0 {
 			return fmt.Errorf("limits.%s must be positive, got %d", l.name, l.v)
 		}
+	}
+	if err := rp.TestGate.validate(); err != nil {
+		return err
+	}
+	// The attempt ledger lives inside a full-snapshot RunState, so its ceiling shares the counter
+	// ceiling every other stored count is bounded by.
+	if rp.Limits.MaxTestAttempts > MaxBudget {
+		return fmt.Errorf("limits.max_test_attempts must be <= %d, got %d", MaxBudget, rp.Limits.MaxTestAttempts)
+	}
+	// Cross-validated, not merely present. An attempt result is issued to the verifier as a file inside
+	// an evidence packet, so a record ceiling above the packet's per-file ceiling would describe a run
+	// whose outcome is policy-valid and cannot be shown to the party that has to review it. Checking
+	// each bound in isolation would accept exactly that policy.
+	if rp.Limits.MaxTestRecordBytes > rp.Limits.EvidenceMaxFileBytes {
+		return fmt.Errorf("limits.max_test_record_bytes (%d) exceeds evidence_max_file_bytes (%d), so a result could never be issued as evidence",
+			rp.Limits.MaxTestRecordBytes, rp.Limits.EvidenceMaxFileBytes)
 	}
 	// max_run_turns shares the counter ceiling so a frozen policy never requests a
 	// turn budget the engine's checked counters cannot represent.
@@ -320,6 +429,90 @@ func (rp RunPolicy) Validate() error {
 	}
 	if rp.Limits.EvidenceMaxFileBytes > rp.Limits.EvidenceMaxTotalBytes {
 		return fmt.Errorf("limits.evidence_max_file_bytes (%d) exceeds evidence_max_total_bytes (%d)", rp.Limits.EvidenceMaxFileBytes, rp.Limits.EvidenceMaxTotalBytes)
+	}
+	return nil
+}
+
+// validate enforces the test gate's own shape: exactly one of a command or an explicit disable, and an
+// environment allowlist that can only name variables an operating system can actually carry.
+//
+// The name grammar is [A-Za-z_][A-Za-z0-9_]* and it is narrower than any platform requires. That is
+// what makes the Windows case-fold exact: with names restricted to ASCII, "one variable to the OS" is a
+// plain A-Z mapping that validation and child-environment construction cannot implement differently.
+// A rule stated as "case-insensitive" would be locale- and API-dependent, and the two could disagree.
+//
+// The FOLD-COLLISION check is deliberately not here. Whether Path and PATH are one variable or two is a
+// property of the host, and this document is portable; a policy that is fine on Linux and ambiguous on
+// Windows is refused at attach, where the platform is known, rather than made unparseable everywhere.
+func (g TestGate) validate() error {
+	hasArgv := len(g.Argv) > 0
+	if hasArgv == g.Disabled {
+		return fmt.Errorf("test_gate must set exactly one of argv or disabled")
+	}
+	if hasArgv {
+		if strings.TrimSpace(g.Argv[0]) == "" {
+			return fmt.Errorf("test_gate.argv[0] must name a command")
+		}
+		for i, a := range g.Argv {
+			// Later arguments may be empty ON PURPOSE and are preserved; none may contain NUL, which no
+			// exec interface can carry.
+			if strings.ContainsRune(a, 0) {
+				return fmt.Errorf("test_gate.argv[%d] contains NUL", i)
+			}
+		}
+	}
+	for i, n := range g.Env.Inherit {
+		if err := validateEnvName(n); err != nil {
+			return fmt.Errorf("test_gate.env.inherit[%d]: %w", i, err)
+		}
+	}
+	// Sorted so the error a user sees does not depend on Go's map iteration order.
+	names := make([]string, 0, len(g.Env.Set))
+	for n := range g.Env.Set {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if err := validateEnvName(n); err != nil {
+			return fmt.Errorf("test_gate.env.set: %w", err)
+		}
+		if strings.ContainsRune(g.Env.Set[n], 0) {
+			return fmt.Errorf("test_gate.env.set[%s] contains NUL", n)
+		}
+	}
+	// A name in both halves has two answers for one variable, and which one wins would be an
+	// implementation detail rather than a stated policy.
+	inherited := make(map[string]bool, len(g.Env.Inherit))
+	for _, n := range g.Env.Inherit {
+		if inherited[n] {
+			return fmt.Errorf("test_gate.env.inherit names %s twice", n)
+		}
+		inherited[n] = true
+	}
+	for _, n := range names {
+		if inherited[n] {
+			return fmt.Errorf("test_gate.env names %s in both inherit and set", n)
+		}
+	}
+	return nil
+}
+
+// validateEnvName enforces the portable ASCII grammar for an environment variable name.
+func validateEnvName(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty environment variable name")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c == '_', c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return fmt.Errorf("environment variable name %q starts with a digit", name)
+			}
+		default:
+			return fmt.Errorf("environment variable name %q is not [A-Za-z_][A-Za-z0-9_]*", name)
+		}
 	}
 	return nil
 }
@@ -334,13 +527,9 @@ func ValidateEffective(tc TaskContract, rp RunPolicy) error {
 	if err := rp.Validate(); err != nil {
 		return err
 	}
-	hasCmd := strings.TrimSpace(rp.TestGate.Command) != ""
-	switch {
-	case rp.TestGate.Disabled && hasCmd:
-		return fmt.Errorf("test_gate: cannot set both a command and disabled")
-	case !rp.TestGate.Disabled && !hasCmd:
-		return fmt.Errorf("test_gate: set a non-blank command or explicitly disable it")
-	case rp.TestGate.Disabled && len(tc.RequiredTests) > 0:
+	// The XOR itself is checked by rp.Validate above, which every caller of this function reaches; what
+	// is left is the part that needs the TASK, and therefore cannot live in the policy's own validation.
+	if rp.TestGate.Disabled && len(tc.RequiredTests) > 0 {
 		return fmt.Errorf("test_gate: disabled, but the task contract requires tests: %v", tc.RequiredTests)
 	}
 	return nil

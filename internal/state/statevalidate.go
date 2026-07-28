@@ -93,9 +93,9 @@ func validate(rs *RunState) error {
 	if rs.Base != rs.EffectivePolicy.BaseBranch {
 		return fmt.Errorf("base %q must equal effective_policy.base_branch %q", rs.Base, rs.EffectivePolicy.BaseBranch)
 	}
-	hasCmd := strings.TrimSpace(rs.EffectivePolicy.TestGate.Command) != ""
-	if hasCmd == rs.EffectivePolicy.TestGate.Disabled {
-		return fmt.Errorf("effective_policy.test_gate must set exactly one of command or disabled")
+	hasArgv := len(rs.EffectivePolicy.TestGate.Argv) > 0
+	if hasArgv == rs.EffectivePolicy.TestGate.Disabled {
+		return fmt.Errorf("effective_policy.test_gate must set exactly one of argv or disabled")
 	}
 	if locatorKey(rs.TaskSnapshot.RelPath) == locatorKey(rs.PolicySnapshot.RelPath) {
 		return fmt.Errorf("task and policy snapshot paths must be distinct")
@@ -141,6 +141,93 @@ func validate(rs *RunState) error {
 	}
 	if err := validateBudgetHonesty(rs); err != nil {
 		return err
+	}
+	if err := validateTestAttempts(rs); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTestAttempts enforces the v8 attempt invariants.
+//
+// The ledger is the run's only record of what the mechanical gate actually did, and every rule here
+// exists because its absence would let the record say something that is not true:
+//
+//   - an active ref must be well formed and bound to a tree, or an outcome would be a claim about "the
+//     code" with no way to say which code;
+//   - the ledger is bounded by the policy's own ceiling, because indeterminate retries do not spend the
+//     fix budget and would otherwise grow a full-snapshot state without limit;
+//   - one result digest may not appear twice, because the digest IS the evidence for an outcome and the
+//     same evidence cannot authorize two different answers;
+//   - an attempt id may not be reused, since the containment, the intent and the result all bind it.
+func validateTestAttempts(rs *RunState) error {
+	if a := rs.ActiveTestAttempt; a != nil {
+		if !validID(a.AttemptID) {
+			return fmt.Errorf("active_test_attempt.attempt_id is not a valid id")
+		}
+		if a.StartRevision == 0 || a.StartRevision > rs.Revision {
+			return fmt.Errorf("active_test_attempt.start_revision %d out of range (1..%d)", a.StartRevision, rs.Revision)
+		}
+		if !isGitOID(a.TestedCommit) {
+			return fmt.Errorf("active_test_attempt.tested_commit is not a git object id")
+		}
+		if !isGitOID(a.TestedTree) {
+			return fmt.Errorf("active_test_attempt.tested_tree is not a git object id")
+		}
+		if !isSHA256Hex(a.IntentDigest) {
+			return fmt.Errorf("active_test_attempt.intent_digest is not a sha256")
+		}
+	}
+	max := rs.EffectivePolicy.Limits.MaxTestAttempts
+	if max > 0 && len(rs.TestAttempts) > max {
+		return fmt.Errorf("test_attempts has %d entries, exceeding limits.max_test_attempts %d", len(rs.TestAttempts), max)
+	}
+	seenID := make(map[string]bool, len(rs.TestAttempts))
+	seenDigest := make(map[string]bool, len(rs.TestAttempts))
+	for i, e := range rs.TestAttempts {
+		if !validID(e.AttemptID) {
+			return fmt.Errorf("test_attempts[%d].attempt_id is not a valid id", i)
+		}
+		if seenID[e.AttemptID] {
+			return fmt.Errorf("test_attempts[%d] repeats attempt id %q", i, e.AttemptID)
+		}
+		seenID[e.AttemptID] = true
+		if e.StartRevision == 0 || e.StartRevision > rs.Revision {
+			return fmt.Errorf("test_attempts[%d].start_revision %d out of range (1..%d)", i, e.StartRevision, rs.Revision)
+		}
+		if e.BoundRevision == 0 || e.BoundRevision > rs.Revision {
+			return fmt.Errorf("test_attempts[%d].bound_revision %d out of range (1..%d)", i, e.BoundRevision, rs.Revision)
+		}
+		if e.BoundRevision < e.StartRevision {
+			return fmt.Errorf("test_attempts[%d] was bound at revision %d, before it started at %d", i, e.BoundRevision, e.StartRevision)
+		}
+		if !isGitOID(e.TestedCommit) || !isGitOID(e.TestedTree) {
+			return fmt.Errorf("test_attempts[%d] tested identity is not a git object id", i)
+		}
+		if !isSHA256Hex(e.ResultDigest) {
+			return fmt.Errorf("test_attempts[%d].result_digest is not a sha256", i)
+		}
+		if seenDigest[e.ResultDigest] {
+			return fmt.Errorf("test_attempts[%d] reuses a result digest already bound to another outcome", i)
+		}
+		seenDigest[e.ResultDigest] = true
+		switch e.Execution {
+		case TestExecutionPassed, TestExecutionFailed, TestExecutionIndeterminate:
+		default:
+			return fmt.Errorf("test_attempts[%d].execution %q is not a known outcome", i, e.Execution)
+		}
+		switch e.Identity {
+		case TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved:
+		default:
+			return fmt.Errorf("test_attempts[%d].identity %q is not a known observation", i, e.Identity)
+		}
+		if strings.TrimSpace(e.TerminalReason) == "" || len(e.TerminalReason) > 256 {
+			return fmt.Errorf("test_attempts[%d].terminal_reason is required and bounded", i)
+		}
+		// An attempt cannot be both active and finalized: the ref is MOVED into the ledger, not copied.
+		if rs.ActiveTestAttempt != nil && rs.ActiveTestAttempt.AttemptID == e.AttemptID {
+			return fmt.Errorf("test_attempts[%d] finalizes attempt %q while it is still the active one", i, e.AttemptID)
+		}
 	}
 	return nil
 }
@@ -282,6 +369,26 @@ func validateTransition(old, next *RunState) error {
 	for i := range old.Counters.StepFixes {
 		if next.Counters.StepFixes[i] < old.Counters.StepFixes[i] {
 			return fmt.Errorf("step fix %d must not decrease", i)
+		}
+	}
+	// The attempt ledger is append-only in the strong sense: existing entries are frozen BY VALUE and
+	// the sequence may only grow at the end.
+	//
+	// Checking only the length would let an entry be rewritten in place while the count stayed the
+	// same — which is precisely how an indeterminate attempt could be quietly reclassified as a clean
+	// pass after the fact, erasing the distinction between a broken environment and working code that
+	// the ledger exists to preserve.
+	if len(next.TestAttempts) < len(old.TestAttempts) {
+		return fmt.Errorf("test attempts must not shrink (%d -> %d)", len(old.TestAttempts), len(next.TestAttempts))
+	}
+	for i := range old.TestAttempts {
+		if !reflect.DeepEqual(next.TestAttempts[i], old.TestAttempts[i]) {
+			return fmt.Errorf("finalized test attempt %d is immutable", i)
+		}
+	}
+	for i := len(old.TestAttempts); i < len(next.TestAttempts); i++ {
+		if next.TestAttempts[i].BoundRevision != next.Revision {
+			return fmt.Errorf("newly finalized test attempt %d must bind to revision %d, got %d", i, next.Revision, next.TestAttempts[i].BoundRevision)
 		}
 	}
 	// Accepted turns are append-only; existing entries are frozen and a NEW turn
@@ -582,21 +689,38 @@ func redactAndGuard(rs *RunState) error {
 	}
 
 	control := map[string]string{
-		"run_id":                             rs.RunID,
-		"base":                               rs.Base,
-		"base_commit":                        rs.BaseCommit,
-		"worktree_rel_path":                  rs.WorktreeRelPath,
-		"run_branch":                         rs.RunBranch,
-		"phase":                              string(rs.Phase),
-		"lifecycle":                          string(rs.Lifecycle),
-		"task_snapshot.rel_path":             rs.TaskSnapshot.RelPath,
-		"task_snapshot.digest":               rs.TaskSnapshot.Digest,
-		"policy_snapshot.rel_path":           rs.PolicySnapshot.RelPath,
-		"policy_snapshot.digest":             rs.PolicySnapshot.Digest,
-		"fs.class":                           rs.FS.Class,
-		"effective_policy.test_gate.command": rs.EffectivePolicy.TestGate.Command,
-		"effective_policy.base_branch":       rs.EffectivePolicy.BaseBranch,
-		"pending_txn_id":                     rs.PendingTxnID,
+		"run_id":                       rs.RunID,
+		"base":                         rs.Base,
+		"base_commit":                  rs.BaseCommit,
+		"worktree_rel_path":            rs.WorktreeRelPath,
+		"run_branch":                   rs.RunBranch,
+		"phase":                        string(rs.Phase),
+		"lifecycle":                    string(rs.Lifecycle),
+		"task_snapshot.rel_path":       rs.TaskSnapshot.RelPath,
+		"task_snapshot.digest":         rs.TaskSnapshot.Digest,
+		"policy_snapshot.rel_path":     rs.PolicySnapshot.RelPath,
+		"policy_snapshot.digest":       rs.PolicySnapshot.Digest,
+		"fs.class":                     rs.FS.Class,
+		"effective_policy.base_branch": rs.EffectivePolicy.BaseBranch,
+		"pending_txn_id":               rs.PendingTxnID,
+	}
+	// EVERY executable element, not just the first. The gate used to be one command string and this map
+	// held that one value; run-policy v2 made it a vector plus an environment, and a guard that still
+	// checked a single field would have left the arguments and the environment unguarded — which is
+	// where a credential is most likely to be written in the first place.
+	//
+	// Environment values are guarded here rather than redacted anywhere, and that is the point: a
+	// redacted pair collapses two distinct secrets to one marker, so a digest over redacted values would
+	// bind something the command never received. Refusing is what keeps the digest over ACTUAL values
+	// sound.
+	for i, a := range rs.EffectivePolicy.TestGate.Argv {
+		control[fmt.Sprintf("effective_policy.test_gate.argv.%d", i)] = a
+	}
+	for i, n := range rs.EffectivePolicy.TestGate.Env.Inherit {
+		control[fmt.Sprintf("effective_policy.test_gate.env.inherit.%d", i)] = n
+	}
+	for n, v := range rs.EffectivePolicy.TestGate.Env.Set {
+		control[fmt.Sprintf("effective_policy.test_gate.env.set.%s", n)] = n + "=" + v
 	}
 	if rs.Assignment != nil {
 		control["assignment.id"] = rs.Assignment.ID

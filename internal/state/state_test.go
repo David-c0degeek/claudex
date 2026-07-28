@@ -247,11 +247,57 @@ func TestBasePolicyMismatchRejected(t *testing.T) {
 	}
 }
 
+// TestSecretInControlFieldRejected covers EVERY executable element of the gate, not just the first.
+//
+// The gate used to be one command string and this test checked that one field. Run-policy v2 made it a
+// vector plus an environment, and an argument or an environment value is where a credential is most
+// likely to be written — so a test that still only checked argv[0] would have left the actual hazard
+// unguarded while looking like coverage.
+//
+// Environment values are REFUSED rather than redacted, and that is deliberate: redaction collapses two
+// distinct secrets to one marker, so a digest over redacted values would bind something the command
+// never received.
 func TestSecretInControlFieldRejected(t *testing.T) {
+	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
+	for _, tc := range []struct {
+		name  string
+		mutet func(*RunState)
+	}{
+		{"argv[0]", func(rs *RunState) {
+			rs.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"deploy token=" + secret}}
+		}},
+		{"a later argument", func(rs *RunState) {
+			rs.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"deploy", "--token=" + secret}}
+		}},
+		{"an env value", func(rs *RunState) {
+			rs.EffectivePolicy.TestGate = config.TestGate{
+				Argv: []string{"go", "test"},
+				Env:  config.TestGateEnv{Set: map[string]string{"TOKEN": secret}},
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			_, err := s.Mutate(0, func(_ uint64, next *RunState) error {
+				initState(next)
+				tc.mutet(next)
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "secret") {
+				t.Fatalf("err = %v, want a secret-in-control rejection", err)
+			}
+			if _, ok, _ := s.Load(); ok {
+				t.Fatalf("a generation was written despite the rejection")
+			}
+		})
+	}
+}
+
+func TestSecretInControlFieldRejectedLegacyShape(t *testing.T) {
 	s := newStore(t)
 	_, err := s.Mutate(0, func(_ uint64, next *RunState) error {
 		initState(next)
-		next.EffectivePolicy.TestGate.Command = "deploy token=sk-ant-abcdefghijklmnopqrstuvwx"
+		next.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"deploy", "token=sk-ant-abcdefghijklmnopqrstuvwx"}}
 		return nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "secret") {
