@@ -351,7 +351,7 @@ func TestTeardownCarriesTheLeaderExitStatus(t *testing.T) {
 			if !res.Leader.Observed {
 				t.Fatal("teardown did not observe the leader")
 			}
-			term, err := TerminalFrom(res, pgid)
+			term, err := terminalFrom(res, pgid)
 			if err != nil {
 				t.Fatalf("TerminalFrom: %v", err)
 			}
@@ -395,7 +395,7 @@ func TestTeardownCarriesSignalTermination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
-	term, err := TerminalFrom(res, pgid)
+	term, err := terminalFrom(res, pgid)
 	if err != nil {
 		t.Fatalf("TerminalFrom: %v", err)
 	}
@@ -414,7 +414,7 @@ func TestTeardownOfAnAlreadyExitedLeader(t *testing.T) {
 	// Let it finish and become a zombie before the teardown begins.
 	time.Sleep(200 * time.Millisecond)
 	res, pgid := reapLeaderOnly(t, cmd)
-	term, err := TerminalFrom(res, pgid)
+	term, err := terminalFrom(res, pgid)
 	if err != nil {
 		t.Fatalf("TerminalFrom: %v", err)
 	}
@@ -426,7 +426,7 @@ func TestTeardownOfAnAlreadyExitedLeader(t *testing.T) {
 // TestTerminalFromRefusesAnUnobservedLeader: "the command ran but we do not know how it ended" is not
 // an outcome TERMINAL may express.
 func TestTerminalFromRefusesAnUnobservedLeader(t *testing.T) {
-	if _, err := TerminalFrom(ReapResult{Reaped: 2, GroupEmpty: true}, 42); err == nil {
+	if _, err := terminalFrom(ReapResult{Reaped: 2, GroupEmpty: true}, 42); err == nil {
 		t.Fatal("TerminalFrom produced a terminal without having observed the leader")
 	}
 }
@@ -440,7 +440,7 @@ func TestTerminalFromRequiresTheGroupEmptyProof(t *testing.T) {
 		GroupEmpty: false,
 		Leader:     LeaderOutcome{Observed: true, Exited: true},
 	}
-	if _, err := TerminalFrom(unfinished, 42); err == nil {
+	if _, err := terminalFrom(unfinished, 42); err == nil {
 		t.Fatal("TerminalFrom accepted a teardown that never proved the group empty")
 	}
 }
@@ -466,7 +466,7 @@ func TestNoTerminalAfterADeadlinedTeardown(t *testing.T) {
 	if !errors.Is(terr, ErrReapDeadline) {
 		t.Fatalf("Teardown: err = %v, want ErrReapDeadline", terr)
 	}
-	if _, err := TerminalFrom(res, pgid); err == nil {
+	if _, err := terminalFrom(res, pgid); err == nil {
 		t.Fatal("a timed-out teardown produced an authoritative terminal")
 	}
 }
@@ -510,7 +510,7 @@ func TestAwaitDoesNotReleaseTheLeaderIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
-	term, err := TerminalFrom(res, pgid)
+	term, err := terminalFrom(res, pgid)
 	if err != nil {
 		t.Fatalf("TerminalFrom: %v", err)
 	}

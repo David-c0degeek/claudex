@@ -240,15 +240,17 @@ func reapGroup(pgid int, p ReapPolicy, acc *ReapResult) (ReapResult, error) {
 	}
 }
 
-// TerminalFrom builds the authoritative TERMINAL from a completed teardown.
+// terminalFrom builds the authoritative TERMINAL from a completed teardown.
 //
-// It exists so the composition is pinned rather than left to each caller: the leader's status, the
-// reap count and the group id all come from the ONE teardown that observed them, which is what keeps
-// the terminal and the cleanup receipt describing the same attempt.
+// It is UNEXPORTED, and that is the point rather than tidiness. Taking the result and the group id as
+// two independent arguments is exactly the shape that let a caller tear down group A and publish A's
+// group-empty proof as a statement about an unrelated group B. The package therefore does not offer
+// that shape to anyone: the only way to reach it is (*Reaper).Terminal, where both arguments come from
+// the one object that holds an identity-bound handle on the group.
 //
 // A teardown that never observed the leader cannot produce a terminal at all — "the command ran but
 // we do not know how it ended" is not one of the outcomes TERMINAL is allowed to express.
-func TerminalFrom(res ReapResult, pgid int) (Terminal, error) {
+func terminalFrom(res ReapResult, pgid int) (Terminal, error) {
 	if !res.Leader.Observed {
 		return Terminal{}, fmt.Errorf("proctree: teardown never observed the command leader; no outcome can be claimed")
 	}
@@ -321,6 +323,24 @@ func (r *Reaper) Close() error {
 
 // Result is everything observed so far.
 func (r *Reaper) Result() ReapResult { return r.res }
+
+// PGID is the owned group's identity, and the ONLY source of it.
+//
+// It is positive by construction: NewReaper refuses a nonpositive group and holds a pidfd on the
+// leader, so the number cannot be recycled while this reaper exists. Anything that records or
+// certifies "the group" reads it from here, because the alternative was demonstrated: Supervision used
+// to carry its own PGID field that validation merely required to be positive, so a supervision could
+// tear down the reaper's group A, obtain A's group-empty proof, and durably publish it as though it
+// described an unrelated group B — with the terminal and the receipt both copying B, so the check
+// between them agreed on a fact neither had observed.
+func (r *Reaper) PGID() int { return r.pgid }
+
+// Terminal builds the authoritative TERMINAL from what THIS reaper observed of the group it owns.
+//
+// The result and the group id are not parameters. They are the reaper's own state, which is what makes
+// the terminal a statement about the group that was actually torn down rather than about whichever
+// number the caller supplied alongside it.
+func (r *Reaper) Terminal() (Terminal, error) { return terminalFrom(r.res, r.pgid) }
 
 // Await waits for the command leader to EXIT, without reaping it and without signalling anything.
 //

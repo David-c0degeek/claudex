@@ -65,7 +65,11 @@ func (w *orderingStat) Write(p []byte) (int, error) {
 
 // superviseStarted wires a real contained command to a real reaper, real receipt publication and the
 // real protocol, with the ordering instruments in place.
-func superviseStarted(t *testing.T, script string, tweak func(*Supervision)) (Supervision, *bytes.Buffer, *os.Root, *orderingLease) {
+//
+// It returns the leader's pid as os/exec reported it. That is an identity source INDEPENDENT of the
+// reaper, and it exists so a test can check that the durable facts describe the group that was
+// actually spawned rather than merely agreeing with whatever the supervision was handed.
+func superviseStarted(t *testing.T, script string, tweak func(*Supervision)) (Supervision, *bytes.Buffer, *os.Root, *orderingLease, int) {
 	t.Helper()
 	if err := BecomeSubreaper(); err != nil {
 		t.Fatalf("BecomeSubreaper: %v", err)
@@ -92,8 +96,8 @@ func superviseStarted(t *testing.T, script string, tweak func(*Supervision)) (Su
 	if err != nil {
 		t.Fatalf("SpawnContained: %v", err)
 	}
-	pgid := cmd.Process.Pid
-	r, err := NewReaper(pgid)
+	leaderPID := cmd.Process.Pid
+	r, err := NewReaper(leaderPID)
 	if err != nil {
 		t.Fatalf("NewReaper: %v", err)
 	}
@@ -102,11 +106,10 @@ func superviseStarted(t *testing.T, script string, tweak func(*Supervision)) (Su
 	s, buf, root, lease := baseSupervision(t, LaunchStarted)
 	s.Spawn = sp
 	s.Reaper = r
-	s.PGID = pgid
 	if tweak != nil {
 		tweak(&s)
 	}
-	return s, buf, root, lease
+	return s, buf, root, lease, leaderPID
 }
 
 func baseSupervision(t *testing.T, outcome LaunchOutcome) (Supervision, *bytes.Buffer, *os.Root, *orderingLease) {
@@ -154,7 +157,7 @@ func baseSupervision(t *testing.T, outcome LaunchOutcome) (Supervision, *bytes.B
 // instant a step happens out of order, so a reordering is caught even though the end state looks the
 // same.
 func TestTerminalSequenceOrderIsEnforced(t *testing.T) {
-	s, buf, root, lease := superviseStarted(t, "exit 3", nil)
+	s, buf, root, lease, leaderPID := superviseStarted(t, "exit 3", nil)
 
 	term, err := RunToTerminal(s)
 	if err != nil {
@@ -183,12 +186,56 @@ func TestTerminalSequenceOrderIsEnforced(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatalf("%d bytes left on stat; more than one frame was sent", buf.Len())
 	}
+	// The durable facts must name the group that was ACTUALLY spawned. leaderPID comes from os/exec,
+	// so this compares the published identity against a source outside the reaper — the check that a
+	// caller-supplied group id would have failed.
+	if got.CommandPGID != leaderPID || term.CommandPGID != leaderPID {
+		t.Fatalf("receipt PGID %d / terminal PGID %d, want the spawned leader %d", got.CommandPGID, term.CommandPGID, leaderPID)
+	}
+}
+
+// TestTerminalCertifiesOnlyTheGroupItToreDown is the regression net for the two-identity defect.
+//
+// Supervision used to carry its own PGID field alongside the reaper, and validation only required it
+// to be positive. Teardown ran on the reaper's group while the terminal and the receipt both recorded
+// the field, so a supervision could prove group A empty and durably publish that proof as a statement
+// about an unrelated group B — and because both false facts copied B, AgreesWith could not see it.
+//
+// The fix is structural: there is nowhere left to put a second group id. This test pins the property
+// that fix exists for. It runs a real command in group A while an unrelated group B stays ALIVE, and
+// requires the published identity to be A and B to be untouched.
+func TestTerminalCertifiesOnlyTheGroupItToreDown(t *testing.T) {
+	bystander := startGroupLeader(t, "sleep 30")
+	bystanderPGID := bystander.Process.Pid
+	t.Cleanup(func() { _, _ = ReapGroup(bystanderPGID, fastPolicy) })
+
+	s, _, root, _, leaderPID := superviseStarted(t, "exit 0", nil)
+	term, err := RunToTerminal(s)
+	if err != nil {
+		t.Fatalf("RunToTerminal: %v", err)
+	}
+	got, err := ReadReceipt(root, "att-1")
+	if err != nil {
+		t.Fatalf("ReadReceipt: %v", err)
+	}
+	if term.CommandPGID != leaderPID || got.CommandPGID != leaderPID {
+		t.Fatalf("published identity terminal=%d receipt=%d, want the group actually torn down (%d)", term.CommandPGID, got.CommandPGID, leaderPID)
+	}
+	// The proof is only worth something if the OTHER group could have been named and was not: an empty
+	// bystander would let a wrong identity look indistinguishable from a right one.
+	empty, err := groupIsEmpty(bystanderPGID)
+	if err != nil {
+		t.Fatalf("groupIsEmpty: %v", err)
+	}
+	if empty {
+		t.Fatal("the bystander group died on its own; the test proves nothing about which group was certified")
+	}
 }
 
 // TestTerminalSequenceClosesStreamsFirst: the coordinator's drain cannot see EOF while the supervisor
 // still holds a write end, so the ordering would deadlock.
 func TestTerminalSequenceClosesStreamsFirst(t *testing.T) {
-	s, _, _, _ := superviseStarted(t, "echo hello; exit 0", nil)
+	s, _, _, _, _ := superviseStarted(t, "echo hello; exit 0", nil)
 	if _, err := RunToTerminal(s); err != nil {
 		t.Fatalf("RunToTerminal: %v", err)
 	}
@@ -225,8 +272,8 @@ func TestTerminalSequenceTearsDownDespiteEarlierFailure(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, buf, root, lease := superviseStarted(t, "sleep 30", nil)
-			pgid := s.PGID
+			s, buf, root, lease, _ := superviseStarted(t, "sleep 30", nil)
+			pgid := s.Reaper.PGID()
 			tc.break_(&s)
 
 			if _, err := RunToTerminal(s); err == nil {
@@ -352,8 +399,11 @@ func TestTerminalSequenceValidation(t *testing.T) {
 			s.Outcome = LaunchSpawnFailed
 			s.SpawnErrorClass = ""
 		}},
-		{"no-command owning a group", func(s *Supervision) { s.PGID = 42 }},
-		{"started without a reaper", func(s *Supervision) { s.Outcome = LaunchStarted; s.PGID = 42 }},
+		// The ONE malformation with no live-group counterpart, and the reason is structural rather
+		// than an omission: the reaper is what owns a group, so a supervision without one has no group
+		// to abandon. Every other case in this list is also exercised against a real running command
+		// in TestTerminalSequenceTearsDownOnValidationFailure.
+		{"started without a reaper", func(s *Supervision) { s.Outcome = LaunchStarted }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, _, _ := baseSupervision(t, LaunchAborted)
@@ -376,19 +426,19 @@ func TestTerminalSequencePublishesNothingWhenTeardownFails(t *testing.T) {
 	// deadline, and the test passes while proving nothing. An ignoring shell that regenerates work
 	// survives SIGTERM and still cannot ignore SIGKILL.
 	const survivesTerm = "trap '' TERM; while :; do sleep 0.05; done"
-	s, buf, root, lease := superviseStarted(t, survivesTerm, func(s *Supervision) {
+	s, buf, root, lease, _ := superviseStarted(t, survivesTerm, func(s *Supervision) {
 		s.Policy = ReapPolicy{Grace: time.Hour, Deadline: 200 * time.Millisecond, Poll: 5 * time.Millisecond}
 		s.AwaitDeadline = time.Now().Add(150 * time.Millisecond)
 	})
-	t.Cleanup(func() { _, _ = ReapGroup(s.PGID, fastPolicy) })
+	t.Cleanup(func() { _, _ = ReapGroup(s.Reaper.PGID(), fastPolicy) })
 
 	// Prove the fixture is hostile before relying on it.
 	time.Sleep(150 * time.Millisecond)
-	if err := signalGroup(s.PGID, unix.SIGTERM); err != nil {
+	if err := signalGroup(s.Reaper.PGID(), unix.SIGTERM); err != nil {
 		t.Fatalf("probe signal: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
-	if empty, eerr := groupIsEmpty(s.PGID); eerr != nil || empty {
+	if empty, eerr := groupIsEmpty(s.Reaper.PGID()); eerr != nil || empty {
 		t.Fatalf("fixture is not SIGTERM-immune (empty=%v err=%v); the test would prove nothing", empty, eerr)
 	}
 
@@ -407,38 +457,75 @@ func TestTerminalSequencePublishesNothingWhenTeardownFails(t *testing.T) {
 	}
 }
 
-// TestTerminalSequenceTearsDownOnValidationFailure is CX's adversarial case, kept.
+// TestTerminalSequenceTearsDownOnValidationFailure is CX's adversarial case, widened to EVERY
+// malformation that can coexist with a running command.
 //
 // It is the third appearance of one asymmetry: close and await failures were made non-short-circuiting
-// so a live group could not be abandoned, and the VALIDATION gate still returned early — so a nil
-// status channel, a missing lease or a bad clock left the command running while the supervisor exited.
-// The reason to clean up is the state of the world, not the validity of the request.
+// so a live group could not be abandoned, and the VALIDATION gate still returned early. The first fix
+// covered only the four reporting fields it happened to look at, which left the OWNERSHIP
+// discriminators — the outcome and the old duplicate group id — still able to disable cleanup: a real
+// started supervision whose Outcome had been set to a no-command value walked away from a live group
+// its reaper could have torn down.
+//
+// So the table now includes every discriminator, including the ones that gate cleanup. The property is
+// that no field on this struct can switch containment cleanup off, because the capability comes from
+// the reaper's existence and every other field only describes what will be reported.
 func TestTerminalSequenceTearsDownOnValidationFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		mutet func(*Supervision)
 	}{
+		// Ownership discriminators: these decide whether the code BELIEVES a group is running, which is
+		// exactly why they must not decide whether it is cleaned up.
+		{"no outcome at all", func(s *Supervision) { s.Outcome = 0 }},
+		{"outcome claims the launch aborted", func(s *Supervision) { s.Outcome = LaunchAborted }},
+		{"outcome claims the spawn failed", func(s *Supervision) {
+			s.Outcome = LaunchSpawnFailed
+			s.SpawnErrorClass = "not_found"
+		}},
+		{"started carrying a spawn error class", func(s *Supervision) { s.SpawnErrorClass = "not_found" }},
+		// Reporting fields.
+		{"no attempt id", func(s *Supervision) { s.AttemptID = "" }},
+		{"no attempt directory", func(s *Supervision) { s.Root = nil }},
 		{"no status channel", func(s *Supervision) { s.Stat = nil }},
+		{"no protocol", func(s *Supervision) { s.Protocol = nil }},
 		{"no lease", func(s *Supervision) { s.Lease = nil }},
 		{"no clock", func(s *Supervision) { s.Now = nil }},
-		// An invalid policy must not become a second reason to skip the cleanup.
+		// Timing fields. An invalid policy must not become a second reason to skip the cleanup, which
+		// is why the emergency path substitutes the shipped default rather than refusing.
 		{"invalid reap policy", func(s *Supervision) { s.Policy = ReapPolicy{} }},
+		// Disclosed rather than overclaimed: this row is NOT independently mutation-detectable.
+		// Reaper.Await refuses a nonpositive poll as well, so deleting the check in validate moves the
+		// refusal from the emergency path to the accumulated-error path — where teardown also runs and
+		// also publishes nothing. The observable outcome is identical, so the row exercises the
+		// property without being able to prove which layer enforced it.
+		{"await poll not positive", func(s *Supervision) { s.AwaitPoll = 0 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, _, _ := superviseStarted(t, "sleep 30", nil)
-			pgid := s.PGID
-			t.Cleanup(func() { _, _ = ReapGroup(pgid, fastPolicy) })
+			s, buf, root, lease, leaderPID := superviseStarted(t, "sleep 30", nil)
+			t.Cleanup(func() { _, _ = ReapGroup(leaderPID, fastPolicy) })
 			tc.mutet(&s)
 
 			if _, err := RunToTerminal(s); err == nil {
 				t.Fatal("RunToTerminal accepted a malformed supervision")
 			}
-			empty, eerr := groupIsEmpty(pgid)
+			empty, eerr := groupIsEmpty(leaderPID)
 			if eerr != nil {
 				t.Fatalf("groupIsEmpty: %v", eerr)
 			}
 			if !empty {
 				t.Fatal("the started command group survived a validation failure; the supervisor would exit leaving it alive")
+			}
+			// Cleaning up is not the same as succeeding: a malformed supervision must still publish
+			// nothing, announce nothing and keep the lease.
+			if _, rerr := ReadReceipt(root, "att-1"); !errors.Is(rerr, ErrReceiptMissing) {
+				t.Fatalf("a receipt was published for a malformed supervision: %v", rerr)
+			}
+			if buf.Len() != 0 {
+				t.Fatal("a terminal was announced for a malformed supervision")
+			}
+			if lease.released != 0 {
+				t.Fatal("the lease was released for a malformed supervision")
 			}
 		})
 	}
