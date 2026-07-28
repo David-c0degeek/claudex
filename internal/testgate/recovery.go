@@ -1,6 +1,9 @@
 package testgate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -132,54 +135,90 @@ type ResultProjection struct {
 	Digest string
 }
 
-// RecordReader re-reads an immutable canonical record and proves it is the one named.
+// RecordBytes is the raw-byte source for one attempt's immutable records.
 //
-// This exists so that "the omitted evidence is still reachable" is a contract with a shape rather than
-// a reassurance. An implementation MUST verify that the bytes it returns hash to the requested digest
-// and fail otherwise; a reader that merely fetches whatever is at a path is the ambient re-read this
-// package refuses, wearing a type.
-type RecordReader interface {
-	ReadRecord(digest string) ([]byte, error)
+// It is deliberately NOT the thing callers use. On its own it is exactly the ambient path read this
+// package refuses, and an interface that merely says "return the bytes for this digest" is satisfied by
+// an implementation that returns whatever is at a path - the verification lived only in a comment. It is
+// bound to ONE attempt so a lookup cannot wander into another attempt's directory.
+type RecordBytes interface {
+	// AttemptID is the attempt this source is rooted at.
+	AttemptID() string
+	// Open returns the raw canonical bytes stored for the named record.
+	Open(digest string) ([]byte, error)
 }
 
-// StreamEvidence is the non-authoritative crash-time staging an interrupted attempt leaves behind.
+// ReadVerifiedRecord is the capability itself: a rooted, digest-verified read.
 //
-// The design keeps these leaves explicitly separate from what state binds: they are partial evidence,
-// retained so an interrupted attempt is not silently evidence-free. Recovery may find them present or
-// absent, and cannot tell from that which cut it is looking at - the cut before GO and the cut after it
-// are indistinguishable, which is the same reason those rows share one decision.
+// It computes the digest of what it got back and refuses anything else, so "the omitted evidence is
+// still reachable" is enforced here rather than promised in a comment. A caller cannot obtain bytes
+// without this check, because the check is the function.
+func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) ([]byte, error) {
+	if src == nil {
+		return nil, fmt.Errorf("%w: no record source was supplied", ErrLifecycle)
+	}
+	if !state.IsSHA256Hex(digest) {
+		return nil, fmt.Errorf("%w: %q is not a record digest", ErrLifecycle, digest)
+	}
+	if src.AttemptID() != attemptID {
+		return nil, fmt.Errorf("%w: the record source is rooted at attempt %q, not %q",
+			ErrLifecycle, src.AttemptID(), attemptID)
+	}
+	raw, err := src.Open(digest)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: reading record %q", ErrLifecycle, digest), err)
+	}
+	if got := sha256Hex(raw); got != digest {
+		return nil, fmt.Errorf("%w: record %q read back as %q", ErrLifecycle, digest, got)
+	}
+	return raw, nil
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// StreamEvidence is one stream's non-authoritative crash-time staging, as recovery found it.
+//
+// stdout and stderr are modelled INDEPENDENTLY, because a crash can leave one readable and the other
+// absent or unreadable, and one combined state cannot say so. It is bound to an attempt for the same
+// reason every other artifact here is: a staging summary from attempt A embedded in attempt B's record
+// would attest bytes attempt B never produced.
 type StreamEvidence struct {
-	State        ArtifactState
-	StdoutDigest string
-	StderrDigest string
-	StdoutBytes  uint64
-	StderrBytes  uint64
-	Truncated    bool
+	State     ArtifactState
+	AttemptID string
+	// Record is the validated stream evidence, required when the state is valid and forbidden otherwise.
+	Record *StreamRecord
 }
 
-// InterruptionPlan is the result record recovery must PUBLISH before it can settle an interrupted
-// attempt.
+// IntentProjection is the part of the published intent a result has to bind.
 //
-// It exists because settling that attempt appends a ledger entry, every ledger entry binds a required
-// canonical result digest, and the attempt that reaches this row has no published result by definition.
-// Without the plan the action names something that cannot be carried out: there would be no record to
-// point the entry at, and whoever executed it would have to invent the execution, the identity and the
-// terminal reason - which are exactly the facts nobody is entitled to invent after a crash.
+// Recovery cannot write a result without it: the record binds the command that ran and the environment
+// identity it ran with, and neither can be re-derived after the fact - re-resolving the command now
+// would describe THIS process's environment, not the one the attempt was authorised against.
+type IntentProjection struct {
+	ResolvedExecutable string
+	ResolvedArgv       []string
+	EnvNames           []string
+	EnvDigest          string
+	Digest             string
+}
+
+// InterruptionPlan is the exact record recovery must publish before it can settle an interrupted
+// attempt, ready to be written.
+//
+// It carries a whole ResultRecord rather than a description of one. Settling that attempt appends a
+// ledger entry, every entry binds a required canonical result digest, and the attempt reaching this row
+// has no published result by definition - so without the record the action names something nobody can
+// perform. An earlier version carried the ledger's own fields plus stream metadata and still could not
+// be executed: the resolved command and environment identity were missing entirely, and the retained
+// bytes were never there at all.
 //
 // The digest is absent on purpose. It is the digest of bytes that do not exist yet, and this decision
 // is what authorises writing them.
 type InterruptionPlan struct {
-	AttemptID    string
-	TestedCommit string
-	TestedTree   string
-	// Execution and Identity are fixed for this row and carried rather than left implicit: the runner
-	// never reported an ending, and no identity observation was ever made, so nothing about the code may
-	// be claimed.
-	Execution      state.TestExecution
-	Identity       state.TestIdentity
-	TerminalReason string
-	// RetainedStreams is the partial evidence found on disk, to be embedded in the published record.
-	RetainedStreams StreamEvidence
+	Record ResultRecord
 }
 
 // ResultEvidence is what was found when the result was looked for.
@@ -207,10 +246,15 @@ type Residue struct {
 	// Intent and Result are the attempt's durable records.
 	Intent Artifact
 	Result ResultEvidence
-	// RetainedStreams is the crash-time staging for an attempt that produced no result.
-	RetainedStreams StreamEvidence
+	// IntentBody is the validated projection of the published intent, required when the intent is valid.
+	IntentBody *IntentProjection
+	// Stdout and Stderr are the crash-time staging for an attempt that produced no result, independently.
+	Stdout StreamEvidence
+	Stderr StreamEvidence
 	// Completion is the section 1 evidence about the attempt's containment domain.
 	Completion CompletionEvidence
+	// Records is the digest-verified source for the bytes the projections omit, rooted at this attempt.
+	Records RecordBytes
 }
 
 // RecoveryAction is what to do with the attempt that was found.
@@ -260,6 +304,9 @@ type Recovery struct {
 	// Publish is the record that must be written BEFORE the ledger entry, present only for
 	// ActionLedgerOnlyInterrupted. Without it that action would name a settlement nobody could perform.
 	Publish *InterruptionPlan
+	// Records is the digest-verified source for everything the projections omit, rooted at this attempt.
+	// Use it through ReadVerifiedRecord; it is carried so the caller never has to find one.
+	Records RecordBytes
 	// Reason is the operator-facing statement of which durable shape was found.
 	Reason string
 }
@@ -370,24 +417,46 @@ func Recover(r Residue) (Recovery, error) {
 	// that were just validated, free to rewrite the attempt id or the bound digests between the decision
 	// and the action it authorises.
 	dec.Attempt = cloneAttemptRef(r.Active)
+	dec.Records = r.Records
 	switch dec.Action {
 	case ActionFinalizeFromResult:
 		dec.Result = cloneResult(r.Result.Record)
 	case ActionLedgerOnlyInterrupted:
 		// Settling this attempt appends a ledger entry, and every entry binds a durable canonical
-		// result - which this attempt does not have. So the decision carries the record to write, built
-		// from the identity the attempt was authorised against and the partial evidence found on disk.
-		dec.Publish = &InterruptionPlan{
-			AttemptID:    r.Active.AttemptID,
-			TestedCommit: r.Active.TestedCommit,
-			TestedTree:   r.Active.TestedTree,
+		// result - which this attempt does not have. So the decision carries the record to write, whole:
+		// the identity the attempt was authorised against, the command and environment identity from the
+		// published intent (they cannot be re-derived, because re-resolving now would describe THIS
+		// process), and the retained bytes found on disk.
+		rec := ResultRecord{
+			AttemptID:          r.Active.AttemptID,
+			TestedCommit:       r.Active.TestedCommit,
+			TestedTree:         r.Active.TestedTree,
+			ResolvedExecutable: r.IntentBody.ResolvedExecutable,
+			ResolvedArgv:       append([]string(nil), r.IntentBody.ResolvedArgv...),
+			EnvNames:           append([]string(nil), r.IntentBody.EnvNames...),
+			EnvDigest:          r.IntentBody.EnvDigest,
 			// Fixed for this row, and carried rather than left implicit. The runner never reported an
 			// ending and no identity observation was ever made, so nothing about the code may be claimed.
-			Execution:       state.TestExecutionInterrupted,
-			Identity:        state.TestIdentityUnobserved,
-			TerminalReason:  state.CanonicalTerminalReason("the attempt was interrupted and no result was published"),
-			RetainedStreams: r.RetainedStreams,
+			Execution:      state.TestExecutionInterrupted,
+			Identity:       state.TestIdentityUnobserved,
+			TerminalReason: state.CanonicalTerminalReason(interruptedTerminalReason),
+			// AUTHORED BY RECOVERY, and said so. The runner that would have reported how the command
+			// ended is gone; storing this in a field whose declared authority is the runner would
+			// present an inference as an observation.
+			TerminalAuthor: state.TerminalByRecovery,
 		}
+		if r.Stdout.State == ArtifactValid {
+			rec.Stdout = cloneStream(*r.Stdout.Record)
+		}
+		if r.Stderr.State == ArtifactValid {
+			rec.Stderr = cloneStream(*r.Stderr.Record)
+		}
+		// The record is refused HERE if it contradicts itself, rather than being handed on for somebody
+		// else to discover was unpublishable.
+		if err := rec.validate(); err != nil {
+			return Recovery{}, err
+		}
+		dec.Publish = &InterruptionPlan{Record: rec}
 	}
 	if r.Standing == StandingNone && r.Intent.State != ArtifactAbsent {
 		// The design separates "nothing" from "an orphan intent". They reach the same action - the
@@ -412,7 +481,8 @@ func (r Residue) known() error {
 	for _, a := range []struct {
 		what string
 		st   ArtifactState
-	}{{"intent", r.Intent.State}, {"result", r.Result.State}, {"retained stream", r.RetainedStreams.State}} {
+	}{{"intent", r.Intent.State}, {"result", r.Result.State},
+		{"stdout staging", r.Stdout.State}, {"stderr staging", r.Stderr.State}} {
 		switch a.st {
 		case ArtifactAbsent, ArtifactValid, ArtifactInvalid:
 		default:
@@ -470,10 +540,21 @@ func (r Residue) shapes() string {
 	if r.Intent.State != ArtifactValid && (r.Intent.AttemptID != "" || r.Intent.Digest != "") {
 		return fmt.Sprintf("the intent is %q but still carries an identity or digest", r.Intent.State)
 	}
-	if r.RetainedStreams.State != ArtifactValid &&
-		(r.RetainedStreams.StdoutDigest != "" || r.RetainedStreams.StderrDigest != "" ||
-			r.RetainedStreams.StdoutBytes != 0 || r.RetainedStreams.StderrBytes != 0 || r.RetainedStreams.Truncated) {
-		return fmt.Sprintf("the retained streams are %q but still carry evidence", r.RetainedStreams.State)
+	for _, st := range []struct {
+		what string
+		ev   StreamEvidence
+	}{{"stdout", r.Stdout}, {"stderr", r.Stderr}} {
+		if st.ev.State == ArtifactValid {
+			if st.ev.Record == nil {
+				return fmt.Sprintf("the %s staging is reported valid with no record behind it", st.what)
+			}
+		} else if st.ev.Record != nil || st.ev.AttemptID != "" {
+			return fmt.Sprintf("the %s staging is %q but still carries a record or an identity", st.what, st.ev.State)
+		}
+	}
+	if (r.Intent.State == ArtifactValid) != (r.IntentBody != nil) {
+		return fmt.Sprintf("the intent is %q but its body is %s", r.Intent.State,
+			map[bool]string{true: "present", false: "missing"}[r.IntentBody != nil])
 	}
 	return ""
 }
@@ -507,6 +588,28 @@ func (r Residue) inconsistency() string {
 		if r.Intent.Digest != r.Active.IntentDigest {
 			return fmt.Sprintf("attempt %q binds intent digest %q but the durable intent is %q",
 				r.Active.AttemptID, r.Active.IntentDigest, r.Intent.Digest)
+		}
+		if r.IntentBody.Digest != r.Active.IntentDigest {
+			return fmt.Sprintf("attempt %q binds intent digest %q but the intent body read back as %q",
+				r.Active.AttemptID, r.Active.IntentDigest, r.IntentBody.Digest)
+		}
+		// A staging summary from another attempt embedded here would attest bytes this attempt never
+		// produced.
+		for _, st := range []struct {
+			what string
+			ev   StreamEvidence
+		}{{"stdout", r.Stdout}, {"stderr", r.Stderr}} {
+			if st.ev.State == ArtifactInvalid {
+				return fmt.Sprintf("attempt %q has %s staging that could not be validated", r.Active.AttemptID, st.what)
+			}
+			if st.ev.State == ArtifactValid && st.ev.AttemptID != r.Active.AttemptID {
+				return fmt.Sprintf("attempt %q is active but the %s staging belongs to %q",
+					r.Active.AttemptID, st.what, st.ev.AttemptID)
+			}
+		}
+		if r.Records != nil && r.Records.AttemptID() != r.Active.AttemptID {
+			return fmt.Sprintf("attempt %q is active but the record source is rooted at %q",
+				r.Active.AttemptID, r.Records.AttemptID())
 		}
 		switch r.Result.State {
 		case ArtifactInvalid:
@@ -603,6 +706,10 @@ func clonePlan(p *InterruptionPlan) *InterruptionPlan {
 	if p == nil {
 		return nil
 	}
-	c := *p
-	return &c
+	return &InterruptionPlan{Record: *cloneRecord(&p.Record)}
 }
+
+// interruptedTerminalReason is the deterministic account recovery authors for an attempt whose runner
+// did not survive to write one. It is fixed rather than composed so two recoveries of the same attempt
+// produce the same bytes, and therefore the same record digest.
+const interruptedTerminalReason = "interrupted: the attempt was settled by recovery and no runner terminal was published"

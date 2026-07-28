@@ -68,7 +68,7 @@ func finalize(t *testing.T, s *Store, prev RunState, digest string, tweak func(*
 			ResultDigest:   digest,
 			Execution:      TestExecutionOK,
 			Identity:       TestIdentityUnchanged,
-			TerminalReason: "exited 0",
+			TerminalReason: "exited 0", TerminalAuthor: TerminalByRunner,
 		}
 		if tweak != nil {
 			tweak(&e)
@@ -225,7 +225,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 			n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 				AttemptID: "attempt-0001", StartRevision: rev, BoundRevision: rev,
 				TestedCommit: hex40(), TestedTree: hex40(), ResultDigest: sha256Hex(2),
-				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0", TerminalAuthor: TerminalByRunner,
 			})
 			return nil
 		})
@@ -260,7 +260,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 			n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 				AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
 				TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(4),
-				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0", TerminalAuthor: TerminalByRunner,
 			})
 			return nil // ref deliberately left in place
 		})
@@ -277,7 +277,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 				return FinalizedAttempt{
 					AttemptID: id, StartRevision: a.StartRevision, BoundRevision: rev,
 					TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: digest,
-					Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+					Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0", TerminalAuthor: TerminalByRunner,
 				}
 			}
 			n.TestAttempts = append(n.TestAttempts, mk(a.AttemptID, sha256Hex(5)), mk("attempt-0002", sha256Hex(6)))
@@ -305,7 +305,7 @@ func TestFinalizingAndStartingAreSeparateOperations(t *testing.T) {
 		n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 			AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
 			TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(14),
-			Execution: TestExecutionInterrupted, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone",
+			Execution: TestExecutionInterrupted, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone", TerminalAuthor: TerminalByRunner,
 		})
 		n.ActiveTestAttempt = attemptRef("attempt-0002", rev)
 		return nil
@@ -771,5 +771,49 @@ func TestTheCancelledExceptionStillNeedsTheWholeFact(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "an active test attempt requires") {
 		t.Fatalf("err = %v, want a half-state refusal", err)
+	}
+}
+
+// TestATerminalAccountMustNameItsAuthority.
+//
+// The field has two possible authorities and reading it without knowing which applies is reading
+// somebody's prose as somebody else's observation. Ordinarily the runner reports how the command ended;
+// an attempt interrupted by a crash has no runner left to report anything, so recovery authors the
+// account deterministically. Only that row may do so - anything else recording recovery prose would be
+// presenting an inference as an observation.
+func TestATerminalAccountMustNameItsAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		author    TerminalAuthor
+		execution TestExecution
+		wantErr   string
+	}{
+		{"the zero value is not an authority", "", TestExecutionOK, "not a known authority"},
+		{"an invented authority", "the operator", TestExecutionOK, "not a known authority"},
+		{"recovery may author an interrupted account", TerminalByRecovery, TestExecutionInterrupted, ""},
+		{"the runner may author an interrupted account", TerminalByRunner, TestExecutionInterrupted, ""},
+		{"recovery may not author an ok account", TerminalByRecovery, TestExecutionOK, "authored by recovery"},
+		{"recovery may not author a timeout account", TerminalByRecovery, TestExecutionTimeout, "authored by recovery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStore(t)
+			active := start(t, st, atTests(t, st), "attempt-0001")
+			_, err := finalize(t, st, active, sha256Hex(1), func(e *FinalizedAttempt) {
+				e.TerminalAuthor = tc.author
+				e.Execution = tc.execution
+				if tc.execution != TestExecutionOK {
+					e.Identity = TestIdentityUnobserved
+				}
+			})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("a legitimate account was refused: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

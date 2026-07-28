@@ -135,15 +135,20 @@ func TestEvidenceBindingCannotChangeUnderALiveAssignment(t *testing.T) {
 //   - v7 never carried attempt identity, so a v7 generation in TESTS names no attempt — and it also
 //     embeds a run-policy v1 test gate, which the current validator cannot accept at all. That second
 //     point is why the policy and state bumps had to land together: a policy-only bump would have made
-//     every existing generation undecodable while the state schema still claimed to be current.
+//     every existing generation undecodable while the state schema still claimed to be current;
+//   - v8 recorded a terminal account with no authority for it. An attempt interrupted by a crash has no
+//     runner left to report how the command ended, so recovery authors that account — and a v8 entry
+//     read as current would present that inference as the runner's own observation. The zero value is
+//     deliberately not a member of the vocabulary, so such an entry fails remediation instead of
+//     defaulting to the more trustworthy of the two answers.
 func TestDecodeRejectsSupersededStateVersions(t *testing.T) {
-	for _, v := range []int{6, 7} {
+	for _, v := range []int{6, 7, 8} {
 		doc := []byte(fmt.Sprintf(`{"schema_version":%d,"run_id":"r","revision":2,"accepted_turns":{}}`, v))
 		if _, err := decodeRunState(genstore.Record{Generation: 2, Payload: doc}); !errors.Is(err, ErrUnsupportedSchema) {
 			t.Fatalf("v%d decode err = %v, want ErrUnsupportedSchema", v, err)
 		}
 	}
-	if RunStateVersion != 8 {
-		t.Fatalf("RunStateVersion = %d, want 8", RunStateVersion)
+	if RunStateVersion != 9 {
+		t.Fatalf("RunStateVersion = %d, want 9", RunStateVersion)
 	}
 }

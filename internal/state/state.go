@@ -64,7 +64,7 @@ import (
 // one: state embeds the frozen policy and decode calls the CURRENT validator, so a
 // policy-only bump would make every existing generation undecodable while the
 // state schema still claimed to be the old one.
-const RunStateVersion = 8
+const RunStateVersion = 9
 
 // stateRetention{Keep,Trigger} configure the state stores' pre-append hysteresis compaction
 // (genstore.WithRetention): each generation is a full self-sufficient snapshot, so recovery
@@ -584,9 +584,44 @@ type FinalizedAttempt struct {
 	// Execution and Identity are the two independent halves of the outcome.
 	Execution TestExecution `json:"execution"`
 	Identity  TestIdentity  `json:"identity"`
-	// TerminalReason is the runner's own word for how the command ended (exited, signalled, timed out,
-	// cancelled, spawn failure class). It is descriptive; Execution is what decides anything.
+	// TerminalReason is the account of how the command ended (exited, signalled, timed out, cancelled,
+	// spawn failure class). It is descriptive; Execution is what decides anything.
 	TerminalReason string `json:"terminal_reason"`
+	// TerminalAuthor says WHO wrote that account.
+	//
+	// It exists because the field has two possible authorities and reading it without knowing which
+	// applies is reading somebody's prose as somebody else's observation. Ordinarily the runner reports
+	// how the command ended. But an attempt interrupted by a crash has no runner terminal at all - the
+	// process that would have written one is gone - and recovery must still finalize it, so the account
+	// there is authored deterministically by recovery. Storing that in a field declared to be the
+	// runner's own word would attribute an inference to an observer that never made it.
+	TerminalAuthor TerminalAuthor `json:"terminal_author"`
+}
+
+// TerminalAuthor is the closed vocabulary of authorities for a terminal account.
+type TerminalAuthor string
+
+const (
+	// TerminalByRunner means the process that ran the command reported how it ended.
+	TerminalByRunner TerminalAuthor = "runner"
+	// TerminalByRecovery means no runner account exists, because the attempt was interrupted, and the
+	// account was authored deterministically while settling it.
+	TerminalByRecovery TerminalAuthor = "recovery"
+)
+
+// AllTerminalAuthors is the closed vocabulary.
+func AllTerminalAuthors() []TerminalAuthor {
+	return []TerminalAuthor{TerminalByRunner, TerminalByRecovery}
+}
+
+// KnownTerminalAuthor reports whether a is in the vocabulary.
+func KnownTerminalAuthor(a TerminalAuthor) bool {
+	for _, k := range AllTerminalAuthors() {
+		if a == k {
+			return true
+		}
+	}
+	return false
 }
 
 // Store is the run-state store over a genstore.
