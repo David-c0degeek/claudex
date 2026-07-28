@@ -133,11 +133,17 @@ type harness struct {
 	failNthAcquire, failNthRelease   int
 	acquireCalls, releaseCalls       int
 	failAuthorize, failPublishIntent error
+	publishedDigest                  string
 	failArm, failBind                error
 	armReturnsContainment            bool
 	bindStatus, confirmStatus        CommitStatus
 	finalizeStatus, confirmFinStatus CommitStatus
 	failConfirmFin                   error
+	confirmFinDigest                 string
+	confirmFinAttemptID              string
+	confirmFinExecution              state.TestExecution
+	confirmFinIdentity               state.TestIdentity
+	confirmFinNoEntry                bool
 	failConfirm                      error
 	failReauthorize, failObserve     error
 	failPublishResult, failFinalize  error
@@ -189,16 +195,26 @@ func newHarness(t *testing.T) *harness {
 			h.r.requireGuard("authorize", 1)
 			h.r.requireNotYet("authorize", "publish-intent")
 			h.r.step("authorize")
-			return thePrepared, h.failAuthorize
+			// A CLONE of the package fixture. Returning it directly makes the fixture itself mutable
+			// through every test that runs, so one mutation test would corrupt the data every other test
+			// in this file asserts against - and the corruption would depend on execution order.
+			return clonePrepared(thePrepared), h.failAuthorize
 		},
-		PublishIntent: func(p PreparedAttempt) error {
+		PublishIntent: func(p PreparedAttempt) (string, error) {
 			t.Helper()
 			h.r.requireGuard("publish-intent", 1)
 			h.r.requireBefore("publish-intent", "authorize")
 			h.r.requireNotYet("publish-intent", "arm")
 			h.r.step("publish-intent")
-			h.sawIntentSpec = p.Spec
-			return h.failPublishIntent
+			// A SNAPSHOT, not a shallow copy. Recording `p.Spec` directly shares the backing arrays with
+			// the value under test, so a collaborator that mutates after being observed silently rewrites
+			// the observation too — the assertion instrument would be aliased to the thing it audits.
+			h.sawIntentSpec = clonePrepared(p).Spec
+			d := h.publishedDigest
+			if d == "" {
+				d = p.IntentDigest
+			}
+			return d, h.failPublishIntent
 		},
 		ArmContainment: func(p PreparedAttempt) (Containment, error) {
 			t.Helper()
@@ -208,7 +224,7 @@ func newHarness(t *testing.T) *harness {
 			// the containment already existed.
 			h.r.requireNotYet("arm", "bind-active")
 			h.r.step("arm")
-			h.sawArmSpec = p.Spec
+			h.sawArmSpec = clonePrepared(p).Spec
 			if h.failArm != nil {
 				if h.armReturnsContainment {
 					// A partial arm still hands back what exists, so the caller can release it.
@@ -268,13 +284,36 @@ func newHarness(t *testing.T) *harness {
 			h.sawFinalizeDigest = digest
 			return h.finalizeStatus, h.failFinalize
 		},
-		ConfirmFinalize: func(PreparedAttempt) (CommitStatus, error) {
+		ConfirmFinalize: func(p PreparedAttempt, term Terminal, id Identity, digest string) (FinalizeConfirmation, error) {
 			t.Helper()
 			// Settled while the second guard is STILL held, and by reading rather than retrying.
 			h.r.requireGuard("confirm-finalize", 1)
 			h.r.requireBefore("confirm-finalize", "finalize")
 			h.r.step("confirm-finalize")
-			return h.confirmFinStatus, h.failConfirmFin
+			conf := FinalizeConfirmation{Status: h.confirmFinStatus}
+			if h.confirmFinStatus == BindCommitted {
+				entry := FinalizedEntry{
+					AttemptID: p.AttemptID, ResultDigest: digest,
+					Execution: term.Execution, Identity: id.Value,
+				}
+				if h.confirmFinDigest != "" {
+					entry.ResultDigest = h.confirmFinDigest
+				}
+				if h.confirmFinAttemptID != "" {
+					entry.AttemptID = h.confirmFinAttemptID
+				}
+				if h.confirmFinExecution != "" {
+					entry.Execution = h.confirmFinExecution
+				}
+				if h.confirmFinIdentity != "" {
+					entry.Identity = h.confirmFinIdentity
+				}
+				if h.confirmFinNoEntry {
+					return FinalizeConfirmation{Status: BindCommitted}, h.failConfirmFin
+				}
+				conf.Entry = &entry
+			}
+			return conf, h.failConfirmFin
 		},
 	}
 	return h
@@ -896,9 +935,12 @@ func TestTheIdentityMustAgreeWithItsOwnEvidence(t *testing.T) {
 // chosen. The read-only fakes elsewhere in this file cannot detect that, so this one mutates on purpose.
 func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 	h := newHarness(t)
-	original := h.deps.PublishIntent
-	h.deps.PublishIntent = func(p PreparedAttempt) error {
-		// Exactly the kind of in-place tidying a real implementation might do.
+	// Every seam that receives a PreparedAttempt records what it was handed and then scribbles over it,
+	// which is the kind of in-place tidying a real canonicalizer or sorter would do. Wrapping only ONE
+	// seam proves only that seam: the value flows through six of them, and the clone that protects the
+	// next collaborator is invisible to a test whose mutator runs after it.
+	seen := map[string]PreparedAttempt{}
+	scribble := func(p PreparedAttempt) {
 		for i := range p.Spec.Argv {
 			p.Spec.Argv[i] = "MUTATED"
 		}
@@ -908,26 +950,215 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 				p.Spec.Env.Env[i].Name[0] = 'Z'
 			}
 		}
-		p.Spec.Cwd = "/mutated"
-		return original(p)
+	}
+	observe := func(who string, p PreparedAttempt) {
+		seen[who] = clonePrepared(p) // a SNAPSHOT: recording p directly would alias the thing under audit.
+		scribble(p)
 	}
 
-	if _, err := Run(h.deps); err != nil {
+	// The authorizer keeps its own reference and mutates it LATER, once the lifecycle is under way.
+	// Nothing else can detect a missing clone at the authorization boundary, because the very next seam
+	// clones defensively and hides it.
+	var retained PreparedAttempt
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func() (PreparedAttempt, error) {
+		p, err := authorize()
+		retained = p
+		return p, err
+	}
+
+	publishIntent, arm := h.deps.PublishIntent, h.deps.ArmContainment
+	bind, reauth := h.deps.BindActive, h.deps.Reauthorize
+	observeID, publishResult := h.deps.ObserveIdentity, h.deps.PublishResult
+	h.deps.PublishIntent = func(p PreparedAttempt) (string, error) {
+		observe("intent publication", p)
+		scribble(retained) // the authorizer, reaching back through the value it handed over
+		return publishIntent(p)
+	}
+	h.deps.ArmContainment = func(p PreparedAttempt) (Containment, error) {
+		observe("arming", p)
+		return arm(p)
+	}
+	h.deps.BindActive = func(p PreparedAttempt) (CommitStatus, error) {
+		observe("binding", p)
+		return bind(p)
+	}
+	h.deps.Reauthorize = func(p PreparedAttempt) error {
+		observe("re-authorization", p)
+		return reauth(p)
+	}
+	h.deps.ObserveIdentity = func(p PreparedAttempt, term Terminal) (Identity, error) {
+		observe("identity observation", p)
+		return observeID(p, term)
+	}
+	h.deps.PublishResult = func(p PreparedAttempt, term Terminal, id Identity) (string, error) {
+		observe("result publication", p)
+		return publishResult(p, term, id)
+	}
+
+	res, err := Run(h.deps)
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !slices.Equal(h.sawArmSpec.Argv, theSpec.Argv) {
-		t.Fatalf("arming received mutated argv %q, want the authorized %q", h.sawArmSpec.Argv, theSpec.Argv)
+	seen["the returned result"] = res.Prepared
+	for who, got := range seen {
+		if !slices.Equal(got.Spec.Argv, theSpec.Argv) {
+			t.Fatalf("%s received argv %q, want the authorized %q", who, got.Spec.Argv, theSpec.Argv)
+		}
+		if got.Spec.Cwd != theSpec.Cwd {
+			t.Fatalf("%s received cwd %q, want %q", who, got.Spec.Cwd, theSpec.Cwd)
+		}
+		if !reflect.DeepEqual(got.Spec.Env, theSpec.Env) {
+			t.Fatalf("%s received a mutated environment: %+v", who, got.Spec.Env)
+		}
 	}
-	if h.sawArmSpec.Cwd != theSpec.Cwd {
-		t.Fatalf("arming received mutated cwd %q", h.sawArmSpec.Cwd)
+	// PUBLISHED and ARMED must both be the authorized execution. Asserting only the second would leave
+	// the two free to differ - a green test with the intent describing command B and command A running.
+	if len(seen) != 7 {
+		t.Fatalf("only %d seams were audited: %v", len(seen), seen)
 	}
-	if !reflect.DeepEqual(h.sawArmSpec.Env, theSpec.Env) {
-		t.Fatalf("arming received a mutated environment: %+v", h.sawArmSpec.Env)
-	}
-	// And the package's own fixture must be untouched, or every other test in this file has been
-	// running against corrupted data.
+	// And the package fixture is untouched, or every other test here has been running on corrupt data.
 	if !slices.Equal(theSpec.Argv, []string{"go", "test", "./..."}) {
 		t.Fatalf("the shared fixture was mutated: %q", theSpec.Argv)
+	}
+}
+
+// TestThePublishedIntentMustBeTheAuthorizedOne.
+//
+// Isolating later collaborators from mutation is necessary and not sufficient: a publisher that writes
+// a different command produces an intent describing execution B while arming runs execution A, and
+// nothing downstream would notice. The publisher therefore reports the digest of the exact bytes it
+// wrote, and the lifecycle compares it to what was authorized.
+func TestThePublishedIntentMustBeTheAuthorizedOne(t *testing.T) {
+	h := newHarness(t)
+	h.publishedDigest = strings.Repeat("f", 64)
+
+	_, err := Run(h.deps)
+	if !errors.Is(err, ErrOrphanedIntent) {
+		t.Fatalf("err = %v, want ErrOrphanedIntent", err)
+	}
+	if !strings.Contains(err.Error(), "not the authorized") {
+		t.Fatalf("err = %v, want it to name the mismatch", err)
+	}
+	if h.r.did("arm") || h.r.did("bind-active") {
+		t.Fatalf("an attempt proceeded on top of an intent that describes something else: %v", h.r.steps)
+	}
+}
+
+// TestConfirmationMustFindTHISLifecyclesOutcome.
+//
+// Given only the attempt id, confirmation could answer no better than "some finalization exists" — so
+// an entry written by another party, carrying a different result, would have been reported as this
+// lifecycle's success, returning a digest nothing in the ledger references.
+func TestConfirmationMustFindTHISLifecyclesOutcome(t *testing.T) {
+	t.Run("a committed entry with a different result digest", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinDigest = strings.Repeat("9", 64)
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+		if !strings.Contains(err.Error(), "is not the one published here") {
+			t.Fatalf("err = %v, want it to name the mismatch", err)
+		}
+	})
+
+	t.Run("a committed entry belonging to another attempt", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinAttemptID = "somebody-elses-attempt"
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	// A bound entry can also record the SAME digest under a different verdict, which is a ledger that
+	// disagrees with itself about what this attempt did. Comparing only the digest would accept it.
+	t.Run("a committed entry recording a different execution", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinExecution = state.TestExecutionTimeout
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	t.Run("a committed entry recording a different identity", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinIdentity = state.TestIdentityUnobserved
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	t.Run("committed with no entry to show for it", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+		h.confirmFinNoEntry = true
+
+		_, err := Run(h.deps)
+		if !errors.Is(err, ErrRecoveryOwned) {
+			t.Fatalf("err = %v, want ErrRecoveryOwned", err)
+		}
+	})
+
+	t.Run("the matching entry is accepted", func(t *testing.T) {
+		h := newHarness(t)
+		h.finalizeStatus = BindUncertain
+		h.confirmFinStatus = BindCommitted
+
+		res, err := Run(h.deps)
+		if err != nil {
+			t.Fatalf("a matching confirmation was rejected: %v", err)
+		}
+		if res.ResultDigest == "" {
+			t.Fatal("no result digest returned")
+		}
+	})
+}
+
+// TestAChangedIdentityMustNameRealGitObjects.
+//
+// Non-empty and different is not "a valid observed identity that differs": arbitrary strings were
+// durably publishable and routed to `fail`, spending the code-fix budget on an observation that cannot
+// name a git object at all.
+func TestAChangedIdentityMustNameRealGitObjects(t *testing.T) {
+	valid := strings.Repeat("9", 40)
+	for _, tc := range []struct {
+		name string
+		id   Identity
+	}{
+		{"neither is an oid", Identity{Value: state.TestIdentityChanged, Commit: "x", Tree: "y"}},
+		{"the commit is not an oid", Identity{Value: state.TestIdentityChanged, Commit: "x", Tree: valid}},
+		{"the tree is not an oid", Identity{Value: state.TestIdentityChanged, Commit: valid, Tree: "y"}},
+		{"upper-case hex", Identity{Value: state.TestIdentityChanged, Commit: strings.Repeat("A", 40), Tree: valid}},
+		{"the wrong length", Identity{Value: state.TestIdentityChanged, Commit: strings.Repeat("9", 39), Tree: valid}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.identity = tc.id
+			_, err := Run(h.deps)
+			if err == nil || !strings.Contains(err.Error(), "not git object ids") {
+				t.Fatalf("err = %v, want a git-identity refusal", err)
+			}
+			if h.r.did("publish-result") {
+				t.Fatalf("it reached the durable result seam: %v", h.r.steps)
+			}
+		})
 	}
 }
 

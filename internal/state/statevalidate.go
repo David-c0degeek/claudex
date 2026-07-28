@@ -987,6 +987,10 @@ func validateTimes(rs *RunState) error {
 	return nil
 }
 
+// IsGitOID is the ONE grammar for a git object id, exported so callers outside this package validate
+// against the same rule rather than copying it. A copied grammar is a grammar that drifts.
+func IsGitOID(s string) bool { return isGitOID(s) }
+
 func isGitOID(s string) bool {
 	if len(s) != 40 && len(s) != 64 {
 		return false

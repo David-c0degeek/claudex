@@ -199,12 +199,17 @@ type Deps struct {
 	// every check has passed, so its failure writes nothing.
 	Authorize func() (PreparedAttempt, error)
 
-	// PublishIntent durably writes the immutable intent for exactly this prepared attempt.
+	// PublishIntent durably writes the immutable intent and returns the digest of the EXACT canonical
+	// bytes it wrote.
+	//
+	// Returning the digest is what makes "published and armed are the same execution" checkable rather
+	// than assumed: without it, a publisher could persist one command while arming ran another, and
+	// isolating the later calls from mutation would not have revealed it — the two would simply differ.
 	//
 	// Durability uncertainty here is BENIGN and needs no status: either the intent is on disk and
 	// orphaned, or it is not, and the design treats an orphan intent as ignorable with a fresh attempt
 	// superseding it. Nothing acts on an intent that no active reference points at.
-	PublishIntent func(PreparedAttempt) error
+	PublishIntent func(PreparedAttempt) (digest string, err error)
 
 	// ArmContainment arms the containment with NO command in it. It returns the Containment even on
 	// failure when anything was partially armed, so the caller can always release what exists.
@@ -234,10 +239,16 @@ type Deps struct {
 	// reason: "it failed" does not say whether the outcome was applied.
 	FinalizeOutcome func(PreparedAttempt, Terminal, Identity, string) (CommitStatus, error)
 
-	// ConfirmFinalize settles an uncertain outcome append while the second guard is STILL HELD. The
-	// design's row for this is "re-confirm; never double-apply", so confirmation READS rather than
-	// retries: re-applying an outcome that did commit would bind a second verdict to one attempt.
-	ConfirmFinalize func(PreparedAttempt) (CommitStatus, error)
+	// ConfirmFinalize settles an uncertain outcome append while the second guard is STILL HELD.
+	//
+	// It receives the EXPECTED tuple, and returns the entry it actually found. Given only the attempt
+	// id it could answer no better than "some finalization exists", which is not the question — an
+	// implementation would have had to capture the expectation through the side channel this package
+	// exists to eliminate, or accept any ledger entry for the attempt, including one written by another
+	// party with a different result. Confirmation READS rather than retries: the design's row is
+	// "re-confirm; never double-apply", because re-applying an outcome that did commit would bind a
+	// second verdict to one attempt.
+	ConfirmFinalize func(PreparedAttempt, Terminal, Identity, string) (FinalizeConfirmation, error)
 }
 
 // Handoff transfers a live containment to whoever called Run, for the cases where this function must
@@ -291,6 +302,22 @@ func (g GuardDisposition) String() string {
 		return "unknown"
 	}
 	return "unset"
+}
+
+// FinalizedEntry is the ledger entry confirmation actually found.
+type FinalizedEntry struct {
+	AttemptID    string
+	ResultDigest string
+	Execution    state.TestExecution
+	Identity     state.TestIdentity
+}
+
+// FinalizeConfirmation is the authoritative answer about an uncertain outcome append.
+type FinalizeConfirmation struct {
+	Status CommitStatus
+	// Entry is what is bound, and must be present when Status is committed — otherwise "committed" is
+	// an assertion with nothing behind it.
+	Entry *FinalizedEntry
 }
 
 // Result is what one completed attempt produced.
@@ -402,15 +429,25 @@ func Run(d Deps) (Result, error) {
 // bind status is returned so the caller can tell whether releasing is its job at all.
 func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error) {
 	// 1. Nothing is written until every check has passed, so this failure leaves no residue at all.
-	prep, err := d.Authorize()
+	authorized, err := d.Authorize()
 	if err != nil {
 		return PreparedAttempt{}, nil, 0, errors.Join(fmt.Errorf("%w: authorizing the attempt", ErrRefused), err)
 	}
+	// Cloned IMMEDIATELY on return, so this function owns the master copy outright. Anything the
+	// authorizer still holds a reference to cannot reach through and change what later steps receive.
+	prep := clonePrepared(authorized)
 
 	// 2. The intent is durable before anything can act on it. From HERE the strict no-residue promise no
 	// longer holds: an orphan intent may exist, which is why later failures carry a weaker class.
-	if err := d.PublishIntent(clonePrepared(prep)); err != nil {
+	published, err := d.PublishIntent(clonePrepared(prep))
+	if err != nil {
 		return prep, nil, 0, errors.Join(fmt.Errorf("%w: publishing the attempt intent", ErrOrphanedIntent), err)
+	}
+	// What was WRITTEN must be what was AUTHORIZED. An intent describing a different command is durable
+	// at this point, so the attempt cannot proceed on top of it.
+	if published != prep.IntentDigest {
+		return prep, nil, 0, fmt.Errorf("%w: the published intent digest %q is not the authorized %q",
+			ErrOrphanedIntent, published, prep.IntentDigest)
 	}
 
 	// 3. Armed DORMANT. A crash here leaves an armed containment with no command in it, which is cheap
@@ -427,7 +464,7 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 	if err != nil || st == BindUncertain {
 		// Uncertainty is settled WHILE THE GUARD IS STILL HELD, because this is the only moment it can
 		// be settled cheaply. Afterwards the question belongs to recovery.
-		confirmed, cerr := d.ConfirmBind(prep)
+		confirmed, cerr := d.ConfirmBind(clonePrepared(prep))
 		if cerr != nil {
 			return prep, cont, BindUncertain, errors.Join(
 				fmt.Errorf("%w: the active binding could not be confirmed", ErrRecoveryOwned), err, cerr)
@@ -455,7 +492,7 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, error) {
 	// 9a. The attempt being finalized must still be THE active one. Between releasing and reacquiring
 	// the guard, another party may have cancelled it or a recovery may have finalized it.
-	if err := d.Reauthorize(prep); err != nil {
+	if err := d.Reauthorize(clonePrepared(prep)); err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: re-authorizing the attempt", ErrLifecycle), err)
 	}
 
@@ -490,14 +527,24 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 	// references a result a reader cannot fetch.
 	st, err := d.FinalizeOutcome(clonePrepared(prep), term, ident, digest)
 	if err != nil || st == BindUncertain {
-		// Settled while the guard is STILL held, and by READING rather than retrying: the design's row
-		// is "re-confirm; never double-apply", because re-applying an outcome that did commit would bind
-		// a second verdict to one attempt.
-		confirmed, cerr := d.ConfirmFinalize(prep)
+		conf, cerr := d.ConfirmFinalize(clonePrepared(prep), term, ident, digest)
 		if cerr != nil {
 			return Result{}, errors.Join(fmt.Errorf("%w: the outcome could not be confirmed", ErrLifecycle), err, cerr)
 		}
-		st = confirmed
+		if conf.Status == BindCommitted {
+			// "Committed" is only useful if it is OUR outcome. A bound entry for this attempt carrying a
+			// different result was written by somebody else, and reporting success would return a digest
+			// that nothing in the ledger references.
+			if conf.Entry == nil {
+				return Result{}, fmt.Errorf("%w: the outcome was reported committed with no entry to show for it", ErrRecoveryOwned)
+			}
+			if conf.Entry.AttemptID != prep.AttemptID || conf.Entry.ResultDigest != digest ||
+				conf.Entry.Execution != term.Execution || conf.Entry.Identity != ident.Value {
+				return Result{}, fmt.Errorf("%w: the bound outcome for attempt %q is not the one published here (bound digest %q, published %q)",
+					ErrRecoveryOwned, prep.AttemptID, conf.Entry.ResultDigest, digest)
+			}
+		}
+		st = conf.Status
 	}
 	switch st {
 	case BindCommitted:
@@ -508,7 +555,7 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 		// there is nothing live to preserve here - only the state question, which recovery re-reads.
 		return Result{}, fmt.Errorf("%w: the outcome is visible but unconfirmed", ErrLifecycle)
 	}
-	return Result{Prepared: prep, Terminal: term, Identity: ident, ResultDigest: digest, Outcome: outcome}, nil
+	return Result{Prepared: clonePrepared(prep), Terminal: term, Identity: ident, ResultDigest: digest, Outcome: outcome}, nil
 }
 
 // acceptTerminal canonicalizes and shape-checks the runner's fact at the boundary where it enters this
@@ -585,6 +632,13 @@ func acceptIdentity(prep PreparedAttempt, id Identity) error {
 	case state.TestIdentityChanged:
 		if id.Commit == "" || id.Tree == "" {
 			return fmt.Errorf("%w: identity says changed but observed no commit/tree to have changed to", ErrLifecycle)
+		}
+		// A VALID observed identity, not merely a non-empty one. Arbitrary strings were durably
+		// publishable and routed to `fail`, spending the code-fix budget on an observation that cannot
+		// name a git object at all. The grammar is imported from the one authority rather than copied,
+		// because a copied grammar drifts.
+		if !state.IsGitOID(id.Commit) || !state.IsGitOID(id.Tree) {
+			return fmt.Errorf("%w: identity says changed but %q/%q are not git object ids", ErrLifecycle, id.Commit, id.Tree)
 		}
 		if id.Commit == prep.TestedCommit && id.Tree == prep.TestedTree {
 			return fmt.Errorf("%w: identity says changed but names exactly the authorized commit/tree", ErrLifecycle)
