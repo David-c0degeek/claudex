@@ -73,12 +73,39 @@ var theSpec = ExecutionSpec{
 	Digest: strings.Repeat("e", 64),
 }
 
-var thePrepared = PreparedAttempt{
-	AttemptID:    "attempt-0001",
-	TestedCommit: strings.Repeat("a", 40),
-	TestedTree:   strings.Repeat("b", 40),
-	IntentDigest: strings.Repeat("c", 64),
-	Spec:         theSpec,
+// rebind recomputes the intent digest for a bent prepared attempt.
+//
+// The lifecycle now REFUSES an authorization whose bound digest is not the digest of the intent it
+// describes, so a test that changes a field of the attempt has to rebind it - which is the rule working,
+// not an inconvenience.
+func rebind(t *testing.T, p PreparedAttempt) PreparedAttempt {
+	t.Helper()
+	_, digest, err := buildIntentRecord(p)
+	if err != nil {
+		t.Fatalf("rebinding the intent: %v", err)
+	}
+	p.IntentDigest = digest
+	return p
+}
+
+// thePrepared binds the digest of the intent it actually describes, computed rather than asserted -
+// which is the property the lifecycle now enforces, so a constant here would simply be refused.
+var thePrepared = func() PreparedAttempt {
+	p := preparedShape
+	_, digest, err := buildIntentRecord(p)
+	if err != nil {
+		panic("fixture intent does not encode: " + err.Error())
+	}
+	p.IntentDigest = digest
+	return p
+}()
+
+var preparedShape = PreparedAttempt{
+	AttemptID:     "attempt-0001",
+	StartRevision: 41,
+	TestedCommit:  strings.Repeat("a", 40),
+	TestedTree:    strings.Repeat("b", 40),
+	Spec:          theSpec,
 	// The frozen COMBINED retained-output ceiling, carried with the attempt because the lifecycle has to
 	// enforce it and does not read policy.
 	MaxOutputBytes: 32768,
@@ -169,7 +196,7 @@ type harness struct {
 	identity                         Identity
 
 	// What each step actually received, so the facts can be proven to travel.
-	sawIntentSpec        ExecutionSpec
+	sawIntentRecord      *IntentRecord
 	sawAuthorizeRevision uint64
 	sawArmSpec           ExecutionSpec
 	sawObserveTerminal   Terminal
@@ -236,19 +263,20 @@ func newHarness(t *testing.T) *harness {
 			}
 			return p, h.failAuthorize
 		},
-		PublishIntent: func(p PreparedAttempt) (string, error) {
+		PublishIntent: func(rec IntentRecord) (string, error) {
 			t.Helper()
 			h.r.requireGuard("publish-intent", 1)
 			h.r.requireBefore("publish-intent", "authorize")
 			h.r.requireNotYet("publish-intent", "arm")
 			h.r.step("publish-intent")
-			// A SNAPSHOT, not a shallow copy. Recording `p.Spec` directly shares the backing arrays with
-			// the value under test, so a collaborator that mutates after being observed silently rewrites
-			// the observation too — the assertion instrument would be aliased to the thing it audits.
-			h.sawIntentSpec = clonePrepared(p).Spec
-			d := h.publishedDigest
-			if d == "" {
-				d = p.IntentDigest
+			h.sawIntentRecord = &rec
+			if h.publishedDigest != "" {
+				return h.publishedDigest, h.failPublishIntent
+			}
+			// A PRODUCTION-SHAPED publisher encodes what it was handed and reports THAT record's digest.
+			_, d, err := rec.Encode()
+			if err != nil {
+				return "", err
 			}
 			return d, h.failPublishIntent
 		},
@@ -438,7 +466,7 @@ func TestTheFactsTravelBetweenTheSteps(t *testing.T) {
 	for _, got := range []struct {
 		who  string
 		spec ExecutionSpec
-	}{{"intent publication", h.sawIntentSpec}, {"arming", h.sawArmSpec}} {
+	}{{"arming", h.sawArmSpec}} {
 		if got.spec.Executable != theSpec.Executable || !slices.Equal(got.spec.Argv, theSpec.Argv) {
 			t.Fatalf("%s saw executable/argv %q %q, want %q %q", got.who,
 				got.spec.Executable, got.spec.Argv, theSpec.Executable, theSpec.Argv)
@@ -1024,7 +1052,7 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 		expect  []string
 	}{
 		{"the ordinary path", func(*harness) {}, []string{
-			"intent publication", "arming", "binding", "re-authorization",
+			"arming", "binding", "re-authorization",
 			"identity observation", "finalization", "the returned result"}},
 		{"an unresolved active bind", func(h *harness) {
 			h.bindStatus, h.confirmStatus = BindUncertain, BindCommitted
@@ -1066,16 +1094,20 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 			}
 
 			var reportedDigest string
+			var publishedView ExecutionView
 			publishIntent, arm := h.deps.PublishIntent, h.deps.ArmContainment
 			bind, confirmBind := h.deps.BindActive, h.deps.ConfirmBind
 			reauth, observeID := h.deps.Reauthorize, h.deps.ObserveIdentity
 			publishResult, finalize := h.deps.PublishResult, h.deps.FinalizeOutcome
 			confirmFin := h.deps.ConfirmFinalize
-			h.deps.PublishIntent = func(p PreparedAttempt) (string, error) {
-				observe("intent publication", p)
-				scribble(retained) // the authorizer, reaching back through the value it handed over
-				d, err := publishIntent(p)
+			h.deps.PublishIntent = func(rec IntentRecord) (string, error) {
+				// The intent seam receives the RECORD the lifecycle built, not the prepared attempt, so
+				// there is no prepared value here to audit. What it can still show is the authorizer
+				// reaching back through the value it handed over.
+				scribble(retained)
+				d, err := publishIntent(rec)
 				reportedDigest = d
+				publishedView = rec.View
 				return d, err
 			}
 			h.deps.ArmContainment = func(p PreparedAttempt) (Containment, error) {
@@ -1137,8 +1169,23 @@ func TestAMutatingCollaboratorCannotChangeWhatLaterStepsReceive(t *testing.T) {
 			// leave the two free to differ - a green test with the intent describing command B while
 			// command A runs. The digest the publisher REPORTED must therefore still describe the bytes
 			// its own recorder snapshotted.
-			if reportedDigest != seen["intent publication"].IntentDigest {
-				t.Fatalf("the publisher reported digest %q for the bytes %q", reportedDigest, seen["intent publication"].IntentDigest)
+			// PUBLISHED and ARMED must describe the same execution. Asserting only the second would
+			// leave the two free to differ - a green test with the intent describing command B while
+			// command A runs.
+			if reportedDigest != thePrepared.IntentDigest {
+				t.Fatalf("the publisher reported digest %q, the attempt bound %q", reportedDigest, thePrepared.IntentDigest)
+			}
+			armedView, verr := seen["arming"].Spec.View()
+			if verr != nil {
+				t.Fatalf("View: %v", verr)
+			}
+			gotView, gerr := publishedView.Digest()
+			wantView, werr := armedView.Digest()
+			if gerr != nil || werr != nil {
+				t.Fatalf("digesting: %v / %v", gerr, werr)
+			}
+			if gotView != wantView {
+				t.Fatalf("the intent describes execution %s but arming ran %s", gotView, wantView)
 			}
 			// And the package fixture is untouched, or every other test here has been running on corrupt
 			// data.
@@ -1823,7 +1870,7 @@ func TestTheCombinedRetainedOutputRespectsTheFrozenCeiling(t *testing.T) {
 	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
 		p, err := authorize(rev)
 		p.MaxOutputBytes = 8
-		return p, err
+		return rebind(t, p), err
 	}
 	half := []byte("12345")
 	h.cont.term = Terminal{
@@ -1881,7 +1928,7 @@ func TestASkewedExcerptIsRefusedAtTheCollaboratorBoundary(t *testing.T) {
 	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
 		p, err := authorize(rev)
 		p.MaxOutputBytes = 8
-		return p, err
+		return rebind(t, p), err
 	}
 	// The right total, divided the wrong way: all head, no tail.
 	h.cont.term = Terminal{
@@ -1897,5 +1944,64 @@ func TestASkewedExcerptIsRefusedAtTheCollaboratorBoundary(t *testing.T) {
 	}
 	if h.r.did("publish-result") {
 		t.Fatalf("a skewed excerpt reached the durable seam: %v", h.r.steps)
+	}
+}
+
+// TestTheIntentIsBuiltAndDIGESTEDOnTheMainPath.
+//
+// The intent type existed and nothing on the live path constructed one: publication received the
+// prepared attempt, and the reference bound whatever digest authorization claimed. That is the same
+// self-reported-identity defect the result path had to be corrected for, on the other artifact.
+func TestTheIntentIsBuiltAndDIGESTEDOnTheMainPath(t *testing.T) {
+	h := newHarness(t)
+	if _, err := Run(h.deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rec := h.sawIntentRecord
+	if rec == nil {
+		t.Fatal("no intent record was published")
+	}
+	if rec.AttemptID != thePrepared.AttemptID || rec.StartRevision != thePrepared.StartRevision ||
+		rec.TestedCommit != thePrepared.TestedCommit || rec.TestedTree != thePrepared.TestedTree {
+		t.Fatalf("the intent does not describe the attempt it is for: %+v", rec)
+	}
+	// The reserved revision is bound, so the attempt can be placed in the run's history at all.
+	if rec.StartRevision == 0 {
+		t.Fatal("the intent binds no start revision")
+	}
+	if rec.SpecDigest != theSpec.Digest {
+		t.Fatalf("the intent binds spec %q, the attempt armed %q", rec.SpecDigest, theSpec.Digest)
+	}
+	if rec.MaxOutputBytes != thePrepared.MaxOutputBytes {
+		t.Fatalf("the intent binds ceiling %d, the attempt froze %d", rec.MaxOutputBytes, thePrepared.MaxOutputBytes)
+	}
+	_, digest, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("the published intent cannot be encoded: %v", err)
+	}
+	if digest != thePrepared.IntentDigest {
+		t.Fatalf("the reference binds %q but the published intent is %q", thePrepared.IntentDigest, digest)
+	}
+}
+
+// TestAnAuthorizationThatMISDESCRIBESItsIntentIsRefused.
+//
+// The reference's intent digest used to be taken on trust. If it names something other than the intent
+// this attempt is about to publish, the durable reference points at bytes nobody wrote.
+func TestAnAuthorizationThatMISDESCRIBESItsIntentIsRefused(t *testing.T) {
+	h := newHarness(t)
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.IntentDigest = strings.Repeat("b", 64)
+		return p, err
+	}
+
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "but the intent it describes is") {
+		t.Fatalf("err = %v, want a refusal naming both digests", err)
+	}
+	if h.r.did("publish-intent") {
+		t.Fatalf("a misdescribed intent was published: %v", h.r.steps)
 	}
 }

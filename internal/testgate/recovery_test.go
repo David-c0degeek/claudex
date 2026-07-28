@@ -71,9 +71,9 @@ func theView() ExecutionView {
 
 func intentRecord() IntentRecord {
 	return IntentRecord{
-		SchemaVersion: IntentRecordVersion, AttemptID: theAttemptID,
+		SchemaVersion: IntentRecordVersion, AttemptID: theAttemptID, StartRevision: 41,
 		TestedCommit: theCommit, TestedTree: theTree,
-		View: theView(), MaxOutputBytes: 32768,
+		View: theView(), SpecDigest: strings.Repeat("7a", 32), MaxOutputBytes: 32768,
 	}
 }
 
@@ -119,7 +119,7 @@ func stagedStream(t *testing.T, budget uint64, filler byte) StreamEvidence {
 
 // bothStreamBudgets is the allocation the fixture's ceiling produces when both streams are present.
 func bothStreamBudgets() (uint64, uint64) {
-	return AllocateOutputBudget(true, true, intentRecord().MaxOutputBytes)
+	return AllocateOutputBudget(intentRecord().MaxOutputBytes)
 }
 
 // fakeRecords is a record source rooted at one attempt. Open returns whatever it was given, so the
@@ -149,6 +149,7 @@ func publishedResult(t *testing.T) *VerifiedRecord {
 	rec := validRecord()
 	rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
 	rec.View = theView()
+	rec.SpecDigest = intentRecord().SpecDigest
 	raw, digest, err := rec.Encode()
 	if err != nil {
 		t.Fatalf("encoding the fixture result: %v", err)
@@ -938,12 +939,14 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 		want string
 	}{
 		{"stdout from another attempt", func(r *Residue) {
-			ev := stagedStream(t, intentRecord().MaxOutputBytes, 'o')
+			outBudget, _ := bothStreamBudgets()
+			ev := stagedStream(t, outBudget, 'o')
 			ev.AttemptID = "somebody-else"
 			r.Stdout = ev
 		}, "stdout staging belongs to"},
 		{"stderr from another attempt", func(r *Residue) {
-			ev := stagedStream(t, intentRecord().MaxOutputBytes, 'o')
+			outBudget, _ := bothStreamBudgets()
+			ev := stagedStream(t, outBudget, 'o')
 			ev.AttemptID = "somebody-else"
 			r.Stderr = ev
 		}, "stderr staging belongs to"},
@@ -965,7 +968,8 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 	}
 	// One stream present and the other absent is an ordinary crash, not an inconsistency.
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream(t, intentRecord().MaxOutputBytes, 'o')
+	outOnly, _ := bothStreamBudgets()
+	r.Stdout = stagedStream(t, outOnly, 'o')
 	got, err := Recover(r)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1026,6 +1030,7 @@ func TestAResultAboutDifferentCodeCannotFinalizeThisAttempt(t *testing.T) {
 		rec := validRecord()
 		rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
 		rec.View = theView()
+		rec.SpecDigest = intentRecord().SpecDigest
 		mutate(&rec)
 		r.Result.Verified = verifiedRecordOf(t, rec)
 
@@ -1297,6 +1302,7 @@ func TestAResultForADifferentExecutionCannotFinalizeThisAttempt(t *testing.T) {
 			rec := validRecord()
 			rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
 			rec.View = theView()
+			rec.SpecDigest = intentRecord().SpecDigest
 			tc.bend(&rec.View)
 
 			r := residueFor(t, observation{StandingActive, true, CompletionProven})
@@ -1319,7 +1325,8 @@ func TestAResultForADifferentExecutionCannotFinalizeThisAttempt(t *testing.T) {
 // supplied, the record about to be written could change between the decision and the write.
 func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 	r := residueFor(t, observation{StandingActive, false, CompletionProven})
-	r.Stdout = stagedStream(t, intentRecord().MaxOutputBytes, 'o')
+	outOnly, _ := bothStreamBudgets()
+	r.Stdout = stagedStream(t, outOnly, 'o')
 
 	got, err := Recover(r)
 	if err != nil {
@@ -1369,6 +1376,7 @@ func verifiedFor(t *testing.T, attemptID string) ResultEvidence {
 	rec := validRecord()
 	rec.AttemptID, rec.TestedCommit, rec.TestedTree = attemptID, theCommit, theTree
 	rec.View = theView()
+	rec.SpecDigest = intentRecord().SpecDigest
 	return ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
 }
 
@@ -1415,5 +1423,124 @@ func TestTheDecisionSurvivesTheCallerZeroingItsEvidence(t *testing.T) {
 	}
 	if got.Result.Digest() != wantDigest || got.Result.Record().AttemptID != theAttemptID {
 		t.Fatalf("the decision's record changed underneath it: %+v", got.Result.Record())
+	}
+}
+
+// TestTheIntentMustEXPLAINTheActiveReference.
+//
+// Comparing the attempt id alone let a disagreeing intent supply the execution view and the frozen
+// bounds for a record whose identity came from the reference - a hybrid of two artifacts that never
+// described the same attempt.
+func TestTheIntentMustEXPLAINTheActiveReference(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bend func(*IntentRecord)
+		want string
+	}{
+		{"a different attempt", func(in *IntentRecord) { in.AttemptID = "somebody-else" }, "attempt id"},
+		{"a different start revision", func(in *IntentRecord) { in.StartRevision = 999 }, "start revision"},
+		{"a different tested commit", func(in *IntentRecord) { in.TestedCommit = strings.Repeat("c", 40) }, "tested commit"},
+		{"a different tested tree", func(in *IntentRecord) { in.TestedTree = strings.Repeat("d", 40) }, "tested tree"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := intentRecord()
+			tc.bend(&in)
+			verified := verifiedIntentOf(t, in)
+
+			r := residueFor(t, observation{StandingActive, false, CompletionProven})
+			r.IntentBody = verified
+			// The reference binds THIS intent's digest, so the mismatch under test is the identity
+			// disagreement rather than the digest check firing first.
+			r.Active.IntentDigest = verified.Digest()
+			r.Intent.Digest = verified.Digest()
+
+			got, err := Recover(r)
+			if err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if got.Action != ActionBlock || !strings.Contains(got.Reason, tc.want) {
+				t.Fatalf("%+v, want a block naming the %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnIntentRecordIsRefusedWhenItCannotDescribeAnAttempt.
+//
+// The validator was reachable only through builders that fill every field, so most of its rules had never
+// executed. That is the third time in this slice a validator has been exercised only by code that cannot
+// violate it.
+func TestAnIntentRecordIsRefusedWhenItCannotDescribeAnAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bend func(*IntentRecord)
+		want string
+	}{
+		{"no schema version", func(in *IntentRecord) { in.SchemaVersion = 0 }, "schema version"},
+		{"no attempt", func(in *IntentRecord) { in.AttemptID = "" }, "names no attempt"},
+		// Without it the attempt cannot be placed in the run's history at all.
+		{"no start revision", func(in *IntentRecord) { in.StartRevision = 0 }, "binds no start revision"},
+		{"a commit that is not an oid", func(in *IntentRecord) { in.TestedCommit = "x" }, "not git object ids"},
+		{"a tree that is not an oid", func(in *IntentRecord) { in.TestedTree = "x" }, "not git object ids"},
+		// The view carries the environment IDENTITY, the spec its ordered VALUES; neither stands in for
+		// the other, so both are bound and both are checked.
+		{"no execution spec digest", func(in *IntentRecord) { in.SpecDigest = "" }, "execution spec digest"},
+		{"a spec digest that is not a digest", func(in *IntentRecord) { in.SpecDigest = "nope" }, "execution spec digest"},
+		{"no output ceiling", func(in *IntentRecord) { in.MaxOutputBytes = 0 }, "binds no output ceiling"},
+		{"no executable", func(in *IntentRecord) { in.View.Executable = nil }, "names no executable"},
+		{"no argv", func(in *IntentRecord) { in.View.Argv = nil }, "has no argv"},
+		{"no working directory", func(in *IntentRecord) { in.View.Cwd = nil }, "names no working directory"},
+		{"an environment digest that is not a digest", func(in *IntentRecord) { in.View.EnvDigest = "x" }, "is not a sha256"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := intentRecord()
+			tc.bend(&in)
+			if _, _, err := in.Encode(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+	if _, _, err := intentRecord().Encode(); err != nil {
+		t.Fatalf("the baseline intent was refused, so every case above may pass for that reason: %v", err)
+	}
+}
+
+// TestTheIntentBoundaryRefusesDocumentsItDidNotWrite mirrors the result boundary, because an intent read
+// back non-canonically has the same problem: one record with several durable digests.
+func TestTheIntentBoundaryRefusesDocumentsItDidNotWrite(t *testing.T) {
+	raw, _, err := intentRecord().Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		doc  []byte
+		want string
+	}{
+		{"not JSON at all", []byte("not an intent"), ""},
+		// Named by the STRICT decoder rather than by the canonical comparison, so an operator is told
+		// which field is wrong instead of being told the whole document is misshapen.
+		{"an unknown field", append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"extra":1}`)...), "decoding"},
+		{"trailing content", append(append([]byte(nil), raw...), []byte("{}")...), ""},
+		{"a duplicated key", bytes.Replace(append([]byte(nil), raw...), []byte(`{"attempt_id"`),
+			[]byte(`{"attempt_id":"somebody-else","attempt_id"`), 1), ""},
+		{"whitespace", append(append([]byte(" "), raw...), ' '), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecodeIntentRecord(tc.doc)
+			if err == nil {
+				t.Fatal("a document this schema would not have written was accepted")
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+	back, err := DecodeIntentRecord(raw)
+	if err != nil {
+		t.Fatalf("the canonical form was refused: %v", err)
+	}
+	if back.AttemptID != theAttemptID || back.StartRevision != 41 {
+		t.Fatalf("the decoded intent is not the one encoded: %+v", back)
 	}
 }

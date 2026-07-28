@@ -241,11 +241,20 @@ type StreamEvidence struct {
 // design binds them here precisely so a recovering process can apply the same limits the live path did
 // without reading policy itself.
 type IntentRecord struct {
-	SchemaVersion int           `json:"schema_version"`
-	AttemptID     string        `json:"attempt_id"`
+	SchemaVersion int    `json:"schema_version"`
+	AttemptID     string `json:"attempt_id"`
+	// StartRevision is the reserved revision the attempt becomes active at. The design lists it and the
+	// prepared attempt requires the published intent to bind it, so an intent without it describes an
+	// attempt nobody can place in the run's history.
+	StartRevision uint64        `json:"start_revision"`
 	TestedCommit  string        `json:"tested_commit"`
 	TestedTree    string        `json:"tested_tree"`
 	View          ExecutionView `json:"execution_view"`
+	// SpecDigest is the digest of the canonical exec.spec.v1 artifact - the bytes the supervisor is
+	// handed and checks. It is NOT the view's digest: the view carries the environment IDENTITY, while
+	// the spec carries the ordered environment VALUES, so one cannot stand in for the other. Two
+	// identities, both bound, rather than two identities with a prose-only relationship.
+	SpecDigest string `json:"spec_digest"`
 	// MaxOutputBytes is the frozen COMBINED retained-output ceiling.
 	MaxOutputBytes uint64 `json:"max_output_bytes"`
 }
@@ -264,6 +273,12 @@ func (r IntentRecord) validate() error {
 	if !state.IsGitOID(r.TestedCommit) || !state.IsGitOID(r.TestedTree) {
 		return fmt.Errorf("%w: the intent is about %q/%q, which are not git object ids",
 			ErrLifecycle, r.TestedCommit, r.TestedTree)
+	}
+	if r.StartRevision == 0 {
+		return fmt.Errorf("%w: the intent binds no start revision", ErrLifecycle)
+	}
+	if !state.IsSHA256Hex(r.SpecDigest) {
+		return fmt.Errorf("%w: the execution spec digest %q is not a sha256", ErrLifecycle, r.SpecDigest)
 	}
 	if r.MaxOutputBytes == 0 {
 		return fmt.Errorf("%w: the intent binds no output ceiling", ErrLifecycle)
@@ -591,9 +606,11 @@ func Recover(r Residue) (Recovery, error) {
 			AttemptID:     r.Active.AttemptID,
 			TestedCommit:  r.Active.TestedCommit,
 			TestedTree:    r.Active.TestedTree,
-			// The SAME view the intent bound. It cannot be re-derived: resolving now would describe THIS
-			// process's environment, not the one the attempt was authorised against.
-			View: intent.View,
+			// The SAME view and the SAME spec identity the intent bound. Neither can be re-derived:
+			// resolving now would describe THIS process's environment, not the one the attempt was
+			// authorised against.
+			View:       intent.View,
+			SpecDigest: intent.SpecDigest,
 			// Fixed for this row, and carried rather than left implicit. The runner never reported an
 			// ending and no identity observation was ever made, so nothing about the code may be claimed.
 			Execution:      state.TestExecutionInterrupted,
@@ -657,6 +674,23 @@ func (r Residue) known() error {
 		}
 	}
 	return nil
+}
+
+// intentDisagreesWithActive names the first fact on which the durable intent and the active reference
+// differ, or "" when the intent explains the reference.
+func intentDisagreesWithActive(in IntentRecord, ref state.TestAttemptRef) string {
+	for _, f := range []struct{ what, intent, active string }{
+		{"attempt id", in.AttemptID, ref.AttemptID},
+		{"start revision", fmt.Sprintf("%d", in.StartRevision), fmt.Sprintf("%d", ref.StartRevision)},
+		{"tested commit", in.TestedCommit, ref.TestedCommit},
+		{"tested tree", in.TestedTree, ref.TestedTree},
+	} {
+		if f.intent != f.active {
+			return fmt.Sprintf("the active reference says %s %q but its durable intent says %q",
+				f.what, f.active, f.intent)
+		}
+	}
+	return ""
 }
 
 // ledgerDisagreesWithRecord names the first bound field on which the ledger entry and the record it
@@ -770,9 +804,12 @@ func (r Residue) inconsistency() string {
 			return fmt.Sprintf("attempt %q binds intent digest %q but the intent body read back as %q",
 				r.Active.AttemptID, r.Active.IntentDigest, r.IntentBody.Digest())
 		}
-		if intent := r.IntentBody.Record(); intent.AttemptID != r.Active.AttemptID {
-			return fmt.Sprintf("attempt %q is active but the durable intent belongs to %q",
-				r.Active.AttemptID, intent.AttemptID)
+		// The intent has to EXPLAIN the reference, not merely sit behind it. Comparing the attempt id
+		// alone let a disagreeing intent supply the execution view and the frozen bounds for a record
+		// whose identity came from the reference - a hybrid of two artifacts that never described the
+		// same attempt.
+		if bad := intentDisagreesWithActive(r.IntentBody.Record(), *r.Active); bad != "" {
+			return bad
 		}
 		// A staging summary from another attempt embedded here would attest bytes this attempt never
 		// produced.

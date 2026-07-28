@@ -13,6 +13,7 @@ func validRecord() ResultRecord {
 	return ResultRecord{
 		AttemptID: theAttemptID, TestedCommit: theCommit, TestedTree: theTree,
 		SchemaVersion: ResultRecordVersion,
+		SpecDigest:    strings.Repeat("7a", 32),
 		View: ExecutionView{
 			Executable: Bytes("/usr/bin/go"),
 			Argv:       ByteList{Bytes("go"), Bytes("test"), Bytes("./...")},
@@ -46,6 +47,9 @@ func TestAResultRecordIsRefusedWhenItContradictsItself(t *testing.T) {
 		{"no argv", func(r *ResultRecord) { r.View.Argv = nil }, "has no argv"},
 		{"no working directory", func(r *ResultRecord) { r.View.Cwd = nil }, "names no working directory"},
 		{"an environment digest that is not a digest", func(r *ResultRecord) { r.View.EnvDigest = "nope" }, "is not a sha256"},
+		// The view carries the environment IDENTITY; the spec carries its ordered VALUES, so neither
+		// digest stands in for the other and both must be bound.
+		{"no execution spec digest", func(r *ResultRecord) { r.SpecDigest = "" }, "execution spec digest"},
 		{"no schema version", func(r *ResultRecord) { r.SchemaVersion = 0 }, "schema version"},
 
 		{"an unknown execution", func(r *ResultRecord) { r.Execution = "probably-fine" }, "unknown execution"},
@@ -446,18 +450,9 @@ func TestTheSplitRuleIsEnforcedNotJustDefined(t *testing.T) {
 	}
 
 	// The combined budget is DIVIDED, so both allocations are named rather than left to a producer.
-	out, errB := AllocateOutputBudget(true, true, 9)
+	out, errB := AllocateOutputBudget(9)
 	if out != 5 || errB != 4 {
-		t.Fatalf("two present streams got %d/%d of nine bytes", out, errB)
-	}
-	if out, errB = AllocateOutputBudget(true, false, 9); out != 9 || errB != 0 {
-		t.Fatalf("a lone stdout got %d/%d", out, errB)
-	}
-	if out, errB = AllocateOutputBudget(false, true, 9); out != 0 || errB != 9 {
-		t.Fatalf("a lone stderr got %d/%d", out, errB)
-	}
-	if out, errB = AllocateOutputBudget(false, false, 9); out != 0 || errB != 0 {
-		t.Fatalf("two absent streams were allocated %d/%d", out, errB)
+		t.Fatalf("nine bytes divided %d/%d", out, errB)
 	}
 }
 
@@ -491,5 +486,35 @@ func TestEncodingSettlesNilAgainstEmptyBeforeHashing(t *testing.T) {
 	}
 	if bytes.Contains(rawA, []byte("null")) {
 		t.Fatalf("an empty value was written as null: %s", rawA)
+	}
+}
+
+// TestTheAllocationDoesNotDependOnWhatSurvivedTheCrash.
+//
+// Both capture streams exist from the moment the attempt starts, whatever is readable afterwards. An
+// earlier version gave a lone present stream the whole ceiling, which made the division a function of
+// which staging file happened to survive: a runner capturing both pipes keeps half, and a recovery that
+// finds only the stdout staging recomputes the whole ceiling and rejects the excerpt the runner
+// legitimately wrote. Availability after a crash cannot redefine history.
+func TestTheAllocationDoesNotDependOnWhatSurvivedTheCrash(t *testing.T) {
+	const ceiling = 100
+	outBudget, _ := AllocateOutputBudget(ceiling)
+
+	stream := bytes.Repeat([]byte{'o'}, 500)
+	head, tail, truncated := SplitExcerpt(stream, outBudget)
+	if !truncated {
+		t.Fatal("the fixture was not truncated")
+	}
+	// Written while BOTH pipes were being captured.
+	rec := StreamRecord{Present: true, SourceBytes: 500, RedactedBytes: 500,
+		SHA256: strings.Repeat("3c", 32), Head: head, Tail: tail, Truncated: true}
+
+	// Read back when only stdout staging survived. The allocation must be the same one.
+	againOut, _ := AllocateOutputBudget(ceiling)
+	if againOut != outBudget {
+		t.Fatalf("the allocation changed from %d to %d because stderr staging was missing", outBudget, againOut)
+	}
+	if err := rec.CheckSplit("stdout", againOut); err != nil {
+		t.Fatalf("a legitimately written excerpt was rejected after a crash: %v", err)
 	}
 }

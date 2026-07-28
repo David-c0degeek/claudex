@@ -47,6 +47,10 @@ type ResultRecord struct {
 	// View is the ONE description of what ran. Its digest is what proves this result describes the
 	// execution that was armed, rather than a similar-looking one.
 	View ExecutionView `json:"execution_view"`
+	// SpecDigest is the canonical exec.spec.v1 artifact the supervisor was handed. The view carries the
+	// environment IDENTITY; the spec carries its ordered VALUES, so neither digest stands in for the
+	// other and both are bound.
+	SpecDigest string `json:"spec_digest"`
 
 	// Execution and Identity are the two independent halves of the outcome.
 	Execution state.TestExecution `json:"execution"`
@@ -128,19 +132,17 @@ func (s StreamRecord) CheckSplit(what string, budget uint64) error {
 //
 // The policy bounds the streams together, and until the division is named a 100/0 allocation and a 50/50
 // allocation both respect the same ceiling - so a verifier could not say which bytes should have been
-// kept. A present stream gets an equal share; when only one is present it gets all of it; an odd byte
-// goes to stdout.
-func AllocateOutputBudget(stdoutPresent, stderrPresent bool, combined uint64) (outBudget, errBudget uint64) {
-	switch {
-	case stdoutPresent && stderrPresent:
-		outBudget = (combined + 1) / 2
-		return outBudget, combined - outBudget
-	case stdoutPresent:
-		return combined, 0
-	case stderrPresent:
-		return 0, combined
-	}
-	return 0, 0
+// kept. Half each, with an odd byte to stdout.
+//
+// It deliberately does NOT depend on which streams turned out to be present. An earlier version gave a
+// lone present stream the whole ceiling, which made the allocation a function of what survived a crash:
+// a runner capturing both pipes keeps half, and a recovery that finds only the stdout staging recomputes
+// the whole ceiling and rejects the excerpt the runner legitimately wrote. Both capture streams exist
+// from the moment the attempt starts, whatever is readable afterwards, so the division is settled then.
+// Availability after a crash cannot redefine history.
+func AllocateOutputBudget(combined uint64) (outBudget, errBudget uint64) {
+	outBudget = (combined + 1) / 2
+	return outBudget, combined - outBudget
 }
 
 // SplitExcerpt allocates a bounded excerpt DETERMINISTICALLY: the head takes the larger half of an odd
@@ -177,6 +179,9 @@ func (r ResultRecord) validate() error {
 	}
 	if err := r.View.validate(); err != nil {
 		return err
+	}
+	if !state.IsSHA256Hex(r.SpecDigest) {
+		return fmt.Errorf("%w: the execution spec digest %q is not a sha256", ErrLifecycle, r.SpecDigest)
 	}
 	if !state.KnownTestExecution(r.Execution) {
 		return fmt.Errorf("%w: the result records the unknown execution %q", ErrLifecycle, r.Execution)

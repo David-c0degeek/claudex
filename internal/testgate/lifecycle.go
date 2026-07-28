@@ -99,9 +99,12 @@ type ExecutionSpec struct {
 	// Env is the frozen environment, ordered, as raw name/value BYTES — an inherited Unix value need not
 	// be valid UTF-8, and the child must receive it byte for byte.
 	Env config.ResolvedExecution
-	// Digest is the identity of everything above, bound in the intent and the result. It is the digest of
-	// the ExecutionView below, so the spec and the record cannot describe different things while claiming
-	// the same identity.
+	// Digest is the canonical exec.spec.v1 artifact digest - the bytes the supervisor is handed and
+	// checks. It is bound in BOTH the intent and the result.
+	//
+	// It is deliberately not the ExecutionView's digest. The view carries the environment IDENTITY, the
+	// spec carries its ordered VALUES, so neither can stand in for the other; leaving one of them
+	// unbound with a prose sentence relating them would have been two identities and one check.
 	Digest string
 }
 
@@ -286,7 +289,7 @@ type Deps struct {
 	// Durability uncertainty here is BENIGN and needs no status: either the intent is on disk and
 	// orphaned, or it is not, and the design treats an orphan intent as ignorable with a fresh attempt
 	// superseding it. Nothing acts on an intent that no active reference points at.
-	PublishIntent func(PreparedAttempt) (digest string, err error)
+	PublishIntent func(IntentRecord) (digest string, err error)
 
 	// ArmContainment arms the containment with NO command in it. It returns the Containment even on
 	// failure when anything was partially armed, so the caller can always release what exists.
@@ -547,15 +550,26 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 
 	// 2. The intent is durable before anything can act on it. From HERE the strict no-residue promise no
 	// longer holds: an orphan intent may exist, which is why later failures carry a weaker class.
-	published, err := d.PublishIntent(clonePrepared(prep))
+	// The intent is BUILT and ENCODED here, so its digest is computed rather than taken on trust. The
+	// previous version accepted whatever digest authorization supplied and whatever the publisher
+	// reported, which is the same self-reported-identity defect the result path had to be corrected for.
+	intent, expected, err := buildIntentRecord(prep)
+	if err != nil {
+		return prep, nil, 0, err
+	}
+	if expected != prep.IntentDigest {
+		return prep, nil, 0, fmt.Errorf("%w: authorization bound intent digest %q, but the intent it describes is %q",
+			ErrRefused, prep.IntentDigest, expected)
+	}
+	published, err := d.PublishIntent(intent)
 	if err != nil {
 		return prep, nil, 0, errors.Join(fmt.Errorf("%w: publishing the attempt intent", ErrOrphanedIntent), err)
 	}
 	// What was WRITTEN must be what was AUTHORIZED. An intent describing a different command is durable
 	// at this point, so the attempt cannot proceed on top of it.
-	if published != prep.IntentDigest {
+	if published != expected {
 		return prep, nil, 0, fmt.Errorf("%w: the published intent digest %q is not the authorized %q",
-			ErrOrphanedIntent, published, prep.IntentDigest)
+			ErrOrphanedIntent, published, expected)
 	}
 
 	// 3. Armed DORMANT. A crash here leaves an armed containment with no command in it, which is cheap
@@ -790,7 +804,7 @@ func checkRetainedOutput(stdout, stderr StreamRecord, combined uint64) error {
 		return fmt.Errorf("%w: the retained output is %d bytes, over the frozen ceiling of %d",
 			ErrLifecycle, stdout.RetainedBytes()+stderr.RetainedBytes(), combined)
 	}
-	outBudget, errBudget := AllocateOutputBudget(stdout.Present, stderr.Present, combined)
+	outBudget, errBudget := AllocateOutputBudget(combined)
 	if err := stdout.CheckSplit("stdout", outBudget); err != nil {
 		return err
 	}
@@ -800,6 +814,34 @@ func checkRetainedOutput(stdout, stderr StreamRecord, combined uint64) error {
 func cloneTerminal(t Terminal) Terminal {
 	t.Stdout, t.Stderr = cloneStream(t.Stdout), cloneStream(t.Stderr)
 	return t
+}
+
+// buildIntentRecord assembles the intent the attempt is about to publish, and returns it with the digest
+// of its canonical bytes.
+//
+// It exists on the main path because the digest has to be COMPUTED somewhere that holds the facts. An
+// intent type that only recovery ever constructed meant the live path published something whose shape
+// nothing checked, and the reference bound a digest whose provenance was a promise.
+func buildIntentRecord(prep PreparedAttempt) (IntentRecord, string, error) {
+	view, err := prep.Spec.View()
+	if err != nil {
+		return IntentRecord{}, "", err
+	}
+	rec := IntentRecord{
+		SchemaVersion:  IntentRecordVersion,
+		AttemptID:      prep.AttemptID,
+		StartRevision:  prep.StartRevision,
+		TestedCommit:   prep.TestedCommit,
+		TestedTree:     prep.TestedTree,
+		View:           view,
+		SpecDigest:     prep.Spec.Digest,
+		MaxOutputBytes: prep.MaxOutputBytes,
+	}
+	_, digest, err := rec.Encode()
+	if err != nil {
+		return IntentRecord{}, "", err
+	}
+	return rec, digest, nil
 }
 
 func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (ResultRecord, error) {
@@ -813,6 +855,7 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 		TestedCommit:   prep.TestedCommit,
 		TestedTree:     prep.TestedTree,
 		View:           view,
+		SpecDigest:     prep.Spec.Digest,
 		Execution:      term.Execution,
 		Identity:       ident.Value,
 		TerminalReason: term.TerminalReason,
