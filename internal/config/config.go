@@ -46,6 +46,15 @@ const (
 // always be persisted to its limit.
 const MaxBudget = 1 << 14
 
+// MaxEffectivePolicyWireBytes bounds the parsed policy's own encoding.
+//
+// It exists because the effective policy is carried in the bootstrap intent NEXT TO the source it was
+// parsed from, so a large argv element or environment is paid for twice. The budget it comes from:
+// the intent carries two 16 KiB source snapshots as base64 (2 * 21848 = 43696 bytes), leaving roughly
+// 21840 of the 64 KiB transaction payload for this structure, the resolved execution and the identity
+// fields.
+const MaxEffectivePolicyWireBytes = 12 * 1024
+
 // TaskContract is the run's goal and acceptance definition (harvested shape).
 type TaskContract struct {
 	SchemaVersion      int      `json:"schema_version"`
@@ -472,6 +481,24 @@ func (rp RunPolicy) Validate() error {
 	}
 	if err := rp.TestGate.validate(); err != nil {
 		return err
+	}
+	// The EFFECTIVE policy carries into the bootstrap intent ALONGSIDE the policy source it was parsed
+	// from, so its bytes are counted twice: once base64-expanded as PolicyCanonical, and again as this
+	// structure. The 16 KiB source bound therefore says nothing useful about the intent's size — a
+	// perfectly valid policy can spend its whole source budget on one argv element, and that element
+	// appears in both terms. Review measured exactly that: a legal maximum-sized pair produced a 69769
+	// byte payload against a 65536 byte ceiling.
+	//
+	// Bounding this structure directly is what makes the two terms independent, so the intent's total
+	// can be reasoned about at all. BootstrapIntent additionally checks the assembled payload, because
+	// arithmetic across four separate ceilings is a proof that rots.
+	wire, err := json.Marshal(rp)
+	if err != nil {
+		return fmt.Errorf("effective policy: %w", err)
+	}
+	if len(wire) > MaxEffectivePolicyWireBytes {
+		return fmt.Errorf("the effective policy encodes to %d bytes, limit %d; the test gate's argv or environment is too large to carry alongside the policy source",
+			len(wire), MaxEffectivePolicyWireBytes)
 	}
 	// The attempt ledger lives inside a full-snapshot RunState, so its ceiling shares the counter
 	// ceiling every other stored count is bounded by.

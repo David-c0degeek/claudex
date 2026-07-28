@@ -341,3 +341,109 @@ func TestDisabledGateResolvesNoEnvironment(t *testing.T) {
 		t.Fatalf("scratch layout missing: %+v", re)
 	}
 }
+
+// TestTheExecutionViewDecoderIsStrictAndCanonical.
+//
+// A custom unmarshaller opts OUT of the caller's decoder settings, so the DisallowUnknownFields that
+// bootstrap and state decoding rely on never reaches these nested fields. Left plain, one execution
+// identity would have many valid durable byte shapes, and a future or stale field would be discarded at
+// recovery without anyone noticing.
+func TestTheExecutionViewDecoderIsStrictAndCanonical(t *testing.T) {
+	p := scratchPaths(testRelDir)
+	base := ResolvedExecution{
+		Identity:    NameByteExact,
+		Env:         []ResolvedVar{{Name: []byte("PATH"), Value: []byte("/usr/bin")}},
+		ScratchHome: p[0], ScratchCache: p[1], ScratchTemp: p[2],
+	}
+	valid, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var round ResolvedExecution
+	if err := json.Unmarshal(valid, &round); err != nil {
+		t.Fatalf("the canonical encoding was refused by its own decoder: %v", err)
+	}
+	if !reflect.DeepEqual(round, base) {
+		t.Fatalf("round trip changed the value: %+v -> %+v", base, round)
+	}
+
+	for _, tc := range []struct {
+		name string
+		doc  string
+		want string
+	}{
+		{
+			"an unknown field",
+			strings.Replace(string(valid), `{"identity"`, `{"unknown":"accepted","identity"`, 1),
+			"unknown field",
+		},
+		{
+			"a null collapsed to empty",
+			strings.Replace(string(valid), `"env":[`, `"env":null,"ignored":[`, 1),
+			"null",
+		},
+		{
+			"a duplicate key",
+			strings.Replace(string(valid), `{"identity"`, `{"identity":"byte_exact","identity"`, 1),
+			"duplicate key",
+		},
+		{
+			"a case-aliased key",
+			strings.Replace(string(valid), `"scratch_home"`, `"Scratch_Home"`, 1),
+			"non-canonical key spelling",
+		},
+		{
+			"trailing content",
+			string(valid) + " x",
+			"after top-level value",
+		},
+		{
+			// encoding/base64 accepts embedded newlines, which decode to identical bytes — so one
+			// identity would have several valid spellings and a digest over the carrier would bind the
+			// spelling rather than the content.
+			"non-canonical base64",
+			// The newline is JSON-ESCAPED, so the decoded field really contains one — which
+			// encoding/base64 happily accepts, decoding to the same bytes as the canonical spelling.
+			strings.Replace(string(valid), `"UEFUSA=="`, `"UEFU\nSA=="`, 1),
+			"canonical encoding",
+		},
+		{
+			"a missing required field",
+			strings.Replace(string(valid), `,"scratch_temp":"`+p[2]+`"`, ``, 1),
+			"required",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got ResolvedExecution
+			err := json.Unmarshal([]byte(tc.doc), &got)
+			if err == nil {
+				t.Fatalf("accepted %s: %s", tc.name, tc.doc)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestADisabledGateStillRefusesAStatedSecret.
+//
+// Resolution used to skip the whole environment path when the gate was disabled, so no credential check
+// ran — while the value sat in PolicyCanonical and EffectivePolicy either way, and txn.Run durably
+// appends the intent before any participant executes. A credential reached the journal precisely
+// BECAUSE nothing was going to use it.
+func TestADisabledGateStillRefusesAStatedSecret(t *testing.T) {
+	g := TestGate{Disabled: true, Env: TestGateEnv{Set: []EnvAssignment{{Name: "TOKEN", Value: "ordinary"}}}}
+	if _, err := ResolveForRun(g, "linux", host(nil), testRelDir); err == nil {
+		t.Fatal("a disabled gate carrying a credential-shaped entry was accepted")
+	} else if !strings.Contains(err.Error(), "looks like a credential") {
+		t.Fatalf("err = %v, want a credential refusal", err)
+	}
+	// The validator agrees, so a value that reached state by some other path is refused too.
+	ok := ResolvedExecution{Identity: NameByteExact, Env: []ResolvedVar{}}
+	pp := scratchPaths(testRelDir)
+	ok.ScratchHome, ok.ScratchCache, ok.ScratchTemp = pp[0], pp[1], pp[2]
+	if err := ok.ValidateFor(g, "linux", testRelDir); err == nil || !strings.Contains(err.Error(), "looks like a credential") {
+		t.Fatalf("err = %v, want the validator to refuse it as well", err)
+	}
+}

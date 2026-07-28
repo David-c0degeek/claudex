@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -132,10 +133,36 @@ func (re ResolvedExecution) MarshalJSON() ([]byte, error) {
 	return json.Marshal(w)
 }
 
+// UnmarshalJSON is STRICT and CANONICAL, and it has to implement both itself.
+//
+// A custom unmarshaller opts out of the caller's decoder settings: the DisallowUnknownFields that
+// bootstrap and state decoding rely on does not reach these nested fields, so without this the carrier
+// would silently accept an unknown or case-aliased field, a duplicate key, a null collapsed to empty,
+// and non-canonical base64 with embedded newlines. Each of those gives ONE execution identity several
+// durable byte shapes — and a future or stale field would be discarded at recovery without anyone
+// noticing.
 func (re *ResolvedExecution) UnmarshalJSON(data []byte) error {
+	// The package's own walker: duplicate keys, non-canonical key spellings, explicit nulls and
+	// trailing content, at every depth.
+	if err := checkStrictJSON(data); err != nil {
+		return fmt.Errorf("resolved execution: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var w wireResolvedExecution
-	if err := json.Unmarshal(data, &w); err != nil {
-		return err
+	if err := dec.Decode(&w); err != nil {
+		return fmt.Errorf("resolved execution: %w", err)
+	}
+	// Every field REQUIRED, present explicitly. An absent `env` decoding to empty would make "no
+	// environment" and "the field was lost" the same document.
+	present := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &present); err != nil {
+		return fmt.Errorf("resolved execution: %w", err)
+	}
+	for _, k := range []string{"identity", "env", "scratch_home", "scratch_cache", "scratch_temp"} {
+		if _, ok := present[k]; !ok {
+			return fmt.Errorf("resolved execution: %s is required", k)
+		}
 	}
 	out := ResolvedExecution{
 		Identity:     NameIdentity(w.Identity),
@@ -145,11 +172,11 @@ func (re *ResolvedExecution) UnmarshalJSON(data []byte) error {
 		ScratchTemp:  w.ScratchTemp,
 	}
 	for i, e := range w.Env {
-		n, err := base64.StdEncoding.DecodeString(e.NameB64)
+		n, err := decodeCanonicalB64(e.NameB64)
 		if err != nil {
 			return fmt.Errorf("resolved execution env[%d] name: %w", i, err)
 		}
-		v, err := base64.StdEncoding.DecodeString(e.ValueB64)
+		v, err := decodeCanonicalB64(e.ValueB64)
 		if err != nil {
 			return fmt.Errorf("resolved execution env[%d] value: %w", i, err)
 		}
@@ -157,6 +184,23 @@ func (re *ResolvedExecution) UnmarshalJSON(data []byte) error {
 	}
 	*re = out
 	return nil
+}
+
+// decodeCanonicalB64 decodes base64 and requires the spelling to be the ONE canonical encoding of its
+// own bytes.
+//
+// encoding/base64 accepts variants — embedded CR/LF among them — that decode to identical bytes. Left
+// alone, one execution identity would have many valid durable spellings, so a digest over the carrier
+// would bind the spelling rather than the content. Re-encoding and comparing is the whole check.
+func decodeCanonicalB64(s string) ([]byte, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if base64.StdEncoding.EncodeToString(b) != s {
+		return nil, fmt.Errorf("base64 is not the canonical encoding of its own bytes")
+	}
+	return b, nil
 }
 
 // Resolution ceilings, validated at attach BEFORE anything is journaled.
@@ -172,7 +216,7 @@ const (
 	MaxResolvedEnvNames = 64
 	MaxResolvedEnvValue = 4096
 	// MaxResolvedExecutionWireBytes bounds the marshaled JSON of this value.
-	MaxResolvedExecutionWireBytes = 8192
+	MaxResolvedExecutionWireBytes = 6 * 1024
 )
 
 // EnvLookup reads an ambient variable. It is a parameter so resolution is testable without mutating the
@@ -233,6 +277,15 @@ func AuthorizedEnvNames(g TestGate, goos string) ([]string, error) {
 // to an empty string. The two are distinguishable to a program — `os.LookupEnv` reports which — and
 // inventing an empty value would hand the command a variable the host never had.
 func ResolveExecution(g TestGate, goos string, look EnvLookup, scratchHome, scratchCache, scratchTemp string) (ResolvedExecution, error) {
+	// Checked BEFORE the disabled branch, because a stated secret is persisted whether or not it will
+	// ever execute: the value sits in PolicyCanonical and EffectivePolicy, and txn.Run durably appends
+	// the whole intent before any participant runs. Skipping the check for a disabled gate meant a
+	// credential reached the journal precisely because nothing was going to use it.
+	for _, e := range g.Env.Set {
+		if err := refuseCredential(e.Name, e.Value); err != nil {
+			return ResolvedExecution{}, err
+		}
+	}
 	re := ResolvedExecution{Identity: IdentityFor(goos), Env: []ResolvedVar{}}
 	if !g.Disabled {
 		names, err := AuthorizedEnvNames(g, goos)
@@ -325,19 +378,18 @@ func (re ResolvedExecution) ValidateFor(g TestGate, goos, relDir string) error {
 		if want, ok := setValues[key]; ok && string(e.Value) != want {
 			return fmt.Errorf("resolved execution value of %s is not the value the policy sets", name)
 		}
-		// Rejected, never redacted. Redaction collapses two distinct secrets to one marker, so a digest
-		// over redacted values would bind something the command never received — refusing is what makes
-		// a digest over ACTUAL values sound. It happens here so it happens BEFORE the intent is
-		// marshaled and journaled.
-		if redact.Text(name+"="+string(e.Value)) != name+"="+string(e.Value) {
-			return fmt.Errorf("resolved execution value of %s looks like a credential; name it in the policy without a secret value, or do not inherit it", name)
+		if err := refuseCredential(name, string(e.Value)); err != nil {
+			return err
 		}
 	}
-	if !g.Disabled {
-		for _, e := range g.Env.Set {
-			if !seen[FoldName(e.Name, id)] {
-				return fmt.Errorf("resolved execution omits %s, which the policy sets explicitly", e.Name)
-			}
+	// The stated pairs are guarded whether or not the gate will execute, for the same reason resolution
+	// guards them: they are persisted either way.
+	for _, e := range g.Env.Set {
+		if err := refuseCredential(e.Name, e.Value); err != nil {
+			return err
+		}
+		if !g.Disabled && !seen[FoldName(e.Name, id)] {
+			return fmt.Errorf("resolved execution omits %s, which the policy sets explicitly", e.Name)
 		}
 	}
 
@@ -364,6 +416,20 @@ func (re ResolvedExecution) ValidateFor(g TestGate, goos, relDir string) error {
 	}
 	if len(b) > MaxResolvedExecutionWireBytes {
 		return fmt.Errorf("resolved execution encodes to %d bytes, limit %d", len(b), MaxResolvedExecutionWireBytes)
+	}
+	return nil
+}
+
+// refuseCredential rejects a credential-shaped assignment.
+//
+// Rejected, never redacted. Redaction collapses two distinct secrets to one marker, so a digest over
+// redacted values would bind something the command never received — refusing is what keeps a digest
+// over ACTUAL values sound. The pair is tested together because the detector's rules are
+// schema-sensitive: an ordinary-looking value carries the signal only alongside its name.
+func refuseCredential(name, value string) error {
+	pair := name + "=" + value
+	if redact.Text(pair) != pair {
+		return fmt.Errorf("environment value of %s looks like a credential; name it in the policy without a secret value, or do not inherit it", name)
 	}
 	return nil
 }

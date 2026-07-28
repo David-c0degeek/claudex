@@ -21,6 +21,7 @@ import (
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
+	"github.com/David-c0degeek/claudex/internal/txn"
 )
 
 // intentKind is the txn kind for a first-attach bootstrap.
@@ -233,6 +234,22 @@ func (in BootstrapIntent) validate() error {
 	// journal redirect HOME, cache and temp outside the run entirely.
 	if err := in.ResolvedExecution.ValidateFor(policy.TestGate, config.HostGOOS(), in.RelDir); err != nil {
 		return fmt.Errorf("attach: intent resolved_execution: %w", err)
+	}
+	// The ASSEMBLED payload, not the sum of four independent ceilings.
+	//
+	// Every component is bounded separately, and that was not enough: the effective policy is carried
+	// next to the source it was parsed from, so a valid 16 KiB policy spending its budget on one argv
+	// element paid for that element twice, and review measured a legal maximum-sized intent at 69769
+	// bytes against the 65536 ceiling. Arithmetic across separate bounds is a proof that rots as any
+	// one of them moves; measuring the thing that actually has to fit does not.
+	//
+	// It is checked HERE, before journal.Run, so an intent that cannot be written is refused while the
+	// run does not yet exist — rather than at append time, when it is already being created.
+	if payload, merr := in.marshal(); merr != nil {
+		return fmt.Errorf("attach: intent payload: %w", merr)
+	} else if len(payload) > txn.MaxPayloadBytes {
+		return fmt.Errorf("attach: the bootstrap intent marshals to %d bytes, over the %d-byte transaction payload ceiling; reduce the task contract, the run policy, or the inherited environment",
+			len(payload), txn.MaxPayloadBytes)
 	}
 	if in.Base != policy.BaseBranch {
 		return fmt.Errorf("attach: intent base must equal the policy base branch")
