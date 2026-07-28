@@ -128,7 +128,23 @@ func (s StreamRecord) CheckSplit(what string, budget uint64) error {
 	return nil
 }
 
-// ExcerptBudget is the largest RAW retained excerpt that still leaves the canonical record within its
+// MaxRepresentableCount is the largest byte count the canonical encoder can carry.
+//
+// Canonical JSON restricts integers to the range every reader can hold exactly, which is smaller than a
+// uint64 and smaller than an int64: 2^53-1. The field type admits far larger values, so the boundary
+// refuses them with an explanation rather than letting the encoder fail later with a message about
+// integer ranges - which is what happened the first two times a worst-case record was built here, once
+// for exceeding int64 and once for exceeding this.
+const MaxRepresentableCount = uint64(1)<<53 - 1
+
+// MinRetainedExcerptBytes is the smallest combined excerpt an attempt must still be able to keep.
+//
+// It exists so the pre-attempt gate has something concrete to reserve. A policy whose record ceiling is
+// exhausted by metadata alone leaves an attempt that can run and then produce a record nobody can store,
+// and the honest moment to say so is before anything is minted.
+const MinRetainedExcerptBytes = 256
+
+// ExcerptBudget is the largest RAW combined excerpt that still leaves the canonical record within its
 // ceiling.
 //
 // It exists because the two policy bounds measure different things and neither implies the other. The
@@ -137,9 +153,12 @@ func (s StreamRecord) CheckSplit(what string, budget uint64) error {
 // design is explicit that this metadata can make even a ZERO-OUTPUT record nearly exhaust the ceiling,
 // so an excerpt sized against the raw bound alone can produce a record nobody can store.
 //
-// It is derived from the ACTUAL fixed size - the record encoded with empty excerpts - rather than from an
-// estimate, because an estimate of a variable-length thing is a number that is wrong for exactly the
-// inputs that matter.
+// It is found by SEARCH against the real encoder rather than by arithmetic. Canonical growth is
+// 4*ceil(n/3) PER BYTE STRING, and the budget is divided across up to four independently padded fields -
+// stdout head and tail, stderr head and tail - so a single 4/3 ratio over the aggregate understates the
+// padding. With 403 canonical bytes to spare that ratio yields 302 raw bytes, which one stream splits
+// 151+151 and encodes as 204+204, over the ceiling by five. A second approximate formula would only move
+// where the approximation is wrong; encoding the candidate answers exactly.
 //
 // CONTRACT: pass the record with EVERY field final except the excerpt bytes, including each stream's
 // Present flag, counts and digest. Those are per-stream metadata that only exists once a stream is
@@ -147,29 +166,84 @@ func (s StreamRecord) CheckSplit(what string, budget uint64) error {
 // that will actually be written, and the budget would be too generous by exactly the amount that
 // matters.
 func ExcerptBudget(rec ResultRecord, maxRecordBytes uint64) (uint64, error) {
-	bare := rec
-	bare.Stdout, bare.Stderr = emptyLike(rec.Stdout), emptyLike(rec.Stderr)
-	raw, _, err := bare.Encode()
+	fits, err := excerptFits(rec, 0, maxRecordBytes)
 	if err != nil {
 		return 0, err
 	}
-	fixed := uint64(len(raw))
-	if fixed >= maxRecordBytes {
-		return 0, fmt.Errorf("%w: the record's fixed metadata is %d canonical bytes, at or over the %d-byte ceiling",
-			ErrLifecycle, fixed, maxRecordBytes)
+	if !fits {
+		return 0, fmt.Errorf("%w: the record's fixed metadata does not fit the %d-byte ceiling even with no output",
+			ErrLifecycle, maxRecordBytes)
 	}
-	// Base64 expands 4 bytes per 3, so the raw budget is three quarters of what remains. Rounding DOWN,
-	// because a budget that is occasionally one byte too generous is a budget that occasionally produces
-	// an unstorable record.
-	return (maxRecordBytes - fixed) * 3 / 4, nil
+	// The answer is monotone - a larger excerpt never encodes smaller - so a binary search over the
+	// candidate totals is exact and bounded.
+	lo, hi := uint64(0), maxRecordBytes
+	for lo < hi {
+		mid := lo + (hi-lo+1)/2
+		ok, err := excerptFits(rec, mid, maxRecordBytes)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo, nil
 }
 
-func emptyLike(s StreamRecord) StreamRecord {
+// excerptFits reports whether a combined excerpt of exactly this size, allocated by the deterministic
+// rules, encodes within the ceiling.
+func excerptFits(rec ResultRecord, combined, maxRecordBytes uint64) (bool, error) {
+	sized := sizedLike(rec, combined)
+	raw, _, err := sized.Encode()
+	if err != nil {
+		return false, err
+	}
+	return uint64(len(raw)) <= maxRecordBytes, nil
+}
+
+// sizedLike fills the record's excerpts to exactly the deterministic allocation of a combined budget,
+// which is what makes the search measure the record that would actually be written.
+func sizedLike(rec ResultRecord, combined uint64) ResultRecord {
+	outBudget, errBudget := AllocateOutputBudget(combined)
+	rec.Stdout = fillExcerpt(rec.Stdout, outBudget)
+	rec.Stderr = fillExcerpt(rec.Stderr, errBudget)
+	return rec
+}
+
+func fillExcerpt(s StreamRecord, budget uint64) StreamRecord {
 	if !s.Present {
 		return s
 	}
-	s.Head, s.Tail, s.Truncated = Bytes{}, Bytes{}, true
+	head := (budget + 1) / 2
+	s.Head = make(Bytes, head)
+	s.Tail = make(Bytes, budget-head)
+	// The search is about SIZE, so the stream is treated as longer than the excerpt: an untruncated one
+	// would have its digest recomputed against these filler bytes and be refused for the wrong reason.
+	s.Truncated = true
+	if s.RedactedBytes <= budget {
+		s.RedactedBytes = budget + 1
+	}
 	return s
+}
+
+// EffectiveOutputBudget is the ONE budget both builders use.
+//
+// The two ceilings have to become one number before anything is allocated or checked. Sizing the excerpt
+// against the record ceiling while validating the split against the raw ceiling made the two constraints
+// contradictory: a correctly shrunk excerpt failed the split rule, which requires the allocation to be
+// filled exactly, and an excerpt that filled the raw allocation failed the record ceiling. There was no
+// excerpt that satisfied both.
+func EffectiveOutputBudget(rec ResultRecord, maxOutputBytes, maxRecordBytes uint64) (uint64, error) {
+	derived, err := ExcerptBudget(rec, maxRecordBytes)
+	if err != nil {
+		return 0, err
+	}
+	if derived < maxOutputBytes {
+		return derived, nil
+	}
+	return maxOutputBytes, nil
 }
 
 // AllocateOutputBudget divides ONE combined ceiling between the two streams.
@@ -332,6 +406,9 @@ func (s StreamRecord) validate(what string) error {
 	}
 	if !state.IsSHA256Hex(s.SHA256) {
 		return fmt.Errorf("%w: the %s digest %q is not a sha256", ErrLifecycle, what, s.SHA256)
+	}
+	if s.SourceBytes > MaxRepresentableCount || s.RedactedBytes > MaxRepresentableCount {
+		return fmt.Errorf("%w: %s reports counts the canonical encoder cannot represent", ErrLifecycle, what)
 	}
 	// The excerpt is drawn FROM the redacted stream, so it cannot be longer than it.
 	if s.RetainedBytes() > s.RedactedBytes {

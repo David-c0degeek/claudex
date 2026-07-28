@@ -1615,8 +1615,8 @@ func TestAPublishedResultMustHonourTheContractItsOwnIntentFROZE(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Recover: %v", err)
 		}
-		if got.Action != ActionBlock || !strings.Contains(got.Reason, "record ceiling") {
-			t.Fatalf("%+v, want a block naming the record ceiling", got)
+		if got.Action != ActionBlock || !strings.Contains(got.Reason, "ceiling") {
+			t.Fatalf("%+v, want a block naming the ceiling", got)
 		}
 	})
 }

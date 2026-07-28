@@ -636,7 +636,11 @@ func Recover(r Residue) (Recovery, error) {
 		// The SAME bounds the live path applies, from the frozen policy the intent carries. Without them
 		// here, staging large enough to fit an unrelated encoder ceiling became a publishable result
 		// despite a smaller limit the operator actually set.
-		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, intent.MaxOutputBytes); err != nil {
+		budget, berr := EffectiveOutputBudget(rec, intent.MaxOutputBytes, intent.MaxRecordBytes)
+		if berr != nil {
+			return Recovery{}, berr
+		}
+		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
 			return Recovery{}, err
 		}
 		if err := checkRecordFits(rec, intent.MaxRecordBytes); err != nil {
@@ -877,7 +881,12 @@ func (r Residue) inconsistency() string {
 			// sound, which says nothing about whether it respects the bounds this attempt froze: reading
 			// it back does not re-check them, so finalizing without this adopts a record the live path
 			// would have refused to write.
-			if err := checkRetainedOutput(rec.Stdout, rec.Stderr, in.MaxOutputBytes); err != nil {
+			budget, berr := EffectiveOutputBudget(rec, in.MaxOutputBytes, in.MaxRecordBytes)
+			if berr != nil {
+				return fmt.Sprintf("attempt %q has a published result whose budget cannot be derived: %v",
+					r.Active.AttemptID, berr)
+			}
+			if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
 				return fmt.Sprintf("attempt %q has a published result that breaks its own output contract: %v",
 					r.Active.AttemptID, err)
 			}

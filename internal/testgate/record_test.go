@@ -530,41 +530,78 @@ func TestTheExcerptBudgetComesFromTheRecordsACTUALFixedSize(t *testing.T) {
 	// EVERY field final except the excerpt bytes, which is the contract: the counts and the digest are
 	// per-stream metadata that only exists once a stream is present, so measuring a record with absent
 	// streams would understate the fixed size by exactly the amount that matters.
-	rec := validRecord()
-	rec.Stdout = StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
-		SHA256: strings.Repeat("3c", 32), Head: Bytes{}, Tail: Bytes{}, Truncated: true}
-	bare, _, err := rec.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
+	base := func(bothStreams bool) ResultRecord {
+		rec := validRecord()
+		rec.Stdout = StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+			SHA256: strings.Repeat("3c", 32), Head: Bytes{}, Tail: Bytes{}, Truncated: true}
+		if bothStreams {
+			rec.Stderr = rec.Stdout
+		}
+		return rec
 	}
-	fixed := uint64(len(bare))
 
-	budget, err := ExcerptBudget(rec, fixed+400)
-	if err != nil {
-		t.Fatalf("ExcerptBudget: %v", err)
-	}
-	// Three quarters of what remains, because base64 expands four bytes per three.
-	if budget != 300 {
-		t.Fatalf("budget = %d, want 300 raw bytes for 400 canonical ones", budget)
-	}
-	// An excerpt of exactly that size still fits, with the SAME metadata the budget was measured against.
-	half := (budget + 1) / 2
-	rec.Stdout.Head = bytes.Repeat([]byte{'x'}, int(half))
-	rec.Stdout.Tail = bytes.Repeat([]byte{'x'}, int(budget-half))
-	sized, _, err := rec.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if uint64(len(sized)) > fixed+400 {
-		t.Fatalf("an excerpt at the derived budget produced %d canonical bytes, over %d", len(sized), fixed+400)
+	// The assertion is a PROPERTY, not a number: the derived budget fits and one byte more does not.
+	// An earlier version asserted the arithmetic's answer, which is how a formula that was wrong for
+	// padded, split fields went unnoticed.
+	for _, bothStreams := range []bool{false, true} {
+		rec := base(bothStreams)
+		bare, _, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		for _, spare := range []uint64{400, 401, 402, 403, 404, 1000} {
+			ceiling := uint64(len(bare)) + spare
+			budget, err := ExcerptBudget(rec, ceiling)
+			if err != nil {
+				t.Fatalf("both=%t spare=%d: %v", bothStreams, spare, err)
+			}
+			atBudget, _, err := sizedLike(rec, budget).Encode()
+			if err != nil {
+				t.Fatalf("encoding at the budget: %v", err)
+			}
+			if uint64(len(atBudget)) > ceiling {
+				t.Fatalf("both=%t spare=%d: a %d-byte excerpt encodes to %d, over the %d ceiling",
+					bothStreams, spare, budget, len(atBudget), ceiling)
+			}
+			over, _, err := sizedLike(rec, budget+1).Encode()
+			if err != nil {
+				t.Fatalf("encoding one over: %v", err)
+			}
+			if uint64(len(over)) <= ceiling {
+				t.Fatalf("both=%t spare=%d: budget %d is not maximal; %d also fits",
+					bothStreams, spare, budget, budget+1)
+			}
+		}
 	}
 
 	// A ceiling the metadata alone already exhausts is refused rather than answered with a nonsense
 	// budget - the zero-output case the design calls out by name.
-	if _, err := ExcerptBudget(rec, fixed); err == nil {
-		t.Fatal("a ceiling the fixed metadata already fills produced a budget")
-	}
-	if _, err := ExcerptBudget(validRecord(), 10); err == nil {
+	if _, err := ExcerptBudget(base(false), 10); err == nil {
 		t.Fatal("a ceiling smaller than the metadata produced a budget")
+	}
+}
+
+// TestCountsBeyondTheEncodersRangeAreRefused.
+//
+// Canonical JSON restricts integers to the range every reader holds exactly, which is smaller than the
+// uint64 the field type admits. Without this the record is accepted here and fails much later with a
+// message about integer ranges - which is exactly how the first two worst-case records built in this
+// package failed.
+func TestCountsBeyondTheEncodersRangeAreRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bend func(*StreamRecord)
+	}{
+		{"source bytes", func(s *StreamRecord) { s.SourceBytes = MaxRepresentableCount + 1 }},
+		{"redacted bytes", func(s *StreamRecord) { s.RedactedBytes = MaxRepresentableCount + 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := StreamRecord{Present: true, SourceBytes: 3, RedactedBytes: 3,
+				SHA256: sha256Hex([]byte("abc")), Head: Bytes("abc")}
+			tc.bend(&s)
+			if err := s.validate("stdout"); err == nil || !strings.Contains(err.Error(), "cannot represent") {
+				t.Fatalf("err = %v, want a representability refusal", err)
+			}
+		})
 	}
 }

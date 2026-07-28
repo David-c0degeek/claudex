@@ -47,6 +47,7 @@ package testgate
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/David-c0degeek/claudex/internal/config"
 	"github.com/David-c0degeek/claudex/internal/state"
@@ -558,6 +559,14 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 	// The intent is BUILT and ENCODED here, so its digest is computed rather than taken on trust. The
 	// previous version accepted whatever digest authorization supplied and whatever the publisher
 	// reported, which is the same self-reported-identity defect the result path had to be corrected for.
+	// BEFORE anything is minted. An attempt whose metadata alone cannot leave room for an excerpt will
+	// run a command and then produce a record nobody can store, and the honest moment to say so is
+	// here - not after the identity observation, by which point the attempt is bound and the command
+	// has already happened.
+	if err := checkAttemptCanProduceAStorableRecord(prep); err != nil {
+		return prep, nil, 0, errors.Join(fmt.Errorf("%w: the attempt cannot produce a storable result", ErrRefused), err)
+	}
+
 	intent, expected, err := buildIntentRecord(prep)
 	if err != nil {
 		// NOTHING durable exists yet - no intent, no containment, no active reference - so this belongs
@@ -807,6 +816,56 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 //
 // They belong together because neither is meaningful alone: a ceiling with no allocation rule does not
 // say which bytes to keep, and an allocation rule with no ceiling does not say how many.
+// checkAttemptCanProduceAStorableRecord is the pre-attempt gate.
+//
+// It builds the WORST CASE this attempt could produce - the longest terminal account the ledger admits,
+// both streams present with their digests and counts - and requires that record to leave room for at
+// least a minimum excerpt. The design asks for exactly this at attempt-time resolution, because the
+// argv and environment metadata are variable and a policy can be perfectly valid while making a
+// zero-output record unissuable for THIS command.
+func checkAttemptCanProduceAStorableRecord(prep PreparedAttempt) error {
+	view, err := prep.Spec.View()
+	if err != nil {
+		return err
+	}
+	worst := ResultRecord{
+		SchemaVersion: ResultRecordVersion,
+		AttemptID:     prep.AttemptID,
+		TestedCommit:  prep.TestedCommit,
+		TestedTree:    prep.TestedTree,
+		View:          view,
+		SpecDigest:    prep.Spec.Digest,
+		Execution:     state.TestExecutionNonzero,
+		Identity:      state.TestIdentityUnobserved,
+		// The longest account the ledger will accept, so the gate is not passed by an attempt that only
+		// fits while nothing goes wrong.
+		TerminalReason: strings.Repeat("x", state.MaxTerminalReasonBytes),
+		TerminalAuthor: state.TerminalByRunner,
+		HasExitCode:    true,
+		ExitCode:       255,
+		Stdout:         worstStream(),
+		Stderr:         worstStream(),
+	}
+	budget, err := ExcerptBudget(worst, prep.MaxRecordBytes)
+	if err != nil {
+		return err
+	}
+	if budget < MinRetainedExcerptBytes {
+		return fmt.Errorf("%w: this command's record leaves room for %d excerpt bytes, below the %d it must be able to keep",
+			ErrLifecycle, budget, MinRetainedExcerptBytes)
+	}
+	return nil
+}
+
+func worstStream() StreamRecord {
+	return StreamRecord{
+		// The largest counts the canonical encoder can represent, which is what makes this a worst case
+		// rather than merely a large one.
+		Present: true, SourceBytes: MaxRepresentableCount, RedactedBytes: MaxRepresentableCount,
+		SHA256: strings.Repeat("f", 64), Truncated: true,
+	}
+}
+
 // checkRecordFits proves the CANONICAL record is storable, which the raw excerpt bound does not.
 func checkRecordFits(rec ResultRecord, maxRecordBytes uint64) error {
 	raw, _, err := rec.Encode()
@@ -891,7 +950,14 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 	// checking admits a record twice the size the operator allowed; accepting any division of the right
 	// total makes "head+tail" a shape rather than a rule, so two producers could keep different bytes
 	// and each call itself correct.
-	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, prep.MaxOutputBytes); err != nil {
+	// ONE effective budget, so the allocation, the split rule and the final size check all describe the
+	// same thing. Sizing against one ceiling and validating against the other left no excerpt that could
+	// satisfy both.
+	budget, err := EffectiveOutputBudget(rec, prep.MaxOutputBytes, prep.MaxRecordBytes)
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, budget); err != nil {
 		return ResultRecord{}, err
 	}
 	if err := checkRecordFits(rec, prep.MaxRecordBytes); err != nil {

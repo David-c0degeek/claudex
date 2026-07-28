@@ -2025,11 +2025,19 @@ func TestTheCanonicalRecordRespectsItsOwnCeiling(t *testing.T) {
 	}
 
 	_, err := Run(h.deps)
-	if err == nil || !strings.Contains(err.Error(), "over the frozen ceiling of 200") {
-		t.Fatalf("err = %v, want a record-ceiling refusal", err)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("err = %v, want ErrRefused", err)
 	}
-	if h.r.did("publish-result") {
-		t.Fatalf("an unstorable record reached the durable seam: %v", h.r.steps)
+	if !strings.Contains(err.Error(), "storable") {
+		t.Fatalf("err = %v, want it to say the attempt cannot produce a storable result", err)
+	}
+	// BEFORE anything is minted. Discovering this after the identity observation means the attempt is
+	// bound, the command has already run, and the only thing left is to report that its result cannot be
+	// written down.
+	for _, step := range []string{"publish-intent", "arm", "bind-active", "go", "publish-result"} {
+		if h.r.did(step) {
+			t.Fatalf("%q happened for an attempt that cannot produce a storable result: %v", step, h.r.steps)
+		}
 	}
 }
 
@@ -2056,5 +2064,146 @@ func TestAnIntentThatCannotBeBuiltIsARefusalNotATeardown(t *testing.T) {
 	}
 	if h.r.did("publish-intent") || h.r.did("arm") {
 		t.Fatalf("work proceeded past an unbuildable intent: %v", h.r.steps)
+	}
+}
+
+// TestThePreAttemptGateUsesTheWORSTCaseRecord.
+//
+// The gate exists to refuse an attempt whose own metadata leaves no room for output. That is only true
+// if it measures the worst record this attempt could produce - the longest terminal account the ledger
+// admits, both streams present with their digests and counts. A gate built from a hopeful record passes
+// attempts that fit only while nothing goes wrong.
+//
+// The thresholds are COMPUTED from the production functions rather than written down, so the test cannot
+// drift from the rule it checks.
+func TestThePreAttemptGateUsesTheWORSTCaseRecord(t *testing.T) {
+	// The gate is only meaningful if it measures the WORST record this attempt could produce. Each
+	// weakening below is a hopeful record - a short terminal account, one stream instead of two, no
+	// excerpt reserve - and for each there is a ceiling it accepts. The real gate must REFUSE at that
+	// ceiling, or it is the hopeful gate wearing the worst-case comment.
+	//
+	// The ceilings are COMPUTED from the production pieces rather than written down, so the test cannot
+	// drift from the rule it checks.
+	realGate := func(maxRecord uint64) error {
+		p := preparedShape
+		p.MaxRecordBytes = maxRecord
+		return checkAttemptCanProduceAStorableRecord(p)
+	}
+	view, err := preparedShape.Spec.View()
+	if err != nil {
+		t.Fatalf("View: %v", err)
+	}
+	worst := func() ResultRecord {
+		return ResultRecord{
+			SchemaVersion: ResultRecordVersion, AttemptID: preparedShape.AttemptID,
+			TestedCommit: preparedShape.TestedCommit, TestedTree: preparedShape.TestedTree,
+			View: view, SpecDigest: preparedShape.Spec.Digest,
+			Execution: state.TestExecutionNonzero, Identity: state.TestIdentityUnobserved,
+			TerminalReason: strings.Repeat("x", state.MaxTerminalReasonBytes),
+			TerminalAuthor: state.TerminalByRunner, HasExitCode: true, ExitCode: 255,
+			Stdout: worstStream(), Stderr: worstStream(),
+		}
+	}
+
+	// smallestAccepting finds the least ceiling at which a gate built on rec, with the given reserve,
+	// would pass.
+	smallestAccepting := func(rec ResultRecord, reserve uint64) uint64 {
+		lo, hi := uint64(1), uint64(1<<20)
+		for lo < hi {
+			mid := lo + (hi-lo)/2
+			b, err := ExcerptBudget(rec, mid)
+			if err == nil && b >= reserve {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		return lo
+	}
+
+	for _, tc := range []struct {
+		name    string
+		weak    ResultRecord
+		reserve uint64
+	}{
+		{"a short terminal account", func() ResultRecord { r := worst(); r.TerminalReason = "x"; return r }(),
+			MinRetainedExcerptBytes},
+		{"only one stream", func() ResultRecord { r := worst(); r.Stderr = StreamRecord{}; return r }(),
+			MinRetainedExcerptBytes},
+		{"no excerpt reserve at all", worst(), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ceiling := smallestAccepting(tc.weak, tc.reserve)
+			// The weakened gate accepts here...
+			if b, err := ExcerptBudget(tc.weak, ceiling); err != nil || b < tc.reserve {
+				t.Fatalf("the weakened shape does not accept at %d: budget=%d err=%v", ceiling, b, err)
+			}
+			// ...and the real one must not.
+			if err := realGate(ceiling); err == nil {
+				t.Fatalf("the gate accepts a %d-byte ceiling that only a hopeful record fits", ceiling)
+			}
+		})
+	}
+
+	// And it does accept something, or it would refuse every attempt and prove nothing.
+	if err := realGate(65536); err != nil {
+		t.Fatalf("the gate refuses an ordinary ceiling: %v", err)
+	}
+}
+
+// TestTheGateAndTheBuilderAgreeOnOneBudget.
+//
+// Sizing the excerpt against the record ceiling while validating the split against the raw ceiling made
+// the two constraints contradictory: a correctly shrunk excerpt failed the split rule, which requires
+// the allocation to be filled exactly, and one that filled the raw allocation failed the record ceiling.
+// There was no excerpt satisfying both.
+func TestTheGateAndTheBuilderAgreeOnOneBudget(t *testing.T) {
+	h := newHarness(t)
+	// A record ceiling that binds BELOW the raw output ceiling, which is the case the contradiction
+	// lived in.
+	const tightRecord = 2200
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.MaxRecordBytes = tightRecord
+		return rebind(t, p), err
+	}
+
+	// Size the excerpt the way a producer would: from the effective budget, not the raw one.
+	probe := ResultRecord{
+		SchemaVersion: ResultRecordVersion, AttemptID: thePrepared.AttemptID,
+		TestedCommit: thePrepared.TestedCommit, TestedTree: thePrepared.TestedTree,
+		SpecDigest: theSpec.Digest, Execution: state.TestExecutionOK,
+		Identity: state.TestIdentityUnchanged, TerminalReason: "exited 0",
+		TerminalAuthor: state.TerminalByRunner, HasExitCode: true,
+		Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+			SHA256: strings.Repeat("3c", 32), Truncated: true},
+	}
+	view, err := theSpec.View()
+	if err != nil {
+		t.Fatalf("View: %v", err)
+	}
+	probe.View = view
+	budget, err := EffectiveOutputBudget(probe, thePrepared.MaxOutputBytes, tightRecord)
+	if err != nil {
+		t.Fatalf("EffectiveOutputBudget: %v", err)
+	}
+	if budget >= thePrepared.MaxOutputBytes {
+		t.Fatalf("budget %d did not bind below the raw ceiling %d, so this case is not the one under test",
+			budget, thePrepared.MaxOutputBytes)
+	}
+	outBudget, _ := AllocateOutputBudget(budget)
+	head := (outBudget + 1) / 2
+	h.cont.term = Terminal{
+		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
+		HasExitCode: true,
+		Stdout: StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+			SHA256: strings.Repeat("3c", 32),
+			Head:   bytes.Repeat([]byte{'o'}, int(head)), Tail: bytes.Repeat([]byte{'o'}, int(outBudget-head)),
+			Truncated: true},
+	}
+
+	if _, err := Run(h.deps); err != nil {
+		t.Fatalf("an excerpt sized from the effective budget was refused: %v", err)
 	}
 }
