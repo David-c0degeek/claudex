@@ -987,6 +987,10 @@ func validateTimes(rs *RunState) error {
 	return nil
 }
 
+// IsSHA256Hex is the ONE grammar for a canonical record digest, exported for the same reason as
+// IsGitOID: a caller outside this package that spells the rule itself will spell it differently.
+func IsSHA256Hex(s string) bool { return isSHA256Hex(s) }
+
 // IsGitOID is the ONE grammar for a git object id, exported so callers outside this package validate
 // against the same rule rather than copying it. A copied grammar is a grammar that drifts.
 func IsGitOID(s string) bool { return isGitOID(s) }

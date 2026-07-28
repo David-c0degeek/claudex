@@ -321,10 +321,13 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 	// trust and a defect nobody can reproduce on demand.
 	//
 	// The fix is a FACT rather than a delay: the child writes a byte, the test reads it, and only a
-	// process that has finished loading and reached its own code can have written it. The shell then
-	// FORKS for its sleep rather than exec-ing, so the observed process does no further loading at all
-	// and the window is closed by construction rather than merely made narrower. Deliberately NOT
-	// `exec sleep` after the announcement: a second execve reopens the same window.
+	// process that has finished loading and reached its own code can have written it.
+	//
+	// The sleeper is started in the BACKGROUND and the shell then blocks in its own `wait` builtin. That
+	// detail is load-bearing. A plain trailing command would let the shell take the usual last-command
+	// optimisation and REPLACE ITSELF with it - a second execve, after the announcement, reopening the
+	// very window this is meant to close. Backgrounding forces a fork, and `wait` is a builtin, so the
+	// observed process demonstrably has no further loading left to do.
 	//
 	// HONESTY ABOUT THE EVIDENCE: the original failure was observed once, under a loaded full-suite run,
 	// and 200 repeats of the old shape on a warm cache did not reproduce it. This fix is therefore
@@ -355,7 +358,7 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 
 	spec := ExecSpec{
 		Executable: []byte(shellBin),
-		Argv:       [][]byte{[]byte("sh"), []byte("-c"), []byte("echo r; sleep 30")},
+		Argv:       [][]byte{[]byte("sh"), []byte("-c"), []byte("echo r; sleep 30 & wait")},
 		Cwd:        []byte(t.TempDir()),
 		Env:        []EnvVar{{Name: []byte("PATH"), Value: []byte("/usr/bin:/bin")}},
 		Identity:   NameByteExact,

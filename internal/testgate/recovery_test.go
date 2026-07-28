@@ -9,16 +9,27 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
+// Fixture values that satisfy the grammars PRODUCTION enforces.
+//
+// The first version used "intent-digest-7", which state rejects outright as a non-SHA-256 digest. Its
+// reachability test therefore proved only that the fixture satisfied THIS package's local consistency
+// rules - not that any admissible run state could hold it - which is the difference between a state
+// that occurs and a state that merely type-checks.
 const (
-	theAttemptID  = "attempt-7"
-	theIntentHash = "intent-digest-7"
-	theResultHash = "result-digest-7"
+	theAttemptID = "attempt-7"
+)
+
+var (
+	theIntentHash = strings.Repeat("1a", 32)
+	theResultHash = strings.Repeat("2b", 32)
+	theCommit     = strings.Repeat("a", 40)
+	theTree       = strings.Repeat("b", 40)
 )
 
 func activeRef() *state.TestAttemptRef {
 	return &state.TestAttemptRef{
 		AttemptID: theAttemptID, StartRevision: 41,
-		TestedCommit: strings.Repeat("a", 40), TestedTree: strings.Repeat("b", 40),
+		TestedCommit: theCommit, TestedTree: theTree,
 		IntentDigest: theIntentHash,
 	}
 }
@@ -26,7 +37,7 @@ func activeRef() *state.TestAttemptRef {
 func ledgerEntry() *state.FinalizedAttempt {
 	return &state.FinalizedAttempt{
 		AttemptID: theAttemptID, StartRevision: 41, BoundRevision: 42,
-		TestedCommit: strings.Repeat("a", 40), TestedTree: strings.Repeat("b", 40),
+		TestedCommit: theCommit, TestedTree: theTree,
 		ResultDigest: theResultHash, Execution: state.TestExecutionOK,
 		Identity: state.TestIdentityUnchanged, TerminalReason: "exited 0",
 	}
@@ -34,13 +45,34 @@ func ledgerEntry() *state.FinalizedAttempt {
 
 func noArtifact() Artifact { return Artifact{State: ArtifactAbsent} }
 
+func noResult() ResultEvidence { return ResultEvidence{State: ArtifactAbsent} }
+
+func publishedResult() *PublishedResult {
+	return &PublishedResult{
+		AttemptID: theAttemptID, TestedCommit: theCommit, TestedTree: theTree,
+		Execution: state.TestExecutionOK, Identity: state.TestIdentityUnchanged,
+		TerminalReason: "exited 0", Digest: theResultHash,
+	}
+}
+
+func provenFor(id string) CompletionEvidence {
+	return CompletionEvidence{Fact: CompletionProven, AttemptID: id}
+}
+
+func completion(f CompletionFact) CompletionEvidence {
+	if f == CompletionProven {
+		return provenFor(theAttemptID)
+	}
+	return CompletionEvidence{Fact: f}
+}
+
 // residueFor builds an ADMISSIBLE residue for one reachable observation.
 //
 // It exists so completeness can be measured against states that can actually be observed rather than
 // against a Cartesian product of vocabularies. If a key cannot be given consistent evidence, it is not a
 // state anything can find on disk, and a decision for it would be a decision about nothing.
 func residueFor(o observation) Residue {
-	r := Residue{Standing: o.standing, Completion: o.completion, Intent: noArtifact(), Result: noArtifact()}
+	r := Residue{Standing: o.standing, Completion: completion(o.completion), Intent: noArtifact(), Result: noResult()}
 	switch o.standing {
 	case StandingActive:
 		r.Active = activeRef()
@@ -50,7 +82,7 @@ func residueFor(o observation) Residue {
 		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
 	}
 	if o.hasResult {
-		r.Result = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theResultHash}
+		r.Result = ResultEvidence{State: ArtifactValid, Record: publishedResult()}
 	}
 	return r
 }
@@ -68,13 +100,13 @@ func TestEveryDesignCrashRowReachesItsStatedRecovery(t *testing.T) {
 		want    RecoveryAction
 	}{
 		{"before intent published",
-			Residue{Standing: StandingNone, Intent: noArtifact(), Result: noArtifact(), Completion: CompletionUnavailable}, ActionFreshAttempt},
+			Residue{Standing: StandingNone, Intent: noArtifact(), Result: noResult(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		{"after intent, before arming containment",
-			Residue{Standing: StandingNone, Intent: orphanIntent, Result: noArtifact(), Completion: CompletionUnavailable}, ActionFreshAttempt},
+			Residue{Standing: StandingNone, Intent: orphanIntent, Result: noResult(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		// Nothing was bound, so no containment domain was ever attributed to this run and no proof is
 		// owed - which is exactly why this row needs none on Windows.
 		{"after arming, before active CAS",
-			Residue{Standing: StandingNone, Intent: orphanIntent, Result: noArtifact(), Completion: CompletionUnavailable}, ActionFreshAttempt},
+			Residue{Standing: StandingNone, Intent: orphanIntent, Result: noResult(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		{"after active CAS, before GO, on Linux",
 			residueFor(observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
 		{"after active CAS, before GO, on Windows and other POSIX",
@@ -186,6 +218,14 @@ func TestTheTwoIndistinguishableCutsReachTheSameConclusion(t *testing.T) {
 // and finalized at once - and a row for one of those reads later as a decision somebody made about a
 // state that can occur. So every key here must be REACHABLE: constructible as admissible evidence that
 // actually arrives at that row.
+//
+// WHAT THIS DOES AND DOES NOT PROVE. The fixtures satisfy the grammars production enforces, asserted
+// below against the exported state predicates rather than against a local copy of the rules - an earlier
+// version used digests state rejects outright, so its "admissible" evidence was admissible only to this
+// package. It still stops short of constructing a whole RunState and putting it through the state
+// validator, which is unexported; so this establishes grammar-conforming, locally consistent evidence
+// arriving at each row, not full run-state admissibility. Said plainly here rather than implied to be
+// more.
 func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 	want := map[observation]bool{}
 	for _, o := range reachableObservations() {
@@ -209,6 +249,26 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 	for key := range recoveryTable {
 		if !want[key] {
 			t.Errorf("the table decides %+v, which no admissible observation can produce", key)
+		}
+	}
+	// The fixtures must satisfy the rules PRODUCTION applies, through the production predicates.
+	ref, entry, rec := activeRef(), ledgerEntry(), publishedResult()
+	for _, f := range []struct {
+		name string
+		ok   bool
+	}{
+		{"active intent digest", state.IsSHA256Hex(ref.IntentDigest)},
+		{"active tested commit", state.IsGitOID(ref.TestedCommit)},
+		{"active tested tree", state.IsGitOID(ref.TestedTree)},
+		{"ledger result digest", state.IsSHA256Hex(entry.ResultDigest)},
+		{"ledger tested commit", state.IsGitOID(entry.TestedCommit)},
+		{"ledger tested tree", state.IsGitOID(entry.TestedTree)},
+		{"result digest", state.IsSHA256Hex(rec.Digest)},
+		{"result tested commit", state.IsGitOID(rec.TestedCommit)},
+		{"result tested tree", state.IsGitOID(rec.TestedTree)},
+	} {
+		if !f.ok {
+			t.Errorf("the %s in the reachability fixtures is not what production accepts", f.name)
 		}
 	}
 	if len(recoveryTable) != len(want) {
@@ -292,10 +352,17 @@ func TestTheDecisionCarriesTheEvidenceItWasMadeFrom(t *testing.T) {
 	if got.Attempt == nil || got.Attempt.AttemptID != theAttemptID {
 		t.Fatalf("the decision does not name the attempt it is about: %+v", got.Attempt)
 	}
-	if got.ResultDigest != theResultHash {
-		t.Fatalf("ResultDigest = %q, want the digest of the record to finalize from", got.ResultDigest)
+	if got.Result == nil {
+		t.Fatal("the decision names no result to finalize from")
 	}
-	if got.Attempt.StartRevision != 41 || got.Attempt.TestedTree != strings.Repeat("b", 40) {
+	// A digest identifies bytes; it is not those bytes. Every field state requires in the ledger entry
+	// must be here, or whoever carries this out has to find the record again by ambient re-read.
+	if got.Result.Digest != theResultHash || got.Result.Execution != state.TestExecutionOK ||
+		got.Result.Identity != state.TestIdentityUnchanged || got.Result.TerminalReason != "exited 0" ||
+		got.Result.TestedCommit != theCommit || got.Result.TestedTree != theTree {
+		t.Fatalf("the decision cannot be executed from what it carries: %+v", got.Result)
+	}
+	if got.Attempt.StartRevision != 41 || got.Attempt.TestedTree != theTree {
 		t.Fatalf("the reference lost the identity the attempt is a statement about: %+v", got.Attempt)
 	}
 }
@@ -308,13 +375,18 @@ func TestTheDecisionCarriesTheEvidenceItWasMadeFrom(t *testing.T) {
 func TestAResultBelongingToAnotherAttemptIsRefusedAsEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		result Artifact
+		result ResultEvidence
 		want   string
 	}{
-		{"a result for another attempt",
-			Artifact{State: ArtifactValid, AttemptID: "somebody-else", Digest: theResultHash}, "belongs to"},
+		{"a result for another attempt", func() ResultEvidence {
+			rec := publishedResult()
+			rec.AttemptID = "somebody-else"
+			return ResultEvidence{State: ArtifactValid, Record: rec}
+		}(), "belongs to"},
 		{"a result that could not be validated",
-			Artifact{State: ArtifactInvalid, AttemptID: theAttemptID}, "could not be validated"},
+			ResultEvidence{State: ArtifactInvalid}, "could not be validated"},
+		{"a result reported valid with nothing behind it",
+			ResultEvidence{State: ArtifactValid}, "no record behind it"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := residueFor(observation{StandingActive, true, CompletionProven})
@@ -340,7 +412,9 @@ func TestAResultBelongingToAnotherAttemptIsRefusedAsEvidence(t *testing.T) {
 // record is evidence the two disagree about what this attempt did.
 func TestAFinalizedAttemptMustAgreeWithTheResultOnDisk(t *testing.T) {
 	r := residueFor(observation{StandingFinalized, true, CompletionProven})
-	r.Result.Digest = "a-different-record"
+	rec := publishedResult()
+	rec.Digest = strings.Repeat("9", 64)
+	r.Result.Record = rec
 
 	got, err := Recover(r)
 	if err != nil {
@@ -359,18 +433,18 @@ func TestMissingCounterpartsForAStandingAreRefusedAsEvidence(t *testing.T) {
 		want    string
 	}{
 		{"active with no reference",
-			Residue{Standing: StandingActive, Intent: noArtifact(), Result: noArtifact(), Completion: CompletionProven},
+			Residue{Standing: StandingActive, Intent: noArtifact(), Result: noResult(), Completion: completion(CompletionProven)},
 			"no reference was supplied"},
 		{"finalized with no ledger entry",
-			Residue{Standing: StandingFinalized, Intent: noArtifact(), Result: noArtifact(), Completion: CompletionProven},
+			Residue{Standing: StandingFinalized, Intent: noArtifact(), Result: noResult(), Completion: completion(CompletionProven)},
 			"no entry was supplied"},
 		{"finalized with an active reference too",
 			Residue{Standing: StandingFinalized, Finalized: ledgerEntry(), Active: activeRef(),
-				Intent: noArtifact(), Result: noArtifact(), Completion: CompletionProven},
+				Intent: noArtifact(), Result: noResult(), Completion: completion(CompletionProven)},
 			"an active reference was supplied too"},
 		{"nothing outstanding but a reference supplied",
 			Residue{Standing: StandingNone, Active: activeRef(),
-				Intent: noArtifact(), Result: noArtifact(), Completion: CompletionProven},
+				Intent: noArtifact(), Result: noResult(), Completion: completion(CompletionProven)},
 			"names no attempt but a reference"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -395,8 +469,8 @@ func TestADurableResultWithNothingOutstandingBlocks(t *testing.T) {
 		got, err := Recover(Residue{
 			Standing:   StandingNone,
 			Intent:     noArtifact(),
-			Result:     Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theResultHash},
-			Completion: c,
+			Result:     ResultEvidence{State: ArtifactValid, Record: publishedResult()},
+			Completion: completion(c),
 		})
 		if err != nil {
 			t.Fatalf("Recover: %v", err)
@@ -435,7 +509,7 @@ func TestUnknownVocabularyValuesAreRefused(t *testing.T) {
 		want  string
 	}{
 		{"standing", func(r *Residue) { r.Standing = "probably-running" }, "unknown attempt standing"},
-		{"completion", func(r *Residue) { r.Completion = "probably-dead" }, "unknown completion fact"},
+		{"completion", func(r *Residue) { r.Completion.Fact = "probably-dead" }, "unknown completion fact"},
 		{"intent artifact", func(r *Residue) { r.Intent.State = "probably-there" }, "unknown intent artifact state"},
 		{"result artifact", func(r *Residue) { r.Result.State = "probably-there" }, "unknown result artifact state"},
 	} {
@@ -459,12 +533,12 @@ func TestUnknownVocabularyValuesAreRefused(t *testing.T) {
 // must stay one conclusion - an orphan intent is superseded, never resumed - while still reading
 // differently to whoever has to act on them. It must NOT follow a bound attempt, which is being resumed.
 func TestAnOrphanIntentChangesTheAccountButNotTheAction(t *testing.T) {
-	bare, err := Recover(Residue{Standing: StandingNone, Intent: noArtifact(), Result: noArtifact(),
-		Completion: CompletionUnavailable})
+	bare, err := Recover(Residue{Standing: StandingNone, Intent: noArtifact(), Result: noResult(),
+		Completion: completion(CompletionUnavailable)})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	orphan, err := Recover(Residue{Standing: StandingNone, Result: noArtifact(), Completion: CompletionUnavailable,
+	orphan, err := Recover(Residue{Standing: StandingNone, Result: noResult(), Completion: completion(CompletionUnavailable),
 		Intent: Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -523,8 +597,116 @@ func TestAZeroResidueIsRefusedRatherThanReadAsNothingFound(t *testing.T) {
 	// And a residue that is fully populated except for one forgotten artifact is refused too, since
 	// that is the shape a partial migration actually produces.
 	r := residueFor(observation{StandingActive, false, CompletionProven})
-	r.Result = Artifact{}
+	r.Result = ResultEvidence{}
 	if _, err := Recover(r); !errors.Is(err, ErrLifecycle) {
 		t.Fatalf("err = %v, want a refusal for an unset result artifact", err)
+	}
+}
+
+// TestTheCompletionProofMustBeAboutTHISAttempt.
+//
+// This is the most dangerous unbound value in the package: the completion fact is the single input that
+// authorises consuming an attempt's reference and releasing a new command. The receipt carrying it is
+// attempt-bound by design, so a stale one left by an earlier attempt, classified as proven, would settle
+// a live attempt and start a second command beside its running processes - the exact outcome the fact
+// exists to prevent.
+func TestTheCompletionProofMustBeAboutTHISAttempt(t *testing.T) {
+	for _, hasResult := range []bool{false, true} {
+		r := residueFor(observation{StandingActive, hasResult, CompletionProven})
+		r.Completion = provenFor("an-earlier-attempt")
+
+		got, err := Recover(r)
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if got.Action != ActionBlock {
+			t.Fatalf("result=%t: a foreign completion proof settled the attempt: %+v", hasResult, got)
+		}
+		if !strings.Contains(got.Reason, "not the outstanding") {
+			t.Fatalf("reason = %q, want it to name whose domain was actually proven", got.Reason)
+		}
+	}
+	// An unproven fact carries no attempt, and that must not itself be read as a mismatch - the block
+	// must come from the missing proof, with its own account.
+	r := residueFor(observation{StandingActive, false, CompletionAbsent})
+	got, err := Recover(r)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got.Action != ActionBlock || strings.Contains(got.Reason, "not the outstanding") {
+		t.Fatalf("an absent fact was reported as a mismatched one: %+v", got)
+	}
+}
+
+// TestAFinalizedAttemptWithoutItsResultIsInconsistent.
+//
+// Every ledger entry binds a required canonical result digest, and state references a result only once
+// that record is durable. "Ledger-only" describes the OUTCOME - no edge, no budget - not an entry
+// pointing at a record that is not there.
+func TestAFinalizedAttemptWithoutItsResultIsInconsistent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result ResultEvidence
+		want   string
+	}{
+		{"absent", noResult(), "no result is durable"},
+		{"unreadable", ResultEvidence{State: ArtifactInvalid}, "could not be validated"},
+		{"valid with nothing behind it", ResultEvidence{State: ArtifactValid}, "no record behind it"},
+		{"belonging to another attempt", func() ResultEvidence {
+			rec := publishedResult()
+			rec.AttemptID = "somebody-else"
+			return ResultEvidence{State: ArtifactValid, Record: rec}
+		}(), "belongs to"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := residueFor(observation{StandingFinalized, true, CompletionProven})
+			r.Result = tc.result
+
+			got, err := Recover(r)
+			if err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if got.Action != ActionBlock || !strings.Contains(got.Reason, tc.want) {
+				t.Fatalf("%+v, want a block containing %q", got, tc.want)
+			}
+		})
+	}
+	// And the result-less finalized keys must not be listed reachable, or the table would carry a
+	// decision for a state that cannot occur.
+	for _, o := range reachableObservations() {
+		if o.standing == StandingFinalized && !o.hasResult {
+			t.Fatalf("%+v is listed reachable, but a finalized attempt always binds a durable result", o)
+		}
+	}
+}
+
+// TestTheDecisionCannotBeRewrittenThroughTheCallersPointers.
+//
+// The decision authorises consuming a reference and applying a result. If the caller keeps a handle into
+// the values that were validated, it can rewrite the attempt id or the bound digests between the
+// decision and the action - which is the same class slice 3b had to close at every collaborator
+// boundary, and a validated value is only validated while nobody else can reach it.
+func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
+	r := residueFor(observation{StandingActive, true, CompletionProven})
+	got, err := Recover(r)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	r.Active.AttemptID = "MUTATED"
+	r.Active.StartRevision = 999
+	r.Active.IntentDigest = "MUTATED"
+	r.Active.TestedTree = "MUTATED"
+	r.Result.Record.Digest = "MUTATED"
+	r.Result.Record.Execution = state.TestExecutionTimeout
+	r.Result.Record.TerminalReason = "MUTATED"
+
+	if got.Attempt.AttemptID != theAttemptID || got.Attempt.StartRevision != 41 ||
+		got.Attempt.IntentDigest != theIntentHash || got.Attempt.TestedTree != theTree {
+		t.Fatalf("the caller rewrote the attempt the decision was about: %+v", got.Attempt)
+	}
+	if got.Result.Digest != theResultHash || got.Result.Execution != state.TestExecutionOK ||
+		got.Result.TerminalReason != "exited 0" {
+		t.Fatalf("the caller rewrote the result the decision applies: %+v", got.Result)
 	}
 }

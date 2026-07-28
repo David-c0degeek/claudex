@@ -36,6 +36,19 @@ func AllCompletionFacts() []CompletionFact {
 	return []CompletionFact{CompletionProven, CompletionAbsent, CompletionUnavailable}
 }
 
+// CompletionEvidence is the completion fact AND whose domain it is about.
+//
+// The fact alone was the most dangerous unbound value in this package: it is the one input that
+// authorises consuming an attempt's reference and letting a new command run, and the receipt that
+// carries it is attempt-bound by design. A stale receipt left by attempt A, classified as proven while
+// attempt B is outstanding, would settle B and start a fresh command beside B's live processes - which
+// is precisely the outcome the fact exists to prevent.
+type CompletionEvidence struct {
+	Fact CompletionFact
+	// AttemptID is the attempt the receipt was published for, required when the fact is proven.
+	AttemptID string
+}
+
 // AttemptStanding is what the run state says about the most recent attempt.
 //
 // It is ONE closed value rather than independent "active" and "finalized" flags, because the store
@@ -87,12 +100,39 @@ func AllArtifactStates() []ArtifactState {
 //
 // The identity travels with it because the decisions below act on specific records: finalizing "from
 // the durable result" is sound only if that result belongs to the attempt being finalized, and a bare
-// boolean cannot establish it. Without this the executor would have to find the decisive record again
-// through an ambient re-read, which is the untyped side channel this package exists to remove.
+// boolean cannot establish it.
+//
+// This shape is enough for the INTENT, which nothing here has to execute - its presence and its digest
+// are the whole of what the decisions depend on. The result needs more, and gets it below.
 type Artifact struct {
 	State     ArtifactState
 	AttemptID string
 	Digest    string
+}
+
+// PublishedResult is the canonical result record, carried in full.
+//
+// A digest identifies bytes; it is not those bytes. Applying a published result means appending a
+// ledger entry, and every field state requires in that entry comes from this record - so a decision
+// carrying only the digest is not an executable decision, and whoever carried it out would have to find
+// the record again by ambient re-read. That is the untyped side channel this package exists to remove,
+// and naming the digest is not removing it.
+type PublishedResult struct {
+	AttemptID      string
+	TestedCommit   string
+	TestedTree     string
+	Execution      state.TestExecution
+	Identity       state.TestIdentity
+	TerminalReason string
+	// Digest is the canonical digest of this record, and the identity state binds.
+	Digest string
+}
+
+// ResultEvidence is what was found when the result was looked for.
+type ResultEvidence struct {
+	State ArtifactState
+	// Record is the validated body, required when the state is valid.
+	Record *PublishedResult
 }
 
 // Residue is the durable evidence a recovering process can read.
@@ -110,9 +150,9 @@ type Residue struct {
 	Finalized *state.FinalizedAttempt
 	// Intent and Result are the attempt's durable records.
 	Intent Artifact
-	Result Artifact
-	// Completion is the section 1 fact about the attempt's containment domain.
-	Completion CompletionFact
+	Result ResultEvidence
+	// Completion is the section 1 evidence about the attempt's containment domain.
+	Completion CompletionEvidence
 }
 
 // RecoveryAction is what to do with the attempt that was found.
@@ -151,10 +191,13 @@ const (
 // behind it and no later reader has to remember anything.
 type Recovery struct {
 	Action RecoveryAction
-	// Attempt is the reference the action is about, present when the standing was active.
+	// Attempt is the reference the action is about, present when the standing was active. It is a CLONE:
+	// the caller must not be able to rewrite the attempt id, revision or bound digests after they were
+	// validated and before the action is carried out.
 	Attempt *state.TestAttemptRef
-	// ResultDigest names the record to finalize from, present only for ActionFinalizeFromResult.
-	ResultDigest string
+	// Result is the record to finalize from, in full, present only for ActionFinalizeFromResult. Also a
+	// clone, for the same reason.
+	Result *PublishedResult
 	// Reason is the operator-facing statement of which durable shape was found.
 	Reason string
 }
@@ -175,11 +218,17 @@ type observation struct {
 func reachableObservations() []observation {
 	var out []observation
 	for _, c := range AllCompletionFacts() {
+		// A result belonging to no attempt is rejected as inconsistent evidence before the table is
+		// consulted, so this standing exists only without one.
 		out = append(out, observation{StandingNone, false, c})
 		for _, r := range []bool{false, true} {
 			out = append(out, observation{StandingActive, r, c})
-			out = append(out, observation{StandingFinalized, r, c})
 		}
+		// A ledger entry BINDS a required canonical result digest, and state references a result only
+		// once that record is durable. So a finalized attempt whose result is missing is not a state
+		// that can exist - "ledger-only" means no outcome edge and no budget spent, not an entry
+		// pointing at nothing.
+		out = append(out, observation{StandingFinalized, true, c})
 	}
 	return out
 }
@@ -199,10 +248,8 @@ func init() {
 		// The most recent attempt is settled. Whether it was settled by the coordinator that ran it or
 		// by an earlier recovery, its containment domain was proven dead first - a settled attempt with
 		// an unproven domain is not a state this function will produce.
-		for _, r := range []bool{false, true} {
-			recoveryTable[observation{StandingFinalized, r, c}] = Recovery{
-				Action: ActionFreshAttempt, Reason: "the most recent attempt is settled in the ledger"}
-		}
+		recoveryTable[observation{StandingFinalized, true, c}] = Recovery{
+			Action: ActionFreshAttempt, Reason: "the most recent attempt is settled in the ledger"}
 	}
 
 	// An attempt is outstanding with a published result: the design's "after result published, before
@@ -246,14 +293,17 @@ func Recover(r Residue) (Recovery, error) {
 		return Recovery{Action: ActionBlock, Attempt: r.Active, Reason: bad}, nil
 	}
 
-	dec, ok := recoveryTable[observation{r.Standing, r.Result.State == ArtifactValid, r.Completion}]
+	dec, ok := recoveryTable[observation{r.Standing, r.Result.State == ArtifactValid, r.Completion.Fact}]
 	if !ok {
 		return Recovery{}, fmt.Errorf("%w: no recovery is decided for standing=%q result=%q completion=%q",
-			ErrLifecycle, r.Standing, r.Result.State, r.Completion)
+			ErrLifecycle, r.Standing, r.Result.State, r.Completion.Fact)
 	}
-	dec.Attempt = r.Active
+	// CLONED, not aliased. The caller supplied these and would otherwise keep a handle into the values
+	// that were just validated, free to rewrite the attempt id or the bound digests between the decision
+	// and the action it authorises.
+	dec.Attempt = cloneAttemptRef(r.Active)
 	if dec.Action == ActionFinalizeFromResult {
-		dec.ResultDigest = r.Result.Digest
+		dec.Result = cloneResult(r.Result.Record)
 	}
 	if r.Standing == StandingNone && r.Intent.State != ArtifactAbsent {
 		// The design separates "nothing" from "an orphan intent". They reach the same action - the
@@ -270,10 +320,10 @@ func (r Residue) known() error {
 	default:
 		return fmt.Errorf("%w: unknown attempt standing %q", ErrLifecycle, r.Standing)
 	}
-	switch r.Completion {
+	switch r.Completion.Fact {
 	case CompletionProven, CompletionAbsent, CompletionUnavailable:
 	default:
-		return fmt.Errorf("%w: unknown completion fact %q", ErrLifecycle, r.Completion)
+		return fmt.Errorf("%w: unknown completion fact %q", ErrLifecycle, r.Completion.Fact)
 	}
 	for _, a := range []struct {
 		what string
@@ -322,9 +372,19 @@ func (r Residue) inconsistency() string {
 		case ArtifactInvalid:
 			return fmt.Sprintf("attempt %q has a result that could not be validated", r.Active.AttemptID)
 		case ArtifactValid:
-			if r.Result.AttemptID != r.Active.AttemptID {
-				return fmt.Sprintf("attempt %q is active but the durable result belongs to %q", r.Active.AttemptID, r.Result.AttemptID)
+			if r.Result.Record == nil {
+				return fmt.Sprintf("attempt %q has a result reported valid with no record behind it", r.Active.AttemptID)
 			}
+			if r.Result.Record.AttemptID != r.Active.AttemptID {
+				return fmt.Sprintf("attempt %q is active but the durable result belongs to %q", r.Active.AttemptID, r.Result.Record.AttemptID)
+			}
+		}
+		// The proof that authorises consuming this reference must be a proof about THIS attempt. The
+		// receipt is attempt-bound by design, and a stale one from an earlier attempt would otherwise
+		// settle a live one and release a new command beside its processes.
+		if r.Completion.Fact == CompletionProven && r.Completion.AttemptID != r.Active.AttemptID {
+			return fmt.Sprintf("the completion fact proves the domain of attempt %q, not the outstanding %q",
+				r.Completion.AttemptID, r.Active.AttemptID)
 		}
 	case StandingFinalized:
 		if r.Finalized == nil {
@@ -333,9 +393,27 @@ func (r Residue) inconsistency() string {
 		if r.Active != nil {
 			return fmt.Sprintf("attempt %q is finalized but an active reference was supplied too", r.Finalized.AttemptID)
 		}
-		if r.Result.State == ArtifactValid && r.Result.Digest != r.Finalized.ResultDigest {
+		// A ledger entry binds a required canonical result digest, and state references a result only
+		// once that record is durable. An entry pointing at a record that is missing or unreadable is
+		// therefore inconsistent evidence, not a "ledger-only" finalization - that phrase means no
+		// outcome edge and no budget spent, not an entry with nothing behind it.
+		switch r.Result.State {
+		case ArtifactAbsent:
+			return fmt.Sprintf("attempt %q is finalized against result %q but no result is durable",
+				r.Finalized.AttemptID, r.Finalized.ResultDigest)
+		case ArtifactInvalid:
+			return fmt.Sprintf("attempt %q is finalized but its result could not be validated", r.Finalized.AttemptID)
+		}
+		if r.Result.Record == nil {
+			return fmt.Sprintf("attempt %q has a result reported valid with no record behind it", r.Finalized.AttemptID)
+		}
+		if r.Result.Record.AttemptID != r.Finalized.AttemptID {
+			return fmt.Sprintf("attempt %q is finalized but the durable result belongs to %q",
+				r.Finalized.AttemptID, r.Result.Record.AttemptID)
+		}
+		if r.Result.Record.Digest != r.Finalized.ResultDigest {
 			return fmt.Sprintf("attempt %q is finalized against result %q but the durable result is %q",
-				r.Finalized.AttemptID, r.Finalized.ResultDigest, r.Result.Digest)
+				r.Finalized.AttemptID, r.Finalized.ResultDigest, r.Result.Record.Digest)
 		}
 	case StandingNone:
 		if r.Active != nil || r.Finalized != nil {
@@ -350,4 +428,24 @@ func (r Residue) inconsistency() string {
 		}
 	}
 	return ""
+}
+
+// cloneAttemptRef and cloneResult hand out owned copies.
+//
+// Slice 3b had to learn this at every collaborator boundary: a validated value reachable through a
+// pointer the caller still holds is a value that can change between the check and the use.
+func cloneAttemptRef(r *state.TestAttemptRef) *state.TestAttemptRef {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	return &c
+}
+
+func cloneResult(r *PublishedResult) *PublishedResult {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	return &c
 }
