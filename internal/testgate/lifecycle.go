@@ -161,12 +161,17 @@ type PreparedAttempt struct {
 	// Spec is what will run, complete. Carried because arming and intent publication both need the exact
 	// command AND environment authorization chose, and neither may construct its own.
 	Spec ExecutionSpec
-	// MaxOutputBytes is the frozen policy ceiling on the COMBINED retained stdout+stderr excerpt.
+	// MaxOutputBytes is the frozen policy ceiling on the COMBINED retained stdout+stderr excerpt, in RAW
+	// bytes. MaxRecordBytes is the ceiling on the CANONICAL result record.
 	//
-	// It travels with the attempt because this lifecycle has to enforce it and does not read policy.
-	// Without it the bound could only be applied by whoever happened to have the policy in scope, which
-	// is the side channel this value exists to close.
+	// They are separate because they measure different things and neither implies the other: the excerpt
+	// is base64 in the record, and the argv, environment names and terminal account are variable-length
+	// metadata that can make even a zero-output record nearly exhaust the record ceiling. Checking the
+	// raw excerpt alone does not prove the encoded record fits anywhere.
+	//
+	// Both travel with the attempt because this lifecycle has to enforce them and does not read policy.
 	MaxOutputBytes uint64
+	MaxRecordBytes uint64
 }
 
 // Terminal is what the RUNNER observed about the command, in the closed vocabulary.
@@ -555,7 +560,10 @@ func (d Deps) armUnderGuard() (PreparedAttempt, Containment, CommitStatus, error
 	// reported, which is the same self-reported-identity defect the result path had to be corrected for.
 	intent, expected, err := buildIntentRecord(prep)
 	if err != nil {
-		return prep, nil, 0, err
+		// NOTHING durable exists yet - no intent, no containment, no active reference - so this belongs
+		// to the refusal class with the digest mismatch below it. Returning the builder's error unchanged
+		// reported "an attempt exists and was torn down" for a spec that was never written anywhere.
+		return prep, nil, 0, errors.Join(fmt.Errorf("%w: building the attempt intent", ErrRefused), err)
 	}
 	if expected != prep.IntentDigest {
 		return prep, nil, 0, fmt.Errorf("%w: authorization bound intent digest %q, but the intent it describes is %q",
@@ -799,6 +807,19 @@ func acceptTerminal(t Terminal) (Terminal, error) {
 //
 // They belong together because neither is meaningful alone: a ceiling with no allocation rule does not
 // say which bytes to keep, and an allocation rule with no ceiling does not say how many.
+// checkRecordFits proves the CANONICAL record is storable, which the raw excerpt bound does not.
+func checkRecordFits(rec ResultRecord, maxRecordBytes uint64) error {
+	raw, _, err := rec.Encode()
+	if err != nil {
+		return err
+	}
+	if uint64(len(raw)) > maxRecordBytes {
+		return fmt.Errorf("%w: the canonical result is %d bytes, over the frozen ceiling of %d",
+			ErrLifecycle, len(raw), maxRecordBytes)
+	}
+	return nil
+}
+
 func checkRetainedOutput(stdout, stderr StreamRecord, combined uint64) error {
 	if !FitsCombinedOutputCeiling(stdout, stderr, combined) {
 		return fmt.Errorf("%w: the retained output is %d bytes, over the frozen ceiling of %d",
@@ -836,6 +857,7 @@ func buildIntentRecord(prep PreparedAttempt) (IntentRecord, string, error) {
 		View:           view,
 		SpecDigest:     prep.Spec.Digest,
 		MaxOutputBytes: prep.MaxOutputBytes,
+		MaxRecordBytes: prep.MaxRecordBytes,
 	}
 	_, digest, err := rec.Encode()
 	if err != nil {
@@ -870,6 +892,9 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 	// total makes "head+tail" a shape rather than a rule, so two producers could keep different bytes
 	// and each call itself correct.
 	if err := checkRetainedOutput(rec.Stdout, rec.Stderr, prep.MaxOutputBytes); err != nil {
+		return ResultRecord{}, err
+	}
+	if err := checkRecordFits(rec, prep.MaxRecordBytes); err != nil {
 		return ResultRecord{}, err
 	}
 	// Refused HERE if it contradicts itself, rather than handed on for the publisher to discover it

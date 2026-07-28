@@ -518,3 +518,53 @@ func TestTheAllocationDoesNotDependOnWhatSurvivedTheCrash(t *testing.T) {
 		t.Fatalf("a legitimately written excerpt was rejected after a crash: %v", err)
 	}
 }
+
+// TestTheExcerptBudgetComesFromTheRecordsACTUALFixedSize.
+//
+// The two policy bounds measure different things and neither implies the other: raw retained bytes
+// against canonical bytes, where the excerpt is base64 and the argv, environment names and terminal
+// account are variable-length. The design says outright that this metadata can make even a ZERO-OUTPUT
+// record nearly exhaust the record ceiling, so an excerpt sized against the raw bound alone can produce
+// a record nobody can store.
+func TestTheExcerptBudgetComesFromTheRecordsACTUALFixedSize(t *testing.T) {
+	// EVERY field final except the excerpt bytes, which is the contract: the counts and the digest are
+	// per-stream metadata that only exists once a stream is present, so measuring a record with absent
+	// streams would understate the fixed size by exactly the amount that matters.
+	rec := validRecord()
+	rec.Stdout = StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+		SHA256: strings.Repeat("3c", 32), Head: Bytes{}, Tail: Bytes{}, Truncated: true}
+	bare, _, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	fixed := uint64(len(bare))
+
+	budget, err := ExcerptBudget(rec, fixed+400)
+	if err != nil {
+		t.Fatalf("ExcerptBudget: %v", err)
+	}
+	// Three quarters of what remains, because base64 expands four bytes per three.
+	if budget != 300 {
+		t.Fatalf("budget = %d, want 300 raw bytes for 400 canonical ones", budget)
+	}
+	// An excerpt of exactly that size still fits, with the SAME metadata the budget was measured against.
+	half := (budget + 1) / 2
+	rec.Stdout.Head = bytes.Repeat([]byte{'x'}, int(half))
+	rec.Stdout.Tail = bytes.Repeat([]byte{'x'}, int(budget-half))
+	sized, _, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if uint64(len(sized)) > fixed+400 {
+		t.Fatalf("an excerpt at the derived budget produced %d canonical bytes, over %d", len(sized), fixed+400)
+	}
+
+	// A ceiling the metadata alone already exhausts is refused rather than answered with a nonsense
+	// budget - the zero-output case the design calls out by name.
+	if _, err := ExcerptBudget(rec, fixed); err == nil {
+		t.Fatal("a ceiling the fixed metadata already fills produced a budget")
+	}
+	if _, err := ExcerptBudget(validRecord(), 10); err == nil {
+		t.Fatal("a ceiling smaller than the metadata produced a budget")
+	}
+}

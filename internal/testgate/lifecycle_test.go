@@ -109,6 +109,7 @@ var preparedShape = PreparedAttempt{
 	// The frozen COMBINED retained-output ceiling, carried with the attempt because the lifecycle has to
 	// enforce it and does not read policy.
 	MaxOutputBytes: 32768,
+	MaxRecordBytes: 65536,
 }
 
 var theTerminal = Terminal{
@@ -1972,8 +1973,12 @@ func TestTheIntentIsBuiltAndDIGESTEDOnTheMainPath(t *testing.T) {
 	if rec.SpecDigest != theSpec.Digest {
 		t.Fatalf("the intent binds spec %q, the attempt armed %q", rec.SpecDigest, theSpec.Digest)
 	}
+	// BOTH frozen bounds, because they measure different things and neither implies the other.
 	if rec.MaxOutputBytes != thePrepared.MaxOutputBytes {
-		t.Fatalf("the intent binds ceiling %d, the attempt froze %d", rec.MaxOutputBytes, thePrepared.MaxOutputBytes)
+		t.Fatalf("the intent binds output ceiling %d, the attempt froze %d", rec.MaxOutputBytes, thePrepared.MaxOutputBytes)
+	}
+	if rec.MaxRecordBytes != thePrepared.MaxRecordBytes {
+		t.Fatalf("the intent binds record ceiling %d, the attempt froze %d", rec.MaxRecordBytes, thePrepared.MaxRecordBytes)
 	}
 	_, digest, err := rec.Encode()
 	if err != nil {
@@ -2003,5 +2008,53 @@ func TestAnAuthorizationThatMISDESCRIBESItsIntentIsRefused(t *testing.T) {
 	}
 	if h.r.did("publish-intent") {
 		t.Fatalf("a misdescribed intent was published: %v", h.r.steps)
+	}
+}
+
+// TestTheCanonicalRecordRespectsItsOwnCeiling.
+//
+// The raw output bound does not prove the encoded record fits: the excerpt is base64 in the record, and
+// the argv, environment names and terminal account around it are variable-length.
+func TestTheCanonicalRecordRespectsItsOwnCeiling(t *testing.T) {
+	h := newHarness(t)
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.MaxRecordBytes = 200 // smaller than this attempt's own metadata
+		return rebind(t, p), err
+	}
+
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "over the frozen ceiling of 200") {
+		t.Fatalf("err = %v, want a record-ceiling refusal", err)
+	}
+	if h.r.did("publish-result") {
+		t.Fatalf("an unstorable record reached the durable seam: %v", h.r.steps)
+	}
+}
+
+// TestAnIntentThatCannotBeBuiltIsARefusalNotATeardown.
+//
+// Nothing durable exists at that point - no intent, no containment, no active reference - so reporting
+// it in the lifecycle class told an operator an attempt existed and was torn down, about a spec that was
+// never written anywhere.
+func TestAnIntentThatCannotBeBuiltIsARefusalNotATeardown(t *testing.T) {
+	h := newHarness(t)
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.Spec.Digest = "not-a-digest"
+		return p, err
+	}
+
+	_, err := Run(h.deps)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("err = %v, want ErrRefused", err)
+	}
+	if errors.Is(err, ErrOrphanedIntent) || errors.Is(err, ErrRecoveryOwned) {
+		t.Fatalf("err = %v claims residue exists", err)
+	}
+	if h.r.did("publish-intent") || h.r.did("arm") {
+		t.Fatalf("work proceeded past an unbuildable intent: %v", h.r.steps)
 	}
 }

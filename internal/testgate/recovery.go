@@ -255,8 +255,11 @@ type IntentRecord struct {
 	// the spec carries the ordered environment VALUES, so one cannot stand in for the other. Two
 	// identities, both bound, rather than two identities with a prose-only relationship.
 	SpecDigest string `json:"spec_digest"`
-	// MaxOutputBytes is the frozen COMBINED retained-output ceiling.
+	// MaxOutputBytes is the frozen COMBINED retained-output ceiling, in RAW bytes; MaxRecordBytes is the
+	// ceiling on the CANONICAL result record. Both are bound here so a recovering process applies the
+	// same limits the live path did without reading policy itself.
 	MaxOutputBytes uint64 `json:"max_output_bytes"`
+	MaxRecordBytes uint64 `json:"max_record_bytes"`
 }
 
 // IntentRecordVersion is the on-disk schema version of an intent record.
@@ -282,6 +285,9 @@ func (r IntentRecord) validate() error {
 	}
 	if r.MaxOutputBytes == 0 {
 		return fmt.Errorf("%w: the intent binds no output ceiling", ErrLifecycle)
+	}
+	if r.MaxRecordBytes == 0 {
+		return fmt.Errorf("%w: the intent binds no record ceiling", ErrLifecycle)
 	}
 	return r.View.validate()
 }
@@ -633,6 +639,9 @@ func Recover(r Residue) (Recovery, error) {
 		if err := checkRetainedOutput(rec.Stdout, rec.Stderr, intent.MaxOutputBytes); err != nil {
 			return Recovery{}, err
 		}
+		if err := checkRecordFits(rec, intent.MaxRecordBytes); err != nil {
+			return Recovery{}, err
+		}
 		// PUBLISHABLE, proved by the publication boundary itself rather than by the weaker internal
 		// check. Validating alone left the version unchecked, so the plan was refused only at the moment
 		// it was written - which is exactly where a crash-recovery path must not first learn it is
@@ -846,14 +855,35 @@ func (r Residue) inconsistency() string {
 			// And about the same EXECUTION. Same attempt and same tree is not the same command: a
 			// canonical, digest-verified result for a different argv or working directory satisfied
 			// every other check here. One digest comparison, so no field can be forgotten.
+			in := r.IntentBody.Record()
 			gotView, gerr := rec.View.Digest()
-			wantView, werr := r.IntentBody.Record().View.Digest()
+			wantView, werr := in.View.Digest()
 			if gerr != nil || werr != nil {
 				return fmt.Sprintf("attempt %q: the execution view could not be digested", r.Active.AttemptID)
 			}
 			if gotView != wantView {
 				return fmt.Sprintf("attempt %q was armed with execution %s but its result describes %s",
 					r.Active.AttemptID, wantView, gotView)
+			}
+			// The OTHER execution identity. The view carries the environment identity; the spec digest
+			// names the canonical bytes the supervisor was handed, so comparing one and not the other
+			// leaves a result naming a different exec.spec.v1 finalizable - and the comment claiming both
+			// were compared made that harder to notice, not easier.
+			if rec.SpecDigest != in.SpecDigest {
+				return fmt.Sprintf("attempt %q was armed with spec %s but its result names %s",
+					r.Active.AttemptID, in.SpecDigest, rec.SpecDigest)
+			}
+			// And the SAME policy contract the other builder applies. A verified result is structurally
+			// sound, which says nothing about whether it respects the bounds this attempt froze: reading
+			// it back does not re-check them, so finalizing without this adopts a record the live path
+			// would have refused to write.
+			if err := checkRetainedOutput(rec.Stdout, rec.Stderr, in.MaxOutputBytes); err != nil {
+				return fmt.Sprintf("attempt %q has a published result that breaks its own output contract: %v",
+					r.Active.AttemptID, err)
+			}
+			if err := checkRecordFits(rec, in.MaxRecordBytes); err != nil {
+				return fmt.Sprintf("attempt %q has a published result that breaks its own record ceiling: %v",
+					r.Active.AttemptID, err)
 			}
 		}
 		// The proof that authorises consuming this reference must be a proof about THIS attempt. The

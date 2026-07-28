@@ -128,6 +128,50 @@ func (s StreamRecord) CheckSplit(what string, budget uint64) error {
 	return nil
 }
 
+// ExcerptBudget is the largest RAW retained excerpt that still leaves the canonical record within its
+// ceiling.
+//
+// It exists because the two policy bounds measure different things and neither implies the other. The
+// output bound counts raw retained bytes; the record bound counts CANONICAL bytes, where the excerpt is
+// base64 and the argv, environment names and terminal account are all variable-length metadata. The
+// design is explicit that this metadata can make even a ZERO-OUTPUT record nearly exhaust the ceiling,
+// so an excerpt sized against the raw bound alone can produce a record nobody can store.
+//
+// It is derived from the ACTUAL fixed size - the record encoded with empty excerpts - rather than from an
+// estimate, because an estimate of a variable-length thing is a number that is wrong for exactly the
+// inputs that matter.
+//
+// CONTRACT: pass the record with EVERY field final except the excerpt bytes, including each stream's
+// Present flag, counts and digest. Those are per-stream metadata that only exists once a stream is
+// present, so a record handed over with absent streams measures a smaller fixed size than the record
+// that will actually be written, and the budget would be too generous by exactly the amount that
+// matters.
+func ExcerptBudget(rec ResultRecord, maxRecordBytes uint64) (uint64, error) {
+	bare := rec
+	bare.Stdout, bare.Stderr = emptyLike(rec.Stdout), emptyLike(rec.Stderr)
+	raw, _, err := bare.Encode()
+	if err != nil {
+		return 0, err
+	}
+	fixed := uint64(len(raw))
+	if fixed >= maxRecordBytes {
+		return 0, fmt.Errorf("%w: the record's fixed metadata is %d canonical bytes, at or over the %d-byte ceiling",
+			ErrLifecycle, fixed, maxRecordBytes)
+	}
+	// Base64 expands 4 bytes per 3, so the raw budget is three quarters of what remains. Rounding DOWN,
+	// because a budget that is occasionally one byte too generous is a budget that occasionally produces
+	// an unstorable record.
+	return (maxRecordBytes - fixed) * 3 / 4, nil
+}
+
+func emptyLike(s StreamRecord) StreamRecord {
+	if !s.Present {
+		return s
+	}
+	s.Head, s.Tail, s.Truncated = Bytes{}, Bytes{}, true
+	return s
+}
+
 // AllocateOutputBudget divides ONE combined ceiling between the two streams.
 //
 // The policy bounds the streams together, and until the division is named a 100/0 allocation and a 50/50

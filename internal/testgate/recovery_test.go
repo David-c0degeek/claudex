@@ -73,7 +73,8 @@ func intentRecord() IntentRecord {
 	return IntentRecord{
 		SchemaVersion: IntentRecordVersion, AttemptID: theAttemptID, StartRevision: 41,
 		TestedCommit: theCommit, TestedTree: theTree,
-		View: theView(), SpecDigest: strings.Repeat("7a", 32), MaxOutputBytes: 32768,
+		View: theView(), SpecDigest: strings.Repeat("7a", 32),
+		MaxOutputBytes: 32768, MaxRecordBytes: 65536,
 	}
 }
 
@@ -1487,6 +1488,9 @@ func TestAnIntentRecordIsRefusedWhenItCannotDescribeAnAttempt(t *testing.T) {
 		{"no execution spec digest", func(in *IntentRecord) { in.SpecDigest = "" }, "execution spec digest"},
 		{"a spec digest that is not a digest", func(in *IntentRecord) { in.SpecDigest = "nope" }, "execution spec digest"},
 		{"no output ceiling", func(in *IntentRecord) { in.MaxOutputBytes = 0 }, "binds no output ceiling"},
+		// A different bound measuring a different thing: raw retained bytes against canonical record
+		// bytes, where the excerpt is base64 and the metadata is variable-length.
+		{"no record ceiling", func(in *IntentRecord) { in.MaxRecordBytes = 0 }, "binds no record ceiling"},
 		{"no executable", func(in *IntentRecord) { in.View.Executable = nil }, "names no executable"},
 		{"no argv", func(in *IntentRecord) { in.View.Argv = nil }, "has no argv"},
 		{"no working directory", func(in *IntentRecord) { in.View.Cwd = nil }, "names no working directory"},
@@ -1543,4 +1547,76 @@ func TestTheIntentBoundaryRefusesDocumentsItDidNotWrite(t *testing.T) {
 	if back.AttemptID != theAttemptID || back.StartRevision != 41 {
 		t.Fatalf("the decoded intent is not the one encoded: %+v", back)
 	}
+}
+
+// TestAPublishedResultMustHonourTheContractItsOwnIntentFROZE.
+//
+// A verified result is STRUCTURALLY sound; that says nothing about whether it respects the bounds this
+// attempt froze, because reading it back does not re-check them. And the view digest is only one of the
+// two execution identities - comparing it alone left a result naming a different exec.spec.v1 finalizable
+// while a comment claimed both were compared, which makes the gap harder to see rather than easier.
+func TestAPublishedResultMustHonourTheContractItsOwnIntentFROZE(t *testing.T) {
+	base := func(t *testing.T) ResultRecord {
+		rec := validRecord()
+		rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+		rec.View = theView()
+		rec.SpecDigest = intentRecord().SpecDigest
+		return rec
+	}
+	for _, tc := range []struct {
+		name string
+		bend func(*ResultRecord)
+		want string
+	}{
+		{"a result naming another execution spec", func(r *ResultRecord) {
+			r.SpecDigest = strings.Repeat("9", 64)
+		}, "but its result names"},
+		{"a result over the frozen output ceiling", func(r *ResultRecord) {
+			big := bytes.Repeat([]byte{'o'}, int(intentRecord().MaxOutputBytes)+10)
+			r.Stdout = StreamRecord{Present: true, SourceBytes: uint64(len(big)), RedactedBytes: uint64(len(big)),
+				SHA256: sha256Hex(big), Head: big}
+		}, "output contract"},
+		{"a result whose excerpt is split the wrong way", func(r *ResultRecord) {
+			outBudget, _ := bothStreamBudgets()
+			all := bytes.Repeat([]byte{'o'}, int(outBudget))
+			r.Stdout = StreamRecord{Present: true, SourceBytes: 99999, RedactedBytes: 99999,
+				SHA256: strings.Repeat("3c", 32), Head: all, Truncated: true}
+		}, "output contract"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := base(t)
+			tc.bend(&rec)
+			r := residueFor(t, observation{StandingActive, true, CompletionProven})
+			r.Result = ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
+
+			got, err := Recover(r)
+			if err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if got.Action != ActionBlock || !strings.Contains(got.Reason, tc.want) {
+				t.Fatalf("%+v, want a block containing %q", got, tc.want)
+			}
+		})
+	}
+
+	// A result over the CANONICAL record ceiling, which the raw output bound does not catch: the excerpt
+	// is base64 there, and the metadata around it is variable-length.
+	t.Run("a result over the frozen record ceiling", func(t *testing.T) {
+		in := intentRecord()
+		in.MaxRecordBytes = 300
+		rec := base(t)
+		r := residueFor(t, observation{StandingActive, true, CompletionProven})
+		r.Result = ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
+		verified := verifiedIntentOf(t, in)
+		r.IntentBody = verified
+		r.Active.IntentDigest, r.Intent.Digest = verified.Digest(), verified.Digest()
+
+		got, err := Recover(r)
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if got.Action != ActionBlock || !strings.Contains(got.Reason, "record ceiling") {
+			t.Fatalf("%+v, want a block naming the record ceiling", got)
+		}
+	})
 }
