@@ -149,7 +149,9 @@ func validate(rs *RunState) error {
 	// The frozen environment must still be authorized by the frozen policy. Validating it here rather
 	// than trusting the bootstrap means a state that was hand-edited, or written by a build whose
 	// authority model differed, cannot hand a command variables the policy never allowed.
-	if err := rs.ResolvedExecution.ValidateFor(rs.EffectivePolicy.TestGate, config.HostGOOS()); err != nil {
+	// The run directory is DERIVED from the run id, never taken from the state being validated, so a
+	// tampered state cannot supply the very path its scratch layout is then checked against.
+	if err := rs.ResolvedExecution.ValidateFor(rs.EffectivePolicy.TestGate, config.HostGOOS(), RunDirRelFor(rs.RunID)); err != nil {
 		return fmt.Errorf("resolved_execution: %w", err)
 	}
 	return nil
@@ -214,15 +216,13 @@ func validateAttemptTransition(old, next *RunState) error {
 	case old.ActiveTestAttempt != nil && next.ActiveTestAttempt != nil:
 		o, n := old.ActiveTestAttempt, next.ActiveTestAttempt
 		if o.AttemptID != n.AttemptID {
-			// Replacing one live attempt with another in a single step would silently abandon the
-			// first: it never reaches the ledger, so nothing records that it ran.
-			if appended == 0 {
-				return fmt.Errorf("active attempt %q was replaced by %q without finalizing it", o.AttemptID, n.AttemptID)
-			}
-			if n.StartRevision != next.Revision {
-				return fmt.Errorf("the replacement active attempt must start at revision %d, got %d", next.Revision, n.StartRevision)
-			}
-			break
+			// Finalizing one attempt and starting its replacement are DISTINCT guarded operations, and
+			// one CAS may not do both. Allowing it whenever a ledger entry was appended looked
+			// reasonable — the old attempt does reach the ledger — but it lets the next attempt be
+			// created without the run ever passing through the state that authorizes starting one:
+			// ownerless TESTS with NO active attempt. A ledger-only indeterminate finalization satisfies
+			// placement on its own, so the intermediate authorization would simply never be observed.
+			return fmt.Errorf("active attempt %q was replaced by %q in one transition; finalizing and starting are separate operations", o.AttemptID, n.AttemptID)
 		}
 		// 6. A live attempt's identity is frozen. Its tree, its intent and its start are what the
 		// eventual outcome is a statement ABOUT, so changing them mid-flight would let the answer be
@@ -821,9 +821,17 @@ func redactAndGuard(rs *RunState) error {
 	for i, n := range rs.EffectivePolicy.TestGate.Env.Inherit {
 		control[fmt.Sprintf("effective_policy.test_gate.env.inherit.%d", i)] = n
 	}
+	// Fed as `name=value`, NOT as two separate entries. The detector's rules are schema-sensitive: a
+	// bare value like `ordinary-value` matches nothing on its own, and it is the PAIR that carries the
+	// signal. Splitting them — which an earlier version did — silently disabled the very rule that
+	// makes an environment assignment recognizable as a credential.
 	for i, e := range rs.EffectivePolicy.TestGate.Env.Set {
-		control[fmt.Sprintf("effective_policy.test_gate.env.set.%d.name", i)] = e.Name
-		control[fmt.Sprintf("effective_policy.test_gate.env.set.%d.value", i)] = e.Value
+		control[fmt.Sprintf("effective_policy.test_gate.env.set.%d", i)] = e.Name + "=" + e.Value
+	}
+	// Defence in depth. Resolution refuses a credential-shaped pair BEFORE the intent is journaled,
+	// which is the boundary that matters; this catches a state that was written by some other path.
+	for i, e := range rs.ResolvedExecution.Env {
+		control[fmt.Sprintf("resolved_execution.env.%d", i)] = string(e.Name) + "=" + string(e.Value)
 	}
 	if rs.Assignment != nil {
 		control["assignment.id"] = rs.Assignment.ID

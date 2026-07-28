@@ -581,22 +581,51 @@ func (s *Store) WithWrite(fn func(path string, data []byte, perm os.FileMode) er
 // cloneForNext deep-copies prev (or returns a normalized fresh state) so the
 // mutator always sees usable collections and transition validation can compare
 // old vs new without aliasing.
+// cloneSlice copies a slice, preserving the nil/empty distinction the immutability checks compare on.
+func cloneSlice[T any](src []T) []T {
+	if src == nil {
+		return nil
+	}
+	dst := make([]T, len(src))
+	copy(dst, src)
+	return dst
+}
+
 func cloneForNext(prev *RunState) *RunState {
 	if prev == nil {
 		return &RunState{AcceptedTurns: map[string]AcceptedTurn{}, Counters: Counters{StepFixes: []int{}}}
 	}
 	n := *prev
 	n.Counters.StepFixes = cloneInts(prev.Counters.StepFixes)
-	// Copied, not shared. A struct copy duplicates only the slice HEADER, so a mutator writing
-	// next.TestAttempts[i] would write through to the previous state as well — and the append-only
-	// check compares next against prev, so the rewrite it exists to catch would be invisible to it.
-	// A test caught exactly that: rewriting a finalized entry in place was accepted.
-	if prev.TestAttempts != nil {
-		n.TestAttempts = append([]FinalizedAttempt(nil), prev.TestAttempts...)
-	}
+	// Copied, not shared — for EVERY nested mutable collection, not just the ones that were noticed.
+	//
+	// A struct copy duplicates only the slice HEADER, so a mutator writing next.X[i] writes through to
+	// the previous state as well; the immutability checks compare next against prev with DeepEqual, so
+	// they would see equality and accept the very rewrite they exist to catch. That was first found for
+	// TestAttempts and then found again, by review, still present on the frozen policy's argv and
+	// environment and on the resolved environment — which are exactly the authorities a run must not be
+	// able to edit after bootstrap.
+	// make+copy rather than append-to-nil, because append on an EMPTY source yields nil: an
+	// empty-but-present collection would come back absent, and the immutability comparison would then
+	// fail on a mutation that changed nothing.
+	n.TestAttempts = cloneSlice(prev.TestAttempts)
 	if prev.ActiveTestAttempt != nil {
 		a := *prev.ActiveTestAttempt
 		n.ActiveTestAttempt = &a
+	}
+	n.EffectivePolicy.TestGate.Argv = cloneSlice(prev.EffectivePolicy.TestGate.Argv)
+	n.EffectivePolicy.TestGate.Env.Inherit = cloneSlice(prev.EffectivePolicy.TestGate.Env.Inherit)
+	n.EffectivePolicy.TestGate.Env.Set = cloneSlice(prev.EffectivePolicy.TestGate.Env.Set)
+	if prev.ResolvedExecution.Env != nil {
+		env := make([]config.ResolvedVar, len(prev.ResolvedExecution.Env))
+		for i, e := range prev.ResolvedExecution.Env {
+			// The byte slices too: copying the ResolvedVar struct still shares Name and Value.
+			env[i] = config.ResolvedVar{
+				Name:  cloneSlice(e.Name),
+				Value: cloneSlice(e.Value),
+			}
+		}
+		n.ResolvedExecution.Env = env
 	}
 	n.AcceptedTurns = make(map[string]AcceptedTurn, len(prev.AcceptedTurns))
 	for k, v := range prev.AcceptedTurns {

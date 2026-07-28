@@ -75,33 +75,38 @@ const (
 	UnknownFSAcknowledge UnknownFSPolicy = "acknowledge" // proceed at operator's risk
 )
 
-// PlatformRequiredEnv is the fixed set of names the OPERATING SYSTEM requires for a process to start
+// platformRequiredEnv is the fixed set of names the OPERATING SYSTEM requires for a process to start
 // and for executable lookup to work, per GOOS. It is part of the authority model, not an addition made
 // during resolution.
 //
-// The distinction is the whole point of naming it here (TURN-268 pin 5). An earlier draft had the
-// default allowlist contain only PATH and had resolution quietly add SystemRoot, ComSpec and PATHEXT on
+// It is UNEXPORTED. An exported map is writable by any importer, so a "closed set" that anyone could
+// append to would be a claim the type system contradicts — the authority would be mutable at runtime
+// while the documentation called it enumerated.
+//
+// The distinction between enumerating and injecting is the point. An earlier draft had the default
+// allowlist contain only PATH and had resolution quietly add SystemRoot, ComSpec and PATHEXT on
 // Windows. That contradicted this package's own claim that nothing unnamed reaches the command:
-// recording an implicitly added value does not make it policy-authorized, and it let resolution enlarge
-// the effective policy. The alternative — putting them in the DEFAULT — is worse in a different way,
-// because then one policy document would parse to different values on different hosts and the
-// bootstrap intent's parse-equality invariant could not hold.
+// recording an implicitly added value does not make it policy-authorized. The alternative — putting
+// them in the DEFAULT — is worse in a different way, because then one policy document would parse to
+// different values on different hosts and the bootstrap intent's parse-equality invariant could not
+// hold.
 //
 // So they are neither defaulted nor injected: they are ENUMERATED, closed, and not operator-
-// configurable. The authorized allowlist is `env.inherit` ∪ PlatformRequiredEnv[GOOS], every resolved
-// name is validated against that union, and an operator naming one of them explicitly is redundant
-// rather than an error.
+// configurable. The authorized allowlist is `env.inherit` union platformRequiredEnv[GOOS], every
+// resolved name is validated against that union, and an operator naming one of them in the SAME
+// spelling is redundant rather than an error.
 //
 // PATHEXT is present on Windows because executable lookup consults it; its absence was a real defect
 // found earlier, not a completeness gesture.
-var PlatformRequiredEnv = map[string][]string{
+var platformRequiredEnv = map[string][]string{
 	"windows": {"ComSpec", "PATHEXT", "SystemRoot"},
 	// Unix needs nothing beyond what the operator names; PATH is already the default.
 }
 
-// PlatformRequired returns the enumerated platform set for a GOOS, sorted and never nil.
+// PlatformRequired returns the enumerated platform set for a GOOS. It returns a COPY: handing out the
+// backing array would make the closed set appendable by its callers.
 func PlatformRequired(goos string) []string {
-	names := PlatformRequiredEnv[goos]
+	names := platformRequiredEnv[goos]
 	out := make([]string, len(names))
 	copy(out, names)
 	return out
@@ -127,7 +132,7 @@ type EnvAssignment struct {
 // It exists because naming what the command may see is the only way the environment can be a frozen
 // input rather than an ambient one. Inherit lists the variables whose values are taken from the host
 // AT FIRST ATTACH and frozen from then on; Set supplies values the policy states outright. Nothing
-// reaches the command except what is named here and the enumerated PlatformRequiredEnv set below.
+// reaches the command except what is named here and the enumerated platform-required set above.
 //
 // HOME is deliberately NOT in the default allowlist. Git, npm and cloud tooling load credential-bearing
 // configuration from it, so inheriting it by default would have contradicted this contract's own

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"github.com/David-c0degeek/claudex/internal/config"
 	"strings"
 	"testing"
 )
@@ -285,6 +286,132 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 			t.Fatalf("err = %v, want a multi-finalization refusal", err)
 		}
 	})
+}
+
+// TestFinalizingAndStartingAreSeparateOperations.
+//
+// One CAS must not finalize an attempt and start its replacement. Permitting it whenever a ledger entry
+// was appended looked reasonable — the old attempt does reach the ledger — but the next attempt would
+// then be created without the run ever passing through the state that authorizes starting one:
+// ownerless TESTS with NO active attempt. A ledger-only indeterminate finalization satisfies placement
+// on its own, so that intermediate authorization would simply never be observed.
+func TestFinalizingAndStartingAreSeparateOperations(t *testing.T) {
+	s := newStore(t)
+	started := start(t, s, atTests(t, s), "attempt-0001")
+	_, err := s.Mutate(started.Revision, func(rev uint64, n *RunState) error {
+		a := *n.ActiveTestAttempt
+		n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
+			AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
+			TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(14),
+			Execution: TestExecutionIndeterminate, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone",
+		})
+		n.ActiveTestAttempt = attemptRef("attempt-0002", rev)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "separate operations") {
+		t.Fatalf("err = %v, want a finalize-and-replace refusal", err)
+	}
+	// Done as two transitions it is fine, which is what makes the refusal a sequencing rule rather than
+	// a prohibition on retrying.
+	done := mustFinalize(t, s, started, sha256Hex(15))
+	if _, err := s.Mutate(done.Revision, func(rev uint64, n *RunState) error {
+		n.ActiveTestAttempt = attemptRef("attempt-0002", rev)
+		return nil
+	}); err != nil {
+		t.Fatalf("a separately-started replacement was refused: %v", err)
+	}
+}
+
+// TestFrozenCollectionsCannotBeMutatedInPlace.
+//
+// A struct copy duplicates only a slice HEADER, so a mutator writing next.X[i] writes through to the
+// previous state — and the immutability checks compare next against prev, so they would see equality
+// and accept the rewrite they exist to catch. It was found once on the attempt ledger and was still
+// present, unnoticed, on every other frozen collection: the argv the gate runs, the environment it is
+// allowed to see, and the environment actually frozen for it.
+func TestFrozenCollectionsCannotBeMutatedInPlace(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*RunState)
+		mutet func(*RunState)
+		want  string
+	}{
+		{
+			"the gate's argv",
+			func(n *RunState) { n.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"go", "test"}} },
+			func(n *RunState) { n.EffectivePolicy.TestGate.Argv[1] = "rm" },
+			"effective_policy is immutable",
+		},
+		{
+			// Reordered, for the same reason as the set case below: substituting a DIFFERENT name would
+			// de-authorize an already-resolved variable and be refused by the authorization check
+			// first, leaving the aliasing untested.
+			"the inherited environment allowlist",
+			func(n *RunState) {
+				n.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"go", "test"},
+					Env: config.TestGateEnv{Inherit: []string{"ALPHA", "BETA"}}}
+			},
+			func(n *RunState) {
+				n.EffectivePolicy.TestGate.Env.Inherit[0], n.EffectivePolicy.TestGate.Env.Inherit[1] =
+					n.EffectivePolicy.TestGate.Env.Inherit[1], n.EffectivePolicy.TestGate.Env.Inherit[0]
+			},
+			"effective_policy is immutable",
+		},
+		{
+			// Reordered rather than revalued: the derivation binding would refuse a changed VALUE
+			// before immutability was reached, so the case would then prove the wrong guard. Order is
+			// not semantic to derivation, which leaves the aliasing as the only thing under test.
+			"the explicitly set environment",
+			func(n *RunState) {
+				n.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"go", "test"},
+					Env: config.TestGateEnv{Set: []config.EnvAssignment{{Name: "CI", Value: "1"}, {Name: "GOFLAGS", Value: "-count=1"}}}}
+			},
+			func(n *RunState) {
+				n.EffectivePolicy.TestGate.Env.Set[0], n.EffectivePolicy.TestGate.Env.Set[1] =
+					n.EffectivePolicy.TestGate.Env.Set[1], n.EffectivePolicy.TestGate.Env.Set[0]
+			},
+			"effective_policy is immutable",
+		},
+		{
+			// An INHERITED name, whose value the policy does not pin — so the derivation check has
+			// nothing to say and immutability is what must catch the rewrite. This is the one that
+			// matters most: it is the environment the command actually runs with.
+			"the frozen resolved environment",
+			func(n *RunState) {
+				n.EffectivePolicy.TestGate = config.TestGate{Argv: []string{"go", "test"},
+					Env: config.TestGateEnv{Inherit: []string{"CI"}}}
+			},
+			func(n *RunState) { n.ResolvedExecution.Env[0].Value = []byte("/attacker/bin") },
+			"resolved_execution is immutable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			init, err := s.Mutate(0, func(_ uint64, n *RunState) error {
+				initState(n)
+				tc.setup(n)
+				// Resolved against a host that HAS the inherited names, so the frozen environment is
+				// non-empty and there is something to try to rewrite.
+				re, rerr := config.ResolveForRun(n.EffectivePolicy.TestGate, config.HostGOOS(),
+					func(name string) (string, bool) { return "ambient-" + name, true }, RunDirRelFor(n.RunID))
+				if rerr != nil {
+					return rerr
+				}
+				n.ResolvedExecution = re
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			_, err = s.Mutate(init.Revision, func(_ uint64, n *RunState) error {
+				tc.mutet(n)
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
 }
 
 // TestLedgerIsAppendOnlyByValue is the invariant a length check would not give.

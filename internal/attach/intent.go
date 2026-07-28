@@ -228,7 +228,10 @@ func (in BootstrapIntent) validate() error {
 	// source — it comes from the host — while the transaction payload caps at 64 KiB, so a small policy
 	// could otherwise resolve to an intent that cannot be written, discovered only once the run was
 	// already being created.
-	if err := in.ResolvedExecution.ValidateFor(policy.TestGate, config.HostGOOS()); err != nil {
+	// RelDir is proven above to be the derived run directory, so passing it here binds the scratch
+	// layout to the run rather than accepting any three non-blank strings — which is what let a forged
+	// journal redirect HOME, cache and temp outside the run entirely.
+	if err := in.ResolvedExecution.ValidateFor(policy.TestGate, config.HostGOOS(), in.RelDir); err != nil {
 		return fmt.Errorf("attach: intent resolved_execution: %w", err)
 	}
 	if in.Base != policy.BaseBranch {

@@ -1,7 +1,8 @@
 package config
 
 import (
-	"slices"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -17,129 +18,292 @@ func host(vals map[string]string) EnvLookup {
 	}
 }
 
+const testRelDir = ".claudex/runs/run-a"
+
 func resolve(t *testing.T, g TestGate, goos string, look EnvLookup) ResolvedExecution {
 	t.Helper()
-	re, err := ResolveForRun(g, goos, look, ".claudex/runs/run-a")
+	re, err := ResolveForRun(g, goos, look, testRelDir)
 	if err != nil {
 		t.Fatalf("ResolveForRun: %v", err)
 	}
 	return re
 }
 
-// TestResolutionFreezesTheValueNotJustTheName is the point of the whole shape.
-//
-// Allowlisting a name makes inheritance INTENTIONAL; it does not stop the value changing underneath the
-// run. Resolution reads the host once, and everything afterwards reads the frozen copy.
-func TestResolutionFreezesTheValueNotJustTheName(t *testing.T) {
-	re := resolve(t, gateInherit("PATH"), "linux", host(map[string]string{"PATH": "/usr/bin"}))
-	want := []EnvAssignment{{Name: "PATH", Value: "/usr/bin"}}
-	if !slices.Equal(re.Env, want) {
-		t.Fatalf("env = %+v, want %+v", re.Env, want)
+func envNames(re ResolvedExecution) []string {
+	out := make([]string, 0, len(re.Env))
+	for _, e := range re.Env {
+		out = append(out, string(e.Name))
 	}
+	return out
 }
 
-// TestAnAbsentInheritedNameStaysAbsent. "Set to empty" and "not set" are distinguishable to a program,
-// so inventing an empty value would hand the command a variable the host never had.
-func TestAnAbsentInheritedNameStaysAbsent(t *testing.T) {
-	re := resolve(t, gateInherit("PATH", "CI"), "linux", host(map[string]string{"PATH": "/usr/bin"}))
+func envValue(re ResolvedExecution, name string) (string, bool) {
 	for _, e := range re.Env {
-		if e.Name == "CI" {
-			t.Fatalf("an absent inherited name was materialized as %q", e.Value)
+		if string(e.Name) == name {
+			return string(e.Value), true
 		}
 	}
+	return "", false
 }
 
-// TestPlatformRequiredNamesAreAuthorizedNotInjected is CX's pin 5 made executable.
+// TestResolutionFreezesTheValueNotJustTheName is the point of the whole shape. Allowlisting a name
+// makes inheritance INTENTIONAL; it does not stop the value changing underneath the run.
+func TestResolutionFreezesTheValueNotJustTheName(t *testing.T) {
+	re := resolve(t, gateInherit("PATH"), "linux", host(map[string]string{"PATH": "/usr/bin"}))
+	if v, ok := envValue(re, "PATH"); !ok || v != "/usr/bin" {
+		t.Fatalf("env = %v, want the host's PATH frozen", envNames(re))
+	}
+}
+
+// TestArbitraryBytesSurviveTheWire.
 //
-// The Windows names must be part of the AUTHORITY — reachable through AuthorizedEnvNames and therefore
-// accepted by validation — rather than added during resolution to a policy that never mentioned them.
-// The difference is observable: an implicitly added value would be refused by ValidateFor, which is
-// exactly what makes "nothing unnamed reaches the command" true rather than aspirational.
+// A Unix environment value is an arbitrary byte string that need not be valid UTF-8, and Go's JSON
+// encoder silently REPLACES invalid bytes. Persisting the execution view as JSON strings would
+// therefore bind something the child never receives — the same defect the evidence packet had to be
+// fixed for over git paths. This is why the execution view has its own base64 shape while the source
+// policy keeps plain UTF-8.
+func TestArbitraryBytesSurviveTheWire(t *testing.T) {
+	raw := []byte{0xff, 0xfe, 'a', 0x80}
+	re := ResolvedExecution{
+		Identity: NameByteExact,
+		Env:      []ResolvedVar{{Name: []byte("WEIRD"), Value: raw}},
+	}
+	p := scratchPaths(testRelDir)
+	re.ScratchHome, re.ScratchCache, re.ScratchTemp = p[0], p[1], p[2]
+
+	b, err := json.Marshal(re)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got ResolvedExecution
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(got.Env[0].Value, raw) {
+		t.Fatalf("value round-tripped as %v, want %v — invalid UTF-8 was not preserved", got.Env[0].Value, raw)
+	}
+	// And the plain-string shape really would have lost it, so this test is about a live hazard.
+	if string([]rune(string(raw))) == string(raw) {
+		t.Fatal("the fixture is valid UTF-8; it proves nothing about byte preservation")
+	}
+}
+
+// TestWindowsNameIdentityCollisions is the TURN-240 pin.
+//
+// Windows supplies ONE variable for `Path` and `PATH`. An exact-spelling allowlist would freeze two
+// entries while the child received one, so the durable identity would describe an environment that
+// never existed. The same document is perfectly valid on Linux, where they ARE two variables — which is
+// why the check belongs to resolution, where the platform is known, and not to the portable document.
+func TestWindowsNameIdentityCollisions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gate TestGate
+	}{
+		{"two inherited spellings", gateInherit("Path", "PATH")},
+		{"inherited and set", TestGate{Argv: []string{"go", "test"},
+			Env: TestGateEnv{Inherit: []string{"Path"}, Set: []EnvAssignment{{Name: "PATH", Value: "x"}}}}},
+		{"two set spellings", TestGate{Argv: []string{"go", "test"},
+			Env: TestGateEnv{Set: []EnvAssignment{{Name: "Ci", Value: "1"}, {Name: "CI", Value: "2"}}}}},
+		{"a differently-spelled platform name", gateInherit("systemroot")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ResolveForRun(tc.gate, "windows", host(map[string]string{"PATH": "p", "Path": "p", "systemroot": "s"}), testRelDir); err == nil {
+				t.Fatal("windows resolution accepted two spellings of one variable")
+			}
+			// The very same policy is fine on Linux, where they are genuinely distinct.
+			if _, err := ResolveForRun(tc.gate, "linux", host(map[string]string{"PATH": "p", "Path": "p", "systemroot": "s", "CI": "1", "Ci": "2"}), testRelDir); err != nil {
+				t.Fatalf("linux resolution refused a policy that is valid there: %v", err)
+			}
+		})
+	}
+}
+
+// TestFrozenIdentityIsNotReinterpretedByAnotherHost.
+//
+// A value frozen under one platform's name rules says nothing about what the other would have produced,
+// so a Linux-origin environment containing only PATH must not be re-validated as valid Windows state.
+func TestFrozenIdentityIsNotReinterpretedByAnotherHost(t *testing.T) {
+	g := gateInherit("PATH")
+	lin := resolve(t, g, "linux", host(map[string]string{"PATH": "/usr/bin"}))
+	if lin.Identity != NameByteExact {
+		t.Fatalf("identity = %q, want byte_exact", lin.Identity)
+	}
+	err := lin.ValidateFor(g, "windows", testRelDir)
+	if err == nil || !strings.Contains(err.Error(), "different platform name rules") {
+		t.Fatalf("err = %v, want a host-identity refusal", err)
+	}
+}
+
+// TestPlatformRequiredNamesAreAuthorizedNotInjected. The Windows names must be part of the AUTHORITY —
+// reachable through AuthorizedEnvNames and therefore accepted by validation — rather than added during
+// resolution to a policy that never mentioned them.
 func TestPlatformRequiredNamesAreAuthorizedNotInjected(t *testing.T) {
 	g := gateInherit("PATH")
 	h := host(map[string]string{"PATH": `C:\bin`, "SystemRoot": `C:\Windows`, "ComSpec": `C:\Windows\cmd.exe`, "PATHEXT": ".EXE"})
 
 	win := resolve(t, g, "windows", h)
-	var names []string
-	for _, e := range win.Env {
-		names = append(names, e.Name)
-	}
 	for _, want := range []string{"ComSpec", "PATH", "PATHEXT", "SystemRoot"} {
-		if !slices.Contains(names, want) {
-			t.Fatalf("windows resolution %v omits the platform-required %q", names, want)
+		if _, ok := envValue(win, want); !ok {
+			t.Fatalf("windows resolution %v omits the platform-required %q", envNames(win), want)
 		}
 	}
-	// The same policy on Linux carries only what it named: the platform set is per-GOOS, not a global
-	// enlargement of every policy.
 	lin := resolve(t, g, "linux", h)
-	if len(lin.Env) != 1 || lin.Env[0].Name != "PATH" {
-		t.Fatalf("linux resolution = %+v, want only PATH", lin.Env)
+	if len(lin.Env) != 1 || string(lin.Env[0].Name) != "PATH" {
+		t.Fatalf("linux resolution = %v, want only PATH", envNames(lin))
 	}
-	// And a value the policy never authorized is refused rather than recorded.
 	rogue := win
-	rogue.Env = append(slices.Clone(win.Env), EnvAssignment{Name: "SECRET", Value: "x"})
-	slices.SortFunc(rogue.Env, func(a, b EnvAssignment) int { return strings.Compare(a.Name, b.Name) })
-	if err := rogue.ValidateFor(g, "windows"); err == nil || !strings.Contains(err.Error(), "does not authorize") {
+	rogue.Env = append(append([]ResolvedVar{}, win.Env...), ResolvedVar{Name: []byte("SECRET"), Value: []byte("x")})
+	if err := rogue.ValidateFor(g, "windows", testRelDir); err == nil || !strings.Contains(err.Error(), "does not authorize") {
 		t.Fatalf("err = %v, want an authorization refusal", err)
 	}
 }
 
-// TestExplicitlySetNamesMustSurviveResolution. A `set` entry is stated by the policy, so unlike an
-// inherited name it cannot legitimately be missing afterwards.
-func TestExplicitlySetNamesMustSurviveResolution(t *testing.T) {
+// TestThePlatformSetCannotBeEnlargedByACaller. A closed set that any importer could append to would be
+// a claim the type system contradicts.
+func TestThePlatformSetCannotBeEnlargedByACaller(t *testing.T) {
+	got := PlatformRequired("windows")
+	got = append(got, "SECRET")
+	_ = got
+	for _, n := range PlatformRequired("windows") {
+		if n == "SECRET" {
+			t.Fatal("PlatformRequired handed out its own backing array; the authority is mutable")
+		}
+	}
+}
+
+// TestExplicitlySetValuesAreBoundExactly.
+//
+// Requiring only that a `set` NAME be present let a forged or recovered intent substitute any value it
+// liked while passing validation — the policy said what the value is, so validation must say so too.
+func TestExplicitlySetValuesAreBoundExactly(t *testing.T) {
 	g := TestGate{Argv: []string{"go", "test"}, Env: TestGateEnv{Set: []EnvAssignment{{Name: "CI", Value: "1"}}}}
-	re := resolve(t, g, "linux", host(nil))
-	if !slices.Equal(re.Env, []EnvAssignment{{Name: "CI", Value: "1"}}) {
-		t.Fatalf("env = %+v, want the explicitly set entry", re.Env)
+	re := resolve(t, g, "linux", host(map[string]string{"CI": "ambient"}))
+	if v, _ := envValue(re, "CI"); v != "1" {
+		t.Fatalf("an ambient value overrode an explicitly set one: %q", v)
 	}
-	// A set value does NOT come from the host, so an ambient value of the same name cannot win.
-	re = resolve(t, g, "linux", host(map[string]string{"CI": "ambient"}))
-	if re.Env[0].Value != "1" {
-		t.Fatalf("an ambient value overrode an explicitly set one: %q", re.Env[0].Value)
+	forged := re
+	forged.Env = []ResolvedVar{{Name: []byte("CI"), Value: []byte("tampered")}}
+	if err := forged.ValidateFor(g, "linux", testRelDir); err == nil || !strings.Contains(err.Error(), "not the value the policy sets") {
+		t.Fatalf("err = %v, want a substituted-value refusal", err)
 	}
-	missing := ResolvedExecution{Env: []EnvAssignment{}, ScratchHome: "h", ScratchCache: "c", ScratchTemp: "t"}
-	if err := missing.ValidateFor(g, "linux"); err == nil || !strings.Contains(err.Error(), "sets explicitly") {
+	missing := ResolvedExecution{Identity: NameByteExact, Env: []ResolvedVar{}}
+	p := scratchPaths(testRelDir)
+	missing.ScratchHome, missing.ScratchCache, missing.ScratchTemp = p[0], p[1], p[2]
+	if err := missing.ValidateFor(g, "linux", testRelDir); err == nil || !strings.Contains(err.Error(), "sets explicitly") {
 		t.Fatalf("err = %v, want a refusal for an omitted set entry", err)
 	}
 }
 
-// TestResolvedEnvironmentIsBoundedBeforeAnythingIsJournaled.
+// TestScratchPathsMustBeTheDerivedLayout.
 //
-// An inherited value is not bounded by the 16 KiB policy source — it comes from the host — while a
-// prepared-transaction payload caps at 64 KiB. Without these ceilings a small, valid policy could
-// resolve to an intent that cannot be written, discovered only once the run was already being created.
-func TestResolvedEnvironmentIsBoundedBeforeAnythingIsJournaled(t *testing.T) {
+// Checking only that the three paths are non-blank let a forged journal point HOME, cache and temp
+// anywhere on the machine — defeating the credential isolation those directories exist to provide,
+// while still satisfying "the paths are set".
+func TestScratchPathsMustBeTheDerivedLayout(t *testing.T) {
+	g := gateInherit("PATH")
+	re := resolve(t, g, "linux", host(map[string]string{"PATH": "/usr/bin"}))
+	for _, tc := range []struct {
+		name  string
+		tweak func(*ResolvedExecution)
+	}{
+		{"home redirected outside the run", func(r *ResolvedExecution) { r.ScratchHome = "/home/operator" }},
+		{"cache redirected outside the run", func(r *ResolvedExecution) { r.ScratchCache = "/tmp/elsewhere" }},
+		{"temp redirected outside the run", func(r *ResolvedExecution) { r.ScratchTemp = "/tmp/elsewhere" }},
+		{"another run's layout", func(r *ResolvedExecution) { *r, _ = ResolveExecutionForTest(g, ".claudex/runs/run-b") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			forged := re
+			tc.tweak(&forged)
+			if err := forged.ValidateFor(g, "linux", testRelDir); err == nil || !strings.Contains(err.Error(), "derived layout") {
+				t.Fatalf("err = %v, want a scratch-layout refusal", err)
+			}
+		})
+	}
+}
+
+// ResolveExecutionForTest builds a resolution for another run directory, used to prove one run's layout
+// is refused for a different run.
+func ResolveExecutionForTest(g TestGate, relDir string) (ResolvedExecution, error) {
+	return ResolveForRun(g, "linux", host(map[string]string{"PATH": "/usr/bin"}), relDir)
+}
+
+// TestResolvedSecretsAreRefusedBeforeAnythingIsPersisted.
+//
+// The transaction durably appends the whole intent before any participant runs, so a credential-shaped
+// value must be refused HERE — at resolution — or it reaches the journal before any later guard can
+// object. Refused rather than redacted: redaction collapses two distinct secrets to one marker, so a
+// digest over redacted values would bind something the command never received.
+func TestResolvedSecretsAreRefusedBeforeAnythingIsPersisted(t *testing.T) {
+	const secret = "sk-ant-abcdefghijklmnopqrstuvwx"
+	t.Run("inherited from the host", func(t *testing.T) {
+		_, err := ResolveForRun(gateInherit("TOKEN"), "linux", host(map[string]string{"TOKEN": secret}), testRelDir)
+		if err == nil || !strings.Contains(err.Error(), "looks like a credential") {
+			t.Fatalf("err = %v, want a credential refusal", err)
+		}
+	})
+	t.Run("stated in the policy", func(t *testing.T) {
+		g := TestGate{Argv: []string{"go", "test"}, Env: TestGateEnv{Set: []EnvAssignment{{Name: "TOKEN", Value: secret}}}}
+		_, err := ResolveForRun(g, "linux", host(nil), testRelDir)
+		if err == nil || !strings.Contains(err.Error(), "looks like a credential") {
+			t.Fatalf("err = %v, want a credential refusal", err)
+		}
+	})
+	// A CREDENTIAL-SHAPED NAME is refused whatever its value, and that is a deliberate false positive
+	// rather than an oversight. internal/redact is explicitly heuristic, this project REFUSES rather
+	// than redacts, and the two together mean the conservative direction is the only sound one: a
+	// variable called TOKEN whose value happens to be innocuous today is one policy edit away from
+	// carrying a real credential into a durable journal. An operator who needs such a name gets a clear
+	// refusal instead of a run whose bootstrap record may hold their secret.
+	t.Run("a credential-shaped name is refused whatever the value", func(t *testing.T) {
+		_, err := ResolveForRun(gateInherit("TOKEN"), "linux", host(map[string]string{"TOKEN": "ordinary"}), testRelDir)
+		if err == nil || !strings.Contains(err.Error(), "looks like a credential") {
+			t.Fatalf("err = %v, want the conservative refusal", err)
+		}
+	})
+	t.Run("an ordinary variable is not refused", func(t *testing.T) {
+		if _, err := ResolveForRun(gateInherit("CI"), "linux", host(map[string]string{"CI": "1"}), testRelDir); err != nil {
+			t.Fatalf("an ordinary variable was refused: %v", err)
+		}
+	})
+}
+
+// TestResolvedEnvironmentIsBoundedByItsENCODEDSize.
+//
+// The binding constraint is the transaction payload, which already carries two base64-expanded 16 KiB
+// snapshots. A raw-byte ceiling said nothing about what the payload would actually hold, and the one
+// that was there (32 KiB raw) could not have fitted alongside the snapshots at all.
+func TestResolvedEnvironmentIsBoundedByItsENCODEDSize(t *testing.T) {
 	t.Run("one oversized value", func(t *testing.T) {
-		g := gateInherit("BIG")
-		_, err := ResolveForRun(g, "linux", host(map[string]string{"BIG": strings.Repeat("x", MaxResolvedEnvValue+1)}), ".claudex/runs/run-a")
+		_, err := ResolveForRun(gateInherit("BIG"), "linux",
+			host(map[string]string{"BIG": strings.Repeat("x", MaxResolvedEnvValue+1)}), testRelDir)
 		if err == nil || !strings.Contains(err.Error(), "limit") {
 			t.Fatalf("err = %v, want a per-value ceiling refusal", err)
+		}
+	})
+	t.Run("aggregate wire size", func(t *testing.T) {
+		var names []string
+		vals := map[string]string{}
+		for i := 0; i < 8; i++ {
+			n := "VAR" + string(rune('A'+i))
+			names = append(names, n)
+			vals[n] = strings.Repeat("y", MaxResolvedEnvValue)
+		}
+		_, err := ResolveForRun(gateInherit(names...), "linux", host(vals), testRelDir)
+		if err == nil || !strings.Contains(err.Error(), "encodes to") {
+			t.Fatalf("err = %v, want an encoded-size refusal", err)
 		}
 	})
 	t.Run("too many names", func(t *testing.T) {
 		var names []string
 		vals := map[string]string{}
 		for i := 0; i <= MaxResolvedEnvNames; i++ {
-			n := "VAR_" + strings.Repeat("A", i%20) + string(rune('a'+i%26)) + string(rune('a'+i/26))
+			n := "V" + string(rune('A'+i/26)) + string(rune('a'+i%26))
 			names = append(names, n)
 			vals[n] = "v"
 		}
-		_, err := ResolveForRun(gateInherit(names...), "linux", host(vals), ".claudex/runs/run-a")
+		_, err := ResolveForRun(gateInherit(names...), "linux", host(vals), testRelDir)
 		if err == nil || !strings.Contains(err.Error(), "environment names, limit") {
 			t.Fatalf("err = %v, want a name-count refusal", err)
-		}
-	})
-	t.Run("aggregate too large", func(t *testing.T) {
-		var names []string
-		vals := map[string]string{}
-		for i := 0; i < 16; i++ {
-			n := "VAR" + string(rune('A'+i))
-			names = append(names, n)
-			vals[n] = strings.Repeat("y", MaxResolvedEnvValue)
-		}
-		_, err := ResolveForRun(gateInherit(names...), "linux", host(vals), ".claudex/runs/run-a")
-		if err == nil || !strings.Contains(err.Error(), "environment is") {
-			t.Fatalf("err = %v, want an aggregate ceiling refusal", err)
 		}
 	})
 }
@@ -151,19 +315,17 @@ func TestResolutionIsCanonical(t *testing.T) {
 	h := host(map[string]string{"PATH": "/usr/bin", "CI": "1", "ALPHA": "a"})
 	first := resolve(t, g, "linux", h)
 	second := resolve(t, g, "linux", h)
-	if !slices.Equal(first.Env, second.Env) {
-		t.Fatalf("resolution is not deterministic:\n%+v\n%+v", first.Env, second.Env)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("resolution is not deterministic:\n%+v\n%+v", first, second)
 	}
 	for i := 1; i < len(first.Env); i++ {
-		if first.Env[i-1].Name >= first.Env[i].Name {
-			t.Fatalf("resolution is not sorted: %+v", first.Env)
+		if string(first.Env[i-1].Name) >= string(first.Env[i].Name) {
+			t.Fatalf("resolution is not sorted: %v", envNames(first))
 		}
 	}
-	unsorted := ResolvedExecution{
-		Env:         []EnvAssignment{{Name: "PATH", Value: "/usr/bin"}, {Name: "CI", Value: "1"}},
-		ScratchHome: "h", ScratchCache: "c", ScratchTemp: "t",
-	}
-	if err := unsorted.ValidateFor(g, "linux"); err == nil || !strings.Contains(err.Error(), "not sorted") {
+	unsorted := first
+	unsorted.Env = []ResolvedVar{{Name: []byte("PATH"), Value: []byte("/usr/bin")}, {Name: []byte("CI"), Value: []byte("1")}}
+	if err := unsorted.ValidateFor(g, "linux", testRelDir); err == nil || !strings.Contains(err.Error(), "not sorted") {
 		t.Fatalf("err = %v, want a canonical-order refusal", err)
 	}
 }
@@ -173,7 +335,7 @@ func TestResolutionIsCanonical(t *testing.T) {
 func TestDisabledGateResolvesNoEnvironment(t *testing.T) {
 	re := resolve(t, TestGate{Disabled: true}, "windows", host(map[string]string{"SystemRoot": `C:\Windows`}))
 	if len(re.Env) != 0 {
-		t.Fatalf("a disabled gate resolved %+v", re.Env)
+		t.Fatalf("a disabled gate resolved %v", envNames(re))
 	}
 	if re.ScratchHome == "" || re.ScratchCache == "" || re.ScratchTemp == "" {
 		t.Fatalf("scratch layout missing: %+v", re)

@@ -45,10 +45,15 @@ func isDurabilityUnconfirmed(err error) bool {
 	return errors.As(err, &g) || errors.As(err, &a)
 }
 
+// MaxPayloadBytes is the ceiling on one prepared transaction's payload. It is exported so a producer
+// can PROVE its intent fits before writing one, rather than discovering the refusal at journal time,
+// when the run is already being created.
+const MaxPayloadBytes = 64 * 1024
+
 const (
 	RecordVersion = 1
 	IntentVersion = 1
-	maxPayload    = 64 * 1024
+	maxPayload    = MaxPayloadBytes
 	maxSteps      = 64
 
 	// journalRetention{Keep,Trigger} bound the journal at the next-transaction preflight: once
