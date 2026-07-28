@@ -323,11 +323,16 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 	// The fix is a FACT rather than a delay: the child writes a byte, the test reads it, and only a
 	// process that has finished loading and reached its own code can have written it.
 	//
-	// The sleeper is started in the BACKGROUND and the shell then blocks in its own `wait` builtin. That
-	// detail is load-bearing. A plain trailing command would let the shell take the usual last-command
-	// optimisation and REPLACE ITSELF with it - a second execve, after the announcement, reopening the
-	// very window this is meant to close. Backgrounding forces a fork, and `wait` is a builtin, so the
-	// observed process demonstrably has no further loading left to do.
+	// ORDER: background the sleeper, THEN announce, THEN block in the shell's own `wait` builtin.
+	//
+	// Every part of that is load-bearing. A plain trailing command would let the shell take the usual
+	// last-command optimisation and REPLACE ITSELF with it - a second execve after the announcement,
+	// reopening the very window this is meant to close - so the sleeper is backgrounded, which forces a
+	// fork, and `wait` is a builtin. And the announcement comes AFTER the fork rather than before it:
+	// announcing first would only move the race, since the shell still had to create the background
+	// child and could open descriptors transiently while doing so. Receipt of the byte has to mean that
+	// BOTH the loading and the child setup are behind the observation point, or it proves nothing about
+	// the listing that follows.
 	//
 	// HONESTY ABOUT THE EVIDENCE: the original failure was observed once, under a loaded full-suite run,
 	// and 200 repeats of the old shape on a warm cache did not reproduce it. This fix is therefore
@@ -358,7 +363,7 @@ func TestContainedChildInheritsExactlyStdioFDs(t *testing.T) {
 
 	spec := ExecSpec{
 		Executable: []byte(shellBin),
-		Argv:       [][]byte{[]byte("sh"), []byte("-c"), []byte("echo r; sleep 30 & wait")},
+		Argv:       [][]byte{[]byte("sh"), []byte("-c"), []byte("sleep 30 & echo r; wait")},
 		Cwd:        []byte(t.TempDir()),
 		Env:        []EnvVar{{Name: []byte("PATH"), Value: []byte("/usr/bin:/bin")}},
 		Identity:   NameByteExact,

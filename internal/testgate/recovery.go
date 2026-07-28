@@ -110,29 +110,85 @@ type Artifact struct {
 	Digest    string
 }
 
-// PublishedResult is the canonical result record, carried in full.
+// ResultProjection is the part of a published result that the LEDGER binds.
 //
-// A digest identifies bytes; it is not those bytes. Applying a published result means appending a
-// ledger entry, and every field state requires in that entry comes from this record - so a decision
-// carrying only the digest is not an executable decision, and whoever carried it out would have to find
-// the record again by ambient re-read. That is the untyped side channel this package exists to remove,
-// and naming the digest is not removing it.
-type PublishedResult struct {
+// It is deliberately NOT called the canonical result, and it is not that. The design's record also
+// carries the resolved argv and executable, the environment identity, the exit and timeout facts, and
+// the retained stream excerpt with its counts, digests and truncation flags - a verifier is expected to
+// inspect all of it. Calling this "the result in full" while it holds a projection was an overclaim
+// that would have been read as permission to drop the rest.
+//
+// What it IS: enough to append the ledger entry, validated, so THAT step needs no re-read. Anything
+// beyond it is reached through RecordReader below, which is a named capability rather than an ambient
+// lookup.
+type ResultProjection struct {
 	AttemptID      string
 	TestedCommit   string
 	TestedTree     string
 	Execution      state.TestExecution
 	Identity       state.TestIdentity
 	TerminalReason string
-	// Digest is the canonical digest of this record, and the identity state binds.
+	// Digest is the canonical digest of the WHOLE record, and the identity state binds.
 	Digest string
+}
+
+// RecordReader re-reads an immutable canonical record and proves it is the one named.
+//
+// This exists so that "the omitted evidence is still reachable" is a contract with a shape rather than
+// a reassurance. An implementation MUST verify that the bytes it returns hash to the requested digest
+// and fail otherwise; a reader that merely fetches whatever is at a path is the ambient re-read this
+// package refuses, wearing a type.
+type RecordReader interface {
+	ReadRecord(digest string) ([]byte, error)
+}
+
+// StreamEvidence is the non-authoritative crash-time staging an interrupted attempt leaves behind.
+//
+// The design keeps these leaves explicitly separate from what state binds: they are partial evidence,
+// retained so an interrupted attempt is not silently evidence-free. Recovery may find them present or
+// absent, and cannot tell from that which cut it is looking at - the cut before GO and the cut after it
+// are indistinguishable, which is the same reason those rows share one decision.
+type StreamEvidence struct {
+	State        ArtifactState
+	StdoutDigest string
+	StderrDigest string
+	StdoutBytes  uint64
+	StderrBytes  uint64
+	Truncated    bool
+}
+
+// InterruptionPlan is the result record recovery must PUBLISH before it can settle an interrupted
+// attempt.
+//
+// It exists because settling that attempt appends a ledger entry, every ledger entry binds a required
+// canonical result digest, and the attempt that reaches this row has no published result by definition.
+// Without the plan the action names something that cannot be carried out: there would be no record to
+// point the entry at, and whoever executed it would have to invent the execution, the identity and the
+// terminal reason - which are exactly the facts nobody is entitled to invent after a crash.
+//
+// The digest is absent on purpose. It is the digest of bytes that do not exist yet, and this decision
+// is what authorises writing them.
+type InterruptionPlan struct {
+	AttemptID    string
+	TestedCommit string
+	TestedTree   string
+	// Execution and Identity are fixed for this row and carried rather than left implicit: the runner
+	// never reported an ending, and no identity observation was ever made, so nothing about the code may
+	// be claimed.
+	Execution      state.TestExecution
+	Identity       state.TestIdentity
+	TerminalReason string
+	// RetainedStreams is the partial evidence found on disk, to be embedded in the published record.
+	RetainedStreams StreamEvidence
 }
 
 // ResultEvidence is what was found when the result was looked for.
 type ResultEvidence struct {
 	State ArtifactState
-	// Record is the validated body, required when the state is valid.
-	Record *PublishedResult
+	// Record is the validated ledger projection, required when the state is valid and forbidden
+	// otherwise - one shape per state, so "absent" cannot arrive carrying a record that something later
+	// decides to trust.
+	Record *ResultProjection
 }
 
 // Residue is the durable evidence a recovering process can read.
@@ -151,6 +207,8 @@ type Residue struct {
 	// Intent and Result are the attempt's durable records.
 	Intent Artifact
 	Result ResultEvidence
+	// RetainedStreams is the crash-time staging for an attempt that produced no result.
+	RetainedStreams StreamEvidence
 	// Completion is the section 1 evidence about the attempt's containment domain.
 	Completion CompletionEvidence
 }
@@ -195,9 +253,13 @@ type Recovery struct {
 	// the caller must not be able to rewrite the attempt id, revision or bound digests after they were
 	// validated and before the action is carried out.
 	Attempt *state.TestAttemptRef
-	// Result is the record to finalize from, in full, present only for ActionFinalizeFromResult. Also a
-	// clone, for the same reason.
-	Result *PublishedResult
+	// Result is the validated ledger projection to finalize from, present only for
+	// ActionFinalizeFromResult. Also a clone, for the same reason. Everything the projection omits is
+	// reached through a RecordReader using Result.Digest.
+	Result *ResultProjection
+	// Publish is the record that must be written BEFORE the ledger entry, present only for
+	// ActionLedgerOnlyInterrupted. Without it that action would name a settlement nobody could perform.
+	Publish *InterruptionPlan
 	// Reason is the operator-facing statement of which durable shape was found.
 	Reason string
 }
@@ -289,8 +351,14 @@ func Recover(r Residue) (Recovery, error) {
 	if err := r.known(); err != nil {
 		return Recovery{}, err
 	}
+	if bad := r.shapes(); bad != "" {
+		return Recovery{Action: ActionBlock, Attempt: cloneAttemptRef(r.Active), Reason: bad}, nil
+	}
 	if bad := r.inconsistency(); bad != "" {
-		return Recovery{Action: ActionBlock, Attempt: r.Active, Reason: bad}, nil
+		// CLONED here too. The contract on Recovery.Attempt is unconditional, and an operator-facing
+		// block that names an attempt the caller can rename afterwards is worse than one that names
+		// none - it is a report that quietly becomes about something else.
+		return Recovery{Action: ActionBlock, Attempt: cloneAttemptRef(r.Active), Reason: bad}, nil
 	}
 
 	dec, ok := recoveryTable[observation{r.Standing, r.Result.State == ArtifactValid, r.Completion.Fact}]
@@ -302,8 +370,24 @@ func Recover(r Residue) (Recovery, error) {
 	// that were just validated, free to rewrite the attempt id or the bound digests between the decision
 	// and the action it authorises.
 	dec.Attempt = cloneAttemptRef(r.Active)
-	if dec.Action == ActionFinalizeFromResult {
+	switch dec.Action {
+	case ActionFinalizeFromResult:
 		dec.Result = cloneResult(r.Result.Record)
+	case ActionLedgerOnlyInterrupted:
+		// Settling this attempt appends a ledger entry, and every entry binds a durable canonical
+		// result - which this attempt does not have. So the decision carries the record to write, built
+		// from the identity the attempt was authorised against and the partial evidence found on disk.
+		dec.Publish = &InterruptionPlan{
+			AttemptID:    r.Active.AttemptID,
+			TestedCommit: r.Active.TestedCommit,
+			TestedTree:   r.Active.TestedTree,
+			// Fixed for this row, and carried rather than left implicit. The runner never reported an
+			// ending and no identity observation was ever made, so nothing about the code may be claimed.
+			Execution:       state.TestExecutionInterrupted,
+			Identity:        state.TestIdentityUnobserved,
+			TerminalReason:  state.CanonicalTerminalReason("the attempt was interrupted and no result was published"),
+			RetainedStreams: r.RetainedStreams,
+		}
 	}
 	if r.Standing == StandingNone && r.Intent.State != ArtifactAbsent {
 		// The design separates "nothing" from "an orphan intent". They reach the same action - the
@@ -328,7 +412,7 @@ func (r Residue) known() error {
 	for _, a := range []struct {
 		what string
 		st   ArtifactState
-	}{{"intent", r.Intent.State}, {"result", r.Result.State}} {
+	}{{"intent", r.Intent.State}, {"result", r.Result.State}, {"retained stream", r.RetainedStreams.State}} {
 		switch a.st {
 		case ArtifactAbsent, ArtifactValid, ArtifactInvalid:
 		default:
@@ -336,6 +420,62 @@ func (r Residue) known() error {
 		}
 	}
 	return nil
+}
+
+// ledgerDisagreesWithRecord names the first bound field on which the ledger entry and the record it
+// names differ, or "" when they agree.
+func ledgerDisagreesWithRecord(e state.FinalizedAttempt, rec ResultProjection) string {
+	for _, f := range []struct{ name, ledger, record string }{
+		{"tested commit", e.TestedCommit, rec.TestedCommit},
+		{"tested tree", e.TestedTree, rec.TestedTree},
+		{"execution", string(e.Execution), string(rec.Execution)},
+		{"identity", string(e.Identity), string(rec.Identity)},
+		{"terminal reason", e.TerminalReason, rec.TerminalReason},
+	} {
+		if f.ledger != f.record {
+			return fmt.Sprintf("attempt %q is finalized saying %s %q, but the record it names says %q",
+				e.AttemptID, f.name, f.ledger, f.record)
+		}
+	}
+	return ""
+}
+
+// shapes rejects evidence that has more than one way of saying the same thing.
+//
+// A fact with two representations is a fact two readers can disagree about, and here the readers are a
+// recovering process and whatever wrote the residue. Absent must not arrive carrying a record, and a
+// proof must not arrive without the attempt it proves - otherwise "no record" and "a record nobody
+// looked at" become indistinguishable, and so do "unproven" and "proven for somebody else".
+func (r Residue) shapes() string {
+	switch r.Completion.Fact {
+	case CompletionProven:
+		if r.Completion.AttemptID == "" {
+			return "the completion fact is proven but names no attempt"
+		}
+	default:
+		if r.Completion.AttemptID != "" {
+			return fmt.Sprintf("the completion fact is %q but still names attempt %q", r.Completion.Fact, r.Completion.AttemptID)
+		}
+	}
+	switch r.Result.State {
+	case ArtifactValid:
+		if r.Result.Record == nil {
+			return "the result is reported valid with no record behind it"
+		}
+	default:
+		if r.Result.Record != nil {
+			return fmt.Sprintf("the result is %q but still carries a record", r.Result.State)
+		}
+	}
+	if r.Intent.State != ArtifactValid && (r.Intent.AttemptID != "" || r.Intent.Digest != "") {
+		return fmt.Sprintf("the intent is %q but still carries an identity or digest", r.Intent.State)
+	}
+	if r.RetainedStreams.State != ArtifactValid &&
+		(r.RetainedStreams.StdoutDigest != "" || r.RetainedStreams.StderrDigest != "" ||
+			r.RetainedStreams.StdoutBytes != 0 || r.RetainedStreams.StderrBytes != 0 || r.RetainedStreams.Truncated) {
+		return fmt.Sprintf("the retained streams are %q but still carry evidence", r.RetainedStreams.State)
+	}
+	return ""
 }
 
 // inconsistency names the way the evidence contradicts itself, or "" when it hangs together.
@@ -372,11 +512,15 @@ func (r Residue) inconsistency() string {
 		case ArtifactInvalid:
 			return fmt.Sprintf("attempt %q has a result that could not be validated", r.Active.AttemptID)
 		case ArtifactValid:
-			if r.Result.Record == nil {
-				return fmt.Sprintf("attempt %q has a result reported valid with no record behind it", r.Active.AttemptID)
-			}
 			if r.Result.Record.AttemptID != r.Active.AttemptID {
 				return fmt.Sprintf("attempt %q is active but the durable result belongs to %q", r.Active.AttemptID, r.Result.Record.AttemptID)
+			}
+			// A result is a statement ABOUT a particular tree. Finalizing from one that was computed
+			// against different code would publish a verdict about something this attempt never ran.
+			if r.Result.Record.TestedCommit != r.Active.TestedCommit || r.Result.Record.TestedTree != r.Active.TestedTree {
+				return fmt.Sprintf("attempt %q is a statement about %s/%s but its result is about %s/%s",
+					r.Active.AttemptID, r.Active.TestedCommit, r.Active.TestedTree,
+					r.Result.Record.TestedCommit, r.Result.Record.TestedTree)
 			}
 		}
 		// The proof that authorises consuming this reference must be a proof about THIS attempt. The
@@ -404,9 +548,6 @@ func (r Residue) inconsistency() string {
 		case ArtifactInvalid:
 			return fmt.Sprintf("attempt %q is finalized but its result could not be validated", r.Finalized.AttemptID)
 		}
-		if r.Result.Record == nil {
-			return fmt.Sprintf("attempt %q has a result reported valid with no record behind it", r.Finalized.AttemptID)
-		}
 		if r.Result.Record.AttemptID != r.Finalized.AttemptID {
 			return fmt.Sprintf("attempt %q is finalized but the durable result belongs to %q",
 				r.Finalized.AttemptID, r.Result.Record.AttemptID)
@@ -414,6 +555,14 @@ func (r Residue) inconsistency() string {
 		if r.Result.Record.Digest != r.Finalized.ResultDigest {
 			return fmt.Sprintf("attempt %q is finalized against result %q but the durable result is %q",
 				r.Finalized.AttemptID, r.Finalized.ResultDigest, r.Result.Record.Digest)
+		}
+		// Naming the right record is not the same as copying it correctly. The ledger entry holds its own
+		// copies of the tested identity and the verdict, so an entry can point at the real record and
+		// still disagree with it about what happened - and state cannot catch that, because the record is
+		// external to it. This is the case slice 3b's disagreesWithPublished exists for, on the other
+		// side of the same boundary.
+		if bad := ledgerDisagreesWithRecord(*r.Finalized, *r.Result.Record); bad != "" {
+			return bad
 		}
 	case StandingNone:
 		if r.Active != nil || r.Finalized != nil {
@@ -442,10 +591,18 @@ func cloneAttemptRef(r *state.TestAttemptRef) *state.TestAttemptRef {
 	return &c
 }
 
-func cloneResult(r *PublishedResult) *PublishedResult {
+func cloneResult(r *ResultProjection) *ResultProjection {
 	if r == nil {
 		return nil
 	}
 	c := *r
+	return &c
+}
+
+func clonePlan(p *InterruptionPlan) *InterruptionPlan {
+	if p == nil {
+		return nil
+	}
+	c := *p
 	return &c
 }
