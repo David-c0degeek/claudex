@@ -1,6 +1,8 @@
 package state
 
 import (
+	"sort"
+
 	"github.com/David-c0degeek/claudex/internal/config"
 	"strings"
 	"testing"
@@ -703,4 +705,71 @@ func TestTheCancelFactIsWholeOrAbsent(t *testing.T) {
 			t.Fatalf("the whole cancel fact was refused: %v", err)
 		}
 	})
+}
+
+// TestALiveAttemptRequiresARunningRun sweeps the WHOLE lifecycle vocabulary.
+//
+// The rule was once "not cancelled", which is a negative test and therefore admitted every other value:
+// paused, rate-limited, failed and completed runs could all hold a live attempt. An attempt EXECUTES,
+// and only a running run executes — a live attempt under a terminal or paused run is a state the design
+// does not describe, and the lifecycle machine would have been built on top of it.
+//
+// It iterates the production vocabulary rather than a copy, so adding a lifecycle without deciding
+// whether an attempt may live under it fails here. Each case is pinned to the error it ACTUALLY
+// produces: several lifecycles are refused by an older invariant first, and asserting the placement
+// message for those would be asserting something that never runs.
+func TestALiveAttemptRequiresARunningRun(t *testing.T) {
+	// Sorted, so a failure names the same case on every run.
+	var lifecycles []Lifecycle
+	for l := range knownLifecycles {
+		lifecycles = append(lifecycles, l)
+	}
+	sort.Slice(lifecycles, func(i, j int) bool { return lifecycles[i] < lifecycles[j] })
+	if len(lifecycles) < 8 {
+		t.Fatalf("the lifecycle vocabulary has %d values; this sweep expects the full set", len(lifecycles))
+	}
+
+	for _, l := range lifecycles {
+		t.Run(string(l), func(t *testing.T) {
+			s := newStore(t)
+			started := start(t, s, atTests(t, s), "attempt-0001")
+			_, err := s.Mutate(started.Revision, func(_ uint64, n *RunState) error {
+				n.Lifecycle = l
+				// The cancelled arm is the ONE exception, and it requires the whole cancel fact.
+				if l == LifecycleCancelled {
+					n.ActiveTestAttempt.CancelPending = true
+				}
+				return nil
+			})
+			switch l {
+			case LifecycleRunning:
+				if err != nil {
+					t.Fatalf("a running run was refused a live attempt: %v", err)
+				}
+			case LifecycleCancelled:
+				if err != nil {
+					t.Fatalf("the cancelled exception was refused: %v", err)
+				}
+			default:
+				if err == nil {
+					t.Fatalf("a live attempt was accepted under lifecycle %q", l)
+				}
+				t.Logf("%s refused with: %v", l, err)
+			}
+		})
+	}
+}
+
+// TestTheCancelledExceptionStillNeedsTheWholeFact. The sweep above accepts `cancelled`, so this pins
+// that it accepts it only WITH the cancel bound — otherwise the exception would be a hole.
+func TestTheCancelledExceptionStillNeedsTheWholeFact(t *testing.T) {
+	s := newStore(t)
+	started := start(t, s, atTests(t, s), "attempt-0001")
+	_, err := s.Mutate(started.Revision, func(_ uint64, n *RunState) error {
+		n.Lifecycle = LifecycleCancelled // without CancelPending
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "an active test attempt requires") {
+		t.Fatalf("err = %v, want a half-state refusal", err)
+	}
 }

@@ -268,11 +268,16 @@ func validateAttemptTransition(old, next *RunState) error {
 	// on a run the operator had stopped. Requiring the whole shape is what makes the boolean and the
 	// lifecycle one fact instead of two that merely usually agree.
 	if a := next.ActiveTestAttempt; a != nil {
+		// RUNNING, not merely "not cancelled". The lifecycle vocabulary also contains paused,
+		// paused_budget, rate_limited, failed_retryable, failed_terminal and completed, and a negative
+		// test admitted every one of them — so a live attempt could sit under a terminal or paused run,
+		// which is a state the design does not describe and the lifecycle machine would then be built on
+		// top of. An attempt executes; only a running run executes.
 		normal := next.Phase == PhaseTests && next.Assignment == nil &&
-			next.Lifecycle != LifecycleCancelled && !a.CancelPending
+			next.Lifecycle == LifecycleRunning && !a.CancelPending
 		cancelled := next.Lifecycle == LifecycleCancelled && a.CancelPending
 		if !normal && !cancelled {
-			return fmt.Errorf("an active test attempt requires either ownerless TESTS on a non-cancelled run with no cancel pending, "+
+			return fmt.Errorf("an active test attempt requires either ownerless TESTS on a RUNNING run with no cancel pending, "+
 				"or a cancelled run with the cancel bound to the attempt; got phase %s lifecycle %s assigned=%v cancel_pending=%v",
 				next.Phase, next.Lifecycle, next.Assignment != nil, a.CancelPending)
 		}
