@@ -64,7 +64,7 @@ func finalize(t *testing.T, s *Store, prev RunState, digest string, tweak func(*
 			TestedCommit:   a.TestedCommit,
 			TestedTree:     a.TestedTree,
 			ResultDigest:   digest,
-			Execution:      TestExecutionPassed,
+			Execution:      TestExecutionOK,
 			Identity:       TestIdentityUnchanged,
 			TerminalReason: "exited 0",
 		}
@@ -223,7 +223,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 			n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 				AttemptID: "attempt-0001", StartRevision: rev, BoundRevision: rev,
 				TestedCommit: hex40(), TestedTree: hex40(), ResultDigest: sha256Hex(2),
-				Execution: TestExecutionPassed, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
 			})
 			return nil
 		})
@@ -258,7 +258,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 			n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 				AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
 				TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(4),
-				Execution: TestExecutionPassed, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+				Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
 			})
 			return nil // ref deliberately left in place
 		})
@@ -275,7 +275,7 @@ func TestALedgerEntryMustDescribeTheAttemptItFinalizes(t *testing.T) {
 				return FinalizedAttempt{
 					AttemptID: id, StartRevision: a.StartRevision, BoundRevision: rev,
 					TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: digest,
-					Execution: TestExecutionPassed, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
+					Execution: TestExecutionOK, Identity: TestIdentityUnchanged, TerminalReason: "exited 0",
 				}
 			}
 			n.TestAttempts = append(n.TestAttempts, mk(a.AttemptID, sha256Hex(5)), mk("attempt-0002", sha256Hex(6)))
@@ -303,7 +303,7 @@ func TestFinalizingAndStartingAreSeparateOperations(t *testing.T) {
 		n.TestAttempts = append(n.TestAttempts, FinalizedAttempt{
 			AttemptID: a.AttemptID, StartRevision: a.StartRevision, BoundRevision: rev,
 			TestedCommit: a.TestedCommit, TestedTree: a.TestedTree, ResultDigest: sha256Hex(14),
-			Execution: TestExecutionIndeterminate, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone",
+			Execution: TestExecutionInterrupted, Identity: TestIdentityUnobserved, TerminalReason: "supervisor gone",
 		})
 		n.ActiveTestAttempt = attemptRef("attempt-0002", rev)
 		return nil
@@ -421,7 +421,7 @@ func TestLedgerIsAppendOnlyByValue(t *testing.T) {
 
 	t.Run("rewritten in place", func(t *testing.T) {
 		_, err := s.Mutate(one.Revision, func(_ uint64, n *RunState) error {
-			n.TestAttempts[0].Execution = TestExecutionIndeterminate
+			n.TestAttempts[0].Execution = TestExecutionInterrupted
 			return nil
 		})
 		if err == nil || !strings.Contains(err.Error(), "immutable") {
@@ -453,7 +453,7 @@ func TestOneResultDigestCannotAuthorizeTwoOutcomes(t *testing.T) {
 	dup := sha256Hex(8)
 	one := runAttempt(t, s, atTests(t, s), "attempt-0001", dup)
 	started := start(t, s, one, "attempt-0002")
-	_, err := finalize(t, s, started, dup, func(e *FinalizedAttempt) { e.Execution = TestExecutionFailed })
+	_, err := finalize(t, s, started, dup, func(e *FinalizedAttempt) { e.Execution = TestExecutionNonzero })
 	if err == nil || !strings.Contains(err.Error(), "reuses a result digest") {
 		t.Fatalf("err = %v, want a digest-reuse refusal", err)
 	}
@@ -504,10 +504,10 @@ func TestFinalizedOutcomeVocabularyIsClosed(t *testing.T) {
 		tweak func(*FinalizedAttempt)
 		want  string
 	}{
-		{"unknown execution", func(e *FinalizedAttempt) { e.Execution = "probably-fine" }, "not a known outcome"},
-		{"absent execution", func(e *FinalizedAttempt) { e.Execution = "" }, "not a known outcome"},
-		{"unknown identity", func(e *FinalizedAttempt) { e.Identity = "maybe" }, "not a known observation"},
-		{"absent identity", func(e *FinalizedAttempt) { e.Identity = "" }, "not a known observation"},
+		{"unknown execution", func(e *FinalizedAttempt) { e.Execution = "probably-fine" }, "not a known execution observation"},
+		{"absent execution", func(e *FinalizedAttempt) { e.Execution = "" }, "not a known execution observation"},
+		{"unknown identity", func(e *FinalizedAttempt) { e.Identity = "maybe" }, "not a known identity observation"},
+		{"absent identity", func(e *FinalizedAttempt) { e.Identity = "" }, "not a known identity observation"},
 		{"no terminal reason", func(e *FinalizedAttempt) { e.TerminalReason = "  " }, "terminal_reason"},
 		{"malformed result digest", func(e *FinalizedAttempt) { e.ResultDigest = "not-a-digest" }, "result_digest"},
 	} {

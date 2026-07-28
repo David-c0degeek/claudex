@@ -386,24 +386,42 @@ type TestAttemptRef struct {
 	CancelPending bool `json:"cancel_pending,omitempty"`
 }
 
-// TestExecution is what the RUNNER observed: whether the command produced an outcome at all.
+// TestExecution is what the RUNNER observed: how the command ended, in the runner's own terms.
 //
-// It is deliberately independent of TestIdentity below. The two were once a single precedence list, and
-// a precedence list has to be read in order to be understood — whereas a pair of independent facts makes
-// the outcome a total function of both, with no case left implicit.
+// It is deliberately independent of TestIdentity below, and deliberately NOT the verdict. The two were
+// once a single precedence list, and a precedence list has to be read in order to be understood —
+// whereas a pair of independent facts makes the verdict a total function of both, with no case left
+// implicit. TestOutcome is that function.
 type TestExecution string
 
 const (
-	// TestExecutionPassed means the command ran to completion and reported success.
-	TestExecutionPassed TestExecution = "passed"
-	// TestExecutionFailed means the command ran to completion and reported failure. This is a statement
-	// about the CODE.
-	TestExecutionFailed TestExecution = "failed"
-	// TestExecutionIndeterminate means the runner could not obtain an outcome — the supervisor died, a
-	// frame was malformed, cleanup could not be proven. This is a statement about the ENVIRONMENT, and
-	// the distinction matters because it must not spend the fix budget.
-	TestExecutionIndeterminate TestExecution = "indeterminate"
+	// TestExecutionOK means the command ran to completion and reported success.
+	TestExecutionOK TestExecution = "ok"
+	// TestExecutionNonzero means it ran to completion and reported failure. A statement about the CODE.
+	TestExecutionNonzero TestExecution = "nonzero"
+	// TestExecutionTimeout means the policy's deadline expired. Distinct from nonzero because the
+	// command never reported anything, though both map to the same verdict.
+	TestExecutionTimeout TestExecution = "timeout"
+	// TestExecutionCancelled means an operator cancelled the attempt. Nobody's code failed.
+	TestExecutionCancelled TestExecution = "cancelled"
+	// TestExecutionSpawnFailed means the CONFIGURED COMMAND could not start — a statement about the
+	// operator's command, not about the code under test.
+	TestExecutionSpawnFailed TestExecution = "spawn_failed"
+	// TestExecutionInterrupted means the runner lost the ability to obtain an outcome: the supervisor
+	// died, a frame was malformed, the owner disappeared. A statement about the ENVIRONMENT, and the
+	// distinction matters because it must not spend the fix budget.
+	TestExecutionInterrupted TestExecution = "interrupted"
 )
+
+// KnownTestExecution reports whether e is one of the enumerated observations.
+func KnownTestExecution(e TestExecution) bool {
+	switch e {
+	case TestExecutionOK, TestExecutionNonzero, TestExecutionTimeout,
+		TestExecutionCancelled, TestExecutionSpawnFailed, TestExecutionInterrupted:
+		return true
+	}
+	return false
+}
 
 // TestIdentity is whether the repository was the same at the end as at the start.
 type TestIdentity string
@@ -416,6 +434,72 @@ const (
 	// TestIdentityUnobserved means identity could not be established at all.
 	TestIdentityUnobserved TestIdentity = "unobserved"
 )
+
+// KnownTestIdentity reports whether i is one of the enumerated observations.
+func KnownTestIdentity(i TestIdentity) bool {
+	switch i {
+	case TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved:
+		return true
+	}
+	return false
+}
+
+// TestOutcome is the VERDICT the gate acts on, derived from the pair above.
+type TestOutcome string
+
+const (
+	// OutcomePass advances the run.
+	OutcomePass TestOutcome = "pass"
+	// OutcomeFail is an ordinary test-failure edge and spends the fix budget.
+	OutcomeFail TestOutcome = "fail"
+	// OutcomeIndeterminate is retryable and spends NO budget: the code did not fail, the runner could
+	// not decide.
+	OutcomeIndeterminate TestOutcome = "indeterminate"
+	// OutcomeCancelled is ledger-only: no edge, no budget. Nobody's code failed.
+	OutcomeCancelled TestOutcome = "cancelled"
+)
+
+// Outcome is a TOTAL function of the two observations.
+//
+// Total is the property, not a convenience. The predecessor was a precedence list, which has to be read
+// in order to be understood and leaves every unlisted combination undefined — so a pair nobody had
+// thought about would fall through to whatever the last branch happened to be. Here every one of the
+// eighteen combinations has an answer, and an unknown value on either axis is refused rather than
+// guessed, because a verdict the gate cannot justify is worse than no verdict.
+//
+// The order of the rules is itself a set of decisions:
+//
+//   - CANCELLED outranks everything, including a timeout. Operator intent supersedes a bound, and
+//     calling a cancelled attempt a failure would blame the code for a human's decision.
+//   - SPAWN_FAILED and INTERRUPTED are indeterminate whatever identity says. Neither is a statement
+//     about the code, so neither may spend the fix budget.
+//   - UNOBSERVED identity is indeterminate even for a clean exit 0. The gate cannot certify a tree it
+//     did not observe; passing there would be the strongest possible claim made on the weakest
+//     evidence.
+//   - CHANGED identity FAILS even for a clean exit 0, because the result describes a tree that no
+//     longer exists — the run was edited underneath the gate.
+func Outcome(e TestExecution, i TestIdentity) (TestOutcome, error) {
+	if !KnownTestExecution(e) {
+		return "", fmt.Errorf("state: %q is not a known execution observation", e)
+	}
+	if !KnownTestIdentity(i) {
+		return "", fmt.Errorf("state: %q is not a known identity observation", i)
+	}
+	switch {
+	case e == TestExecutionCancelled:
+		return OutcomeCancelled, nil
+	case e == TestExecutionSpawnFailed, e == TestExecutionInterrupted:
+		return OutcomeIndeterminate, nil
+	case i == TestIdentityUnobserved:
+		return OutcomeIndeterminate, nil
+	case i == TestIdentityChanged:
+		return OutcomeFail, nil
+	case e == TestExecutionOK:
+		return OutcomePass, nil
+	default: // nonzero, timeout — both with unchanged identity
+		return OutcomeFail, nil
+	}
+}
 
 // FinalizedAttempt is one immutable ledger entry.
 type FinalizedAttempt struct {

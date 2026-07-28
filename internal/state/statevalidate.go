@@ -323,15 +323,10 @@ func validateTestAttempts(rs *RunState) error {
 			return fmt.Errorf("test_attempts[%d] reuses a result digest already bound to another outcome", i)
 		}
 		seenDigest[e.ResultDigest] = true
-		switch e.Execution {
-		case TestExecutionPassed, TestExecutionFailed, TestExecutionIndeterminate:
-		default:
-			return fmt.Errorf("test_attempts[%d].execution %q is not a known outcome", i, e.Execution)
-		}
-		switch e.Identity {
-		case TestIdentityUnchanged, TestIdentityChanged, TestIdentityUnobserved:
-		default:
-			return fmt.Errorf("test_attempts[%d].identity %q is not a known observation", i, e.Identity)
+		// Validated through the same total function the gate acts on, so a stored pair that the
+		// verdict cannot be derived from is not storable at all.
+		if _, err := Outcome(e.Execution, e.Identity); err != nil {
+			return fmt.Errorf("test_attempts[%d]: %w", i, err)
 		}
 		if strings.TrimSpace(e.TerminalReason) == "" || len(e.TerminalReason) > 256 {
 			return fmt.Errorf("test_attempts[%d].terminal_reason is required and bounded", i)
