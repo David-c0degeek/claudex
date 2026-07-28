@@ -51,6 +51,11 @@ type LaunchDisposition struct {
 	ResultIssued bool
 	// Execution is the recorded observation, empty when no attempt exists to record anything against.
 	Execution state.TestExecution
+	// TerminalAuthor is WHO the recorded account belongs to. It is settled here rather than inferred
+	// later: these are observations a LIVE coordinator makes about its own infrastructure, and the one
+	// authority rule refuses an interruption attributed to the runner - which is the value composition
+	// would otherwise have had to guess.
+	TerminalAuthor state.TerminalAuthor
 	// CompletionFactRequired says whether the attempt can only become retryable once the section 1
 	// cleanup fact is proven. A live-coordinator fault does not weaken that rule: the residue to be
 	// excluded is identical to the crash case.
@@ -69,16 +74,17 @@ var launchTable = map[LaunchFault]LaunchDisposition{
 	FaultArmingDeadline: {
 		Reason: "arming did not complete within its deadline, before anything was bound"},
 	FaultGoWrite: {
-		AttemptBound: true, Execution: state.TestExecutionInterrupted, CompletionFactRequired: true,
+		AttemptBound: true, Execution: state.TestExecutionInterrupted, TerminalAuthor: state.TerminalByCoordinator, CompletionFactRequired: true,
 		Reason: "the GO could not be delivered; framing guarantees a truncated GO is not a GO, so no command started"},
 	FaultSupervisorLostBeforeSpawn: {
-		AttemptBound: true, Execution: state.TestExecutionInterrupted, CompletionFactRequired: true,
+		AttemptBound: true, Execution: state.TestExecutionInterrupted, TerminalAuthor: state.TerminalByCoordinator, CompletionFactRequired: true,
 		Reason: "the supervisor was lost before the command spawned, so its facts are untrustworthy"},
 	FaultSupervisorLostAfterSpawn: {
-		AttemptBound: true, Execution: state.TestExecutionInterrupted, CompletionFactRequired: true,
+		AttemptBound: true, Execution: state.TestExecutionInterrupted, TerminalAuthor: state.TerminalByCoordinator, CompletionFactRequired: true,
 		Reason: "the supervisor was lost after the command spawned; partial streams are retained"},
 	FaultCommandDidNotStart: {
 		AttemptBound: true, ResultIssued: true, Execution: state.TestExecutionSpawnFailed,
+		TerminalAuthor:         state.TerminalByRunner,
 		CompletionFactRequired: true,
 		Reason:                 "the configured test command could not be started, which is an authoritative statement about the policy"},
 }

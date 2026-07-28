@@ -199,3 +199,35 @@ func TestEveryLaunchRowStatesWhyItDecidedWhatItDid(t *testing.T) {
 		seen[d.Reason] = f
 	}
 }
+
+// TestEveryRecordedLaunchFaultNamesItsAuthority.
+//
+// These are observations a LIVE coordinator makes about its own infrastructure, so the authority is
+// settled here rather than inferred by whoever composes this later. The one shared rule refuses an
+// interruption attributed to the runner - had the runner been alive to report, it would have reported
+// the outcome instead - so a table that omitted the authority could not produce a truthful terminal at
+// all.
+func TestEveryRecordedLaunchFaultNamesItsAuthority(t *testing.T) {
+	for _, f := range AllLaunchFaults() {
+		got, err := ClassifyLaunchFault(f)
+		if err != nil {
+			t.Fatalf("ClassifyLaunchFault(%q): %v", f, err)
+		}
+		if got.Execution == "" {
+			if got.TerminalAuthor != "" {
+				t.Fatalf("%q records nothing but still names an authority %q", f, got.TerminalAuthor)
+			}
+			continue
+		}
+		if !state.KnownTerminalAuthor(got.TerminalAuthor) {
+			t.Fatalf("%q records %q with no known authority", f, got.Execution)
+		}
+		// Checked through the PRODUCTION rule, so this table cannot drift from what state will accept.
+		if !state.AuthorityAgreesWithExecution(got.TerminalAuthor, got.Execution) {
+			t.Fatalf("%q attributes %q to %q, which cannot have observed it", f, got.Execution, got.TerminalAuthor)
+		}
+		if got.Execution == state.TestExecutionInterrupted && got.TerminalAuthor != state.TerminalByCoordinator {
+			t.Fatalf("%q is a live-coordinator observation but is attributed to %q", f, got.TerminalAuthor)
+		}
+	}
+}

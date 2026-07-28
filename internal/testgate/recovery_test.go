@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
-	"slices"
 	"strings"
 	"testing"
 
@@ -37,12 +36,16 @@ func activeRef() *state.TestAttemptRef {
 	}
 }
 
-func ledgerEntry() *state.FinalizedAttempt {
+// ledgerEntry is the entry that finalizing the fixture result would have written - including the
+// terminal authority, which the earlier fixture left empty and therefore invalid by state's own rules.
+func ledgerEntry(t *testing.T) *state.FinalizedAttempt {
+	t.Helper()
+	rec := publishedResult(t).Record()
 	return &state.FinalizedAttempt{
 		AttemptID: theAttemptID, StartRevision: 41, BoundRevision: 42,
 		TestedCommit: theCommit, TestedTree: theTree,
-		ResultDigest: theResultHash, Execution: state.TestExecutionOK,
-		Identity: state.TestIdentityUnchanged, TerminalReason: "exited 0",
+		ResultDigest: publishedResult(t).Digest(), Execution: rec.Execution,
+		Identity: rec.Identity, TerminalReason: rec.TerminalReason, TerminalAuthor: rec.TerminalAuthor,
 	}
 }
 
@@ -54,9 +57,11 @@ func noStreams() StreamEvidence { return StreamEvidence{State: ArtifactAbsent} }
 
 func intentBody() *IntentProjection {
 	return &IntentProjection{
+		SpecDigest:         strings.Repeat("7a", 32),
+		Cwd:                "/work",
 		ResolvedExecutable: "/usr/bin/go",
-		ResolvedArgv:       []string{"go", "test", "./..."},
-		EnvNames:           []string{"PATH"},
+		ResolvedArgv:       bs("go", "test", "./..."),
+		EnvNames:           bs("PATH"),
 		EnvDigest:          strings.Repeat("5e", 32),
 		Digest:             theIntentHash,
 	}
@@ -66,10 +71,10 @@ func intentBody() *IntentProjection {
 // digest over the WHOLE redacted stream - which is runner-attested and not recomputable from the
 // excerpt, so it stays a fixed value here.
 func stagedStream(head, tail string) StreamEvidence {
-	retained := truncatedExcerpt(head, tail)
 	return StreamEvidence{State: ArtifactValid, AttemptID: theAttemptID, Record: &StreamRecord{
 		Present: true, SourceBytes: 4096, RedactedBytes: 4000,
-		SHA256: strings.Repeat("3c", 32), Retained: retained, Truncated: true,
+		SHA256: strings.Repeat("3c", 32),
+		Head:   []byte(head), Tail: []byte(tail), Truncated: true,
 	}}
 }
 
@@ -89,12 +94,25 @@ func (f *fakeRecords) Open(digest string) ([]byte, error) {
 	return f.bytes[digest], nil
 }
 
-func publishedResult() *ResultProjection {
-	return &ResultProjection{
-		AttemptID: theAttemptID, TestedCommit: theCommit, TestedTree: theTree,
-		Execution: state.TestExecutionOK, Identity: state.TestIdentityUnchanged,
-		TerminalReason: "exited 0", Digest: theResultHash,
+// publishedResult produces a GENUINELY verified record, by encoding a valid one and reading it back
+// through the rooted, digest-checked path.
+//
+// The earlier fixture hand-built a projection and labelled it valid, which is exactly the thing that
+// made ArtifactValid a caller assertion: no canonical record had to exist for recovery to finalize from
+// it. Going through the real read means these tests cannot assert something production cannot produce.
+func publishedResult(t *testing.T) *VerifiedRecord {
+	t.Helper()
+	rec := validRecord()
+	rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+	raw, digest, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("encoding the fixture result: %v", err)
 	}
+	v, err := ReadVerifiedRecord(&fakeRecords{id: theAttemptID, bytes: map[string][]byte{digest: raw}}, theAttemptID, digest)
+	if err != nil {
+		t.Fatalf("verifying the fixture result: %v", err)
+	}
+	return v
 }
 
 func provenFor(id string) CompletionEvidence {
@@ -113,7 +131,7 @@ func completion(f CompletionFact) CompletionEvidence {
 // It exists so completeness can be measured against states that can actually be observed rather than
 // against a Cartesian product of vocabularies. If a key cannot be given consistent evidence, it is not a
 // state anything can find on disk, and a decision for it would be a decision about nothing.
-func residueFor(o observation) Residue {
+func residueFor(t *testing.T, o observation) Residue {
 	r := Residue{Standing: o.standing, Completion: completion(o.completion), Intent: noArtifact(),
 		Result: noResult(), Stdout: noStreams(), Stderr: noStreams()}
 	switch o.standing {
@@ -122,12 +140,12 @@ func residueFor(o observation) Residue {
 		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
 		r.IntentBody = intentBody()
 	case StandingFinalized:
-		r.Finalized = ledgerEntry()
+		r.Finalized = ledgerEntry(t)
 		r.Intent = Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: theIntentHash}
 		r.IntentBody = intentBody()
 	}
 	if o.hasResult {
-		r.Result = ResultEvidence{State: ArtifactValid, Record: publishedResult()}
+		r.Result = ResultEvidence{State: ArtifactValid, Verified: publishedResult(t)}
 	}
 	return r
 }
@@ -155,21 +173,21 @@ func TestEveryDesignCrashRowReachesItsStatedRecovery(t *testing.T) {
 			Residue{Standing: StandingNone, Intent: orphanIntent, IntentBody: intentBody(), Result: noResult(),
 				Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionUnavailable)}, ActionFreshAttempt},
 		{"after active CAS, before GO, on Linux",
-			residueFor(observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
+			residueFor(t, observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
 		{"after active CAS, before GO, on Windows and other POSIX",
-			residueFor(observation{StandingActive, false, CompletionUnavailable}), ActionBlock},
+			residueFor(t, observation{StandingActive, false, CompletionUnavailable}), ActionBlock},
 		{"after GO, before process exit, on Linux",
-			residueFor(observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
+			residueFor(t, observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
 		{"after GO, before process exit, with no readable fact",
-			residueFor(observation{StandingActive, false, CompletionAbsent}), ActionBlock},
+			residueFor(t, observation{StandingActive, false, CompletionAbsent}), ActionBlock},
 		{"after exit, before the guard is reacquired",
-			residueFor(observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
+			residueFor(t, observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
 		{"after final observation, before result published",
-			residueFor(observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
+			residueFor(t, observation{StandingActive, false, CompletionProven}), ActionLedgerOnlyInterrupted},
 		{"after result published, before outcome CAS",
-			residueFor(observation{StandingActive, true, CompletionProven}), ActionFinalizeFromResult},
+			residueFor(t, observation{StandingActive, true, CompletionProven}), ActionFinalizeFromResult},
 		{"the outcome committed, so nothing is outstanding",
-			residueFor(observation{StandingFinalized, true, CompletionProven}), ActionFreshAttempt},
+			residueFor(t, observation{StandingFinalized, true, CompletionProven}), ActionFreshAttempt},
 	} {
 		t.Run(tc.row, func(t *testing.T) {
 			got, err := Recover(tc.residue)
@@ -194,7 +212,7 @@ func TestEveryDesignCrashRowReachesItsStatedRecovery(t *testing.T) {
 func TestSettlingAnAttemptRequiresItsDomainToBeProvenDead(t *testing.T) {
 	for _, hasResult := range []bool{false, true} {
 		for _, c := range AllCompletionFacts() {
-			got, err := Recover(residueFor(observation{StandingActive, hasResult, c}))
+			got, err := Recover(residueFor(t, observation{StandingActive, hasResult, c}))
 			if err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
@@ -214,7 +232,7 @@ func TestSettlingAnAttemptRequiresItsDomainToBeProvenDead(t *testing.T) {
 // behind it, and the follow-on observation is safe by construction rather than by memory.
 func TestASettledAttemptCannotBeFollowedByAnUnprovenStart(t *testing.T) {
 	for _, c := range []CompletionFact{CompletionAbsent, CompletionUnavailable} {
-		before, err := Recover(residueFor(observation{StandingActive, true, c}))
+		before, err := Recover(residueFor(t, observation{StandingActive, true, c}))
 		if err != nil {
 			t.Fatalf("Recover: %v", err)
 		}
@@ -223,7 +241,7 @@ func TestASettledAttemptCannotBeFollowedByAnUnprovenStart(t *testing.T) {
 		}
 		// And the state it WOULD have left behind is one that permits a fresh start, which is precisely
 		// why the refusal has to happen above rather than here.
-		after, err := Recover(residueFor(observation{StandingFinalized, true, c}))
+		after, err := Recover(residueFor(t, observation{StandingFinalized, true, c}))
 		if err != nil {
 			t.Fatalf("Recover: %v", err)
 		}
@@ -242,8 +260,8 @@ func TestASettledAttemptCannotBeFollowedByAnUnprovenStart(t *testing.T) {
 // true is to assert it.
 func TestTheTwoIndistinguishableCutsReachTheSameConclusion(t *testing.T) {
 	for _, c := range AllCompletionFacts() {
-		beforeGO := residueFor(observation{StandingActive, false, c})
-		afterGO := residueFor(observation{StandingActive, false, c}) // identical by construction; that IS the finding
+		beforeGO := residueFor(t, observation{StandingActive, false, c})
+		afterGO := residueFor(t, observation{StandingActive, false, c}) // identical by construction; that IS the finding
 		a, err := Recover(beforeGO)
 		if err != nil {
 			t.Fatalf("Recover: %v", err)
@@ -283,7 +301,7 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 		}
 		// Reachability is PROVED, not asserted: admissible evidence must exist for the key and must
 		// survive the consistency checks to arrive at it.
-		r := residueFor(o)
+		r := residueFor(t, o)
 		if bad := r.inconsistency(); bad != "" {
 			t.Errorf("%+v is listed reachable but its evidence is inconsistent: %s", o, bad)
 		}
@@ -299,7 +317,8 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 		}
 	}
 	// The fixtures must satisfy the rules PRODUCTION applies, through the production predicates.
-	ref, entry, rec := activeRef(), ledgerEntry(), publishedResult()
+	ref, entry, ver := activeRef(), ledgerEntry(t), publishedResult(t)
+	rec := ver.Record()
 	for _, f := range []struct {
 		name string
 		ok   bool
@@ -310,7 +329,7 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 		{"ledger result digest", state.IsSHA256Hex(entry.ResultDigest)},
 		{"ledger tested commit", state.IsGitOID(entry.TestedCommit)},
 		{"ledger tested tree", state.IsGitOID(entry.TestedTree)},
-		{"result digest", state.IsSHA256Hex(rec.Digest)},
+		{"result digest", state.IsSHA256Hex(ver.Digest())},
 		{"result tested commit", state.IsGitOID(rec.TestedCommit)},
 		{"result tested tree", state.IsGitOID(rec.TestedTree)},
 	} {
@@ -329,8 +348,8 @@ func TestTheTableCoversExactlyTheREACHABLEObservations(t *testing.T) {
 // record holding an attempt in both places is refused. Modelling the two as independent booleans
 // invented a combination nothing can produce and then gave it an action.
 func TestAnAttemptCannotBeActiveAndFinalizedAtOnce(t *testing.T) {
-	r := residueFor(observation{StandingActive, false, CompletionProven})
-	r.Finalized = ledgerEntry()
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
+	r.Finalized = ledgerEntry(t)
 
 	got, err := Recover(r)
 	if err != nil {
@@ -365,7 +384,7 @@ func TestAnActiveAttemptWithoutItsIntentIsInconsistentNotHealthy(t *testing.T) {
 			Artifact{State: ArtifactValid, AttemptID: theAttemptID, Digest: "some-other-digest"}, "but the durable intent is"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingActive, false, CompletionProven})
+			r := residueFor(t, observation{StandingActive, false, CompletionProven})
 			r.Intent = tc.intent
 			if tc.intent.State != ArtifactValid {
 				r.IntentBody = nil
@@ -392,7 +411,7 @@ func TestAnActiveAttemptWithoutItsIntentIsInconsistentNotHealthy(t *testing.T) {
 // record again by ambient re-read - and nothing would then establish that the result it finds is the one
 // this decision was about.
 func TestTheDecisionCarriesTheEvidenceItWasMadeFrom(t *testing.T) {
-	got, err := Recover(residueFor(observation{StandingActive, true, CompletionProven}))
+	got, err := Recover(residueFor(t, observation{StandingActive, true, CompletionProven}))
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -407,10 +426,16 @@ func TestTheDecisionCarriesTheEvidenceItWasMadeFrom(t *testing.T) {
 	}
 	// A digest identifies bytes; it is not those bytes. Every field state requires in the ledger entry
 	// must be here, or whoever carries this out has to find the record again by ambient re-read.
-	if got.Result.Digest != theResultHash || got.Result.Execution != state.TestExecutionOK ||
-		got.Result.Identity != state.TestIdentityUnchanged || got.Result.TerminalReason != "exited 0" ||
-		got.Result.TestedCommit != theCommit || got.Result.TestedTree != theTree {
-		t.Fatalf("the decision cannot be executed from what it carries: %+v", got.Result)
+	res := got.Result.Record()
+	if got.Result.Digest() != publishedResult(t).Digest() || res.Execution != state.TestExecutionOK ||
+		res.Identity != state.TestIdentityUnchanged || res.TerminalReason != "exited 0" ||
+		res.TestedCommit != theCommit || res.TestedTree != theTree ||
+		res.TerminalAuthor != state.TerminalByRunner || res.ResolvedExecutable == "" || res.Cwd == "" {
+		t.Fatalf("the decision cannot be executed from what it carries: %+v", res)
+	}
+	// And the exact bytes the digest was taken over, so nothing has to be found again.
+	if sha256Hex(got.Result.Canonical()) != got.Result.Digest() {
+		t.Fatal("the decision carries bytes that are not the ones it names")
 	}
 	if got.Attempt.StartRevision != 41 || got.Attempt.TestedTree != theTree {
 		t.Fatalf("the reference lost the identity the attempt is a statement about: %+v", got.Attempt)
@@ -428,16 +453,12 @@ func TestAResultBelongingToAnotherAttemptIsRefusedAsEvidence(t *testing.T) {
 		result ResultEvidence
 		want   string
 	}{
-		{"a result for another attempt", func() ResultEvidence {
-			rec := publishedResult()
-			rec.AttemptID = "somebody-else"
-			return ResultEvidence{State: ArtifactValid, Record: rec}
-		}(), "belongs to"},
+		{"a result for another attempt", verifiedFor(t, "somebody-else"), "belongs to"},
 		{"a result that could not be validated",
 			ResultEvidence{State: ArtifactInvalid}, "could not be validated"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingActive, true, CompletionProven})
+			r := residueFor(t, observation{StandingActive, true, CompletionProven})
 			r.Result = tc.result
 
 			got, err := Recover(r)
@@ -459,10 +480,11 @@ func TestAResultBelongingToAnotherAttemptIsRefusedAsEvidence(t *testing.T) {
 // The ledger entry names the result digest it was authorised by. A durable result that is a DIFFERENT
 // record is evidence the two disagree about what this attempt did.
 func TestAFinalizedAttemptMustAgreeWithTheResultOnDisk(t *testing.T) {
-	r := residueFor(observation{StandingFinalized, true, CompletionProven})
-	rec := publishedResult()
-	rec.Digest = strings.Repeat("9", 64)
-	r.Result.Record = rec
+	r := residueFor(t, observation{StandingFinalized, true, CompletionProven})
+	other := validRecord()
+	other.AttemptID, other.TestedCommit, other.TestedTree = theAttemptID, theCommit, theTree
+	other.TerminalReason = "exited 0 (a different record)"
+	r.Result.Verified = verifiedRecordOf(t, other)
 
 	got, err := Recover(r)
 	if err != nil {
@@ -487,7 +509,7 @@ func TestMissingCounterpartsForAStandingAreRefusedAsEvidence(t *testing.T) {
 			Residue{Standing: StandingFinalized, Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionProven)},
 			"no entry was supplied"},
 		{"finalized with an active reference too",
-			Residue{Standing: StandingFinalized, Finalized: ledgerEntry(), Active: activeRef(),
+			Residue{Standing: StandingFinalized, Finalized: ledgerEntry(t), Active: activeRef(),
 				Intent: noArtifact(), Result: noResult(), Stdout: noStreams(), Stderr: noStreams(), Completion: completion(CompletionProven)},
 			"an active reference was supplied too"},
 		{"nothing outstanding but a reference supplied",
@@ -517,7 +539,7 @@ func TestADurableResultWithNothingOutstandingBlocks(t *testing.T) {
 		got, err := Recover(Residue{
 			Standing:   StandingNone,
 			Intent:     noArtifact(),
-			Result:     ResultEvidence{State: ArtifactValid, Record: publishedResult()},
+			Result:     ResultEvidence{State: ArtifactValid, Verified: publishedResult(t)},
 			Stdout:     noStreams(),
 			Stderr:     noStreams(),
 			Completion: completion(c),
@@ -542,7 +564,7 @@ func TestAnUndecidedShapeIsRefusedRatherThanGuessed(t *testing.T) {
 	delete(recoveryTable, key)
 	t.Cleanup(func() { recoveryTable = saved })
 
-	_, err := Recover(residueFor(key))
+	_, err := Recover(residueFor(t, key))
 	if !errors.Is(err, ErrLifecycle) {
 		t.Fatalf("err = %v, want ErrLifecycle", err)
 	}
@@ -552,7 +574,7 @@ func TestAnUndecidedShapeIsRefusedRatherThanGuessed(t *testing.T) {
 }
 
 func TestUnknownVocabularyValuesAreRefused(t *testing.T) {
-	base := residueFor(observation{StandingActive, false, CompletionProven})
+	base := residueFor(t, observation{StandingActive, false, CompletionProven})
 	for _, tc := range []struct {
 		name  string
 		mutex func(*Residue)
@@ -601,7 +623,7 @@ func TestAnOrphanIntentChangesTheAccountButNotTheAction(t *testing.T) {
 	if orphan.Reason == bare.Reason || !strings.Contains(orphan.Reason, "superseded") {
 		t.Fatalf("the reason does not say what happens to the orphan: %q", orphan.Reason)
 	}
-	bound, err := Recover(residueFor(observation{StandingActive, false, CompletionProven}))
+	bound, err := Recover(residueFor(t, observation{StandingActive, false, CompletionProven}))
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -648,7 +670,7 @@ func TestAZeroResidueIsRefusedRatherThanReadAsNothingFound(t *testing.T) {
 	}
 	// And a residue that is fully populated except for one forgotten artifact is refused too, since
 	// that is the shape a partial migration actually produces.
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	r.Result = ResultEvidence{}
 	if _, err := Recover(r); !errors.Is(err, ErrLifecycle) {
 		t.Fatalf("err = %v, want a refusal for an unset result artifact", err)
@@ -664,7 +686,7 @@ func TestAZeroResidueIsRefusedRatherThanReadAsNothingFound(t *testing.T) {
 // exists to prevent.
 func TestTheCompletionProofMustBeAboutTHISAttempt(t *testing.T) {
 	for _, hasResult := range []bool{false, true} {
-		r := residueFor(observation{StandingActive, hasResult, CompletionProven})
+		r := residueFor(t, observation{StandingActive, hasResult, CompletionProven})
 		r.Completion = provenFor("an-earlier-attempt")
 
 		got, err := Recover(r)
@@ -680,7 +702,7 @@ func TestTheCompletionProofMustBeAboutTHISAttempt(t *testing.T) {
 	}
 	// An unproven fact carries no attempt, and that must not itself be read as a mismatch - the block
 	// must come from the missing proof, with its own account.
-	r := residueFor(observation{StandingActive, false, CompletionAbsent})
+	r := residueFor(t, observation{StandingActive, false, CompletionAbsent})
 	got, err := Recover(r)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -703,14 +725,10 @@ func TestAFinalizedAttemptWithoutItsResultIsInconsistent(t *testing.T) {
 	}{
 		{"absent", noResult(), "no result is durable"},
 		{"unreadable", ResultEvidence{State: ArtifactInvalid}, "could not be validated"},
-		{"belonging to another attempt", func() ResultEvidence {
-			rec := publishedResult()
-			rec.AttemptID = "somebody-else"
-			return ResultEvidence{State: ArtifactValid, Record: rec}
-		}(), "belongs to"},
+		{"belonging to another attempt", verifiedFor(t, "somebody-else"), "belongs to"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingFinalized, true, CompletionProven})
+			r := residueFor(t, observation{StandingFinalized, true, CompletionProven})
 			r.Result = tc.result
 
 			got, err := Recover(r)
@@ -738,7 +756,7 @@ func TestAFinalizedAttemptWithoutItsResultIsInconsistent(t *testing.T) {
 // decision and the action - which is the same class slice 3b had to close at every collaborator
 // boundary, and a validated value is only validated while nobody else can reach it.
 func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
-	r := residueFor(observation{StandingActive, true, CompletionProven})
+	r := residueFor(t, observation{StandingActive, true, CompletionProven})
 	got, err := Recover(r)
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -748,17 +766,25 @@ func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
 	r.Active.StartRevision = 999
 	r.Active.IntentDigest = "MUTATED"
 	r.Active.TestedTree = "MUTATED"
-	r.Result.Record.Digest = "MUTATED"
-	r.Result.Record.Execution = state.TestExecutionTimeout
-	r.Result.Record.TerminalReason = "MUTATED"
-
 	if got.Attempt.AttemptID != theAttemptID || got.Attempt.StartRevision != 41 ||
 		got.Attempt.IntentDigest != theIntentHash || got.Attempt.TestedTree != theTree {
 		t.Fatalf("the caller rewrote the attempt the decision was about: %+v", got.Attempt)
 	}
-	if got.Result.Digest != theResultHash || got.Result.Execution != state.TestExecutionOK ||
-		got.Result.TerminalReason != "exited 0" {
-		t.Fatalf("the caller rewrote the result the decision applies: %+v", got.Result)
+	// The verified record cannot be rewritten at all from outside this package - its fields are
+	// unexported, which is what makes "this was verified" a fact rather than a label. Reading it back
+	// still yields the record that was read, and its accessors hand out copies.
+	res := got.Result.Record()
+	res.TerminalReason = "MUTATED"
+	res.Stdout.Head = []byte("MUTATED")
+	if got.Result.Record().TerminalReason != "exited 0" {
+		t.Fatalf("the accessor handed out the record's own storage: %+v", got.Result.Record())
+	}
+	canon := got.Result.Canonical()
+	for i := range canon {
+		canon[i] = 'X'
+	}
+	if sha256Hex(got.Result.Canonical()) != got.Result.Digest() {
+		t.Fatal("the accessor handed out the canonical bytes themselves")
 	}
 }
 
@@ -770,7 +796,7 @@ func TestTheDecisionCannotBeRewrittenThroughTheCallersPointers(t *testing.T) {
 // nothing for the entry to point at, and whoever executed it would have to invent the execution, the
 // identity and the terminal reason, which are the facts nobody is entitled to invent after a crash.
 func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T) {
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	r.Stdout = stagedStream("head", "tail")
 	r.Stderr = stagedStream("out", "err")
 
@@ -787,7 +813,10 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 	rec := got.Publish.Record
 	// It must be PUBLISHABLE. Carrying a record that its own validator would refuse is the same defect
 	// as carrying a description of one.
-	if err := rec.validate(); err != nil {
+	// PUBLISHABLE, proved by the publication boundary rather than the weaker internal check - the
+	// earlier version called validate() and claimed that proved it, while validate did not even check
+	// the schema version the encoder requires.
+	if _, _, err := rec.Encode(); err != nil {
 		t.Fatalf("the planned record cannot be published: %v", err)
 	}
 	if rec.AttemptID != theAttemptID || rec.TestedCommit != theCommit || rec.TestedTree != theTree {
@@ -796,10 +825,14 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 	// The command and the environment identity come from the published intent. They cannot be
 	// re-derived: resolving now would describe THIS process's environment, not the one the attempt was
 	// authorised against.
-	if rec.ResolvedExecutable != "/usr/bin/go" || !slices.Equal(rec.ResolvedArgv, []string{"go", "test", "./..."}) {
+	if rec.ResolvedExecutable != "/usr/bin/go" || len(rec.ResolvedArgv) != 3 ||
+		string(rec.ResolvedArgv[0]) != "go" || string(rec.ResolvedArgv[2]) != "./..." {
 		t.Fatalf("the record does not say which command ran: %+v", rec)
 	}
-	if !slices.Equal(rec.EnvNames, []string{"PATH"}) || rec.EnvDigest != strings.Repeat("5e", 32) {
+	if rec.Cwd != "/work" || rec.SpecDigest != strings.Repeat("7a", 32) {
+		t.Fatalf("the record does not bind the execution spec it ran under: %+v", rec)
+	}
+	if len(rec.EnvNames) != 1 || string(rec.EnvNames[0]) != "PATH" || rec.EnvDigest != strings.Repeat("5e", 32) {
 		t.Fatalf("the record does not bind the environment identity: %+v", rec)
 	}
 	if rec.Execution != state.TestExecutionInterrupted || rec.Identity != state.TestIdentityUnobserved {
@@ -810,10 +843,10 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 		t.Fatalf("recovery prose was attributed to the runner: %+v", rec)
 	}
 	// The retained bytes travel, per stream and in full - metadata alone cannot be embedded in a record.
-	if !bytes.Equal(rec.Stdout.Retained, truncatedExcerpt("head", "tail")) || !rec.Stdout.Truncated {
+	if !bytes.Equal(rec.Stdout.Head, []byte("head")) || !bytes.Equal(rec.Stdout.Tail, []byte("tail")) || !rec.Stdout.Truncated {
 		t.Fatalf("stdout evidence did not survive: %+v", rec.Stdout)
 	}
-	if !bytes.Equal(rec.Stderr.Retained, truncatedExcerpt("out", "err")) || !rec.Stderr.Truncated {
+	if !bytes.Equal(rec.Stderr.Head, []byte("out")) || !bytes.Equal(rec.Stderr.Tail, []byte("err")) || !rec.Stderr.Truncated {
 		t.Fatalf("stderr evidence did not survive: %+v", rec.Stderr)
 	}
 	if rec.Stdout.SourceBytes == rec.Stdout.RedactedBytes {
@@ -837,7 +870,7 @@ func TestSettlingAnInterruptedAttemptCarriesTheRecordItMustPublish(t *testing.T)
 		t.Fatalf("the authored account is not deterministic: %q vs %q", again.Publish.Record.TerminalReason, rec.TerminalReason)
 	}
 	// The other settling row publishes nothing new - it has a record already.
-	fin, err := Recover(residueFor(observation{StandingActive, true, CompletionProven}))
+	fin, err := Recover(residueFor(t, observation{StandingActive, true, CompletionProven}))
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -871,7 +904,7 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 			"stdout staging that could not be validated"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingActive, false, CompletionProven})
+			r := residueFor(t, observation{StandingActive, false, CompletionProven})
 			tc.set(&r)
 
 			got, err := Recover(r)
@@ -884,7 +917,7 @@ func TestStagingFromAnotherAttemptCannotBeEmbedded(t *testing.T) {
 		})
 	}
 	// One stream present and the other absent is an ordinary crash, not an inconsistency.
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	r.Stdout = stagedStream("h", "t")
 	got, err := Recover(r)
 	if err != nil {
@@ -917,8 +950,8 @@ func TestALedgerEntryMustAGREEWithTheRecordItNames(t *testing.T) {
 		{"tested tree", func(e *state.FinalizedAttempt) { e.TestedTree = strings.Repeat("d", 40) }, "tested tree"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingFinalized, true, CompletionProven})
-			entry := ledgerEntry()
+			r := residueFor(t, observation{StandingFinalized, true, CompletionProven})
+			entry := ledgerEntry(t)
 			tc.break_(entry)
 			r.Finalized = entry
 
@@ -938,14 +971,15 @@ func TestALedgerEntryMustAGREEWithTheRecordItNames(t *testing.T) {
 // A result is a statement ABOUT a particular tree. Finalizing from one computed against different code
 // would publish a verdict about something this attempt never ran.
 func TestAResultAboutDifferentCodeCannotFinalizeThisAttempt(t *testing.T) {
-	for _, mutate := range []func(*ResultProjection){
-		func(rec *ResultProjection) { rec.TestedCommit = strings.Repeat("c", 40) },
-		func(rec *ResultProjection) { rec.TestedTree = strings.Repeat("d", 40) },
+	for _, mutate := range []func(*ResultRecord){
+		func(rec *ResultRecord) { rec.TestedCommit = strings.Repeat("c", 40) },
+		func(rec *ResultRecord) { rec.TestedTree = strings.Repeat("d", 40) },
 	} {
-		r := residueFor(observation{StandingActive, true, CompletionProven})
-		rec := publishedResult()
-		mutate(rec)
-		r.Result.Record = rec
+		r := residueFor(t, observation{StandingActive, true, CompletionProven})
+		rec := validRecord()
+		rec.AttemptID, rec.TestedCommit, rec.TestedTree = theAttemptID, theCommit, theTree
+		mutate(&rec)
+		r.Result.Verified = verifiedRecordOf(t, rec)
 
 		got, err := Recover(r)
 		if err != nil {
@@ -977,11 +1011,16 @@ func TestEachEvidenceStateHasExactlyOneShape(t *testing.T) {
 			r.Completion = CompletionEvidence{Fact: CompletionUnavailable, AttemptID: theAttemptID}
 		}, "still names attempt"},
 		{"absent result carrying a record", func(r *Residue) {
-			r.Result = ResultEvidence{State: ArtifactAbsent, Record: publishedResult()}
+			r.Result = ResultEvidence{State: ArtifactAbsent, Verified: publishedResult(t)}
 		}, "still carries a record"},
 		{"invalid result carrying a record", func(r *Residue) {
-			r.Result = ResultEvidence{State: ArtifactInvalid, Record: publishedResult()}
+			r.Result = ResultEvidence{State: ArtifactInvalid, Verified: publishedResult(t)}
 		}, "still carries a record"},
+		// A value that never went through the rooted, digest-checked read. Outside this package it
+		// cannot be built at all; inside it can, so the claim is checked rather than assumed.
+		{"a record that was never verified", func(r *Residue) {
+			r.Result = ResultEvidence{State: ArtifactValid, Verified: &VerifiedRecord{}}
+		}, "never verified"},
 		{"valid result carrying no record", func(r *Residue) {
 			r.Result = ResultEvidence{State: ArtifactValid}
 		}, "no record behind it"},
@@ -997,7 +1036,7 @@ func TestEachEvidenceStateHasExactlyOneShape(t *testing.T) {
 		{"a valid intent with no body", func(r *Residue) { r.IntentBody = nil }, "its body is missing"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := residueFor(observation{StandingActive, false, CompletionProven})
+			r := residueFor(t, observation{StandingActive, false, CompletionProven})
 			tc.break_(&r)
 
 			got, err := Recover(r)
@@ -1017,7 +1056,7 @@ func TestEachEvidenceStateHasExactlyOneShape(t *testing.T) {
 // attempt the caller can rename afterwards is worse than one naming none: it is a report that quietly
 // becomes about something else.
 func TestABlockedDecisionAlsoCannotBeRewrittenThroughTheCallersPointer(t *testing.T) {
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	r.Intent = Artifact{State: ArtifactAbsent}
 
 	got, err := Recover(r)
@@ -1050,10 +1089,10 @@ func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a matching record was refused: %v", err)
 	}
-	if got.Record.AttemptID != theAttemptID {
-		t.Fatalf("the verified record is not the one asked for: %+v", got.Record)
+	if got.Record().AttemptID != theAttemptID {
+		t.Fatalf("the verified record is not the one asked for: %+v", got.Record())
 	}
-	if !bytes.Equal(got.Canonical, good) {
+	if !bytes.Equal(got.Canonical(), good) {
 		t.Fatalf("the canonical bytes were not preserved")
 	}
 
@@ -1129,11 +1168,11 @@ func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
 		for i := range shared {
 			shared[i] = 'X'
 		}
-		if sha256Hex(v.Canonical) != digest {
+		if sha256Hex(v.Canonical()) != digest {
 			t.Fatal("the source rewrote the bytes the caller had verified")
 		}
-		if v.Record.AttemptID != theAttemptID {
-			t.Fatalf("the decoded record changed underneath the caller: %+v", v.Record)
+		if v.Record().AttemptID != theAttemptID {
+			t.Fatalf("the decoded record changed underneath the caller: %+v", v.Record())
 		}
 	})
 }
@@ -1143,7 +1182,7 @@ func TestTheRecordCapabilityVerifiesRatherThanPromises(t *testing.T) {
 // The projections are deliberately partial, so the decision has to hand over the means of reaching the
 // rest. Making the caller find a source would put them back in the position of doing an ambient lookup.
 func TestTheDecisionCarriesTheSourceForWhatItOmits(t *testing.T) {
-	r := residueFor(observation{StandingActive, true, CompletionProven})
+	r := residueFor(t, observation{StandingActive, true, CompletionProven})
 	r.Records = &fakeRecords{id: theAttemptID}
 
 	got, err := Recover(r)
@@ -1172,7 +1211,7 @@ func TestTheDecisionCarriesTheSourceForWhatItOmits(t *testing.T) {
 // an exact intent digest. A body read from somewhere else would put a different command into the record
 // while every other check still passed.
 func TestTheIntentBodyMustBeTheIntentTheAttemptBINDS(t *testing.T) {
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	body := intentBody()
 	body.Digest = strings.Repeat("7f", 32)
 	r.IntentBody = body
@@ -1191,7 +1230,7 @@ func TestTheIntentBodyMustBeTheIntentTheAttemptBINDS(t *testing.T) {
 // The retained excerpt travels into the plan, and it is bytes. If the plan aliased the staging the caller
 // supplied, the record about to be written could change between the decision and the write.
 func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
-	r := residueFor(observation{StandingActive, false, CompletionProven})
+	r := residueFor(t, observation{StandingActive, false, CompletionProven})
 	r.Stdout = stagedStream("h", "t")
 
 	got, err := Recover(r)
@@ -1201,15 +1240,14 @@ func TestThePlannedRecordDoesNotShareTheCallersBytes(t *testing.T) {
 	if got.Publish == nil {
 		t.Fatal("no plan")
 	}
-	retained := r.Stdout.Record.Retained
-	for i := range retained {
-		retained[i] = 'Z'
+	for i := range r.Stdout.Record.Head {
+		r.Stdout.Record.Head[i] = 'Z'
 	}
-	r.IntentBody.ResolvedArgv[0] = "MUTATED"
-	if !bytes.Equal(got.Publish.Record.Stdout.Retained, truncatedExcerpt("h", "t")) {
-		t.Fatalf("the planned record shares the caller's stream bytes: %q", got.Publish.Record.Stdout.Retained)
+	r.IntentBody.ResolvedArgv[0][0] = 'X'
+	if !bytes.Equal(got.Publish.Record.Stdout.Head, []byte("h")) {
+		t.Fatalf("the planned record shares the caller's stream bytes: %q", got.Publish.Record.Stdout.Head)
 	}
-	if got.Publish.Record.ResolvedArgv[0] != "go" {
+	if string(got.Publish.Record.ResolvedArgv[0]) != "go" {
 		t.Fatalf("the planned record shares the caller's argv: %q", got.Publish.Record.ResolvedArgv)
 	}
 }
@@ -1220,4 +1258,49 @@ func canonicalValidRecord() ([]byte, string, error) {
 	rec := validRecord()
 	rec.SchemaVersion = ResultRecordVersion
 	return rec.Encode()
+}
+
+// verifiedRecordOf runs an arbitrary record through the real rooted, digest-checked read, so tests
+// cannot construct evidence production could not produce.
+func verifiedRecordOf(t *testing.T, rec ResultRecord) *VerifiedRecord {
+	t.Helper()
+	raw, digest, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	v, err := ReadVerifiedRecord(&fakeRecords{id: rec.AttemptID, bytes: map[string][]byte{digest: raw}}, rec.AttemptID, digest)
+	if err != nil {
+		t.Fatalf("verifying: %v", err)
+	}
+	return v
+}
+
+func verifiedFor(t *testing.T, attemptID string) ResultEvidence {
+	t.Helper()
+	rec := validRecord()
+	rec.AttemptID, rec.TestedCommit, rec.TestedTree = attemptID, theCommit, theTree
+	return ResultEvidence{State: ArtifactValid, Verified: verifiedRecordOf(t, rec)}
+}
+
+// TestALedgerEntryMustAgreeWithTheRecordAboutWHOSaidIt.
+//
+// The ledger stores the authority beside the account. An entry naming the same digest and verdict while
+// attributing them to somebody else is a record that disagrees with itself about who observed the
+// ending - and the earlier projection dropped the field entirely, so the comparison could not have
+// caught it.
+func TestALedgerEntryMustAgreeWithTheRecordAboutWHOSaidIt(t *testing.T) {
+	r := residueFor(t, observation{StandingFinalized, true, CompletionProven})
+	// ONLY the authority differs, so this isolates the field rather than tripping the execution check
+	// first and passing for the wrong reason.
+	entry := ledgerEntry(t)
+	entry.TerminalAuthor = state.TerminalByRecovery
+	r.Finalized = entry
+
+	got, err := Recover(r)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got.Action != ActionBlock || !strings.Contains(got.Reason, "terminal authority") {
+		t.Fatalf("%+v, want a block naming the authority", got)
+	}
 }

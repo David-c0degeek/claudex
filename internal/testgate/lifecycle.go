@@ -129,6 +129,12 @@ type PreparedAttempt struct {
 	// Spec is what will run, complete. Carried because arming and intent publication both need the exact
 	// command AND environment authorization chose, and neither may construct its own.
 	Spec ExecutionSpec
+	// MaxOutputBytes is the frozen policy ceiling on the COMBINED retained stdout+stderr excerpt.
+	//
+	// It travels with the attempt because this lifecycle has to enforce it and does not read policy.
+	// Without it the bound could only be applied by whoever happened to have the policy in scope, which
+	// is the side channel this value exists to close.
+	MaxOutputBytes uint64
 }
 
 // Terminal is what the RUNNER observed about the command, in the closed vocabulary.
@@ -619,9 +625,22 @@ func (d Deps) finalizeUnderGuard(prep PreparedAttempt, term Terminal) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
+	// What the record IS, computed here. The publisher reports a digest and the state CAS binds it, so
+	// without an independent expectation the ledger can name bytes nobody produced - the same hole
+	// intent publication was corrected for, one step later.
+	_, expected, err := rec.Encode()
+	if err != nil {
+		return Result{}, err
+	}
 	digest, err := d.PublishResult(rec)
 	if err != nil {
 		return Result{}, errors.Join(fmt.Errorf("%w: publishing the result", ErrLifecycle), err)
+	}
+	if digest != expected {
+		// A digest that does not identify the record handed over would be bound by the outcome CAS, and
+		// every later reader would fetch bytes that say something else - or nothing at all.
+		return Result{}, fmt.Errorf("%w: the publisher reported digest %q for a record whose canonical digest is %q",
+			ErrLifecycle, digest, expected)
 	}
 
 	// 11. The outcome CAS names the digest of a record that is ALREADY durable, so state never
@@ -739,9 +758,13 @@ func cloneTerminal(t Terminal) Terminal {
 }
 
 func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (ResultRecord, error) {
-	names := make([]string, 0, len(prep.Spec.Env.Env))
+	names := make([][]byte, 0, len(prep.Spec.Env.Env))
 	for _, e := range prep.Spec.Env.Env {
-		names = append(names, string(e.Name))
+		names = append(names, append([]byte(nil), e.Name...))
+	}
+	argv := make([][]byte, 0, len(prep.Spec.Argv))
+	for _, a := range prep.Spec.Argv {
+		argv = append(argv, []byte(a))
 	}
 	envDigest, err := prep.Spec.Env.EnvIdentityDigest()
 	if err != nil {
@@ -752,8 +775,10 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 		AttemptID:          prep.AttemptID,
 		TestedCommit:       prep.TestedCommit,
 		TestedTree:         prep.TestedTree,
+		SpecDigest:         prep.Spec.Digest,
+		Cwd:                prep.Spec.Cwd,
 		ResolvedExecutable: prep.Spec.Executable,
-		ResolvedArgv:       append([]string(nil), prep.Spec.Argv...),
+		ResolvedArgv:       argv,
 		EnvNames:           names,
 		EnvDigest:          envDigest,
 		Execution:          term.Execution,
@@ -764,6 +789,13 @@ func buildResultRecord(prep PreparedAttempt, term Terminal, ident Identity) (Res
 		ExitCode:           term.ExitCode,
 		Stdout:             cloneStream(term.Stdout),
 		Stderr:             cloneStream(term.Stderr),
+	}
+	// The COMBINED ceiling, applied where the record is built. Per-stream checking admits a record twice
+	// the size the operator allowed, and leaving it to the publisher means it is applied by whoever
+	// happens to hold the policy.
+	if !FitsCombinedOutputCeiling(rec.Stdout, rec.Stderr, prep.MaxOutputBytes) {
+		return ResultRecord{}, fmt.Errorf("%w: the retained output is %d bytes, over the frozen ceiling of %d",
+			ErrLifecycle, rec.Stdout.RetainedBytes()+rec.Stderr.RetainedBytes(), prep.MaxOutputBytes)
 	}
 	// Refused HERE if it contradicts itself, rather than handed on for the publisher to discover it
 	// cannot be written - at which point the attempt is already past the point of being retried cheaply.

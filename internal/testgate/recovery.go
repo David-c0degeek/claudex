@@ -177,18 +177,33 @@ func ReadVerifiedRecord(src RecordBytes, attemptID, digest string) (*VerifiedRec
 	if err != nil {
 		return nil, err
 	}
-	return &VerifiedRecord{Record: rec, Canonical: owned}, nil
+	return &VerifiedRecord{record: rec, canonical: owned, verified: true}, nil
 }
 
-// VerifiedRecord is a record that was read, hashed against the digest that named it, strictly decoded
-// and validated.
+// VerifiedRecord is a record read from an attempt-rooted source, hashed against the digest that named
+// it, strictly decoded, validated, and confirmed canonical.
 //
-// It exists because returning bytes made ArtifactValid something the CALLER asserted. A digest-correct
-// []byte("not a result") satisfied every check and was handed back as a verified record.
+// Its fields are UNEXPORTED on purpose. Exported ones made "this record is valid" something a caller
+// could simply declare, and a caller who can declare it has not been prevented from anything. The zero
+// value is not a verified record and cannot be mistaken for one.
 type VerifiedRecord struct {
-	Record    ResultRecord
-	Canonical []byte
+	record    ResultRecord
+	canonical []byte
+	verified  bool
 }
+
+// Record returns the validated record, as an owned copy.
+func (v VerifiedRecord) Record() ResultRecord { return *cloneRecord(&v.record) }
+
+// Canonical returns the exact bytes the digest was computed over, as an owned copy.
+func (v VerifiedRecord) Canonical() []byte { return append([]byte(nil), v.canonical...) }
+
+// Verified reports whether this value came from a rooted, digest-checked read. The zero value says no,
+// which is what stops a hand-built one being mistaken for evidence.
+func (v VerifiedRecord) Verified() bool { return v.verified }
+
+// Digest is the identity those canonical bytes hash to.
+func (v VerifiedRecord) Digest() string { return sha256Hex(v.canonical) }
 
 // StreamEvidence is one stream's non-authoritative crash-time staging, as recovery found it.
 //
@@ -209,11 +224,16 @@ type StreamEvidence struct {
 // identity it ran with, and neither can be re-derived after the fact - re-resolving the command now
 // would describe THIS process's environment, not the one the attempt was authorised against.
 type IntentProjection struct {
+	SpecDigest         string
+	Cwd                string
 	ResolvedExecutable string
-	ResolvedArgv       []string
-	EnvNames           []string
-	EnvDigest          string
-	Digest             string
+	// ResolvedArgv and EnvNames are BYTES for the same reason they are base64 on the wire: an argv
+	// element or a variable name may not be valid UTF-8, and a string field would normalize it - so the
+	// record would bind something the child never received.
+	ResolvedArgv [][]byte
+	EnvNames     [][]byte
+	EnvDigest    string
+	Digest       string
 }
 
 // InterruptionPlan is the exact record recovery must publish before it can settle an interrupted
@@ -235,10 +255,14 @@ type InterruptionPlan struct {
 // ResultEvidence is what was found when the result was looked for.
 type ResultEvidence struct {
 	State ArtifactState
-	// Record is the validated ledger projection, required when the state is valid and forbidden
-	// otherwise - one shape per state, so "absent" cannot arrive carrying a record that something later
-	// decides to trust.
-	Record *ResultProjection
+	// Verified is the record as ReadVerifiedRecord established it, required when the state is valid and
+	// forbidden otherwise.
+	//
+	// It is a VerifiedRecord rather than a hand-built projection because ArtifactValid has to be a fact
+	// somebody established, not a label a caller applied. With a projection, recovery could finalize an
+	// attempt from fields no canonical record ever contained - and the projection was also quietly
+	// dropping the terminal authority the ledger binds, so the comparison could not have caught it.
+	Verified *VerifiedRecord
 }
 
 // Residue is the durable evidence a recovering process can read.
@@ -308,10 +332,10 @@ type Recovery struct {
 	// the caller must not be able to rewrite the attempt id, revision or bound digests after they were
 	// validated and before the action is carried out.
 	Attempt *state.TestAttemptRef
-	// Result is the validated ledger projection to finalize from, present only for
-	// ActionFinalizeFromResult. Also a clone, for the same reason. Everything the projection omits is
-	// reached through a RecordReader using Result.Digest.
-	Result *ResultProjection
+	// Result is the verified record to finalize from, present only for ActionFinalizeFromResult. It
+	// carries the whole record and the exact canonical bytes its digest was taken over, so nothing has
+	// to be found again.
+	Result *VerifiedRecord
 	// Publish is the record that must be written BEFORE the ledger entry, present only for
 	// ActionLedgerOnlyInterrupted. Without it that action would name a settlement nobody could perform.
 	Publish *InterruptionPlan
@@ -431,7 +455,7 @@ func Recover(r Residue) (Recovery, error) {
 	dec.Records = r.Records
 	switch dec.Action {
 	case ActionFinalizeFromResult:
-		dec.Result = cloneResult(r.Result.Record)
+		dec.Result = r.Result.Verified
 	case ActionLedgerOnlyInterrupted:
 		// Settling this attempt appends a ledger entry, and every entry binds a durable canonical
 		// result - which this attempt does not have. So the decision carries the record to write, whole:
@@ -439,12 +463,15 @@ func Recover(r Residue) (Recovery, error) {
 		// published intent (they cannot be re-derived, because re-resolving now would describe THIS
 		// process), and the retained bytes found on disk.
 		rec := ResultRecord{
+			SchemaVersion:      ResultRecordVersion,
 			AttemptID:          r.Active.AttemptID,
 			TestedCommit:       r.Active.TestedCommit,
 			TestedTree:         r.Active.TestedTree,
+			SpecDigest:         r.IntentBody.SpecDigest,
+			Cwd:                r.IntentBody.Cwd,
 			ResolvedExecutable: r.IntentBody.ResolvedExecutable,
-			ResolvedArgv:       append([]string(nil), r.IntentBody.ResolvedArgv...),
-			EnvNames:           append([]string(nil), r.IntentBody.EnvNames...),
+			ResolvedArgv:       cloneByteSlices(r.IntentBody.ResolvedArgv),
+			EnvNames:           cloneByteSlices(r.IntentBody.EnvNames),
 			EnvDigest:          r.IntentBody.EnvDigest,
 			// Fixed for this row, and carried rather than left implicit. The runner never reported an
 			// ending and no identity observation was ever made, so nothing about the code may be claimed.
@@ -462,9 +489,11 @@ func Recover(r Residue) (Recovery, error) {
 		if r.Stderr.State == ArtifactValid {
 			rec.Stderr = cloneStream(*r.Stderr.Record)
 		}
-		// The record is refused HERE if it contradicts itself, rather than being handed on for somebody
-		// else to discover was unpublishable.
-		if err := rec.validate(); err != nil {
+		// PUBLISHABLE, proved by the publication boundary itself rather than by the weaker internal
+		// check. Validating alone left the version unchecked, so the plan was refused only at the moment
+		// it was written - which is exactly where a crash-recovery path must not first learn it is
+		// unusable.
+		if _, _, err := rec.Encode(); err != nil {
 			return Recovery{}, err
 		}
 		dec.Publish = &InterruptionPlan{Record: rec}
@@ -505,13 +534,14 @@ func (r Residue) known() error {
 
 // ledgerDisagreesWithRecord names the first bound field on which the ledger entry and the record it
 // names differ, or "" when they agree.
-func ledgerDisagreesWithRecord(e state.FinalizedAttempt, rec ResultProjection) string {
+func ledgerDisagreesWithRecord(e state.FinalizedAttempt, rec ResultRecord) string {
 	for _, f := range []struct{ name, ledger, record string }{
 		{"tested commit", e.TestedCommit, rec.TestedCommit},
 		{"tested tree", e.TestedTree, rec.TestedTree},
 		{"execution", string(e.Execution), string(rec.Execution)},
 		{"identity", string(e.Identity), string(rec.Identity)},
 		{"terminal reason", e.TerminalReason, rec.TerminalReason},
+		{"terminal authority", string(e.TerminalAuthor), string(rec.TerminalAuthor)},
 	} {
 		if f.ledger != f.record {
 			return fmt.Sprintf("attempt %q is finalized saying %s %q, but the record it names says %q",
@@ -540,11 +570,17 @@ func (r Residue) shapes() string {
 	}
 	switch r.Result.State {
 	case ArtifactValid:
-		if r.Result.Record == nil {
+		if r.Result.Verified == nil {
 			return "the result is reported valid with no record behind it"
 		}
+		// A value that was never through the rooted, digest-checked read. The zero VerifiedRecord cannot
+		// be built outside this package, but it can be built INSIDE it, so the claim is still checked
+		// rather than assumed from the type.
+		if !r.Result.Verified.Verified() {
+			return "the result carries a record that was never verified"
+		}
 	default:
-		if r.Result.Record != nil {
+		if r.Result.Verified != nil {
 			return fmt.Sprintf("the result is %q but still carries a record", r.Result.State)
 		}
 	}
@@ -626,15 +662,15 @@ func (r Residue) inconsistency() string {
 		case ArtifactInvalid:
 			return fmt.Sprintf("attempt %q has a result that could not be validated", r.Active.AttemptID)
 		case ArtifactValid:
-			if r.Result.Record.AttemptID != r.Active.AttemptID {
-				return fmt.Sprintf("attempt %q is active but the durable result belongs to %q", r.Active.AttemptID, r.Result.Record.AttemptID)
+			rec := r.Result.Verified.Record()
+			if rec.AttemptID != r.Active.AttemptID {
+				return fmt.Sprintf("attempt %q is active but the durable result belongs to %q", r.Active.AttemptID, rec.AttemptID)
 			}
 			// A result is a statement ABOUT a particular tree. Finalizing from one that was computed
 			// against different code would publish a verdict about something this attempt never ran.
-			if r.Result.Record.TestedCommit != r.Active.TestedCommit || r.Result.Record.TestedTree != r.Active.TestedTree {
+			if rec.TestedCommit != r.Active.TestedCommit || rec.TestedTree != r.Active.TestedTree {
 				return fmt.Sprintf("attempt %q is a statement about %s/%s but its result is about %s/%s",
-					r.Active.AttemptID, r.Active.TestedCommit, r.Active.TestedTree,
-					r.Result.Record.TestedCommit, r.Result.Record.TestedTree)
+					r.Active.AttemptID, r.Active.TestedCommit, r.Active.TestedTree, rec.TestedCommit, rec.TestedTree)
 			}
 		}
 		// The proof that authorises consuming this reference must be a proof about THIS attempt. The
@@ -662,20 +698,21 @@ func (r Residue) inconsistency() string {
 		case ArtifactInvalid:
 			return fmt.Sprintf("attempt %q is finalized but its result could not be validated", r.Finalized.AttemptID)
 		}
-		if r.Result.Record.AttemptID != r.Finalized.AttemptID {
+		rec := r.Result.Verified.Record()
+		if rec.AttemptID != r.Finalized.AttemptID {
 			return fmt.Sprintf("attempt %q is finalized but the durable result belongs to %q",
-				r.Finalized.AttemptID, r.Result.Record.AttemptID)
+				r.Finalized.AttemptID, rec.AttemptID)
 		}
-		if r.Result.Record.Digest != r.Finalized.ResultDigest {
+		if r.Result.Verified.Digest() != r.Finalized.ResultDigest {
 			return fmt.Sprintf("attempt %q is finalized against result %q but the durable result is %q",
-				r.Finalized.AttemptID, r.Finalized.ResultDigest, r.Result.Record.Digest)
+				r.Finalized.AttemptID, r.Finalized.ResultDigest, r.Result.Verified.Digest())
 		}
 		// Naming the right record is not the same as copying it correctly. The ledger entry holds its own
 		// copies of the tested identity and the verdict, so an entry can point at the real record and
 		// still disagree with it about what happened - and state cannot catch that, because the record is
 		// external to it. This is the case slice 3b's disagreesWithPublished exists for, on the other
 		// side of the same boundary.
-		if bad := ledgerDisagreesWithRecord(*r.Finalized, *r.Result.Record); bad != "" {
+		if bad := ledgerDisagreesWithRecord(*r.Finalized, rec); bad != "" {
 			return bad
 		}
 	case StandingNone:
@@ -698,14 +735,6 @@ func (r Residue) inconsistency() string {
 // Slice 3b had to learn this at every collaborator boundary: a validated value reachable through a
 // pointer the caller still holds is a value that can change between the check and the use.
 func cloneAttemptRef(r *state.TestAttemptRef) *state.TestAttemptRef {
-	if r == nil {
-		return nil
-	}
-	c := *r
-	return &c
-}
-
-func cloneResult(r *ResultProjection) *ResultProjection {
 	if r == nil {
 		return nil
 	}

@@ -10,17 +10,22 @@ import (
 	"github.com/David-c0degeek/claudex/internal/state"
 )
 
-// truncatedExcerpt builds the head+tail representation with its explicit marker.
-func truncatedExcerpt(head, tail string) []byte {
-	out := append([]byte(head), ElisionMarker...)
-	return append(out, tail...)
+// bs makes the byte-slice lists the execution view uses. Argv and environment names are bytes because
+// they may not be valid UTF-8, and a string would normalize them.
+func bs(vals ...string) [][]byte {
+	out := make([][]byte, len(vals))
+	for i, v := range vals {
+		out[i] = []byte(v)
+	}
+	return out
 }
 
 func validRecord() ResultRecord {
 	return ResultRecord{
 		AttemptID: theAttemptID, TestedCommit: theCommit, TestedTree: theTree,
-		ResolvedExecutable: "/usr/bin/go", ResolvedArgv: []string{"go", "test", "./..."},
-		EnvNames: []string{"PATH"}, EnvDigest: strings.Repeat("5e", 32),
+		SchemaVersion: ResultRecordVersion, SpecDigest: strings.Repeat("7a", 32), Cwd: "/work",
+		ResolvedExecutable: "/usr/bin/go", ResolvedArgv: bs("go", "test", "./..."),
+		EnvNames: bs("PATH"), EnvDigest: strings.Repeat("5e", 32),
 		Execution: state.TestExecutionOK, Identity: state.TestIdentityUnchanged,
 		TerminalReason: "exited 0", TerminalAuthor: state.TerminalByRunner,
 		HasExitCode: true, ExitCode: 0,
@@ -45,6 +50,11 @@ func TestAResultRecordIsRefusedWhenItContradictsItself(t *testing.T) {
 		// the question it exists to answer.
 		{"no executable", func(r *ResultRecord) { r.ResolvedExecutable = "" }, "records no command"},
 		{"no argv", func(r *ResultRecord) { r.ResolvedArgv = nil }, "records no command"},
+		{"no working directory", func(r *ResultRecord) { r.Cwd = "" }, "records no working directory"},
+		// Without it the record can describe the same command in a different directory and still look
+		// consistent with everything else.
+		{"no execution spec digest", func(r *ResultRecord) { r.SpecDigest = "" }, "execution spec digest"},
+		{"no schema version", func(r *ResultRecord) { r.SchemaVersion = 0 }, "schema version"},
 		{"an environment digest that is not a digest", func(r *ResultRecord) { r.EnvDigest = "nope" }, "is not a sha256"},
 		{"an unknown execution", func(r *ResultRecord) { r.Execution = "probably-fine" }, "unknown execution"},
 		{"an unknown identity", func(r *ResultRecord) { r.Identity = "probably-fine" }, "unknown identity"},
@@ -93,7 +103,7 @@ func TestAResultRecordIsRefusedWhenItContradictsItself(t *testing.T) {
 func TestAStreamRecordIsRefusedWhenItsCountsContradictItself(t *testing.T) {
 	valid := StreamRecord{
 		Present: true, SourceBytes: 4096, RedactedBytes: 4000,
-		SHA256: strings.Repeat("3c", 32), Retained: truncatedExcerpt("head", "tail"), Truncated: true,
+		SHA256: strings.Repeat("3c", 32), Head: []byte("head"), Tail: []byte("tail"), Truncated: true,
 	}
 	if err := valid.validate("stdout"); err != nil {
 		t.Fatalf("the baseline stream was refused: %v", err)
@@ -107,34 +117,31 @@ func TestAStreamRecordIsRefusedWhenItsCountsContradictItself(t *testing.T) {
 		// indistinguishable and every reader has to remember to check the flag first.
 		{"absent carrying counts", StreamRecord{SourceBytes: 12}, "absent but still carries evidence"},
 		{"absent carrying a digest", StreamRecord{SHA256: strings.Repeat("3c", 32)}, "absent but still carries evidence"},
-		{"absent carrying bytes", StreamRecord{Retained: []byte("x")}, "absent but still carries evidence"},
+		{"absent carrying bytes", StreamRecord{Head: []byte("x")}, "absent but still carries evidence"},
 		{"absent claiming truncation", StreamRecord{Truncated: true}, "absent but still carries evidence"},
 		{"a digest that is not a digest", func() StreamRecord { s := valid; s.SHA256 = "nope"; return s }(), "is not a sha256"},
 		// The one fact in this record a verifier can RECOMPUTE, so it must be recomputed.
 		{"an untruncated excerpt disagreeing with its own digest", StreamRecord{
 			Present: true, SourceBytes: 3, RedactedBytes: 3,
-			SHA256: strings.Repeat("3c", 32), Retained: []byte("abc"),
+			SHA256: strings.Repeat("3c", 32), Head: []byte("abc"),
 		}, "hashes to"},
-		{"a truncated excerpt with no elision marker", StreamRecord{
-			Present: true, SourceBytes: 99, RedactedBytes: 99,
-			SHA256: strings.Repeat("3c", 32), Retained: []byte("head-tail"), Truncated: true,
-		}, "no elision marker"},
-		{"a truncated excerpt with two markers", StreamRecord{
-			Present: true, SourceBytes: 99, RedactedBytes: 99, SHA256: strings.Repeat("3c", 32),
-			Retained:  append(truncatedExcerpt("a", "b"), ElisionMarker...),
-			Truncated: true,
-		}, "more than one elision marker"},
+		// An untruncated excerpt is the WHOLE stream, so there is nothing for a tail to be the other
+		// side of.
+		{"an untruncated excerpt split into halves", StreamRecord{
+			Present: true, SourceBytes: 3, RedactedBytes: 3,
+			SHA256: sha256Hex([]byte("abc")), Head: []byte("ab"), Tail: []byte("c"),
+		}, "split into two halves"},
 		// The excerpt is drawn FROM the redacted stream, so it cannot be longer than it.
 		{"an excerpt longer than the stream", func() StreamRecord {
 			s := valid
-			s.RedactedBytes, s.Retained, s.Truncated = 2, []byte("abcd"), false
+			s.RedactedBytes, s.Head, s.Tail, s.Truncated = 2, []byte("abcd"), nil, false
 			return s
 		}(), "retains 4 bytes of a 2-byte redacted stream"},
 		// Truncation is a FACT about the excerpt, not a free-standing flag. Left independent, a producer
 		// could keep everything and still claim truncation, or drop bytes and deny it.
 		{"claiming truncation while keeping everything", func() StreamRecord {
 			s := valid
-			s.RedactedBytes, s.Retained = 3, []byte("abc")
+			s.RedactedBytes, s.Head, s.Tail = 3, []byte("abc"), nil
 			return s
 		}(), "claims truncated=true"},
 		{"denying truncation while dropping bytes", func() StreamRecord {
@@ -154,11 +161,11 @@ func TestAStreamRecordIsRefusedWhenItsCountsContradictItself(t *testing.T) {
 	// An untruncated excerpt IS the whole redacted stream, so its digest is recomputable and must match -
 	// a fixture with a made-up digest would have been asserting that the record may disagree with itself.
 	whole := StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 3,
-		SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")}
+		SHA256: sha256Hex([]byte("abc")), Head: []byte("abc")}
 	if err := whole.validate("stderr"); err != nil {
 		t.Fatalf("an untruncated stream was refused: %v", err)
 	}
-	if whole.RetainedBytes() != 3 {
+	if whole.RetainedBytes() != 3 || string(whole.Retained()) != "abc" {
 		t.Fatalf("RetainedBytes = %d, want the length of the excerpt", whole.RetainedBytes())
 	}
 }
@@ -171,26 +178,26 @@ func TestTheRecordCarriesItsOwnBytesRatherThanTheCallersBackingArray(t *testing.
 	original := []byte("keep-me")
 	src := StreamRecord{
 		Present: true, SourceBytes: 9, RedactedBytes: 7,
-		SHA256: sha256Hex(original), Retained: original,
+		SHA256: sha256Hex(original), Head: original,
 	}
 	clone := cloneStream(src)
 	for i := range original {
 		original[i] = 'X'
 	}
-	if string(clone.Retained) != "keep-me" {
-		t.Fatalf("the clone shares the caller's backing array: %q", clone.Retained)
+	if string(clone.Head) != "keep-me" {
+		t.Fatalf("the clone shares the caller's backing array: %q", clone.Head)
 	}
 
 	rec := validRecord()
-	rec.ResolvedArgv = []string{"go", "test"}
-	rec.EnvNames = []string{"PATH"}
+	rec.ResolvedArgv = bs("go", "test")
+	rec.EnvNames = bs("PATH")
 	rec.Stdout = StreamRecord{Present: true, SourceBytes: 4, RedactedBytes: 3,
-		SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")}
+		SHA256: sha256Hex([]byte("abc")), Head: []byte("abc")}
 	c := cloneRecord(&rec)
-	rec.ResolvedArgv[0] = "MUTATED"
-	rec.EnvNames[0] = "MUTATED"
-	rec.Stdout.Retained[0] = 'X'
-	if c.ResolvedArgv[0] != "go" || c.EnvNames[0] != "PATH" || string(c.Stdout.Retained) != "abc" {
+	rec.ResolvedArgv[0][0] = 'X'
+	rec.EnvNames[0][0] = 'X'
+	rec.Stdout.Head[0] = 'X'
+	if string(c.ResolvedArgv[0]) != "go" || string(c.EnvNames[0]) != "PATH" || string(c.Stdout.Head) != "abc" {
 		t.Fatalf("the record clone shares backing arrays with its source: %+v", c)
 	}
 }
@@ -203,7 +210,10 @@ func TestARecordRoundTripsThroughItsCanonicalBoundary(t *testing.T) {
 	rec := validRecord()
 	rec.SchemaVersion = ResultRecordVersion
 	rec.Stdout = StreamRecord{Present: true, SourceBytes: 9, RedactedBytes: 3,
-		SHA256: sha256Hex([]byte{0xff, 0xfe, 0x00}), Retained: []byte{0xff, 0xfe, 0x00}}
+		SHA256: sha256Hex([]byte{0xff, 0xfe, 0x00}), Head: []byte{0xff, 0xfe, 0x00}}
+	// An argv element that is not valid UTF-8, which is the case a JSON string field would silently
+	// normalize - binding bytes the child never received.
+	rec.ResolvedArgv = [][]byte{[]byte("go"), {0xff, 0xfe, 'x'}}
 
 	raw, digest, err := rec.Encode()
 	if err != nil {
@@ -218,8 +228,11 @@ func TestARecordRoundTripsThroughItsCanonicalBoundary(t *testing.T) {
 	}
 	// Arbitrary bytes must survive, which is why the excerpt is base64 on the wire: a stream that is
 	// not valid UTF-8 is exactly the case the design harvested vectors for.
-	if !bytes.Equal(back.Stdout.Retained, []byte{0xff, 0xfe, 0x00}) {
-		t.Fatalf("non-UTF-8 stream bytes did not survive the round trip: %v", back.Stdout.Retained)
+	if !bytes.Equal(back.Stdout.Head, []byte{0xff, 0xfe, 0x00}) {
+		t.Fatalf("non-UTF-8 stream bytes did not survive the round trip: %v", back.Stdout.Head)
+	}
+	if !bytes.Equal(back.ResolvedArgv[1], []byte{0xff, 0xfe, 'x'}) {
+		t.Fatalf("a non-UTF-8 argv element did not survive the round trip: %v", back.ResolvedArgv[1])
 	}
 	if !reflect.DeepEqual(back, rec) {
 		t.Fatalf("round trip changed the record:\n got %+v\nwant %+v", back, rec)
@@ -240,7 +253,6 @@ func TestARecordRoundTripsThroughItsCanonicalBoundary(t *testing.T) {
 // up with two different records.
 func TestTheRecordBoundaryRefusesDocumentsItDidNotWrite(t *testing.T) {
 	rec := validRecord()
-	rec.SchemaVersion = ResultRecordVersion
 	raw, _, err := rec.Encode()
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -264,12 +276,12 @@ func TestTheRecordBoundaryRefusesDocumentsItDidNotWrite(t *testing.T) {
 		}(), "schema version"},
 		{"no version at all", func() []byte {
 			r := validRecord()
+			r.SchemaVersion = 0
 			b, _ := json.Marshal(r)
 			return b
 		}(), "schema version"},
 		{"a document that decodes but contradicts itself", func() []byte {
 			r := validRecord()
-			r.SchemaVersion = ResultRecordVersion
 			r.ExitCode = 17
 			b, _ := json.Marshal(r)
 			return b
@@ -291,13 +303,121 @@ func TestTheRecordBoundaryRefusesDocumentsItDidNotWrite(t *testing.T) {
 // stored is a reference to something that will never exist.
 func TestAnUnpublishableRecordCannotAcquireADigest(t *testing.T) {
 	rec := validRecord()
-	rec.SchemaVersion = ResultRecordVersion
 	rec.TerminalReason = ""
 	if _, _, err := rec.Encode(); err == nil || !strings.Contains(err.Error(), "blank") {
 		t.Fatalf("err = %v, want the encoder to refuse it", err)
 	}
-	rec = validRecord() // version left at zero
+	rec = validRecord()
+	rec.SchemaVersion = 0
 	if _, _, err := rec.Encode(); err == nil || !strings.Contains(err.Error(), "schema version") {
 		t.Fatalf("err = %v, want a version refusal", err)
+	}
+}
+
+// TestTheExcerptSplitIsDeterministic.
+//
+// "Head and tail within the ceiling" is not a specification until the split is named: two producers
+// obeying the same bound could keep different bytes and both call themselves correct, and a verifier
+// could not tell which. Storing the halves separately is also what makes marker collision impossible -
+// process output is arbitrary bytes, so any in-band delimiter is a byte sequence real output can contain.
+func TestTheExcerptSplitIsDeterministic(t *testing.T) {
+	stream := []byte("0123456789")
+	head, tail, truncated := SplitExcerpt(stream, 5)
+	if !truncated || string(head) != "012" || string(tail) != "89" {
+		t.Fatalf("split = %q / %q truncated=%t, want a deterministic head-heavy split", head, tail, truncated)
+	}
+	// Repeating it gives the same answer, which is the whole point.
+	h2, t2, _ := SplitExcerpt(stream, 5)
+	if string(h2) != string(head) || string(t2) != string(tail) {
+		t.Fatal("the split is not deterministic")
+	}
+	// Within budget: the whole stream, no tail, not truncated.
+	head, tail, truncated = SplitExcerpt(stream, 100)
+	if truncated || tail != nil || string(head) != "0123456789" {
+		t.Fatalf("an in-budget stream was split: %q / %q truncated=%t", head, tail, truncated)
+	}
+	// The excerpt never exceeds the budget, and the halves are owned copies.
+	head, tail, _ = SplitExcerpt(stream, 4)
+	if uint64(len(head)+len(tail)) != 4 {
+		t.Fatalf("the split kept %d bytes of a 4-byte budget", len(head)+len(tail))
+	}
+	stream[0] = 'X'
+	if head[0] != '0' {
+		t.Fatal("the split shares the caller's backing array")
+	}
+	// A byte sequence identical to the display marker is ordinary output, and must survive.
+	withMarker := append(append([]byte("a"), ElisionMarker...), 'b')
+	h3, t3, tr := SplitExcerpt(withMarker, uint64(len(withMarker)))
+	if tr || !bytes.Equal(h3, withMarker) || t3 != nil {
+		t.Fatal("output containing the display marker was treated as already truncated")
+	}
+	rec := StreamRecord{Present: true, SourceBytes: uint64(len(withMarker)), RedactedBytes: uint64(len(withMarker)),
+		SHA256: sha256Hex(withMarker), Head: h3}
+	if err := rec.validate("stdout"); err != nil {
+		t.Fatalf("output containing the display marker was refused: %v", err)
+	}
+}
+
+// TestTheCombinedCeilingIsCombined.
+//
+// Per-stream checking admits a record twice the size the operator allowed.
+func TestTheCombinedCeilingIsCombined(t *testing.T) {
+	five := StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 5,
+		SHA256: sha256Hex([]byte("12345")), Head: []byte("12345")}
+	if FitsCombinedOutputCeiling(five, five, 9) {
+		t.Fatal("two five-byte excerpts fit a nine-byte ceiling")
+	}
+	if !FitsCombinedOutputCeiling(five, five, 10) {
+		t.Fatal("two five-byte excerpts did not fit a ten-byte ceiling")
+	}
+	if !FitsCombinedOutputCeiling(five, StreamRecord{}, 5) {
+		t.Fatal("an absent second stream was counted")
+	}
+}
+
+// TestTheDecoderRefusesNonCanonicalDocuments.
+//
+// DisallowUnknownFields alone was not the strict canonical boundary the comment claimed: Go matches keys
+// case-insensitively, takes the last of a duplicated pair, ignores order and tolerates whitespace. Each
+// of those decodes to the same record while hashing differently, so one record would have had several
+// durable digests - and a digest that does not uniquely name a record is not an identity.
+func TestTheDecoderRefusesNonCanonicalDocuments(t *testing.T) {
+	rec := validRecord()
+	raw, _, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		doc  []byte
+	}{
+		{"a duplicated key", bytes.Replace(append([]byte(nil), raw...), []byte(`{"attempt_id"`),
+			[]byte(`{"attempt_id":"somebody-else","attempt_id"`), 1)},
+		{"whitespace", append(append([]byte(" "), raw...), ' ')},
+		{"a case-aliased key", bytes.Replace(append([]byte(nil), raw...), []byte(`"attempt_id"`), []byte(`"Attempt_Id"`), 1)},
+		{"reordered keys", func() []byte {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			// Re-emit with a key deliberately hoisted to the front.
+			out := []byte(`{"terminal_reason":`)
+			out = append(out, m["terminal_reason"]...)
+			for k, v := range m {
+				if k == "terminal_reason" {
+					continue
+				}
+				out = append(out, ',')
+				out = append(out, []byte(`"`+k+`":`)...)
+				out = append(out, v...)
+			}
+			return append(out, '}')
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeResultRecord(tc.doc); err == nil {
+				t.Fatal("a non-canonical document was accepted, so one record has several durable digests")
+			}
+		})
 	}
 }

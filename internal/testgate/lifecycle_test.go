@@ -79,6 +79,9 @@ var thePrepared = PreparedAttempt{
 	TestedTree:   strings.Repeat("b", 40),
 	IntentDigest: strings.Repeat("c", 64),
 	Spec:         theSpec,
+	// The frozen COMBINED retained-output ceiling, carried with the attempt because the lifecycle has to
+	// enforce it and does not read policy.
+	MaxOutputBytes: 32768,
 }
 
 var theTerminal = Terminal{
@@ -124,8 +127,8 @@ func (c *fakeContainment) Close() error {
 	// A runner that reuses its output buffer once the domain is gone. It handed those bytes over at
 	// Wait; if the accepted terminal merely pointed at them, the evidence would change underneath
 	// everything downstream that had already been told what it was.
-	for i := range c.term.Stdout.Retained {
-		c.term.Stdout.Retained[i] = 'R'
+	for i := range c.term.Stdout.Head {
+		c.term.Stdout.Head[i] = 'R'
 	}
 	return c.closeErr
 }
@@ -162,6 +165,7 @@ type harness struct {
 	failConfirm                      error
 	failReauthorize, failObserve     error
 	failPublishResult, failFinalize  error
+	publishedResultDigest            string
 	identity                         Identity
 
 	// What each step actually received, so the facts can be proven to travel.
@@ -320,7 +324,16 @@ func newHarness(t *testing.T) *harness {
 				Stdout: rec.Stdout, Stderr: rec.Stderr,
 			}
 			h.sawResultIdentity = Identity{Value: rec.Identity, Commit: rec.TestedCommit, Tree: rec.TestedTree}
-			return strings.Repeat("d", 64), h.failPublishResult
+			if h.publishedResultDigest != "" {
+				return h.publishedResultDigest, h.failPublishResult
+			}
+			// A PRODUCTION-SHAPED publisher encodes what it was given and reports that record's digest.
+			// Returning a constant demonstrated the very gap this seam is meant to close.
+			_, d, err := rec.Encode()
+			if err != nil {
+				return "", err
+			}
+			return d, h.failPublishResult
 		},
 		FinalizeOutcome: func(_ PreparedAttempt, _ Terminal, _ Identity, digest string) (CommitStatus, error) {
 			t.Helper()
@@ -1159,7 +1172,7 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		Execution: theTerminal.Execution, TerminalReason: theTerminal.TerminalReason,
 		HasExitCode: true, ExitCode: 0, Author: state.TerminalByRunner,
 		Stdout: StreamRecord{Present: true, SourceBytes: 12, RedactedBytes: 3,
-			SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")},
+			SHA256: sha256Hex([]byte("abc")), Head: []byte("abc")},
 	}
 	h.cont.term = accepted
 
@@ -1172,8 +1185,8 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		term.TerminalReason = "MUTATED"
 		// The stream excerpt is the one part of a terminal that is a SLICE, so this is the only field a
 		// collaborator can rewrite through a value copy - and it happens BEFORE the record is built.
-		for i := range term.Stdout.Retained {
-			term.Stdout.Retained[i] = 'Z'
+		for i := range term.Stdout.Head {
+			term.Stdout.Head[i] = 'Z'
 		}
 		return observeID(p, term)
 	}
@@ -1182,15 +1195,19 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 			Execution: rec.Execution, TerminalReason: rec.TerminalReason, Author: rec.TerminalAuthor,
 			HasExitCode: rec.HasExitCode, ExitCode: rec.ExitCode,
 		}
+		// Mutated AFTER the real publisher has seen it: a publisher that corrupts the record before
+		// encoding simply cannot produce a digest for it now, which is the boundary doing its job rather
+		// than the property this test is about.
+		d, err := publishResult(rec)
 		rec.ExitCode = 17
-		return publishResult(rec)
+		return d, err
 	}
 	h.deps.FinalizeOutcome = func(p PreparedAttempt, term Terminal, id Identity, digest string) (CommitStatus, error) {
 		seen["finalization"] = term
 		// The LAST collaborator to see the terminal, and the returned Result is built after it. Without
 		// its own copy, whatever it leaves behind is what the caller is told happened.
-		for i := range term.Stdout.Retained {
-			term.Stdout.Retained[i] = 'Q'
+		for i := range term.Stdout.Head {
+			term.Stdout.Head[i] = 'Q'
 		}
 		return finalize(p, term, id, digest)
 	}
@@ -1200,8 +1217,8 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	seen["the returned result"] = res.Terminal
-	if !bytes.Equal(res.Terminal.Stdout.Retained, []byte("abc")) {
-		t.Fatalf("the returned result carries evidence a later collaborator rewrote: %q", res.Terminal.Stdout.Retained)
+	if !bytes.Equal(res.Terminal.Stdout.Head, []byte("abc")) {
+		t.Fatalf("the returned result carries evidence a later collaborator rewrote: %q", res.Terminal.Stdout.Head)
 	}
 	for who, got := range seen {
 		if got.Execution != accepted.Execution || !got.HasExitCode || got.ExitCode != 0 {
@@ -1215,13 +1232,13 @@ func TestAMutatingCollaboratorCannotChangeTheAcceptedTerminal(t *testing.T) {
 		t.Fatalf("only %d seams were audited: %v", len(seen), seen)
 	}
 	// The evidence the record bound must be what was ACCEPTED, not what a later collaborator left behind.
-	if !bytes.Equal(h.sawResultRecord.Stdout.Retained, []byte("abc")) {
-		t.Fatalf("a collaborator rewrote the stream evidence before it was recorded: %q", h.sawResultRecord.Stdout.Retained)
+	if !bytes.Equal(h.sawResultRecord.Stdout.Head, []byte("abc")) {
+		t.Fatalf("a collaborator rewrote the stream evidence before it was recorded: %q", h.sawResultRecord.Stdout.Head)
 	}
 	// The runner is entitled to reuse its own buffer once the domain is gone - and it does, in Close.
 	// What must NOT happen is that reuse reaching the evidence this process accepted.
-	if !bytes.Equal(res.Terminal.Stdout.Retained, []byte("abc")) {
-		t.Fatalf("the runner's buffer reuse reached the returned result: %q", res.Terminal.Stdout.Retained)
+	if !bytes.Equal(res.Terminal.Stdout.Head, []byte("abc")) {
+		t.Fatalf("the runner's buffer reuse reached the returned result: %q", res.Terminal.Stdout.Head)
 	}
 	// The runner still holds whatever it returned, and it must not be a handle into the accepted fact.
 	if h.cont.term.ExitCode != 0 || h.cont.term.Execution != accepted.Execution {
@@ -1706,9 +1723,9 @@ func TestThePublishedRecordCarriesWhatOnlyTheRunnerSaw(t *testing.T) {
 	t.Run("the runner's own observation, with both streams", func(t *testing.T) {
 		h := newHarness(t)
 		out := StreamRecord{Present: true, SourceBytes: 12, RedactedBytes: 3,
-			SHA256: sha256Hex([]byte("abc")), Retained: []byte("abc")}
+			SHA256: sha256Hex([]byte("abc")), Head: []byte("abc")}
 		errS := StreamRecord{Present: true, SourceBytes: 9, RedactedBytes: 2,
-			SHA256: sha256Hex([]byte("hi")), Retained: []byte("hi")}
+			SHA256: sha256Hex([]byte("hi")), Head: []byte("hi")}
 		h.cont.term = Terminal{
 			Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
 			HasExitCode: true, Stdout: out, Stderr: errS,
@@ -1721,7 +1738,7 @@ func TestThePublishedRecordCarriesWhatOnlyTheRunnerSaw(t *testing.T) {
 		if rec == nil {
 			t.Fatal("nothing was published")
 		}
-		if !bytes.Equal(rec.Stdout.Retained, []byte("abc")) || !bytes.Equal(rec.Stderr.Retained, []byte("hi")) {
+		if !bytes.Equal(rec.Stdout.Head, []byte("abc")) || !bytes.Equal(rec.Stderr.Head, []byte("hi")) {
 			t.Fatalf("the record lost the stream evidence: %+v / %+v", rec.Stdout, rec.Stderr)
 		}
 		if rec.Stdout.SourceBytes != 12 || rec.Stdout.RedactedBytes != 3 {
@@ -1774,4 +1791,70 @@ func TestThePublishedRecordCarriesWhatOnlyTheRunnerSaw(t *testing.T) {
 			t.Fatalf("it reached the durable seam: %v", h.r.steps)
 		}
 	})
+}
+
+// TestTheBoundDigestMustIdentifyTheRecordThatWasPublished.
+//
+// The outcome CAS binds whatever digest publication reports. Without an independently computed
+// expectation the ledger can name bytes nobody produced, and every later reader fetches something else
+// or nothing at all - the same hole intent publication was corrected for, one step later.
+func TestTheBoundDigestMustIdentifyTheRecordThatWasPublished(t *testing.T) {
+	h := newHarness(t)
+	h.publishedResultDigest = strings.Repeat("e", 64)
+
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "canonical digest is") {
+		t.Fatalf("err = %v, want a refusal naming both digests", err)
+	}
+	if h.r.did("finalize") {
+		t.Fatalf("an unverifiable digest reached the outcome CAS: %v", h.r.steps)
+	}
+}
+
+// TestTheCombinedRetainedOutputRespectsTheFrozenCeiling.
+//
+// The policy bounds the two streams TOGETHER. Checking them separately admits a record twice the size
+// the operator allowed, and the bound has to be applied where the record is built, because the publisher
+// does not hold the policy either.
+func TestTheCombinedRetainedOutputRespectsTheFrozenCeiling(t *testing.T) {
+	h := newHarness(t)
+	authorize := h.deps.Authorize
+	h.deps.Authorize = func(rev uint64) (PreparedAttempt, error) {
+		p, err := authorize(rev)
+		p.MaxOutputBytes = 8
+		return p, err
+	}
+	half := []byte("12345")
+	h.cont.term = Terminal{
+		Execution: state.TestExecutionOK, TerminalReason: "exited 0", Author: state.TerminalByRunner,
+		HasExitCode: true,
+		// Each stream is within the ceiling; together they are not.
+		Stdout: StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 5, SHA256: sha256Hex(half), Head: half},
+		Stderr: StreamRecord{Present: true, SourceBytes: 5, RedactedBytes: 5, SHA256: sha256Hex(half), Head: half},
+	}
+
+	_, err := Run(h.deps)
+	if err == nil || !strings.Contains(err.Error(), "over the frozen ceiling") {
+		t.Fatalf("err = %v, want a combined-ceiling refusal", err)
+	}
+	if h.r.did("publish-result") {
+		t.Fatalf("an oversized record reached the durable seam: %v", h.r.steps)
+	}
+}
+
+// TestTheRecordBindsTheWorkingDirectoryTheAttemptRanIn.
+//
+// A result that names the command but not where it ran describes the same argv in a different directory
+// and still looks consistent with everything else in the record.
+func TestTheRecordBindsTheWorkingDirectoryTheAttemptRanIn(t *testing.T) {
+	h := newHarness(t)
+	if _, err := Run(h.deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if h.sawResultRecord.Cwd != theSpec.Cwd {
+		t.Fatalf("the record says cwd %q, the attempt ran in %q", h.sawResultRecord.Cwd, theSpec.Cwd)
+	}
+	if h.sawResultRecord.SpecDigest != theSpec.Digest {
+		t.Fatalf("the record binds spec %q, the attempt armed %q", h.sawResultRecord.SpecDigest, theSpec.Digest)
+	}
 }

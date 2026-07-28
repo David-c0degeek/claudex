@@ -16,11 +16,14 @@ import (
 // closed rather than being read as the current shape.
 const ResultRecordVersion = 1
 
-// ElisionMarker separates the head and tail of a truncated excerpt.
+// ElisionMarker is what a RENDERER puts between the two halves when showing a truncated excerpt to a
+// person. It is deliberately NOT part of the stored representation.
 //
-// The excerpt rule is head+tail with an EXPLICIT marker rather than a silent cut, so a reader can see
-// that bytes are missing and where. Without the marker a truncated excerpt is indistinguishable from
-// output that genuinely contained the two halves adjacent to each other.
+// An earlier version stored head, marker and tail in one blob and validated by searching for exactly
+// one marker. Process output is arbitrary bytes, so that is unsound in both directions: a legitimate
+// excerpt containing this byte sequence was rejected, and any blob containing one copy of it was
+// accepted as a well-formed head+tail. The split is structural now, which makes collision impossible
+// rather than unlikely.
 var ElisionMarker = []byte("\n...[claudex: output elided]...\n")
 
 // ResultRecord is the ONE immutable record an attempt produces, in the shape design section 3 and
@@ -41,12 +44,22 @@ type ResultRecord struct {
 
 	// ResolvedExecutable and ResolvedArgv are the command that actually ran, resolved at attempt start
 	// rather than re-derived. A verifier is expected to be able to see WHICH argv ran.
-	ResolvedExecutable string   `json:"resolved_executable"`
-	ResolvedArgv       []string `json:"resolved_argv"`
+	// SpecDigest is the identity of the whole execution spec that was ARMED - executable, argv, cwd and
+	// environment together. Without it the record can describe the same command in a different working
+	// directory and still look consistent.
+	SpecDigest string `json:"spec_digest"`
+	Cwd        string `json:"cwd"`
+
+	ResolvedExecutable string `json:"resolved_executable"`
+	// ResolvedArgv and EnvNames are base64 on the wire, in EVERY carrier of the execution view.
+	// Canonical JSON is not byte-lossless: an inherited value or an argv element may contain invalid
+	// UTF-8, and encoding it as a JSON string normalizes those bytes, so the digest would bind
+	// something the child never received. Same defect as the git paths at TURN 216.
+	ResolvedArgv [][]byte `json:"resolved_argv_b64"`
 	// EnvNames are the sorted frozen variable names; EnvDigest is over the canonical ACTUAL name/value
 	// list, not a redacted one - redacted pairs collapse distinct secrets onto one marker, so a
 	// redaction-based digest cannot prove equality.
-	EnvNames  []string `json:"env_names"`
+	EnvNames  [][]byte `json:"env_names_b64"`
 	EnvDigest string   `json:"env_digest"`
 
 	// Execution and Identity are the two independent halves of the outcome.
@@ -83,20 +96,53 @@ type StreamRecord struct {
 	// the whole stream, so it is trusted at the same level as the exit code and is NOT recomputable
 	// from this record.
 	SHA256 string `json:"sha256"`
-	// Retained is the bounded excerpt actually kept, as exact bytes. It is base64 on the wire so the
-	// record is self-contained and lossless for output that is not valid UTF-8.
-	Retained []byte `json:"retained_b64"`
+	// Head and Tail are the two halves of the bounded excerpt, stored SEPARATELY so that no byte
+	// sequence in the output can be mistaken for a boundary. Both are base64 on the wire, so the record
+	// is self-contained and lossless for output that is not valid UTF-8.
+	Head []byte `json:"head_b64"`
+	Tail []byte `json:"tail_b64"`
 	// Truncated says whether the excerpt is short of the full redacted stream.
 	Truncated bool `json:"truncated"`
 }
 
 // RetainedBytes is the count of the retained excerpt, derived rather than stored.
 //
-// Storing it beside the slice would be a second representation of one fact, and the two could disagree.
-func (s StreamRecord) RetainedBytes() uint64 { return uint64(len(s.Retained)) }
+// Storing it beside the bytes would be a second representation of one fact, and the two could disagree.
+func (s StreamRecord) RetainedBytes() uint64 { return uint64(len(s.Head) + len(s.Tail)) }
+
+// Retained is the excerpt as one slice, for callers that only want to read it. It is a COPY: handing
+// out the record's own arrays would let a reader edit the evidence.
+func (s StreamRecord) Retained() []byte {
+	out := make([]byte, 0, len(s.Head)+len(s.Tail))
+	out = append(out, s.Head...)
+	return append(out, s.Tail...)
+}
+
+// SplitExcerpt allocates a bounded excerpt DETERMINISTICALLY: the head takes the larger half of an odd
+// budget, and the tail the rest.
+//
+// It is defined here, once, because "head+tail within the ceiling" is not a specification until the
+// split is named - two producers obeying the same ceiling could otherwise keep different bytes and both
+// call themselves correct, and a verifier could not tell which.
+func SplitExcerpt(stream []byte, budget uint64) (head, tail []byte, truncated bool) {
+	if uint64(len(stream)) <= budget {
+		return append([]byte(nil), stream...), nil, false
+	}
+	headLen := (budget + 1) / 2
+	tailLen := budget - headLen
+	return append([]byte(nil), stream[:headLen]...),
+		append([]byte(nil), stream[uint64(len(stream))-tailLen:]...), true
+}
 
 // validate refuses a record that contradicts itself, before anything can publish it.
 func (r ResultRecord) validate() error {
+	// The version is checked HERE rather than only at the encoder, because a record built without one
+	// was passing every check its builder ran and then being refused at publication - which is the
+	// worst place to find out, since the attempt is already bound by then.
+	if r.SchemaVersion != ResultRecordVersion {
+		return fmt.Errorf("%w: result record schema version %d, want %d",
+			ErrLifecycle, r.SchemaVersion, ResultRecordVersion)
+	}
 	if r.AttemptID == "" {
 		return fmt.Errorf("%w: the result names no attempt", ErrLifecycle)
 	}
@@ -106,6 +152,14 @@ func (r ResultRecord) validate() error {
 	}
 	if r.ResolvedExecutable == "" || len(r.ResolvedArgv) == 0 {
 		return fmt.Errorf("%w: the result records no command, so a verifier cannot see which argv ran", ErrLifecycle)
+	}
+	if r.Cwd == "" {
+		return fmt.Errorf("%w: the result records no working directory", ErrLifecycle)
+	}
+	// The spec digest is what proves this record describes the execution that was ARMED, rather than
+	// merely one that looks similar.
+	if !state.IsSHA256Hex(r.SpecDigest) {
+		return fmt.Errorf("%w: the execution spec digest %q is not a sha256", ErrLifecycle, r.SpecDigest)
 	}
 	if !state.IsSHA256Hex(r.EnvDigest) {
 		return fmt.Errorf("%w: the environment digest %q is not a sha256", ErrLifecycle, r.EnvDigest)
@@ -207,7 +261,8 @@ func (s StreamRecord) validate(what string) error {
 		// Absent has ONE shape. Otherwise "no evidence" and "evidence nobody looked at" become
 		// indistinguishable, and whether the extra values are trusted depends on each reader checking
 		// the flag first.
-		if s.SourceBytes != 0 || s.RedactedBytes != 0 || s.SHA256 != "" || len(s.Retained) != 0 || s.Truncated {
+		if s.SourceBytes != 0 || s.RedactedBytes != 0 || s.SHA256 != "" ||
+			len(s.Head) != 0 || len(s.Tail) != 0 || s.Truncated {
 			return fmt.Errorf("%w: %s is absent but still carries evidence", ErrLifecycle, what)
 		}
 		return nil
@@ -232,31 +287,25 @@ func (s StreamRecord) validate(what string) error {
 		// digest is recomputable and must match. Checking only its grammar let a record disagree with
 		// its own bound digest while every other rule passed - and the design's own boundary says this
 		// is one of the facts a verifier recomputes rather than trusts.
-		if got := sha256Hex(s.Retained); got != s.SHA256 {
+		if len(s.Tail) != 0 {
+			return fmt.Errorf("%w: %s is untruncated but split into two halves", ErrLifecycle, what)
+		}
+		if got := sha256Hex(s.Head); got != s.SHA256 {
 			return fmt.Errorf("%w: %s retains the whole stream but hashes to %q, not the bound %q",
 				ErrLifecycle, what, got, s.SHA256)
 		}
-		return nil
-	}
-	// A truncated excerpt is head+tail with an EXPLICIT marker, so a reader can see that bytes are
-	// missing and where. A silent cut is indistinguishable from output that really did contain the two
-	// halves adjacent to each other.
-	if !bytes.Contains(s.Retained, ElisionMarker) {
-		return fmt.Errorf("%w: %s is truncated but carries no elision marker", ErrLifecycle, what)
-	}
-	if idx := bytes.Index(s.Retained, ElisionMarker); idx != bytes.LastIndex(s.Retained, ElisionMarker) {
-		return fmt.Errorf("%w: %s carries more than one elision marker, so the excerpt is not head+tail",
-			ErrLifecycle, what)
 	}
 	return nil
 }
 
-// FitsOutputCeiling reports whether the excerpt respects the policy ceiling.
+// FitsCombinedOutputCeiling reports whether the two streams TOGETHER respect the frozen policy bound.
 //
-// It is separate from validate because the ceiling lives in the run policy and the record does not carry
-// it. Keeping it out of validate would have been the easy thing; naming it here means a caller that has
-// the policy has no excuse for not applying it.
-func (s StreamRecord) FitsOutputCeiling(max uint64) bool { return s.RetainedBytes() <= max }
+// Combined, because that is what the policy bounds - checking each stream separately admits a record
+// twice the size the operator allowed. It takes the ceiling as an argument because the record does not
+// carry policy, and it is named on the type so a caller holding the frozen bound has no excuse.
+func FitsCombinedOutputCeiling(stdout, stderr StreamRecord, max uint64) bool {
+	return stdout.RetainedBytes()+stderr.RetainedBytes() <= max
+}
 
 // cloneStream and cloneRecord hand out owned copies, including the retained bytes.
 //
@@ -265,8 +314,11 @@ func (s StreamRecord) FitsOutputCeiling(max uint64) bool { return s.RetainedByte
 // than scalars.
 func cloneStream(s StreamRecord) StreamRecord {
 	c := s
-	if s.Retained != nil {
-		c.Retained = append([]byte(nil), s.Retained...)
+	if s.Head != nil {
+		c.Head = append([]byte(nil), s.Head...)
+	}
+	if s.Tail != nil {
+		c.Tail = append([]byte(nil), s.Tail...)
 	}
 	return c
 }
@@ -276,12 +328,8 @@ func cloneRecord(r *ResultRecord) *ResultRecord {
 		return nil
 	}
 	c := *r
-	if r.ResolvedArgv != nil {
-		c.ResolvedArgv = append([]string(nil), r.ResolvedArgv...)
-	}
-	if r.EnvNames != nil {
-		c.EnvNames = append([]string(nil), r.EnvNames...)
-	}
+	c.ResolvedArgv = cloneByteSlices(r.ResolvedArgv)
+	c.EnvNames = cloneByteSlices(r.EnvNames)
 	c.Stdout = cloneStream(r.Stdout)
 	c.Stderr = cloneStream(r.Stderr)
 	return &c
@@ -347,10 +395,41 @@ func DecodeResultRecord(raw []byte) (ResultRecord, error) {
 	if err := rec.validate(); err != nil {
 		return ResultRecord{}, err
 	}
+	// The document must be EXACTLY what this schema would have written.
+	//
+	// DisallowUnknownFields alone is not the strict canonical boundary the comment used to claim: Go's
+	// decoder matches keys case-insensitively, takes the last of a duplicated pair, ignores key order
+	// and tolerates whitespace and explicit nulls. Every one of those produces a document that decodes
+	// to this record while hashing differently - so one record would have had several durable digests,
+	// and a digest that does not uniquely name a record is not an identity.
+	//
+	// Re-encoding and comparing settles all of them at once, and it cannot drift from the encoder
+	// because it IS the encoder.
+	reencoded, _, err := rec.Encode()
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	if !bytes.Equal(reencoded, raw) {
+		return ResultRecord{}, fmt.Errorf("%w: the result record is not in canonical form", ErrLifecycle)
+	}
 	return rec, nil
 }
 
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// cloneByteSlices deep-copies a list of byte slices, preserving nil so a round trip is an identity.
+func cloneByteSlices(src [][]byte) [][]byte {
+	if src == nil {
+		return nil
+	}
+	out := make([][]byte, len(src))
+	for i, b := range src {
+		if b != nil {
+			out[i] = append([]byte(nil), b...)
+		}
+	}
+	return out
 }
